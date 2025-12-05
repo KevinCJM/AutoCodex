@@ -3,10 +3,11 @@
 @File: codex_utils.py
 @Modify Time: 2025/12/5 11:12       
 @Author: Kevin-Chen
-@Descriptions: codex exec 工具
+@Descriptions: codex exec 工具函数
 """
 import time
 import json
+import shutil
 import subprocess
 from other_utils import write_json, json_key_exists, CURRENT_DIR
 
@@ -132,50 +133,19 @@ def handle_events(events):
 
 
 # 初始化一个 codex 对话 session
-def init_codex(prompt, folder_path, model_name="gpt-5.1-codex-mini", reasoning_effort="low", timeout=300,
-               session_name=None):
+def init_codex(prompt, folder_path=None, model_name="gpt-5.1-codex-mini", reasoning_effort="low", timeout=300):
     """
-    初始化一个 codex 对话 session
+    初始化一个 codex 对话 session。
 
     参数:
         prompt (str): 输入的提示词或指令
-        folder_path (str): 工作目录路径
+        folder_path (str | None): codex 的工作目录；默认为 None 时使用 CURRENT_DIR/session_name 并自动创建目录
         model_name (str): 使用的模型名称，默认为"gpt-5.1-codex-mini"
         reasoning_effort (str): 推理努力程度，可选值有"low"等，默认为"low"
         timeout (int): 命令执行超时时间（秒），默认为300秒
-        session_name (str): 设置对话名称, 便于记忆
     返回值:
         tuple: 包含三个元素的元组 (信息列表, 智能体的回答, session_ID)
     """
-    # 如果session_name为None，则使用默认名称
-    if session_name is None:
-        session_name = f"临时对话{time.strftime('%Y%m%d%H%M%S')}"
-
-    # 当 session_name 已经存在时，交互式处理：覆盖 / 重新输入 / 退出
-    while json_key_exists(CURRENT_DIR, "session_name.json", session_name):
-        print(f"Session 名称 '{session_name}' 已经存在。")
-        print("请选择操作：")
-        print("  1. 覆盖原有 session")
-        print("  2. 重新输入一个新的 session 名称")
-        print("  3. 退出程序")
-        choice = input("请输入选择编号 (1/2/3)：").strip()
-
-        if choice == "1":
-            # 覆盖：直接使用当前 session_name，后续 write_json 会更新对应的 thread_id
-            break
-        elif choice == "2":
-            new_name = input("请输入新的 session 名称：").strip()
-            if not new_name:
-                print("Session 名称不能为空，请重新输入。")
-                continue
-            session_name = new_name
-            # 循环顶部会再次判断新名称是否存在
-        elif choice == "3":
-            print("已选择退出程序。")
-            raise SystemExit(0)
-        else:
-            print("无效选择，请输入 1 / 2 / 3。")
-
     # 构造codex执行命令的参数列表
     init_cmd = [
         "codex", "exec",
@@ -188,12 +158,8 @@ def init_codex(prompt, folder_path, model_name="gpt-5.1-codex-mini", reasoning_e
     ]
     # 运行命令并解析结果
     events, errs, return_code = run_codex(init_cmd, timeout=timeout)
-    # 处理结果 (信息列表, 智能体的回答, session_ID)
-    responses, agent_message, thread_id = handle_events(events)
-    # 保存 {对话名称: thread_id} 到 session_name.json
-    write_json(CURRENT_DIR, "session_name.json", {session_name: thread_id})
-    # 返回处理结果
-    return responses, agent_message, thread_id
+    # 返回处理结果 (信息列表, 智能体的回答, session_ID)
+    return handle_events(events)
 
 
 # 恢复一个已经存在的 codex 对话 session
@@ -231,11 +197,13 @@ def resume_codex(thread_id, folder_path, prompt, model_name="gpt-5.1-codex-mini"
 if __name__ == "__main__":
     cd_path = CURRENT_DIR
     init_prompt = """记住: 使用中文进行对话和文档编写"""
-    _, msg, session_id = init_codex(init_prompt, cd_path, session_name="记忆测试")
+    _, msg, session_id = init_codex(init_prompt, cd_path)
     print(msg)
     resume_prompt = """记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到."""
-    _, msg, _ = resume_codex(session_id, cd_path, resume_prompt)
+    _, msg, _ = resume_codex(session_id, cd_path, resume_prompt,
+                             "gpt-5.1-codex-mini", "low", 300)
     resume_prompt = """谁来找小白兔? 小白兔在哪? 谁和小白兔在一起? 小白兔在做什么?"""
     print(msg)
-    _, msg, _ = resume_codex(session_id, cd_path, resume_prompt)
+    _, msg, _ = resume_codex(session_id, cd_path, resume_prompt,
+                             "gpt-5.1-codex-mini", "low", 300)
     print(msg)
