@@ -13,6 +13,7 @@ from pathlib import Path
 CURRENT_DIR = Path(__file__).resolve().parent
 
 
+# 判断 data 是否为 JSON 支持的基础数据结构
 def is_valid_json_data(data):
     """
     判断 data 是否为 JSON 支持的基础数据结构
@@ -34,6 +35,7 @@ def is_valid_json_data(data):
     return False
 
 
+# 确保 folder_path/file_path 这个 JSON 文件存在，不存在则创建 {}
 def session_name_json(folder_path, file_path="session_name.json"):
     """
     确保 folder_path/file_path 这个 JSON 文件存在，不存在则创建 {}
@@ -50,6 +52,7 @@ def session_name_json(folder_path, file_path="session_name.json"):
     return session_name_json_path
 
 
+# 在 folder_path/file_path 写入 JSON 数据（以追加键值对方式合并）
 def write_json(folder_path, file_path, data):
     """
     在 folder_path/file_path 写入 JSON 数据（以追加键值对方式合并）
@@ -81,6 +84,7 @@ def write_json(folder_path, file_path, data):
         json.dump(existing, f, ensure_ascii=False, indent=2)
 
 
+# 判断指定的 key 是否已经存在于 folder_path/file_path 对应的 JSON 文件中
 def json_key_exists(folder_path, file_path, key):
     """
     判断指定的 key 是否已经存在于 folder_path/file_path 对应的 JSON 文件中
@@ -103,10 +107,10 @@ def json_key_exists(folder_path, file_path, key):
     return key in existing
 
 
+# 从 folder_path/file_path 对应的 JSON 文件中 删除指定的顶层 key 及其对应的值
 def delete_json_key(folder_path, file_path, key):
     """
-    从 folder_path/file_path 对应的 JSON 文件中
-    删除指定的顶层 key 及其对应的值。
+    从 folder_path/file_path 对应的 JSON 文件中 删除指定的顶层 key 及其对应的值
 
     无论 key 是否存在，函数都会在检查后重写整个 JSON 文件。
     返回布尔值：True 表示确实删除了一个已存在的 key，False 表示原本就不存在。
