@@ -8,7 +8,6 @@
 import os
 import json
 import time
-import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from codex_utils import init_codex, resume_codex
@@ -117,36 +116,15 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
     # 创建 session_folder 文件夹
     os.makedirs(session_folder, exist_ok=False)
 
-    # 创建锁对象以确保多线程打印安全
-    print_lock = threading.Lock()
-
-    def _log_block(title, lines):
-        """保证多线程下日志不交叉"""
-        with print_lock:
-            block = ["", f"==== {title} ===="]
-            block.extend([f"• {line}" for line in lines])
-            block.append("")
-            print("\n".join(block))
-
     # 创建智能体, 明确智能体职责
     agent_id_dict = {}
     max_workers = max(1, min(8, len(agent_name_and_role_dict)))
 
-    def _fmt_answer(ans):
-        if isinstance(ans, list):
-            return " / ".join(map(str, ans))
-        return str(ans)
-
     def _init_agent(agent_name, role):
-        _log_block(f"准备初始化 {agent_name}", [f"角色: {role}"])
-        responses, agent_message, thread_id = init_codex(role, work_folder,
-                                                         model_name, reasoning_effort, timeout)
+        responses, agent_message, t_id = init_codex(role, work_folder,
+                                                    model_name, reasoning_effort, timeout)
         save_agent_dialogue(session_folder, agent_name, role, responses, agent_message, thread_id)
-        _log_block(f"{agent_name} 初始化完成", [
-            f"thread_id: {thread_id}",
-            f"初始回答: {_fmt_answer(agent_message)}"
-        ])
-        return agent_name, thread_id, responses, agent_message
+        return agent_name, t_id, responses, agent_message
 
     # 并发初始化所有智能体
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -177,14 +155,9 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
 
     # 对每个智能体执行公共逻辑提示词
     def _run_general_prompt(agent_name, t_id, g_prompt):
-        _log_block(f"{agent_name} 开始执行公共提示", [f"prompt: {g_prompt}"])
         responses, agent_message, t_id = resume_codex(t_id, work_folder, g_prompt,
                                                       model_name, reasoning_effort, timeout)
-        save_agent_dialogue(session_folder, agent_name, g_prompt, responses, agent_message, thread_id)
-        _log_block(f"{agent_name} 完成公共提示", [
-            f"prompt: {g_prompt}",
-            f"回答: {_fmt_answer(agent_message)}"
-        ])
+        save_agent_dialogue(session_folder, agent_name, g_prompt, responses, agent_message, t_id)
         return agent_name, t_id
 
     # 并发执行通用提示任务
@@ -207,113 +180,120 @@ if __name__ == "__main__":
         """记住:
 1) 使用中文进行对话和文档编写;
 2) 使用 "/Users/chenjunming/Desktop/myenv_312/bin/python3.12" 命令来执行python代码""",
+        "小白兔在哪里?",
+        "小白兔和谁在一起?",
+        "谁来找小白兔?",
         # """深度理解以 local_test_3.py 为入口的代码全链路逻辑. 禁止修改代码."""
     ]
+    #     agent_role_dict = {
+    #         "需求分析师": """你是一名专业的 需求分析师（Business Analyst），负责理解业务目标、约束、流程，并输出结构化、可执行的需求文档。
+    #
+    # 核心职责
+    # 1. 将用户需求拆分为明确的业务目标、输入输出格式、约束条件、异常场景。
+    # 2. 编写 高质量需求文档（Requirements.md），保证结构化、可测试、可实现。
+    # 3. 输出 验收标准，用于测试工程师自动化验证。
+    #
+    # 额外职责：审核算法工程师的代码, 当算法工程师提供新代码时：
+    # 1. 审查代码是否满足需求文档。
+    # 2. 检查逻辑是否遗漏业务规则。
+    # 3. 标记潜在风险、未对齐点、可优化点。
+    # 4. 必要时要求算法工程师补充文档或修改实现。
+    #
+    # 文风要求:
+    # 1. 直接、务实、无废话。
+    # 2. 输出结构化 Markdown 文档。
+    # 3. 使用表格归纳输入/输出/约束。
+    # 4. 避免推测需求，严格基于提供的信息。""",
+    #         "算法工程师": """你是一名资深 算法工程师（Algorithm Engineer / Software Engineer），擅长 Python、NumPy、Pandas、Numba。
+    #
+    # 核心职责:
+    # 1. 根据需求分析师文档实现算法与代码。
+    # 2. 输出可运行的 Python 代码，结构清晰，可测试，可扩展。
+    # 3. 注重性能、内存占用、数据结构合理性。
+    # 4. 遵守项目代码规范。
+    #
+    # 额外职责：审核需求文档
+    # 1. 当需求分析师提交 Requirements 文档时：
+    # 2. 判断需求是否完整、可实现、无矛盾。
+    # 3. 标记模糊部分、不合理约束、潜在性能风险。
+    # 4. 必要时要求需求分析师完善文档。
+    #
+    # 文风要求
+    # 1. 输出代码时必须可直接运行。
+    # 2. 解释算法逻辑时必须简洁精准。
+    # 3. 若需求不合理，必须指出并提出方案。""",
+    #         "测试工程师": """你是一名严格的 测试工程师（QA / Test Engineer），熟悉自动化测试、边界分析、黑盒/白盒测试策略。
+    #
+    #         核心职责
+    #         1. 根据要求生成 测试计划 TestPlan.md。
+    #         2. 设计覆盖率高的测试用例，包括：
+    #          - 正常流程
+    #          - 边界条件
+    #          - 异常输入
+    #          - 性能压力测试
+    #         3. 输出 自动化可执行的测试代码（pytest / unittest）。
+    #
+    #         额外职责：审核需求分析师的文档
+    #         1. 检查需求是否可测试、可验证、有明确验收标准。
+    #         2. 标记未测试的隐性需求、模糊描述。
+    #
+    #         文风要求
+    #         1. 测试用例必须编号、结构化。
+    #         2. 测试代码必须可直接运行。
+    #         3. 不允许遗漏关键边界条件。""",
+    #         "代码审核员1": """你是一名 代码审核员（Code Reviewer / Software Architect），负责质量把关。
+    #
+    #         核心职责
+    #         1. 审核算法工程师的代码：
+    #          - 逻辑正确性
+    #          - 性能、内存效率
+    #          - 安全性、鲁棒性
+    #          - 可维护性、可扩展性
+    #         2. 给出明确修改建议或确认通过。
+    #         3. 必要时可以提供完整的改进版本。
+    #
+    #         额外职责：双向审核
+    #         1. 审核需求分析师的文档
+    #          - 检查是否具备可开发性
+    #          - 检查是否存在歧义、不完整、不一致
+    #          - 标记可能造成实现困难的需求
+    #         2. 审核算法工程师写的最新代码
+    #          - 深入阅读、分析性能、检查边界
+    #          - 发现问题必须逐条指出，可定位到行号/模块
+    #          - 必要时要求重新提交代码或补充验证数据
+    #
+    #         文风要求
+    #         1. 直接指出问题，不拐弯抹角
+    #         2. 给出清晰 actionable 改进建议
+    #         3. 严格，不留隐患""",
+    #         "代码审核员2": """你是一名 代码审核员（Code Reviewer / Software Architect），负责质量把关。
+    #
+    #         核心职责
+    #         1. 审核算法工程师的代码：
+    #          - 逻辑正确性
+    #          - 性能、内存效率
+    #          - 安全性、鲁棒性
+    #          - 可维护性、可扩展性
+    #         2. 给出明确修改建议或确认通过。
+    #         3. 必要时可以提供完整的改进版本。
+    #
+    #         额外职责：双向审核
+    #         1. 审核需求分析师的文档
+    #          - 检查是否具备可开发性
+    #          - 检查是否存在歧义、不完整、不一致
+    #          - 标记可能造成实现困难的需求
+    #         2. 审核算法工程师写的最新代码
+    #          - 深入阅读、分析性能、检查边界
+    #          - 发现问题必须逐条指出，可定位到行号/模块
+    #          - 必要时要求重新提交代码或补充验证数据
+    #
+    #         文风要求
+    #         1. 直接指出问题，不拐弯抹角
+    #         2. 给出清晰 actionable 改进建议
+    #         3. 严格，不留隐患""",
+    #     }
     agent_role_dict = {
-        "需求分析师": """你是一名专业的 需求分析师（Business Analyst），负责理解业务目标、约束、流程，并输出结构化、可执行的需求文档。
-
-核心职责
-1. 将用户需求拆分为明确的业务目标、输入输出格式、约束条件、异常场景。
-2. 编写 高质量需求文档（Requirements.md），保证结构化、可测试、可实现。
-3. 输出 验收标准，用于测试工程师自动化验证。
-
-额外职责：审核算法工程师的代码, 当算法工程师提供新代码时：
-1. 审查代码是否满足需求文档。
-2. 检查逻辑是否遗漏业务规则。
-3. 标记潜在风险、未对齐点、可优化点。
-4. 必要时要求算法工程师补充文档或修改实现。
-
-文风要求:
-1. 直接、务实、无废话。
-2. 输出结构化 Markdown 文档。
-3. 使用表格归纳输入/输出/约束。
-4. 避免推测需求，严格基于提供的信息。""",
-        "算法工程师": """你是一名资深 算法工程师（Algorithm Engineer / Software Engineer），擅长 Python、NumPy、Pandas、Numba。
-
-核心职责:
-1. 根据需求分析师文档实现算法与代码。
-2. 输出可运行的 Python 代码，结构清晰，可测试，可扩展。
-3. 注重性能、内存占用、数据结构合理性。
-4. 遵守项目代码规范。
-
-额外职责：审核需求文档
-1. 当需求分析师提交 Requirements 文档时：
-2. 判断需求是否完整、可实现、无矛盾。
-3. 标记模糊部分、不合理约束、潜在性能风险。
-4. 必要时要求需求分析师完善文档。
-
-文风要求
-1. 输出代码时必须可直接运行。
-2. 解释算法逻辑时必须简洁精准。
-3. 若需求不合理，必须指出并提出方案。""",
-        #         "测试工程师": """你是一名严格的 测试工程师（QA / Test Engineer），熟悉自动化测试、边界分析、黑盒/白盒测试策略。
-        #
-        # 核心职责
-        # 1. 根据要求生成 测试计划 TestPlan.md。
-        # 2. 设计覆盖率高的测试用例，包括：
-        #  - 正常流程
-        #  - 边界条件
-        #  - 异常输入
-        #  - 性能压力测试
-        # 3. 输出 自动化可执行的测试代码（pytest / unittest）。
-        #
-        # 额外职责：审核需求分析师的文档
-        # 1. 检查需求是否可测试、可验证、有明确验收标准。
-        # 2. 标记未测试的隐性需求、模糊描述。
-        #
-        # 文风要求
-        # 1. 测试用例必须编号、结构化。
-        # 2. 测试代码必须可直接运行。
-        # 3. 不允许遗漏关键边界条件。""",
-        #         "代码审核员1": """你是一名 代码审核员（Code Reviewer / Software Architect），负责质量把关。
-        #
-        # 核心职责
-        # 1. 审核算法工程师的代码：
-        #  - 逻辑正确性
-        #  - 性能、内存效率
-        #  - 安全性、鲁棒性
-        #  - 可维护性、可扩展性
-        # 2. 给出明确修改建议或确认通过。
-        # 3. 必要时可以提供完整的改进版本。
-        #
-        # 额外职责：双向审核
-        # 1. 审核需求分析师的文档
-        #  - 检查是否具备可开发性
-        #  - 检查是否存在歧义、不完整、不一致
-        #  - 标记可能造成实现困难的需求
-        # 2. 审核算法工程师写的最新代码
-        #  - 深入阅读、分析性能、检查边界
-        #  - 发现问题必须逐条指出，可定位到行号/模块
-        #  - 必要时要求重新提交代码或补充验证数据
-        #
-        # 文风要求
-        # 1. 直接指出问题，不拐弯抹角
-        # 2. 给出清晰 actionable 改进建议
-        # 3. 严格，不留隐患""",
-        #         "代码审核员2": """你是一名 代码审核员（Code Reviewer / Software Architect），负责质量把关。
-        #
-        # 核心职责
-        # 1. 审核算法工程师的代码：
-        #  - 逻辑正确性
-        #  - 性能、内存效率
-        #  - 安全性、鲁棒性
-        #  - 可维护性、可扩展性
-        # 2. 给出明确修改建议或确认通过。
-        # 3. 必要时可以提供完整的改进版本。
-        #
-        # 额外职责：双向审核
-        # 1. 审核需求分析师的文档
-        #  - 检查是否具备可开发性
-        #  - 检查是否存在歧义、不完整、不一致
-        #  - 标记可能造成实现困难的需求
-        # 2. 审核算法工程师写的最新代码
-        #  - 深入阅读、分析性能、检查边界
-        #  - 发现问题必须逐条指出，可定位到行号/模块
-        #  - 必要时要求重新提交代码或补充验证数据
-        #
-        # 文风要求
-        # 1. 直接指出问题，不拐弯抹角
-        # 2. 给出清晰 actionable 改进建议
-        # 3. 严格，不留隐患""",
+        "需求分析师": "你好, 你是谁? 记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到.",
+        "算法工程师": "你好, 你是谁? 记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到."
     }
     start_session("测试用", w_folder, general_p_list, agent_role_dict)
