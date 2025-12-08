@@ -13,6 +13,40 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from codex_utils import init_codex, resume_codex
 from other_utils import CURRENT_DIR, is_valid_json_data, json_key_exists, session_name_json
 
+# 终端颜色配置与按需分配
+AGENT_COLORS = {}
+COLOR_CYCLE = ["\033[95m", "\033[94m", "\033[96m", "\033[92m", "\033[93m", "\033[91m"]
+COLOR_RESET = "\033[0m"
+
+
+# 将本轮对话打印到终端，按智能体分配不同颜色
+def print_dialogue(agent_name, prompt, answer):
+    """
+    将本轮对话打印到终端，按智能体分配不同颜色。
+
+    参数:
+        agent_name (str): 智能体名称
+        prompt (Any): 输入提示词
+        answer (Any): 智能体回复（列表或字符串）
+    """
+    if agent_name not in AGENT_COLORS:
+        color = COLOR_CYCLE[len(AGENT_COLORS) % len(COLOR_CYCLE)]
+        AGENT_COLORS[agent_name] = color
+    color = AGENT_COLORS.get(agent_name, "")
+
+    def _to_text(content):
+        if is_valid_json_data(content):
+            return json.dumps(content, ensure_ascii=False, indent=2)
+        return str(content)
+
+    prompt_text = _to_text(prompt)
+    if isinstance(answer, list):
+        answer_text = "\n".join(_to_text(item) for item in answer)
+    else:
+        answer_text = _to_text(answer)
+
+    print(f"{color}[{agent_name}] \nprompt:\n{prompt_text}\nreply:\n{answer_text}{COLOR_RESET}\n---\n")
+
 
 # 保存智能体的对话记录到 Markdown 文件中。每个对话记录包括提示词(prompt)、处理过程(process)和回答(answer)
 def save_agent_dialogue(session_folder, agent_name, prompt, process, answer, thread_id, save_process=True):
@@ -107,16 +141,18 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
     异常:
         ValueError: 若 session_name 已存在对应的文件夹或 JSON 键，则抛出异常。
     """
-    ''' 0. 辅助函数 ----------------------------------------------------------------------------------------------- '''
+    ''' 0. 辅助函数 =============================================================================================== '''
 
     # 初始化智能体代理
     def _init_agent(agent_name, role):
         """
         初始化智能体代理
         """
-        responses, agent_message, t_id = init_codex(role, work_folder,
-                                                    model_name, reasoning_effort, timeout)
-        save_agent_dialogue(session_folder, agent_name, role, responses, agent_message, thread_id)
+        responses, agent_message, t_id = init_codex(role, work_folder, model_name,
+                                                    reasoning_effort, timeout)
+        print_dialogue(agent_name, role, agent_message)
+        save_agent_dialogue(session_folder, agent_name, role, responses,
+                            agent_message, t_id)
         return agent_name, t_id, responses, agent_message
 
     # 执行智能体的通用提示词逻辑
@@ -126,6 +162,7 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
         """
         responses, agent_message, t_id = resume_codex(t_id, work_folder, g_prompt,
                                                       model_name, reasoning_effort, timeout)
+        print_dialogue(agent_name, g_prompt, agent_message)
         save_agent_dialogue(session_folder, agent_name, g_prompt, responses, agent_message, t_id)
         return agent_name, t_id
 
@@ -134,14 +171,12 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
     session_folder = os.path.join(CURRENT_DIR, session_name)
     if os.path.exists(session_folder) and json_key_exists(CURRENT_DIR, "session_name.json", session_name):
         raise ValueError(f"{session_name} 已经存在. 更改对话名称, 或者手动删除文件夹与JSON键.")
-
     # 创建 session_folder 文件夹
     os.makedirs(session_folder, exist_ok=False)
 
     ''' 2. 创建智能体 --------------------------------------------------------------------------------------------- '''
     agent_id_dict = {}
     max_workers = max(1, min(8, len(agent_name_and_role_dict)))
-
     # 并发初始化所有智能体
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         init_futures = {
