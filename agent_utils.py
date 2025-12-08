@@ -87,18 +87,37 @@ def save_agent_dialogue(session_folder, agent_name, prompt, process, answer, thr
         f.writelines(blocks)
 
 
+# 初始化一个对话 session，并创建多个智能体并执行通用初始化提示流程
 def start_session(session_name, work_folder, general_prompt_list, agent_name_and_role_dict,
                   model_name="gpt-5.1-codex-mini", reasoning_effort="low", timeout=300):
     """
-    初始化一个对话 session
+    初始化一个对话 session，并创建多个智能体并执行初始化及通用提示流程。
+
+    参数:
+        session_name (str): 当前会话的名称，用于标识唯一 session。
+        work_folder (str): 智能体工作目录路径。
+        general_prompt_list (list of str): 所有智能体需要依次执行的通用提示列表。
+        agent_name_and_role_dict (dict): key 为智能体名称，value 为其对应的角色描述。
+        model_name (str, optional): 使用的语言模型名称，默认为 "gpt-5.1-codex-mini"。
+        reasoning_effort (str, optional): 推理强度设置（如："low", "medium", "high"），默认为 "low"。
+        timeout (int, optional): 请求超时时间（秒），默认为 300 秒。
+
+    返回:
+        bool: 成功完成所有初始化和通用提示后返回 True。
+
+    异常:
+        ValueError: 若 session_name 已存在对应的文件夹或 JSON 键，则抛出异常。
     """
+
     # 判断 session_name 是否已经存在 (1-判断是否有该文件夹, 2-判断是否有该JSON键)
     session_folder = os.path.join(CURRENT_DIR, session_name)
     if os.path.exists(session_folder) and json_key_exists(CURRENT_DIR, "session_name.json", session_name):
         raise ValueError(f"{session_name} 已经存在. 更改对话名称, 或者手动删除文件夹与JSON键.")
+
     # 创建 session_folder 文件夹
     os.makedirs(session_folder, exist_ok=False)
-    # 创建锁对象
+
+    # 创建锁对象以确保多线程打印安全
     print_lock = threading.Lock()
 
     def _log_block(title, lines):
@@ -129,6 +148,7 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
         ])
         return agent_name, thread_id, responses, agent_message
 
+    # 并发初始化所有智能体
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         init_futures = {
             executor.submit(_init_agent, agent_name, role): agent_name
@@ -147,9 +167,11 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
                 session_map = {}
     except (FileNotFoundError, json.JSONDecodeError):
         session_map = {}
-    # 添加 session_name 和 agent_id_dict
+
+    # 添加 session_name 和 agent_id_dict 到 session_map 中
     session_map[session_name] = agent_id_dict
-    # 保存 session_name.json 文件
+
+    # 保存更新后的 session_name.json 文件
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(session_map, f, ensure_ascii=False, indent=2)
 
@@ -165,6 +187,7 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
         ])
         return agent_name, t_id
 
+    # 并发执行通用提示任务
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for general_prompt in general_prompt_list:
             futures = {
