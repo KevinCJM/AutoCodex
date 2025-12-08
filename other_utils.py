@@ -43,12 +43,12 @@ def session_name_json(folder_path, file_path="session_name.json"):
     """
     # 确保目录存在
     os.makedirs(folder_path, exist_ok=True)
-
+    # 构造完整的文件路径
     session_name_json_path = os.path.join(folder_path, file_path)
+    # 检查文件是否存在，不存在则创建空JSON文件
     if not os.path.exists(session_name_json_path):
         with open(session_name_json_path, "w", encoding="utf-8") as f:
             json.dump({}, f, ensure_ascii=False)
-
     return session_name_json_path
 
 
@@ -140,3 +140,7 @@ def delete_json_key(folder_path, file_path, key):
         json.dump(existing, f, ensure_ascii=False, indent=2)
 
     return existed
+
+
+if __name__ == '__main__':
+    pass
