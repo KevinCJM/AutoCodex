@@ -107,7 +107,29 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
     异常:
         ValueError: 若 session_name 已存在对应的文件夹或 JSON 键，则抛出异常。
     """
+    ''' 0. 辅助函数 ----------------------------------------------------------------------------------------------- '''
 
+    # 初始化智能体代理
+    def _init_agent(agent_name, role):
+        """
+        初始化智能体代理
+        """
+        responses, agent_message, t_id = init_codex(role, work_folder,
+                                                    model_name, reasoning_effort, timeout)
+        save_agent_dialogue(session_folder, agent_name, role, responses, agent_message, thread_id)
+        return agent_name, t_id, responses, agent_message
+
+    # 执行智能体的通用提示词逻辑
+    def _run_general_prompt(agent_name, t_id, g_prompt):
+        """
+        执行智能体的通用提示词逻辑
+        """
+        responses, agent_message, t_id = resume_codex(t_id, work_folder, g_prompt,
+                                                      model_name, reasoning_effort, timeout)
+        save_agent_dialogue(session_folder, agent_name, g_prompt, responses, agent_message, t_id)
+        return agent_name, t_id
+
+    ''' 1. 创建对话记录文件夹与JSON ----------------------------------------------------------------------------------'''
     # 判断 session_name 是否已经存在 (1-判断是否有该文件夹, 2-判断是否有该JSON键)
     session_folder = os.path.join(CURRENT_DIR, session_name)
     if os.path.exists(session_folder) and json_key_exists(CURRENT_DIR, "session_name.json", session_name):
@@ -116,15 +138,9 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
     # 创建 session_folder 文件夹
     os.makedirs(session_folder, exist_ok=False)
 
-    # 创建智能体, 明确智能体职责
+    ''' 2. 创建智能体 --------------------------------------------------------------------------------------------- '''
     agent_id_dict = {}
     max_workers = max(1, min(8, len(agent_name_and_role_dict)))
-
-    def _init_agent(agent_name, role):
-        responses, agent_message, t_id = init_codex(role, work_folder,
-                                                    model_name, reasoning_effort, timeout)
-        save_agent_dialogue(session_folder, agent_name, role, responses, agent_message, thread_id)
-        return agent_name, t_id, responses, agent_message
 
     # 并发初始化所有智能体
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -136,7 +152,8 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
             agent_name, thread_id, _, _ = future.result()
             agent_id_dict[agent_name] = thread_id  # 保存智能体ID
 
-    # 将对话以及智能体信息记录到 session_name.json
+    ''' 3. 将对话以及智能体信息记录到 session_name.json -------------------------------------------------------------- '''
+    # 读取 session_name.json 文件, 确保 session_name.json 文件存在
     json_path = session_name_json(CURRENT_DIR, "session_name.json")
     try:
         with open(json_path, "r", encoding="utf-8") as f:
@@ -145,22 +162,12 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
                 session_map = {}
     except (FileNotFoundError, json.JSONDecodeError):
         session_map = {}
-
-    # 添加 session_name 和 agent_id_dict 到 session_map 中
+    # 添加 session_name 和 agent_id_dict 到 session_map 中 & 保存更新后的 session_name.json 文件
     session_map[session_name] = agent_id_dict
-
-    # 保存更新后的 session_name.json 文件
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(session_map, f, ensure_ascii=False, indent=2)
 
-    # 对每个智能体执行公共逻辑提示词
-    def _run_general_prompt(agent_name, t_id, g_prompt):
-        responses, agent_message, t_id = resume_codex(t_id, work_folder, g_prompt,
-                                                      model_name, reasoning_effort, timeout)
-        save_agent_dialogue(session_folder, agent_name, g_prompt, responses, agent_message, t_id)
-        return agent_name, t_id
-
-    # 并发执行通用提示任务
+    ''' 4. 执行通用提示任务 ----------------------------------------------------------------------------------------- '''
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         for general_prompt in general_prompt_list:
             futures = {
@@ -170,7 +177,6 @@ def start_session(session_name, work_folder, general_prompt_list, agent_name_and
             for future in as_completed(futures):
                 agent_name, thread_id = future.result()
                 agent_id_dict[agent_name] = thread_id
-
     return True
 
 
@@ -178,8 +184,8 @@ if __name__ == "__main__":
     w_folder = "/Users/chenjunming/Desktop/KevinGit/GienTechWork/CIB/CIB_wealth_manage"
     general_p_list = [
         """记住:
-1) 使用中文进行对话和文档编写;
-2) 使用 "/Users/chenjunming/Desktop/myenv_312/bin/python3.12" 命令来执行python代码""",
+    1) 使用中文进行对话和文档编写;
+    2) 使用 "/Users/chenjunming/Desktop/myenv_312/bin/python3.12" 命令来执行python代码""",
         "小白兔在哪里?",
         "小白兔和谁在一起?",
         "谁来找小白兔?",
@@ -293,7 +299,7 @@ if __name__ == "__main__":
     #         3. 严格，不留隐患""",
     #     }
     agent_role_dict = {
-        "需求分析师": "你好, 你是谁? 记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到.",
-        "算法工程师": "你好, 你是谁? 记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到."
+        "需求分析师": "这是一个测试. 记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到.",
+        "算法工程师": "这是一个测试. 记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到."
     }
     start_session("测试用", w_folder, general_p_list, agent_role_dict)
