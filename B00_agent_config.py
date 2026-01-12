@@ -18,8 +18,8 @@ print_lock = threading.Lock()
 now = datetime.now()
 today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 working_path = "/Users/chenjunming/Desktop/AutomaticTypesettingTool"
-working_model = "gpt-5.1-codex-mini"
-working_effort = "low"
+working_model = "gpt-5.2-codex"
+working_effort = "xhigh"
 working_timeout = 60 * 10
 resume_retry_max = 5
 resume_retry_interval = 2
@@ -94,7 +94,8 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
     # 记录用户输入的提示信息到日志文件
     with print_lock:
         log_message(log_file_path=log_file_path,
-                    message=prompt,
+                    message=f"--{agent_name}--\n--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
+                            f"{prompt}",
                     color=Colors.BLUE)
 
     # 根据初始化标志选择不同的处理方式：新建会话或恢复会话
@@ -116,6 +117,7 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
             with print_lock:
                 log_message(log_file_path=log_file_path,
                             message=f"--{session_id}--\n--{agent_name}--\n"
+                                    f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
                                     f"init_codex 获取 session_id 失败，准备重试 {retry_count}/{resume_retry_max}",
                             color=Colors.YELLOW)
             time.sleep(resume_retry_interval)
@@ -140,12 +142,15 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
             with print_lock:
                 log_message(log_file_path=log_file_path,
                             message=f"--{session_id}--\n--{agent_name}--\n"
+                                    f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
                                     f"resume_codex 超时或无响应，准备重试 {retry_count}/{resume_retry_max}",
                             color=Colors.YELLOW)
             time.sleep(resume_retry_interval)
     # 记录会话结果到日志文件
     with print_lock:
         log_message(log_file_path=log_file_path,
-                    message=f"--{session_id}--\n--{agent_name}--\n{msg[0]}",
+                    message=f"--{session_id}--\n--{agent_name}--\n"
+                            f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
+                            f"{msg[0]}",
                     color=Colors.GREEN)
     return msg[0], session_id
