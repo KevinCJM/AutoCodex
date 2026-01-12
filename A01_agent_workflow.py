@@ -175,7 +175,12 @@ while first_agent_name != 'success':
     # 合并处理结果, 生成 新的调度器提示词
     what_agent_replay = ''
     for agent_name, msg in what_agent_replay_dict.items():
-        what_agent_replay += f"{agent_name}: \n{msg}\n"
+        what_agent_replay += f"""
+{agent_name}: 
+```
+{msg}
+```
+        """
     doing_director_prompt = f"""
 ---
 你刚刚调用的智能体为 {what_agent_just_use} 返回内容如下:
