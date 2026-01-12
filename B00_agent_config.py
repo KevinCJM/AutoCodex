@@ -28,41 +28,35 @@ requirement_md = "论文自动排版工具-详细设计说明书.md"
 design_md = "里程碑1详细设计.md"
 task_md = "里程碑1任务单.md"
 test_plan_md = "里程碑1测试计划.md"
-common_init_prompt_1 = """
-记住:
+common_init_prompt_1 = """记住:
 1) 使用中文进行对话和文档编写;
 2) 使用 "/Users/chenjunming/Desktop/myenv_312/bin/python3.12" 命令来执行python代码"""
-common_init_prompt_2 = f"""
-深度理解:
+common_init_prompt_2 = f"""深度理解:
 1) 当前代码结构, 
 2) {design_md} 文档
 3) {task_md} 文档
 4) {requirement_md} 文档"""
 agent_init_prompt = {
-    '需求分析师': f"""
-现在起, 你是一个专业的需求分析师, 并且十分了解python代码.
+    '需求分析师': f"""现在起, 你是一个专业的需求分析师, 并且十分了解python代码.
 我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改. 
 在收到我的代码修改描述后, 我需要你:
 走读修改后的新代码, 然后分析代码中的逻辑是否与 {task_md} 一致, 是否与 {design_md} 一致.
 审核完成后说明有问题的地方, 若无问题则返回 '检查通过'. 禁止修改代码与文档. 不要返回多余的信息.
 """,
-    '审核员': f"""
-现在起, 你是一个专业的python代码审核员, 熟悉python的用法和语法. 
+    '审核员': f"""现在起, 你是一个专业的python代码审核员, 熟悉python的用法和语法. 
 我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改.
 在收到我的代码修改描述后, 我需要你:
 走读我修改后的新代码, 然后分析代码中是否存在错误和逻辑问题. 是否与 {task_md} 和 {design_md} 保持逻辑一致.
 审核完成后说明有问题的地方, 若无问题则返回 '审核通过'. 禁止修改代码与文档. 不要返回多余的信息.
 """,
-    '测试工程师': f"""
-现在起, 你是一个专业的python测试工程师, 熟悉python的用法和语法. 
+    '测试工程师': f"""现在起, 你是一个专业的python测试工程师, 熟悉python的用法和语法. 
 我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改. 
 在收到我的代码修改描述后, 我需要你:
 走读我修改后的新代码, 分析代码中是否存在错误和逻辑问题. 是否与 {task_md} 一致, 是否与 {design_md} 一致.
 然后根据 {test_plan_md} 执行测试. 审核以及测试完成后说明有问题的地方, 若无问题则返回 '测试通过'. 不要返回多余的信息.
 禁止修改主体代码, 但是可以创建和修改测试用代码. 所有与测试相关的工作都需要由你来做. 
 """,
-    '开发工程师': f"""
-现在起, 你是一个专业的Python开发工程师.
+    '开发工程师': f"""现在起, 你是一个专业的Python开发工程师.
 我待会儿会按照 {task_md} 的任务安排一步步的让你执行对应任务的开发.
 在收到我的任务安排后, 你需要你:
 根据 {design_md} 以及 {task_md} 中的描述, 进行对应任务的开发.
@@ -94,7 +88,7 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
     with print_lock:
         log_message(log_file_path=log_file_path,
                     message=f"--{agent_name}--\n--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                            f"{prompt}",
+                            f"{prompt}\n",
                     color=Colors.BLUE)
 
     # 根据初始化标志选择不同的处理方式：新建会话或恢复会话
@@ -117,7 +111,7 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                 log_message(log_file_path=log_file_path,
                             message=f"--{session_id}--\n--{agent_name}--\n"
                                     f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                                    f"init_codex 获取 session_id 失败，准备重试 {retry_count}/{resume_retry_max}",
+                                    f"init_codex 获取 session_id 失败，准备重试 {retry_count}/{resume_retry_max}\n",
                             color=Colors.YELLOW)
             time.sleep(resume_retry_interval)
     else:
@@ -142,7 +136,7 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                 log_message(log_file_path=log_file_path,
                             message=f"--{session_id}--\n--{agent_name}--\n"
                                     f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                                    f"resume_codex 超时或无响应，准备重试 {retry_count}/{resume_retry_max}",
+                                    f"resume_codex 超时或无响应，准备重试 {retry_count}/{resume_retry_max}\n",
                             color=Colors.YELLOW)
             time.sleep(resume_retry_interval)
     # 记录会话结果到日志文件
@@ -150,6 +144,6 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
         log_message(log_file_path=log_file_path,
                     message=f"--{session_id}--\n--{agent_name}--\n"
                             f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                            f"{msg[0]}",
+                            f"{msg[0]}\n",
                     color=Colors.GREEN)
     return msg[0], session_id

@@ -27,8 +27,7 @@ def _parse_director_response(massage, log_file):
         raise
 
 
-base_director_prompt = f"""
-你是一个专业的调度智能体.
+base_director_prompt = f"""你是一个专业的调度智能体.
 现在有: 需求分析师, 审核员, 测试工程师, 开发工程师 四个智能体
 当前阶段为开发阶段. 开发流程需要按照 {task_md} 中的任务安排一步步的让开发工程师智能体执行对应任务的开发.
 当开发工程师智能体完成对应任务的开发后, 你需要通知 需求分析师, 审核员, 测试工程师 分别对 开发工程师 智能体的代码进行审核和测试.
@@ -49,26 +48,32 @@ base_director_prompt = f"""
     ```
     开发工程师完成了以下开发:
     {{开发工程师返回的开发说明}}
-
+    
+    你是一个专业的需求分析师.
     走读修改后的新代码, 然后分析代码中的逻辑是否与 {task_md} 一致, 是否与 {design_md} 一致.
     审核完成后说明有问题的地方, 若无问题则返回 '检查通过'. 禁止修改代码与文档.
+    仅审核主体代码, 无需关注测试用代码.
     ```
 2.2) 调用 审核员智能体 时, prompt 模板如下:
     ```
     开发工程师完成了以下开发:
     {{开发工程师返回的开发说明}}
 
+    你是一个专业的python代码审核员.
     走读我修改后的新代码, 然后分析代码中是否存在错误和逻辑问题. 是否与 {task_md} 和 {design_md} 保持逻辑一致.
-    审核完成后说明有问题的地方, 若无问题则返回 '审核通过'. 禁止修改代码与文档.
+    审核完成后说明有问题的地方, 若无问题则返回 '审核通过'. 禁止修改代码与文档. 
+    仅审核主体代码, 无需关注测试用代码.
     ```
 2.3) 调用 测试工程师智能体 时, prompt 模板如下:
     ```
     开发工程师完成了以下开发:
     {{开发工程师返回的开发说明}}
 
+    你是一个专业的测试工程师.
     走读我修改后的新代码, 分析代码中是否存在错误和逻辑问题. 是否与 {task_md} 一致, 是否与 {design_md} 一致.
     然后根据 {test_plan_md} 执行测试. 审核以及测试完成后说明有问题的地方, 若无问题则返回 '测试通过'. 不要返回多余的信息. 
     禁止修改主体代码, 可以创建和修改测试用代码. 测试相关的代码与问题都需要由你来处理.
+    仅审核主体代码, 无需关注测试用代码. 测试用代码由你自行处理.
     ```
 
 3) 收集 需求分析智能体, 审核员智能体, 测试工程师智能体 的审核结果.
@@ -145,16 +150,26 @@ first_agent_name = list(msg_dict.keys())[0]
 while first_agent_name != 'success':
     if first_agent_name not in ['需求分析师', '审核员', '测试工程师', '开发工程师']:
         raise ValueError(f"调度器智能体返回了未知的智能体名称: {first_agent_name}")
-    # 执行 智能体
-    what_agent_just_use = list()
+    # 并发执行智能体
+    agent_items = list(msg_dict.items())
     what_agent_replay_dict = dict()
-    for agent_name, agent_prompt in msg_dict.items():
-        log_file_path = f"{working_path}/agent_{agent_name}_{today_str}.log"
-        session_id = agent_session_id_dict[agent_name]
-        msg, _ = run_agent(agent_name, log_file_path, f"\n{agent_prompt}",
-                           init_yn=False, session_id=session_id)
-        what_agent_just_use.append(agent_name)
-        what_agent_replay_dict[agent_name] = msg
+    with ThreadPoolExecutor(max_workers=len(agent_items)) as executor:
+        futures = {
+            executor.submit(
+                run_agent,
+                agent_name,
+                f"{working_path}/agent_{agent_name}_{today_str}.log",
+                agent_prompt,
+                False,
+                agent_session_id_dict[agent_name],
+            ): agent_name
+            for agent_name, agent_prompt in agent_items
+        }
+        for future in as_completed(futures):
+            agent_name = futures[future]
+            msg, _ = future.result()
+            what_agent_replay_dict[agent_name] = msg
+    what_agent_just_use = [agent_name for agent_name, _ in agent_items]
 
     ''' 4) 调用 调度器智能体 ---------------------------------------------------------------------------------------- '''
     # 合并处理结果, 生成 新的调度器提示词
