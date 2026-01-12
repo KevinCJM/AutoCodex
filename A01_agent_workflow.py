@@ -157,7 +157,7 @@ while first_agent_name != 'success':
     doing_director_prompt = base_director_prompt + doing_director_prompt
 
     # 调用 调度器智能体
-    msg, session_id = run_agent(director_agent_name, log_file_path, init_director_prompt,
+    msg, session_id = run_agent(director_agent_name, log_file_path, doing_director_prompt,
                                 init_yn=False, session_id=director_session_id)
     msg_dict = json.loads(msg)
     first_agent_name = list(msg_dict.keys())[0]
