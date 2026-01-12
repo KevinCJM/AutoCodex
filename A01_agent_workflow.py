@@ -13,6 +13,20 @@ from A02_function_agents import init_agent
 
 print_lock = threading.Lock()
 
+
+def _parse_director_response(massage, log_file):
+    try:
+        return json.loads(massage)
+    except json.JSONDecodeError as exc:
+        with print_lock:
+            log_message(
+                log_file_path=log_file,
+                message=f"调度器返回非JSON，无法解析: {exc}\n原始返回:\n{massage}",
+                color=Colors.RED,
+            )
+        raise
+
+
 base_director_prompt = f"""
 你是一个专业的调度智能体.
 现在有: 需求分析师, 审核员, 测试工程师, 开发工程师 四个智能体
@@ -116,15 +130,15 @@ with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
 
 ''' 2) 初始化 调度器智能体 ------------------------------------------------------------------------------------------- '''
 director_agent_name = "调度器"
-log_file_path = f"{working_path}/agent_{director_agent_name}_{today_str}.log"
+director_log_file_path = f"{working_path}/agent_{director_agent_name}_{today_str}.log"
 init_director_prompt = f"""
 ---
 现在开始你的调度任务, 先分析 {task_md} 中下一个需要开发的任务是什么.
 """
 init_director_prompt = base_director_prompt + init_director_prompt
-msg, director_session_id = run_agent(director_agent_name, log_file_path,
+msg, director_session_id = run_agent(director_agent_name, director_log_file_path,
                                      init_director_prompt, init_yn=True, session_id=None)
-msg_dict = json.loads(msg)
+msg_dict = _parse_director_response(msg, director_log_file_path)
 first_agent_name = list(msg_dict.keys())[0]
 
 ''' 3) 调用 各个功能型智能体 ----------------------------------------------------------------------------------------- '''
@@ -157,7 +171,7 @@ while first_agent_name != 'success':
     doing_director_prompt = base_director_prompt + doing_director_prompt
 
     # 调用 调度器智能体
-    msg, session_id = run_agent(director_agent_name, log_file_path, doing_director_prompt,
+    msg, session_id = run_agent(director_agent_name, director_log_file_path, doing_director_prompt,
                                 init_yn=False, session_id=director_session_id)
-    msg_dict = json.loads(msg)
+    msg_dict = _parse_director_response(msg, director_log_file_path)
     first_agent_name = list(msg_dict.keys())[0]
