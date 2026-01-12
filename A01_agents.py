@@ -125,9 +125,9 @@ init_director_prompt = base_director_prompt + init_director_prompt
 msg, director_session_id = run_agent(director_agent_name, log_file_path,
                                      init_director_prompt, init_yn=True, session_id=None)
 msg_dict = json.loads(msg)
+first_agent_name = list(msg_dict.keys())[0]
 
 ''' 3) 调用 各个功能型智能体 ----------------------------------------------------------------------------------------- '''
-first_agent_name = None
 while first_agent_name != 'success':
     if first_agent_name not in ['需求分析师', '审核员', '测试工程师', '开发工程师']:
         raise ValueError(f"调度器智能体返回了未知的智能体名称: {first_agent_name}")
