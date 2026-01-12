@@ -5,11 +5,9 @@
 @Author: Kevin-Chen
 @Descriptions: codex exec 工具函数
 """
-import time
 import json
-import shutil
 import subprocess
-from other_utils import write_json, json_key_exists, CURRENT_DIR
+from subprocess import TimeoutExpired
 
 
 # 运行 Codex 并解析返回的 JSON 事件流
@@ -27,15 +25,20 @@ def run_codex(cmd, timeout=300):
             - errs: 命令执行的错误输出
             - proc.returncode: 命令执行的返回码
     """
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        check=False,
-        timeout=timeout,
-    )
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=timeout,
+        )
+    except FileNotFoundError as e:
+        return ([], f"找不到可执行文件：{e}", 127)
+    except TimeoutExpired:
+        return ([], f"命令执行超时（{timeout}s）：{cmd}", 124)
     raw = proc.stdout
     errs = proc.stderr
 
@@ -159,7 +162,17 @@ def init_codex(prompt, folder_path=None, model_name="gpt-5.1-codex-mini", reason
     # 运行命令并解析结果
     events, errs, return_code = run_codex(init_cmd, timeout=timeout)
     # 返回处理结果 (信息列表, 智能体的回答, session_ID)
-    return handle_events(events)
+    responses, agent_message, thread_id = handle_events(events)
+    if return_code != 0:
+        responses.append(f"[return_code] → {return_code}")
+    if errs:
+        errs_trimmed = errs.strip()
+        if len(errs_trimmed) > 4000:
+            errs_trimmed = errs_trimmed[:4000] + "…(truncated)"
+        responses.append(f"[stderr] → {errs_trimmed}")
+    if thread_id is None and not agent_message:
+        agent_message = ["Codex 未返回 thread_id（可能是 codex 命令失败或未输出 JSON 事件流）。"]
+    return (responses, agent_message, thread_id)
 
 
 # 恢复一个已经存在的 codex 对话 session
@@ -177,6 +190,10 @@ def resume_codex(thread_id, folder_path, prompt, model_name="gpt-5.1-codex-mini"
     返回:
         tuple: 包含处理结果的元组，通常为(信息列表, 智能体的回答, session_ID)
     """
+    if thread_id is None:
+        return (["[error] → thread_id 为空，无法 resume；请先确保 init_codex 成功返回 thread_id。"],
+                ["thread_id 为空，无法恢复会话。"],
+                None)
     # 构造codex执行命令的参数列表
     init_cmd = [
         "codex", "exec",
@@ -195,7 +212,7 @@ def resume_codex(thread_id, folder_path, prompt, model_name="gpt-5.1-codex-mini"
 
 
 if __name__ == "__main__":
-    cd_path = CURRENT_DIR
+    cd_path = r'/Users/chenjunming/Desktop/AutomaticTypesettingTool'
     init_prompt = """记住: 使用中文进行对话和文档编写"""
     _, msg, session_id = init_codex(init_prompt, cd_path)
     print(msg)
