@@ -151,7 +151,7 @@ while first_agent_name != 'success':
     for agent_name, agent_prompt in msg_dict.items():
         log_file_path = f"{working_path}/agent_{agent_name}_{today_str}.log"
         session_id = agent_session_id_dict[agent_name]
-        msg, _ = run_agent(agent_name, log_file_path, agent_prompt,
+        msg, _ = run_agent(agent_name, log_file_path, f"\n{agent_prompt}",
                            init_yn=False, session_id=session_id)
         what_agent_just_use.append(agent_name)
         what_agent_replay_dict[agent_name] = msg
