@@ -3,7 +3,7 @@
 @File: agents.py
 @Modify Time: 2026/1/11 13:44       
 @Author: Kevin-Chen
-@Descriptions: 
+@Descriptions: 需求分析&详细设计 工作流
 """
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -19,7 +19,7 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 {requirement_str}
 ```
 需求分析师已经根据需求描述写了一份详细设计文档 {design_md}
-需要其他智能体对这个详细设计文档进行检查, 如何结合各个智能体的输出, 让需求分析师对 {design_md} 文档进行优化修改. 
+需要其他智能体对这个详细设计文档进行检查, 然后结合各个智能体的输出, 让需求分析师对 {design_md} 文档进行优化修改. 
 直到所有智能体都返回检查通过.
 
 ---

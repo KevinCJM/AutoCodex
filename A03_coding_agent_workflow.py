@@ -3,9 +3,8 @@
 @File: agents.py
 @Modify Time: 2026/1/11 13:44       
 @Author: Kevin-Chen
-@Descriptions: 
+@Descriptions: 代码开发 工作流
 """
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import *
@@ -152,7 +151,7 @@ while first_agent_name != 'success':
                 run_agent,
                 agent_name,
                 f"{working_path}/agent_{agent_name}_{today_str}.log",
-                agent_prompt,
+                f"{agent_skills_dict[agent_name]} {agent_prompt}",
                 False,
                 agent_session_id_dict[agent_name],
             ): agent_name
