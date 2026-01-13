@@ -53,6 +53,7 @@ def custom_init_agent(agent_name, session_id, custom_agent_prompt):
     # 根据代理名称获取个性化初始化提示，并执行个性化初始化
     run_agent(agent_name, log_file_path, custom_agent_prompt,
               init_yn=False, session_id=session_id)
+    return agent_name, session_id
 
 
 def parse_director_response(massage, log_file):
