@@ -28,23 +28,19 @@ requirement_md = "论文自动排版工具-详细设计说明书.md"
 design_md = "里程碑1详细设计.md"
 task_md = "里程碑1任务单.md"
 test_plan_md = "里程碑1测试计划.md"
+
+# 通用初始化提示词
 common_init_prompt_1 = """记住:
 1) 使用中文进行对话和文档编写;
-2) 使用 "/Users/chenjunming/Desktop/myenv_312/bin/python3.12" 命令来执行python代码"""
+2) 使用 "/Users/chenjunming/Desktop/myenv_312/bin/python3.12" 命令来执行python代码
+"""
 common_init_prompt_2 = f"""深度理解:
 1) 当前代码结构, 
-2) {design_md} 文档
-3) {task_md} 文档
-4) {requirement_md} 文档"""
+2) {requirement_md} 文档
+"""
 
 # 可用智能体列表
 agent_names_list = ['需求分析师', '审核员', '测试工程师', '开发工程师']
-# 智能体对应使用的skills
-agent_skills_dict = {'需求分析师': '$Product Manager',
-                     '审核员': '$System Architect',
-                     '测试工程师': '$Business Analyst',
-                     '开发工程师': '$Business Analyst'
-                     }
 
 # 开发模式下的各个智能体初始化提示
 coding_agent_init_prompt = {

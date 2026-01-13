@@ -5,27 +5,13 @@
 @Author: Kevin-Chen
 @Descriptions: 
 """
-import json
+from A01_coding_agent_workflow import _parse_director_response
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import *
-from A02_init_function_agents import init_agent
+from A02_function_agents import init_agent
 
 print_lock = threading.Lock()
-
-
-def _parse_director_response(massage, log_file):
-    try:
-        return json.loads(massage)
-    except json.JSONDecodeError as exc:
-        with print_lock:
-            log_message(
-                log_file_path=log_file,
-                message=f"调度器返回非JSON，无法解析: {exc}\n原始返回:\n{massage}",
-                color=Colors.RED,
-            )
-        raise
-
 
 base_director_prompt = f"""你是一个专业的调度智能体.
 现在有: 需求分析师, 审核员, 测试工程师, 开发工程师 四个智能体
