@@ -205,7 +205,7 @@ while first_agent_name != 'success':
                 run_agent,
                 agent_name,
                 f"{working_path}/agent_{agent_name}_{today_str}.log",
-                agent_prompt,
+                f"{agent_skills_dict[agent_name]} {agent_prompt}",
                 False,
                 agent_session_id_dict[agent_name],
             ): agent_name
