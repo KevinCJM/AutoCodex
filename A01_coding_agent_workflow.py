@@ -28,7 +28,7 @@ def _parse_director_response(massage, log_file):
 
 
 base_director_prompt = f"""你是一个专业的调度智能体.
-现在有: 需求分析师, 审核员, 测试工程师, 开发工程师 四个智能体
+现在有: {agent_names_list} 这{len(agent_names_list)}个智能体.
 当前阶段为开发阶段. 开发流程需要按照 {task_md} 中的任务安排一步步的让开发工程师智能体执行对应任务的开发.
 当开发工程师智能体完成对应任务的开发后, 你需要通知 需求分析师, 审核员, 测试工程师 分别对 开发工程师 智能体的代码进行审核和测试.
 
