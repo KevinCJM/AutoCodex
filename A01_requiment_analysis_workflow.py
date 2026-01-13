@@ -5,11 +5,10 @@
 @Author: Kevin-Chen
 @Descriptions: 
 """
-from A01_coding_agent_workflow import _parse_director_response
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import *
-from A02_init_function_agents import init_agent, custom_init_agent
+from A02_init_function_agents import init_agent, custom_init_agent, parse_director_response
 
 print_lock = threading.Lock()
 
@@ -190,7 +189,7 @@ init_director_prompt = f"""
 init_director_prompt = base_director_prompt + init_director_prompt
 msg, director_session_id = run_agent(director_agent_name, director_log_file_path,
                                      init_director_prompt, init_yn=True, session_id=None)
-msg_dict = _parse_director_response(msg, director_log_file_path)
+msg_dict = parse_director_response(msg, director_log_file_path)
 first_agent_name = list(msg_dict.keys())[0]
 
 ''' 3) 调用 各个功能型智能体 ----------------------------------------------------------------------------------------- '''
@@ -240,5 +239,5 @@ while first_agent_name != 'success':
     # 调用 调度器智能体
     msg, session_id = run_agent(director_agent_name, director_log_file_path, doing_director_prompt,
                                 init_yn=False, session_id=director_session_id)
-    msg_dict = _parse_director_response(msg, director_log_file_path)
+    msg_dict = parse_director_response(msg, director_log_file_path)
     first_agent_name = list(msg_dict.keys())[0]

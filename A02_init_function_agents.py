@@ -5,6 +5,7 @@
 @Author: Kevin-Chen
 @Descriptions: 初始化多个功能型智能体
 """
+import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import *
@@ -52,6 +53,19 @@ def custom_init_agent(agent_name, session_id, custom_agent_prompt):
     # 根据代理名称获取个性化初始化提示，并执行个性化初始化
     run_agent(agent_name, log_file_path, custom_agent_prompt,
               init_yn=False, session_id=session_id)
+
+
+def parse_director_response(massage, log_file):
+    try:
+        return json.loads(massage)
+    except json.JSONDecodeError as exc:
+        with print_lock:
+            log_message(
+                log_file_path=log_file,
+                message=f"调度器返回非JSON，无法解析: {exc}\n原始返回:\n{massage}",
+                color=Colors.RED,
+            )
+        raise
 
 
 if __name__ == '__main__':
