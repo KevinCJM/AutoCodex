@@ -9,7 +9,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import *
-from A02_init_function_agents import init_agent, custom_init_agent, parse_director_response
+from B03_init_function_agents import init_agent, custom_init_agent, parse_director_response
 
 print_lock = threading.Lock()
 
