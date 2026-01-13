@@ -177,13 +177,8 @@ with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
     for future in as_completed(futures):
         a_name, s_id = future.result()
         agent_session_id_dict[a_name] = s_id
-# 多线程个性化初始化智能体
-with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
-    futures = [executor.submit(custom_init_agent, agent_name, agent_session_id_dict[agent_name],
-                               analysis_agent_init_prompt[agent_name]) for agent_name in agent_names_list]
-    for future in as_completed(futures):
-        a_name, s_id = future.result()
-        agent_session_id_dict[a_name] = s_id
+# 个性化初始化 需求分析师 智能体
+custom_init_agent('需求分析师', agent_session_id_dict['需求分析师'], analysis_agent_init_prompt)
 
 ''' 2) 初始化 调度器智能体 ------------------------------------------------------------------------------------------- '''
 director_agent_name = "调度器"

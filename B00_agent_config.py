@@ -78,8 +78,7 @@ requirement_str = """
 当前代码无法解析有多级标题架构时的word文档. 不管模板里有多少级标题和正文，最终都会只输出 一个标题样式 和 正文样式. 我需要“复杂模板识别”, 能识别不同层级标题 + 对应层级正文, 以及 摘要标题, 图表标题, 参考文献标题 等特殊标题与下属文字的样式.
 """
 # 详细设计模式下各个智能体初始化提示
-analysis_agent_init_prompt = {
-    '需求分析师': f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
+analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
 现在有以下需求补充:
 ```
 {requirement_str}
@@ -87,7 +86,6 @@ analysis_agent_init_prompt = {
 请你根据以上需求补充, 审视当前代码. 进行代码改造的详细设计.
 将详细设计写入 {design_md} 中.
 """
-}
 
 
 # 运行智能代理函数
