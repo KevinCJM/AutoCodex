@@ -36,7 +36,7 @@ def init_agent(agent_name: str):
 
     ''' 3) 个性化初始化 --------------------------------------------------------------------------------- '''
     # 根据代理名称获取个性化初始化提示，并执行个性化初始化
-    agent_prompt = agent_init_prompt[agent_name]
+    agent_prompt = coding_agent_init_prompt[agent_name]
     run_agent(agent_name, log_file_path, agent_prompt,
               init_yn=False, session_id=session_id)
 

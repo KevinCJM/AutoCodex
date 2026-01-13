@@ -36,7 +36,9 @@ common_init_prompt_2 = f"""深度理解:
 2) {design_md} 文档
 3) {task_md} 文档
 4) {requirement_md} 文档"""
-agent_init_prompt = {
+
+# 开发模式下的各个智能体初始化提示
+coding_agent_init_prompt = {
     '需求分析师': f"""现在起, 你是一个专业的需求分析师, 并且十分了解python代码.
 我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改. 
 在收到我的代码修改描述后, 我需要你:
