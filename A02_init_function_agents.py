@@ -12,7 +12,7 @@ from B00_agent_config import *
 print_lock = threading.Lock()
 
 
-# 初始化智能代理
+# 通用初始化智能代理
 def init_agent(agent_name: str):
     """
     初始化智能代理
@@ -34,13 +34,24 @@ def init_agent(agent_name: str):
     run_agent(agent_name, log_file_path, common_init_prompt_2,
               init_yn=False, session_id=session_id)
 
-    ''' 3) 个性化初始化 --------------------------------------------------------------------------------- '''
-    # 根据代理名称获取个性化初始化提示，并执行个性化初始化
-    agent_prompt = coding_agent_init_prompt[agent_name]
-    run_agent(agent_name, log_file_path, agent_prompt,
-              init_yn=False, session_id=session_id)
-
     return agent_name, session_id
+
+
+# 个性化初始化智能代理
+def custom_init_agent(agent_name, session_id, custom_agent_prompt):
+    """
+    个性化初始化智能代理
+
+    :param agent_name: 智能体名称
+    :param session_id:
+    :param custom_agent_prompt:
+    :return:
+    """
+    ''' 个性化初始化 --------------------------------------------------------------------------------- '''
+    log_file_path = f"{working_path}/agent_{agent_name}_{today_str}.log"
+    # 根据代理名称获取个性化初始化提示，并执行个性化初始化
+    run_agent(agent_name, log_file_path, custom_agent_prompt,
+              init_yn=False, session_id=session_id)
 
 
 if __name__ == '__main__':

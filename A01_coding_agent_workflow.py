@@ -9,7 +9,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import *
-from A02_init_function_agents import init_agent
+from A02_init_function_agents import init_agent, custom_init_agent
 
 print_lock = threading.Lock()
 
@@ -129,6 +129,13 @@ agent_session_id_dict = dict()
 # 使用线程池并发初始化多个agent，将agent名称和对应的session ID存储到字典中
 with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
     futures = [executor.submit(init_agent, agent_name) for agent_name in agent_names_list]
+    for future in as_completed(futures):
+        a_name, s_id = future.result()
+        agent_session_id_dict[a_name] = s_id
+# 多线程个性化初始化智能体
+with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
+    futures = [executor.submit(custom_init_agent, agent_name, agent_session_id_dict[agent_name],
+                               coding_agent_init_prompt[agent_name]) for agent_name in agent_names_list]
     for future in as_completed(futures):
         a_name, s_id = future.result()
         agent_session_id_dict[a_name] = s_id
