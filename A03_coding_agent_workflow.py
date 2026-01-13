@@ -146,6 +146,9 @@ with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
     for future in as_completed(futures):
         a_name, s_id = future.result()
         agent_session_id_dict[a_name] = s_id
+# 个性化初始化 需求分析师 智能体, 写测试计划文档
+custom_init_agent('测试工程师', agent_session_id_dict['测试工程师'],
+                  coding_test_agent_init_prompt)
 # 多线程个性化初始化智能体
 with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
     futures = [executor.submit(custom_init_agent, agent_name, agent_session_id_dict[agent_name],
