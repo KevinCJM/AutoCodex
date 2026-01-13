@@ -79,7 +79,7 @@ requirement_str = "当前代码无法解析有多级标题架构时的word文档
 analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
 现在有以下需求: {requirement_str}
 
-请你根据以上需求补充, 审视当前代码. 进行代码改造的详细设计.
+根据以上需求补充, 审视当前代码. 进行代码改造的详细设计.
 将详细设计写入 {design_md} 中.
 """
 # 任务拆分模式下 需求分析师 智能体的初始化提示
@@ -87,7 +87,7 @@ task_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和
 现在有以下需求: {requirement_str}
 
 当前已经根据需求进行了详细设计, 并且写了详细设计文档: {design_md}
-请你根据详细设计 {design_md} 拆分任务单. 将写入 {task_md} 中.
+根据详细设计 {design_md} 拆分任务单. 将写入 {task_md} 中.
 """
 
 
