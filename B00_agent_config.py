@@ -72,23 +72,22 @@ coding_agent_init_prompt = {
 开发, 审核, 自测全部完成后在 {task_md} 中勾选掉对应的任务, 然后返回简要说明你具体修改了什么. 不要返回多余的信息.
 """
 }
-agent_skills_dict = {
-    '需求分析师': '$Product Manager',
-    '审核员': '$System Architect',
-    '测试工程师': '$Business Analyst',
-    '开发工程师': '$Developer',
-}
 
-# 详细设计模式下的需求说明
+# 原始需求说明
 requirement_str = "当前代码无法解析有多级标题架构时的word文档. 不管模板里有多少级标题和正文，最终都会只输出 一个标题样式 和 正文样式. 我需要“复杂模板识别”, 能识别不同层级标题 + 对应层级正文, 以及 摘要标题, 图表标题, 参考文献标题 等特殊标题与下属文字的样式."
-# 详细设计模式下各个智能体初始化提示
+# 详细设计模式下 需求分析师 智能体的初始化提示
 analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
-现在有以下需求补充:
-```
-{requirement_str}
-```
+现在有以下需求: {requirement_str}
+
 请你根据以上需求补充, 审视当前代码. 进行代码改造的详细设计.
 将详细设计写入 {design_md} 中.
+"""
+# 任务拆分模式下 需求分析师 智能体的初始化提示
+task_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Scrum Master
+现在有以下需求: {requirement_str}
+
+当前已经根据需求进行了详细设计, 并且写了详细设计文档: {design_md}
+请你根据详细设计 {design_md} 拆分任务单. 将写入 {task_md} 中.
 """
 
 
