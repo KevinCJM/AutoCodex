@@ -180,7 +180,7 @@ with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
 # 多线程个性化初始化智能体
 with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
     futures = [executor.submit(custom_init_agent, agent_name, agent_session_id_dict[agent_name],
-                               coding_agent_init_prompt[agent_name]) for agent_name in agent_names_list]
+                               analysis_agent_init_prompt[agent_name]) for agent_name in agent_names_list]
     for future in as_completed(futures):
         a_name, s_id = future.result()
         agent_session_id_dict[a_name] = s_id
