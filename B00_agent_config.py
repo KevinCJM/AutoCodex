@@ -17,11 +17,18 @@ print_lock = threading.Lock()
 
 now = datetime.now()
 today_str = f"{now.year}{now.month:02d}{now.day:02d}"
+
+# 工作目录
 working_path = "/Users/chenjunming/Desktop/AutomaticTypesettingTool"
+# 模型名称
 working_model = "gpt-5.2-codex"
+# 推理强度
 working_effort = "xhigh"
+# 模型推理超时时间
 working_timeout = 60 * 10
+# 恢复会话重试次数
 resume_retry_max = 5
+# 恢复会话重试间隔时间
 resume_retry_interval = 2
 
 requirement_md = "论文自动排版工具-详细设计说明书.md"
