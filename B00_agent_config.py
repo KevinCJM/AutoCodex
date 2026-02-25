@@ -19,7 +19,7 @@ now = datetime.now()
 today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 
 # 工作目录
-working_path = "/Users/chenjunming/Desktop/AutomaticTypesettingTool"
+working_path = "/Users/chenjunming/Desktop/KevinGit/KevinTools/AutoWordTool"
 # 模型名称
 working_model = "gpt-5.2-codex"
 # 推理强度
@@ -32,25 +32,23 @@ resume_retry_max = 5
 resume_retry_interval = 2
 
 requirement_md = "论文自动排版工具-详细设计说明书.md"
-design_md = "里程碑1详细设计(多级结构).md"
-task_md = "里程碑1任务单(多级结构).md"
-test_plan_md = "里程碑1测试计划(多级结构).md"
+design_md = "模块识别_架构设计.md.md"
+task_md = "模块识别_任务说明.md"
+test_plan_md = "模块识别_测试计划.md"  # 后续由测试工程师智能体生成的
 
 # 通用初始化提示词
 common_init_prompt_1 = """记住:
 1) 使用中文进行对话和文档编写;
 2) 使用 "/Users/chenjunming/Desktop/myenv_312/bin/python3.12" 命令来执行python代码
 """
-common_init_prompt_2 = f"""深度理解:
-1) 当前代码结构, 
-2) {requirement_md} 文档
+common_init_prompt_2 = f"""深度理解 {design_md} 中的内容和要求.
 """
 
 # 可用智能体列表
 agent_names_list = ['需求分析师', '审核员', '测试工程师', '开发工程师']
 
 # 开发模式下的测试工程师智能体初始化提示词
-coding_test_agent_init_prompt = f"""你是一个专业的python测试工程师.
+coding_test_agent_init_prompt = f"""你是一个专业的python测试工程师. 
 你需要根据 {design_md} 中的描述, 以及 {task_md} 中的任务计划, 设计各个任务对应的测试.
 要求每个任务完成后有一个对应的功能测试 (覆盖度>90%), 以及一个对应的集成测试 (覆盖度>90%). 
 根据此, 设计对应的测试用例. 写入 {test_plan_md} 文件中.
@@ -87,7 +85,9 @@ coding_agent_init_prompt = {
 }
 
 # 原始需求说明
-requirement_str = "当前代码无法解析有多级标题架构时的word文档. 不管模板里有多少级标题和正文，最终都会只输出 一个标题样式 和 正文样式. 我需要“复杂模板识别”, 能识别不同层级标题 + 对应层级正文, 以及 摘要标题, 图表标题, 参考文献标题 等特殊标题与下属文字的样式."
+requirement_str = """
+开发一款word论文板式格式识别工具. 要有GUI界面, 用户可以配置模块的识别逻辑, 然后上传word文档, 工具可以自动识别文档中的各个模块.
+"""
 # 详细设计模式下 需求分析师 智能体的初始化提示
 analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
 现在有以下需求: {requirement_str}

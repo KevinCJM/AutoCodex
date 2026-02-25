@@ -129,76 +129,86 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 返回的格式必须严格满足JSON格式要求.
 """
 
-''' 1) 初始化 各个功能型智能体 ----------------------------------------------------------------------------------------- '''
-agent_session_id_dict = dict()
-# 使用线程池并发初始化多个agent，将agent名称和对应的session ID存储到字典中
-with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
-    futures = [executor.submit(init_agent, agent_name) for agent_name in agent_names_list]
-    for future in as_completed(futures):
-        a_name, s_id = future.result()
-        agent_session_id_dict[a_name] = s_id
-# 个性化初始化 需求分析师 智能体
-custom_init_agent('需求分析师', agent_session_id_dict['需求分析师'], task_agent_init_prompt)
 
-''' 2) 初始化 调度器智能体 ------------------------------------------------------------------------------------------- '''
-director_agent_name = "调度器"
-director_log_file_path = f"{working_path}/agent_{director_agent_name}_{today_str}.log"
-init_director_prompt = f"""
----
-现在开始你的调度任务.
-"""
-init_director_prompt = base_director_prompt + init_director_prompt
-msg, director_session_id = run_agent(director_agent_name, director_log_file_path,
-                                     init_director_prompt, init_yn=True, session_id=None)
-msg_dict = parse_director_response(msg, director_log_file_path)
-first_agent_name = list(msg_dict.keys())[0]
-
-''' 3) 调用 各个功能型智能体 ----------------------------------------------------------------------------------------- '''
-while first_agent_name != 'success':
-    if first_agent_name not in ['需求分析师', '审核员', '测试工程师', '开发工程师']:
-        raise ValueError(f"调度器智能体返回了未知的智能体名称: {first_agent_name}")
-    # 并发执行智能体
-    agent_items = list(msg_dict.items())
-    what_agent_replay_dict = dict()
-    with ThreadPoolExecutor(max_workers=len(agent_items)) as executor:
-        futures = {
-            executor.submit(
-                run_agent,
-                agent_name,
-                f"{working_path}/agent_{agent_name}_{today_str}.log",
-                f"{agent_skills_dict[agent_name]} {agent_prompt}",
-                False,
-                agent_session_id_dict[agent_name],
-            ): agent_name
-            for agent_name, agent_prompt in agent_items
-        }
-        for future in as_completed(futures):
-            agent_name = futures[future]
-            msg, _ = future.result()
-            what_agent_replay_dict[agent_name] = msg
-    what_agent_just_use = [agent_name for agent_name, _ in agent_items]
-
-    ''' 4) 调用 调度器智能体 ---------------------------------------------------------------------------------------- '''
-    # 合并处理结果, 生成 新的调度器提示词
-    what_agent_replay = ''
-    for agent_name, msg in what_agent_replay_dict.items():
-        what_agent_replay += f"""
-{agent_name}: 
-```
-{msg}
-```
-        """
-    doing_director_prompt = f"""
----
-你刚刚调用的智能体为 {what_agent_just_use} 返回内容如下:
-{what_agent_replay}
----
-继续按照上述流程进行调度.
+def main():
     """
-    doing_director_prompt = base_director_prompt + doing_director_prompt
+    任务拆分 工作流 主函数
+    :return:
+    """
+    ''' 1) 初始化 各个功能型智能体 ------------------------------------------------------------------------------------ '''
+    agent_session_id_dict = dict()
+    # 使用线程池并发初始化多个agent，将agent名称和对应的session ID存储到字典中
+    with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
+        futures = [executor.submit(init_agent, agent_name) for agent_name in agent_names_list]
+        for future in as_completed(futures):
+            a_name, s_id = future.result()
+            agent_session_id_dict[a_name] = s_id
+    # 个性化初始化 需求分析师 智能体
+    custom_init_agent('需求分析师', agent_session_id_dict['需求分析师'], task_agent_init_prompt)
 
-    # 调用 调度器智能体
-    msg, session_id = run_agent(director_agent_name, director_log_file_path, doing_director_prompt,
-                                init_yn=False, session_id=director_session_id)
+    ''' 2) 初始化 调度器智能体 -------------------------------------------------------------------------------------- '''
+    director_agent_name = "调度器"
+    director_log_file_path = f"{working_path}/agent_{director_agent_name}_{today_str}.log"
+    init_director_prompt = f"""
+    ---
+    现在开始你的调度任务.
+    """
+    init_director_prompt = base_director_prompt + init_director_prompt
+    msg, director_session_id = run_agent(director_agent_name, director_log_file_path,
+                                         init_director_prompt, init_yn=True, session_id=None)
     msg_dict = parse_director_response(msg, director_log_file_path)
     first_agent_name = list(msg_dict.keys())[0]
+
+    ''' 3) 调用 各个功能型智能体 ------------------------------------------------------------------------------------- '''
+    while first_agent_name != 'success':
+        if first_agent_name not in ['需求分析师', '审核员', '测试工程师', '开发工程师']:
+            raise ValueError(f"调度器智能体返回了未知的智能体名称: {first_agent_name}")
+        # 并发执行智能体
+        agent_items = list(msg_dict.items())
+        what_agent_replay_dict = dict()
+        with ThreadPoolExecutor(max_workers=len(agent_items)) as executor:
+            futures = {
+                executor.submit(
+                    run_agent,
+                    agent_name,
+                    f"{working_path}/agent_{agent_name}_{today_str}.log",
+                    f"{agent_skills_dict[agent_name]} {agent_prompt}",
+                    False,
+                    agent_session_id_dict[agent_name],
+                ): agent_name
+                for agent_name, agent_prompt in agent_items
+            }
+            for future in as_completed(futures):
+                agent_name = futures[future]
+                msg, _ = future.result()
+                what_agent_replay_dict[agent_name] = msg
+        what_agent_just_use = [agent_name for agent_name, _ in agent_items]
+
+        ''' 4) 调用 调度器智能体 ------------------------------------------------------------------------------------ '''
+        # 合并处理结果, 生成 新的调度器提示词
+        what_agent_replay = ''
+        for agent_name, msg in what_agent_replay_dict.items():
+            what_agent_replay += f"""
+    {agent_name}: 
+    ```
+    {msg}
+    ```
+            """
+        doing_director_prompt = f"""
+    ---
+    你刚刚调用的智能体为 {what_agent_just_use} 返回内容如下:
+    {what_agent_replay}
+    ---
+    继续按照上述流程进行调度.
+        """
+        doing_director_prompt = base_director_prompt + doing_director_prompt
+
+        # 调用 调度器智能体
+        msg, session_id = run_agent(director_agent_name, director_log_file_path, doing_director_prompt,
+                                    init_yn=False, session_id=director_session_id)
+        msg_dict = parse_director_response(msg, director_log_file_path)
+        first_agent_name = list(msg_dict.keys())[0]
+
+
+if __name__ == '__main__':
+    main()
