@@ -12,6 +12,10 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import (
+    ANALYST_NAME,
+    HUMAN_QUESTION_TRIGGER,
+    MAX_HUMAN_QA_ROUND,
+    REQUIREMENT_CLARIFICATION_MD,
     agent_names_list,
     analysis_agent_init_prompt,
     design_md,
@@ -22,15 +26,6 @@ from B00_agent_config import (
 )
 from B02_log_tools import Colors, log_message
 from B03_init_function_agents import init_agent, parse_director_response
-
-# [详细设计模式] 人类问答触发词
-HUMAN_QUESTION_TRIGGER = "[[ASK_HUMAN]]"
-# [详细设计模式] 允许向人类提问的智能体名称
-ANALYST_NAME = "需求分析师"
-# [详细设计模式] 最大人类问答轮数
-MAX_HUMAN_QA_ROUND = 100
-# [详细设计模式] 人类问答,需求澄清记录文件名
-REQUIREMENT_CLARIFICATION_MD = "需求澄清记录.md"
 
 print_lock = threading.Lock()
 

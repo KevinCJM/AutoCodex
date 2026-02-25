@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import (
+    REQUIREMENT_CLARIFICATION_MD,
     agent_names_list,
     coding_agent_init_prompt,
     coding_test_agent_init_prompt,
@@ -150,6 +151,17 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 """
 
 
+def prepare_agent_prompt(agent_name, agent_prompt):
+    clarification_rule = f"""
+前置规则:
+1) 你必须优先阅读并参考需求澄清记录文件: {REQUIREMENT_CLARIFICATION_MD}
+2) 文件绝对路径: {working_path}/{REQUIREMENT_CLARIFICATION_MD}
+3) 若文件存在, 你的评审/开发结论必须结合澄清记录中的结论;
+4) 若文件不存在, 说明“暂无人类澄清记录”, 再基于现有信息继续任务.
+"""
+    return f"{agent_skills_dict[agent_name]} {clarification_rule}\n{agent_prompt}"
+
+
 def main():
     """
     代码开发 工作流 主函数
@@ -200,7 +212,7 @@ def main():
                     run_agent,
                     agent_name,
                     f"{working_path}/agent_{agent_name}_{today_str}.log",
-                    f"{agent_skills_dict[agent_name]} {agent_prompt}",
+                    prepare_agent_prompt(agent_name, agent_prompt),
                     False,
                     agent_session_id_dict[agent_name],
                 ): agent_name

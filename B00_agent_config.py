@@ -20,10 +20,6 @@ today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 
 # 工作目录
 working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
-# 模型名称
-working_model = "gpt-5.2"
-# 推理强度
-working_effort = "high"
 # 模型推理超时时间
 working_timeout = 60 * 10
 # 恢复会话重试次数
@@ -37,6 +33,22 @@ design_md = "指标计算服务独立详细设计.md"
 task_md = "任务拆分.md"
 # 测试计划文件, 由[开发模式]生成和使用
 test_plan_md = "测试计划.md"  # 由测试工程师智能体生成的
+# [详细设计模式] 人类问答触发词
+HUMAN_QUESTION_TRIGGER = "[[ASK_HUMAN]]"
+# [详细设计模式] 允许向人类提问的智能体名称
+ANALYST_NAME = "需求分析师"
+# [详细设计模式] 最大人类问答轮数
+MAX_HUMAN_QA_ROUND = 100
+# [跨阶段] 人类问答,需求澄清记录文件名
+REQUIREMENT_CLARIFICATION_MD = "需求澄清记录.md"
+# [通用] 智能体模型与推理强度配置（每个智能体必须单独配置）
+AGENT_MODEL_EFFORT_CONFIG = {
+    "调度器": {"model_name": "gpt-5.3.codex", "reasoning_effort": "medium"},
+    "需求分析师": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
+    "审核员": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
+    "测试工程师": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
+    "开发工程师": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
+}
 
 # [通用] 初始化提示词
 common_init_prompt_1 = """记住:
@@ -151,6 +163,21 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
     Raises:
         ValueError: 当 init_yn 为 False 且 session_id 为空时抛出异常
     """
+    # 解析当前智能体对应的模型与推理强度（强校验：必须显式配置）
+    agent_runtime_cfg = AGENT_MODEL_EFFORT_CONFIG.get(agent_name)
+    if not agent_runtime_cfg:
+        raise ValueError(
+            f"AGENT_MODEL_EFFORT_CONFIG 缺少智能体配置: {agent_name}. "
+            f"请在 B00_agent_config.py 中显式配置 model_name 和 reasoning_effort."
+        )
+    model_name = str(agent_runtime_cfg.get("model_name", "")).strip()
+    reasoning_effort = str(agent_runtime_cfg.get("reasoning_effort", "")).strip()
+    if not model_name or not reasoning_effort:
+        raise ValueError(
+            f"AGENT_MODEL_EFFORT_CONFIG 配置不完整: {agent_name}. "
+            f"当前配置: {agent_runtime_cfg}"
+        )
+
     # 记录用户输入的提示信息到日志文件
     with print_lock:
         log_message(log_file_path=log_file_path,
@@ -164,8 +191,8 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
         while True:
             _, msg, session_id = init_codex(prompt=prompt,
                                             folder_path=working_path,
-                                            model_name=working_model,
-                                            reasoning_effort=working_effort,
+                                            model_name=model_name,
+                                            reasoning_effort=reasoning_effort,
                                             timeout=working_timeout
                                             )
             if session_id and msg and str(msg[0]).strip():
@@ -193,8 +220,8 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
             _, msg, _ = resume_codex(thread_id=session_id,
                                      folder_path=working_path,
                                      prompt=prompt,
-                                     model_name=working_model,
-                                     reasoning_effort=working_effort,
+                                     model_name=model_name,
+                                     reasoning_effort=reasoning_effort,
                                      timeout=working_timeout
                                      )
             if msg and str(msg[0]).strip():
