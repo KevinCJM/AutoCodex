@@ -15,7 +15,6 @@ from B00_agent_config import (
     agent_names_list,
     analysis_agent_init_prompt,
     design_md,
-    requirement_md,
     requirement_str,
     run_agent,
     today_str,
@@ -24,11 +23,16 @@ from B00_agent_config import (
 from B02_log_tools import Colors, log_message
 from B03_init_function_agents import init_agent, parse_director_response
 
-print_lock = threading.Lock()
-ASK_HUMAN_KEY = "ask_human"
+# [详细设计模式] 人类问答触发词
 HUMAN_QUESTION_TRIGGER = "[[ASK_HUMAN]]"
+# [详细设计模式] 允许向人类提问的智能体名称
 ANALYST_NAME = "需求分析师"
-MAX_HUMAN_QA_ROUND = 3
+# [详细设计模式] 最大人类问答轮数
+MAX_HUMAN_QA_ROUND = 100
+# [详细设计模式] 人类问答,需求澄清记录文件名
+REQUIREMENT_CLARIFICATION_MD = "需求澄清记录.md"
+
+print_lock = threading.Lock()
 
 # [详细设计模式] 各个智能体的 skills 技能标签
 agent_skills_dict = {
@@ -54,9 +58,10 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 主要流程如下:
 
 0) 先调度需求分析师进行需求理解与需求澄清.
-- 若需求分析师使用触发词 {HUMAN_QUESTION_TRIGGER} 提问, 说明其需要人类澄清.
-- 人类回答后, 继续调度需求分析师完成澄清.
+- 若{ANALYST_NAME}使用触发词 {HUMAN_QUESTION_TRIGGER} 提问, 说明其需要人类澄清.
+- 人类回答后, 继续{ANALYST_NAME}完成澄清.
 - 澄清完成后再进入后续步骤.
+- 其他智能体在审核前必须参考需求澄清记录文件: {REQUIREMENT_CLARIFICATION_MD}
 
 1) 通知 审核员智能体, 测试工程师智能体, 开发工程师智能体 进行文档审核.
 
@@ -204,18 +209,18 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 ```
 
 ---
-6) 如果需求分析师对需求拿不准, 或者对需求有不明白的地方, 需要先询问人类.
-需求分析师提问时必须使用触发词: {HUMAN_QUESTION_TRIGGER}
+6) 如果{ANALYST_NAME}对需求拿不准, 或者对需求有不明白的地方, 需要先询问人类.
+{ANALYST_NAME}提问时必须使用触发词: {HUMAN_QUESTION_TRIGGER}
 示例:
 ```
-{HUMAN_QUESTION_TRIGGER} 计算服务与 canopy-api-v3 的通信方式是 HTTP 还是 gRPC?
+{HUMAN_QUESTION_TRIGGER} 计算服务的通信方式是 HTTP 还是 gRPC?
 ```
 要求:
 - 问题必须明确、具体, 一次只问一个关键问题.
 - 不允许在需求不明确时自行假设并推进.
 - 在拿到人类回答后, 继续按照上述流程调度.
-- 只有需求分析师可以向人类提问.
-- 调度器禁止返回 ask_human 字段; 需要澄清时, 必须通过调度需求分析师来发起提问.
+- 只有{ANALYST_NAME}可以向人类提问.
+- 需要澄清时, 必须通过调度{ANALYST_NAME}来发起提问.
 
 ---
 返回JSON格式的数据, 格式需要是 {{智能体名称: 提示词}} 格式如下:
@@ -294,7 +299,7 @@ def append_clarification_to_requirement_doc(question, human_answer, analyst_repl
     """
     将问答澄清记录追加到需求说明文档中
     """
-    requirement_doc_path = os.path.join(working_path, requirement_md)
+    requirement_doc_path = os.path.join(working_path, REQUIREMENT_CLARIFICATION_MD)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     section = f"""
 ## 需求澄清记录 {timestamp}
@@ -318,7 +323,14 @@ def append_clarification_to_requirement_doc(question, human_answer, analyst_repl
 
 def prepare_agent_prompt(agent_name, agent_prompt):
     if agent_name != ANALYST_NAME:
-        return f"{agent_skills_dict[agent_name]} {agent_prompt}"
+        clarification_rule = f"""
+评审前置规则:
+1) 你必须优先阅读并参考需求澄清记录文件: {REQUIREMENT_CLARIFICATION_MD}
+2) 文件绝对路径: {working_path}/{REQUIREMENT_CLARIFICATION_MD}
+3) 若文件存在, 你的评审结论必须结合澄清记录中的结论;
+4) 若文件不存在, 说明“暂无人类澄清记录”, 再基于现有信息继续评审.
+"""
+        return f"{agent_skills_dict[agent_name]} {clarification_rule}\n{agent_prompt}"
     analyst_rule = f"""
 规则:
 1) 只有你可以向人类提问;
@@ -422,30 +434,6 @@ def main():
 
     ''' 3) 调用 各个功能型智能体 ------------------------------------------------------------------------------------- '''
     while first_agent_name != 'success':
-        if ASK_HUMAN_KEY in msg_dict:
-            violation_prompt = f"""
----
-你返回了非法字段 ask_human:
-{msg_dict}
-
-规则要求:
-1) 只有需求分析师可以向人类提问;
-2) 调度器禁止直接 ask_human;
-3) 需要澄清时, 请返回对需求分析师的调度提示, 并要求其使用触发词 {HUMAN_QUESTION_TRIGGER} 提问.
----
-请立即按规则重新调度.
-"""
-            msg, session_id = run_agent(
-                director_agent_name,
-                director_log_file_path,
-                base_director_prompt + violation_prompt,
-                init_yn=False,
-                session_id=director_session_id,
-            )
-            msg_dict = parse_director_response(msg, director_log_file_path)
-            first_agent_name = list(msg_dict.keys())[0]
-            continue
-
         if first_agent_name not in ['需求分析师', '审核员', '测试工程师', '开发工程师']:
             raise ValueError(f"调度器智能体返回了未知的智能体名称: {first_agent_name}")
         # 并发执行智能体

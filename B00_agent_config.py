@@ -21,9 +21,9 @@ today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 # 工作目录
 working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
 # 模型名称
-working_model = "gpt-5.2-codex"
+working_model = "gpt-5.2"
 # 推理强度
-working_effort = "low"
+working_effort = "high"
 # 模型推理超时时间
 working_timeout = 60 * 10
 # 恢复会话重试次数
@@ -99,9 +99,25 @@ requirement_str = """
 
 API主要功能为:
 1) 解析header, 识别权限
+    - 当前系统里负责解析 Header 并做权限校验的代码入口是: authorizer.py, guard.py, ctx.py
 2) 改写前端传入的json为可用于指标计算的json
 3) 指标计算主流程
 4) 将结果解析为传给前端的json
+
+能力范围：
+- 必须覆盖
+    - /api/v3/data/table_data/{target_user_id}
+    - /api/v3/data/table_data
+    - /api/v3/data/chart_data/{target_user_id}
+    - /api/v3/data/chart_data
+    - /api/v3/calculation/fetch_data
+    - /api/v3/filters/column_option
+    - /api/v3/mobile/filters/options
+- 服务内统一做这四步
+    - 解析 Authorization 并鉴权
+    - 前端 JSON 预处理（编译成 calculation profile）
+    - 执行 calculation（CalculationSessionFactory）
+    - 输出与现有前端完全兼容的 JSON
 """
 # [详细设计模式] 下需求分析师 智能体的初始化提示
 analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
