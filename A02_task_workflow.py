@@ -5,14 +5,24 @@
 @Author: Kevin-Chen
 @Descriptions: 任务拆分 工作流
 """
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from B00_agent_config import *
+from B00_agent_config import (
+    agent_names_list,
+    design_md,
+    requirement_str,
+    run_agent,
+    task_agent_init_prompt,
+    task_md,
+    today_str,
+    working_path,
+)
 from B03_init_function_agents import init_agent, custom_init_agent, parse_director_response
 
 print_lock = threading.Lock()
 
-# 各个智能体的 skills 标签
+# [任务拆分模式] 各个智能体的 skills 技能标签
 agent_skills_dict = {
     '需求分析师': '$Scrum Master',
     '审核员': '$System Architect',
@@ -20,7 +30,7 @@ agent_skills_dict = {
     '开发工程师': '$Product Manager',
 }
 
-# 调度智能体的 prompt 主体
+# [任务拆分模式] 调度智能体的 prompt 主体
 base_director_prompt = f"""你是一个专业的调度智能体.
 现在有: {agent_names_list} 这{len(agent_names_list)}个智能体.
 当前阶段为 任务拆解 阶段. 当前的需求描述如下: {requirement_str}
@@ -130,6 +140,7 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 """
 
 
+# [任务拆分模式] 任务拆分工作流主函数
 def main():
     """
     任务拆分 工作流 主函数

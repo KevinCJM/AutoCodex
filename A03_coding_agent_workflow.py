@@ -5,9 +5,20 @@
 @Author: Kevin-Chen
 @Descriptions: 代码开发 工作流
 """
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from B00_agent_config import *
+from B00_agent_config import (
+    agent_names_list,
+    coding_agent_init_prompt,
+    coding_test_agent_init_prompt,
+    design_md,
+    run_agent,
+    task_md,
+    test_plan_md,
+    today_str,
+    working_path,
+)
 from B03_init_function_agents import init_agent, custom_init_agent, parse_director_response
 
 print_lock = threading.Lock()

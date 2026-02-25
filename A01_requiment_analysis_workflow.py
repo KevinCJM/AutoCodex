@@ -5,13 +5,32 @@
 @Author: Kevin-Chen
 @Descriptions: 需求分析&详细设计 工作流
 """
+import os
+import re
+import threading
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from B00_agent_config import *
-from B03_init_function_agents import init_agent, custom_init_agent, parse_director_response
+from B00_agent_config import (
+    agent_names_list,
+    analysis_agent_init_prompt,
+    design_md,
+    requirement_md,
+    requirement_str,
+    run_agent,
+    today_str,
+    working_path,
+)
+from B02_log_tools import Colors, log_message
+from B03_init_function_agents import init_agent, parse_director_response
 
 print_lock = threading.Lock()
+ASK_HUMAN_KEY = "ask_human"
+HUMAN_QUESTION_TRIGGER = "[[ASK_HUMAN]]"
+ANALYST_NAME = "需求分析师"
+MAX_HUMAN_QA_ROUND = 3
 
+# [详细设计模式] 各个智能体的 skills 技能标签
 agent_skills_dict = {
     '需求分析师': '$Product Manager',
     '审核员': '$System Architect',
@@ -19,18 +38,25 @@ agent_skills_dict = {
     '开发工程师': '$Developer',
 }
 
+# [详细设计模式] 调度智能体的 prompt 主体
 base_director_prompt = f"""你是一个专业的调度智能体.
 现在有: {agent_names_list} 这{len(agent_names_list)}个智能体.
 当前阶段为 需求分析&详细设计 阶段. 当前的需求描述如下:
 ```
 {requirement_str}
 ```
-需求分析师已经根据需求描述写了一份详细设计文档 {design_md}
-需要其他智能体对这个详细设计文档进行检查, 然后结合各个智能体的输出, 让需求分析师对 {design_md} 文档进行优化修改. 
+你需要先让需求分析师进行需求理解与需求澄清（必要时向人类提问）.
+需求澄清完成后, 再由需求分析师编写详细设计文档 {design_md}.
+之后再让其他智能体对该文档进行检查, 并结合输出让需求分析师迭代优化.
 直到所有智能体都返回检查通过.
 
 ---
 主要流程如下:
+
+0) 先调度需求分析师进行需求理解与需求澄清.
+- 若需求分析师使用触发词 {HUMAN_QUESTION_TRIGGER} 提问, 说明其需要人类澄清.
+- 人类回答后, 继续调度需求分析师完成澄清.
+- 澄清完成后再进入后续步骤.
 
 1) 通知 审核员智能体, 测试工程师智能体, 开发工程师智能体 进行文档审核.
 
@@ -178,6 +204,20 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 ```
 
 ---
+6) 如果需求分析师对需求拿不准, 或者对需求有不明白的地方, 需要先询问人类.
+需求分析师提问时必须使用触发词: {HUMAN_QUESTION_TRIGGER}
+示例:
+```
+{HUMAN_QUESTION_TRIGGER} 计算服务与 canopy-api-v3 的通信方式是 HTTP 还是 gRPC?
+```
+要求:
+- 问题必须明确、具体, 一次只问一个关键问题.
+- 不允许在需求不明确时自行假设并推进.
+- 在拿到人类回答后, 继续按照上述流程调度.
+- 只有需求分析师可以向人类提问.
+- 调度器禁止返回 ask_human 字段; 需要澄清时, 必须通过调度需求分析师来发起提问.
+
+---
 返回JSON格式的数据, 格式需要是 {{智能体名称: 提示词}} 格式如下:
 {{"需求分析师": "相关提示词..."}}
 {{"审核员": "相关提示词...", "测试工程师": "相关提示词...", "开发工程师": "相关提示词...", }}
@@ -189,6 +229,149 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 """
 
 
+# [详细设计模式] 与人类交互: 打印问题并读取输入回答
+def ask_human(question, log_file_path):
+    """
+    与人类交互: 打印问题并读取输入回答
+
+    :param question: 需要人类回答的问题
+    :param log_file_path: 日志文件路径
+    :return: 人类回答
+    """
+    question = str(question or "").strip()
+    if not question:
+        raise ValueError("ask_human 问题不能为空")
+
+    with print_lock:
+        log_message(
+            log_file_path=log_file_path,
+            message=f"[ask_human] 问题:\n{question}",
+            color=Colors.CYAN,
+        )
+
+    print("\n" + "=" * 100)
+    print("[需要人类确认] 以下问题请你回答:")
+    print(question)
+    print("=" * 100)
+
+    try:
+        answer = input("请输入你的回答: ").strip()
+    except EOFError:
+        answer = "人类未提供输入（EOF）。"
+    except KeyboardInterrupt:
+        answer = "人类中断了输入（KeyboardInterrupt）。"
+
+    if not answer:
+        answer = "人类未提供有效回答（空输入）。"
+
+    with print_lock:
+        log_message(
+            log_file_path=log_file_path,
+            message=f"[ask_human] 回答:\n{answer}",
+            color=Colors.MAGENTA,
+        )
+    return answer
+
+
+def extract_human_question(text):
+    """
+    从智能体回复中抽取需要人类回答的问题.
+    仅识别触发词 {HUMAN_QUESTION_TRIGGER}
+    """
+    content = str(text or "").strip()
+    if not content:
+        return None
+
+    matched = re.search(rf"{re.escape(HUMAN_QUESTION_TRIGGER)}\s*(.+)", content, flags=re.S)
+    if matched:
+        question = matched.group(1).strip()
+        if question:
+            return question
+    return None
+
+
+def append_clarification_to_requirement_doc(question, human_answer, analyst_reply, log_file_path):
+    """
+    将问答澄清记录追加到需求说明文档中
+    """
+    requirement_doc_path = os.path.join(working_path, requirement_md)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    section = f"""
+## 需求澄清记录 {timestamp}
+
+- 需求分析师问题: {question}
+- 人类回答: {human_answer}
+- 需求分析师处理结果:
+{analyst_reply}
+
+"""
+    with open(requirement_doc_path, "a", encoding="utf-8") as file:
+        file.write(section)
+
+    with print_lock:
+        log_message(
+            log_file_path=log_file_path,
+            message=f"[clarification] 已将问答追加到需求说明文档: {requirement_doc_path}",
+            color=Colors.GREEN,
+        )
+
+
+def prepare_agent_prompt(agent_name, agent_prompt):
+    if agent_name != ANALYST_NAME:
+        return f"{agent_skills_dict[agent_name]} {agent_prompt}"
+    analyst_rule = f"""
+规则:
+1) 只有你可以向人类提问;
+2) 你需要人类回答时, 必须使用触发词: {HUMAN_QUESTION_TRIGGER};
+3) 人类输入可能是回答, 也可能是反问, 你需要判断是继续提问/解答还是进入下一阶段.
+"""
+    return f"{agent_skills_dict[agent_name]} {analyst_rule}\n{agent_prompt}"
+
+
+def resolve_analyst_question(session_id, agent_log_file_path, initial_msg):
+    """
+    仅处理需求分析师向人类提问的闭环
+    """
+    msg = initial_msg
+    for _ in range(MAX_HUMAN_QA_ROUND):
+        question = extract_human_question(msg)
+        if not question:
+            return msg
+
+        human_answer = ask_human(f"{ANALYST_NAME} 提问: {question}", agent_log_file_path)
+        followup_prompt = f"""
+你刚刚使用触发词 {HUMAN_QUESTION_TRIGGER} 向人类提出了以下问题:
+{question}
+
+人类输入如下（可能是回答, 也可能是反问）:
+{human_answer}
+
+请你先判断该输入属于:
+1) 已回答: 则继续推进需求分析/详细设计;
+2) 反问: 先解答, 再决定是否继续提问.
+
+如果你仍需要向人类提问, 必须继续使用触发词 {HUMAN_QUESTION_TRIGGER} 开头提出且一次只问一个关键问题.
+如果不再需要提问, 请明确写出“需求澄清已完成”.
+"""
+        msg, _ = run_agent(
+            ANALYST_NAME,
+            agent_log_file_path,
+            followup_prompt,
+            init_yn=False,
+            session_id=session_id,
+        )
+        append_clarification_to_requirement_doc(question, human_answer, msg, agent_log_file_path)
+
+    with print_lock:
+        log_message(
+            log_file_path=agent_log_file_path,
+            message=f"[warn] 需求分析师连续提问超过 {MAX_HUMAN_QA_ROUND} 轮, 已停止本轮问答闭环.",
+            color=Colors.YELLOW,
+        )
+    return msg
+
+
+# [详细设计模式] 需求分析&详细设计 工作流 主函数
 def main():
     """
     需求分析&详细设计 工作流 主函数
@@ -203,7 +386,26 @@ def main():
             a_name, s_id = future.result()
             agent_session_id_dict[a_name] = s_id
     # 个性化初始化 需求分析师 智能体
-    custom_init_agent('需求分析师', agent_session_id_dict['需求分析师'], analysis_agent_init_prompt)
+    analyst_prompt = analysis_agent_init_prompt + """
+如果你在需求分析或详细设计过程中遇到不明确点、冲突点、信息缺失点:
+1) 不要自行猜测;
+2) 向人类提问时, 必须使用触发词 [[ASK_HUMAN]];
+3) 问题要具体, 一次一个关键问题;
+4) 先完成“需求理解与需求澄清”, 澄清完成后再进入详细设计文档编写.
+"""
+    analyst_log_file_path = f"{working_path}/agent_需求分析师_{today_str}.log"
+    analyst_msg, _ = run_agent(
+        ANALYST_NAME,
+        analyst_log_file_path,
+        analyst_prompt,
+        init_yn=False,
+        session_id=agent_session_id_dict[ANALYST_NAME],
+    )
+    resolve_analyst_question(
+        session_id=agent_session_id_dict[ANALYST_NAME],
+        agent_log_file_path=analyst_log_file_path,
+        initial_msg=analyst_msg,
+    )
 
     ''' 2) 初始化 调度器智能体 --------------------------------------------------------------------------------------- '''
     director_agent_name = "调度器"
@@ -220,6 +422,30 @@ def main():
 
     ''' 3) 调用 各个功能型智能体 ------------------------------------------------------------------------------------- '''
     while first_agent_name != 'success':
+        if ASK_HUMAN_KEY in msg_dict:
+            violation_prompt = f"""
+---
+你返回了非法字段 ask_human:
+{msg_dict}
+
+规则要求:
+1) 只有需求分析师可以向人类提问;
+2) 调度器禁止直接 ask_human;
+3) 需要澄清时, 请返回对需求分析师的调度提示, 并要求其使用触发词 {HUMAN_QUESTION_TRIGGER} 提问.
+---
+请立即按规则重新调度.
+"""
+            msg, session_id = run_agent(
+                director_agent_name,
+                director_log_file_path,
+                base_director_prompt + violation_prompt,
+                init_yn=False,
+                session_id=director_session_id,
+            )
+            msg_dict = parse_director_response(msg, director_log_file_path)
+            first_agent_name = list(msg_dict.keys())[0]
+            continue
+
         if first_agent_name not in ['需求分析师', '审核员', '测试工程师', '开发工程师']:
             raise ValueError(f"调度器智能体返回了未知的智能体名称: {first_agent_name}")
         # 并发执行智能体
@@ -231,7 +457,7 @@ def main():
                     run_agent,
                     agent_name,
                     f"{working_path}/agent_{agent_name}_{today_str}.log",
-                    f"{agent_skills_dict[agent_name]} {agent_prompt}",
+                    prepare_agent_prompt(agent_name, agent_prompt),
                     False,
                     agent_session_id_dict[agent_name],
                 ): agent_name
@@ -240,6 +466,18 @@ def main():
             for future in as_completed(futures):
                 agent_name = futures[future]
                 msg, _ = future.result()
+                agent_log_file_path = f"{working_path}/agent_{agent_name}_{today_str}.log"
+                if agent_name == ANALYST_NAME:
+                    msg = resolve_analyst_question(
+                        session_id=agent_session_id_dict[agent_name],
+                        agent_log_file_path=agent_log_file_path,
+                        initial_msg=msg,
+                    )
+                elif extract_human_question(msg):
+                    msg = (
+                        f"违规: 只有 {ANALYST_NAME} 可以使用触发词 {HUMAN_QUESTION_TRIGGER} 向人类提问.\n"
+                        f"请由调度器改为调度需求分析师处理此澄清.\n\n原始回复:\n{msg}"
+                    )
                 what_agent_replay_dict[agent_name] = msg
         what_agent_just_use = [agent_name for agent_name, _ in agent_items]
 

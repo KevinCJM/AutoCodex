@@ -172,7 +172,7 @@ def init_codex(prompt, folder_path=None, model_name="gpt-5.1-codex-mini", reason
         responses.append(f"[stderr] → {errs_trimmed}")
     if thread_id is None and not agent_message:
         agent_message = ["Codex 未返回 thread_id（可能是 codex 命令失败或未输出 JSON 事件流）。"]
-    return (responses, agent_message, thread_id)
+    return responses, agent_message, thread_id
 
 
 # 恢复一个已经存在的 codex 对话 session
@@ -212,7 +212,7 @@ def resume_codex(thread_id, folder_path, prompt, model_name="gpt-5.1-codex-mini"
 
 
 if __name__ == "__main__":
-    cd_path = r'/Users/chenjunming/Desktop/AutomaticTypesettingTool'
+    cd_path = r'/Users/chenjunming/Desktop'
     init_prompt = """记住: 使用中文进行对话和文档编写"""
     _, msg, session_id = init_codex(init_prompt, cd_path)
     print(msg)

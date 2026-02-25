@@ -21,9 +21,9 @@ today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 # 工作目录
 working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
 # 模型名称
-working_model = "gpt-5.3-codex"
+working_model = "gpt-5.2-codex"
 # 推理强度
-working_effort = "high"
+working_effort = "low"
 # 模型推理超时时间
 working_timeout = 60 * 10
 # 恢复会话重试次数
@@ -31,29 +31,34 @@ resume_retry_max = 5
 # 恢复会话重试间隔时间
 resume_retry_interval = 2
 
-requirement_md = "论文自动排版工具-详细设计说明书.md"
-design_md = "模块识别_架构设计.md.md"
-task_md = "模块识别_任务说明.md"
-test_plan_md = "模块识别_测试计划.md"  # 后续由测试工程师智能体生成的
+# 需求描述文件, 由[详细设计模式]生成,[任务拆分模式]和[开发模式]使用
+design_md = "指标计算服务独立详细设计.md"
+# 任务说明文件, 由[任务拆分模式]生成,[开发模式]使用
+task_md = "任务拆分.md"
+# 测试计划文件, 由[开发模式]生成和使用
+test_plan_md = "测试计划.md"  # 由测试工程师智能体生成的
 
-# 通用初始化提示词
+# [通用] 初始化提示词
 common_init_prompt_1 = """记住:
 1) 使用中文进行对话和文档编写;
 2) 使用 "/Users/chenjunming/Desktop/myenv_310/bin/python" 命令来执行python代码
 """
-common_init_prompt_2 = f"""深度理解 {design_md} 中的内容和要求.
+# [通用] 初始化提示词2
+common_init_prompt_2 = f"""了解代码架构, 主要是:
+深度理解以 canopy-api-v3/canopy_api_v3/app.py 和 canopy-api-v3/canopy_api_v3/asgi.py 为入口了解API调用全链路逻辑, 另外 canopy-api-v3/canopy_api_v3/core/calculation/call_table_data_api_demo.py 为API测试逻辑
+深度理解以 canopy-api-v3/canopy_api_v3/core/calculation/indicator_tester.py 为入口的指标计算全链路逻辑
 """
 
 # 可用智能体列表
 agent_names_list = ['需求分析师', '审核员', '测试工程师', '开发工程师']
 
-# 开发模式下的测试工程师智能体初始化提示词
+# [开发模式] 下的测试工程师智能体初始化提示词
 coding_test_agent_init_prompt = f"""你是一个专业的python测试工程师. 
 你需要根据 {design_md} 中的描述, 以及 {task_md} 中的任务计划, 设计各个任务对应的测试.
 要求每个任务完成后有一个对应的功能测试 (覆盖度>90%), 以及一个对应的集成测试 (覆盖度>90%). 
 根据此, 设计对应的测试用例. 写入 {test_plan_md} 文件中.
 """
-# 开发模式下的各个智能体初始化提示词
+# [开发模式] 下的各个智能体初始化提示词
 coding_agent_init_prompt = {
     '需求分析师': f"""现在起, 你是一个专业的需求分析师, 并且十分了解python代码.
 我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改. 
@@ -84,18 +89,28 @@ coding_agent_init_prompt = {
 """
 }
 
-# 原始需求说明
+# [通用] 原始需求说明
 requirement_str = """
-开发一款word论文板式格式识别工具. 要有GUI界面, 用户可以配置模块的识别逻辑, 然后上传word文档, 工具可以自动识别文档中的各个模块.
+将 canopy-api-v3/canopy_api_v3/core/calculation 文件夹下面的代码进行改造, 使其可以独立为单独的服务.
+改造完成后, 需要满足以下要求:
+1. 代码需要独立为单独的服务, 不能依赖 canopy-api-v3/canopy_api_v3/core/calculation 外部代码
+2. API需要使用 fastapi 框架实现.
+3. 对已有代码尽可能少的改动
+
+API主要功能为:
+1) 解析header, 识别权限
+2) 改写前端传入的json为可用于指标计算的json
+3) 指标计算主流程
+4) 将结果解析为传给前端的json
 """
-# 详细设计模式下 需求分析师 智能体的初始化提示
+# [详细设计模式] 下需求分析师 智能体的初始化提示
 analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
 现在有以下需求: {requirement_str}
 
 根据以上需求补充, 审视当前代码. 进行代码改造的详细设计.
 将详细设计写入 {design_md} 中.
 """
-# 任务拆分模式下 需求分析师 智能体的初始化提示
+# [任务拆分模式] 下需求分析师 智能体的初始化提示
 task_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Scrum Master
 现在有以下需求: {requirement_str}
 
@@ -150,7 +165,8 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                 log_message(log_file_path=log_file_path,
                             message=f"--{session_id}--\n--{agent_name}--\n"
                                     f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                                    f"init_codex 未返回有效内容或 session_id 为空，准备重试 {retry_count}/{resume_retry_max}\n",
+                                    f"init_codex 未返回有效内容或 session_id 为空，准备重试 {retry_count}/{resume_retry_max}\n"
+                                    f"msg: {msg}",
                             color=Colors.YELLOW)
             time.sleep(resume_retry_interval)
     else:
