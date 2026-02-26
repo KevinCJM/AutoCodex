@@ -9,6 +9,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from B00_agent_config import (
+    format_agent_skills,
     REQUIREMENT_CLARIFICATION_MD,
     agent_names_list,
     coding_agent_init_prompt,
@@ -26,11 +27,12 @@ print_lock = threading.Lock()
 
 # 各个智能体的 skills 标签
 agent_skills_dict = {
-    '需求分析师': '$Product Manager',
-    '审核员': '$System Architect',
-    '测试工程师': '$Business Analyst',
-    '开发工程师': '$Developer',
+    '需求分析师': ['$Product Manager'],
+    '审核员': ['$System Architect'],
+    '测试工程师': ['$Business Analyst'],
+    '开发工程师': ['$Developer'],
 }
+
 
 # 调度智能体的 prompt 主体
 base_director_prompt = f"""你是一个专业的调度智能体.
@@ -152,6 +154,7 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 
 
 def prepare_agent_prompt(agent_name, agent_prompt):
+    skills_prefix = format_agent_skills(agent_name, agent_skills_dict)
     clarification_rule = f"""
 前置规则:
 1) 你必须优先阅读并参考需求澄清记录文件: {REQUIREMENT_CLARIFICATION_MD}
@@ -159,7 +162,7 @@ def prepare_agent_prompt(agent_name, agent_prompt):
 3) 若文件存在, 你的评审/开发结论必须结合澄清记录中的结论;
 4) 若文件不存在, 说明“暂无人类澄清记录”, 再基于现有信息继续任务.
 """
-    return f"{agent_skills_dict[agent_name]} {clarification_rule}\n{agent_prompt}"
+    return f"{skills_prefix} {clarification_rule}\n{agent_prompt}".strip()
 
 
 def main():

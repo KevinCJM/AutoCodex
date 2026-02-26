@@ -43,11 +43,11 @@ MAX_HUMAN_QA_ROUND = 100
 REQUIREMENT_CLARIFICATION_MD = "需求澄清记录.md"
 # [通用] 智能体模型与推理强度配置（每个智能体必须单独配置）
 AGENT_MODEL_EFFORT_CONFIG = {
-    "调度器": {"model_name": "gpt-5.3.codex", "reasoning_effort": "medium"},
-    "需求分析师": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
-    "审核员": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
-    "测试工程师": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
-    "开发工程师": {"model_name": "gpt-5.3.codex", "reasoning_effort": "high"},
+    "调度器": {"model_name": "gpt-5.2", "reasoning_effort": "medium"},
+    "需求分析师": {"model_name": "gpt-5.2", "reasoning_effort": "high"},
+    "审核员": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
+    "测试工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
+    "开发工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "xhigh"},
 }
 
 # [通用] 初始化提示词
@@ -245,3 +245,17 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                             f"{msg[0]}\n",
                     color=Colors.GREEN)
     return msg[0], session_id
+
+
+def format_agent_skills(agent_name, agent_skills_dict):
+    """
+    统一将技能配置格式化为 prompt 前缀，支持 str / list / tuple / set
+    """
+    skills = agent_skills_dict.get(agent_name, [])
+    if isinstance(skills, str):
+        skills_list = [skills.strip()] if skills.strip() else []
+    elif isinstance(skills, (list, tuple, set)):
+        skills_list = [str(skill).strip() for skill in skills if str(skill).strip()]
+    else:
+        raise ValueError(f"agent_skills_dict 配置类型错误: {agent_name} -> {type(skills)}")
+    return " ".join(skills_list)
