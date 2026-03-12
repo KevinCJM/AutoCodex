@@ -11,7 +11,7 @@ import os
 import re
 from datetime import datetime, timedelta
 
-from A02_task_workflow import agent_skills_dict, base_director_prompt
+from A02_task_workflow import base_director_prompt, prepare_agent_prompt
 from B00_agent_config import agent_names_list, run_agent, today_str, working_path
 from B02_log_tools import Colors, log_message
 from B03_init_function_agents import init_agent
@@ -334,7 +334,7 @@ def recover_task_workflow(
             msg, _ = run_agent(
                 agent_name,
                 agent_log_file_path,
-                f"{agent_skills_dict[agent_name]} {agent_prompt}",
+                prepare_agent_prompt(agent_name, agent_prompt),
                 init_yn=False,
                 session_id=session_id,
             )

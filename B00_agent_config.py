@@ -12,6 +12,16 @@ from datetime import datetime
 
 from B01_codex_utils import init_codex, resume_codex
 from B02_log_tools import Colors, log_message
+from B04_human_prompts import (
+    HUMAN_COMMON_INIT_PROMPT_1,
+    HUMAN_COMMON_INIT_PROMPT_2,
+    HUMAN_DESIGN_MD,
+    HUMAN_REQUIREMENT_PROMPT,
+    HUMAN_REQUIREMENT_CLARIFICATION_MD,
+    HUMAN_TASK_MD,
+    HUMAN_TEST_PLAN_MD,
+    HUMAN_WORKING_PATH,
+)
 
 print_lock = threading.Lock()
 
@@ -19,7 +29,7 @@ now = datetime.now()
 today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 
 # 工作目录
-working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
+working_path = HUMAN_WORKING_PATH
 # 模型推理超时时间
 working_timeout = 60 * 10
 # 恢复会话重试次数
@@ -28,11 +38,11 @@ resume_retry_max = 5
 resume_retry_interval = 2
 
 # 需求描述文件, 由[详细设计模式]生成,[任务拆分模式]和[开发模式]使用
-design_md = "指标计算服务独立详细设计.md"
+design_md = HUMAN_DESIGN_MD
 # 任务说明文件, 由[任务拆分模式]生成,[开发模式]使用
-task_md = "任务拆分.md"
+task_md = HUMAN_TASK_MD
 # 测试计划文件, 由[开发模式]生成和使用
-test_plan_md = "测试计划.md"  # 由测试工程师智能体生成的
+test_plan_md = HUMAN_TEST_PLAN_MD  # 由测试工程师智能体生成的
 # [详细设计模式] 人类问答触发词
 HUMAN_QUESTION_TRIGGER = "[[ASK_HUMAN]]"
 # [详细设计模式] 允许向人类提问的智能体名称
@@ -40,7 +50,7 @@ ANALYST_NAME = "需求分析师"
 # [详细设计模式] 最大人类问答轮数
 MAX_HUMAN_QA_ROUND = 100
 # [跨阶段] 人类问答,需求澄清记录文件名
-REQUIREMENT_CLARIFICATION_MD = "需求澄清记录.md"
+REQUIREMENT_CLARIFICATION_MD = HUMAN_REQUIREMENT_CLARIFICATION_MD
 # [通用] 智能体模型与推理强度配置（每个智能体必须单独配置）
 AGENT_MODEL_EFFORT_CONFIG = {
     "调度器": {"model_name": "gpt-5.2", "reasoning_effort": "medium"},
@@ -50,16 +60,9 @@ AGENT_MODEL_EFFORT_CONFIG = {
     "开发工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "xhigh"},
 }
 
-# [通用] 初始化提示词
-common_init_prompt_1 = """记住:
-1) 使用中文进行对话和文档编写;
-2) 使用 "/Users/chenjunming/Desktop/myenv_310/bin/python" 命令来执行python代码
-"""
-# [通用] 初始化提示词2
-common_init_prompt_2 = f"""了解代码架构, 主要是:
-深度理解以 canopy-api-v3/canopy_api_v3/app.py 和 canopy-api-v3/canopy_api_v3/asgi.py 为入口了解API调用全链路逻辑, 另外 canopy-api-v3/canopy_api_v3/core/calculation/call_table_data_api_demo.py 为API测试逻辑
-深度理解以 canopy-api-v3/canopy_api_v3/core/calculation/indicator_tester.py 为入口的指标计算全链路逻辑
-"""
+# [人工维护] 初始化提示词, 默认使用测试/演示内容
+common_init_prompt_1 = HUMAN_COMMON_INIT_PROMPT_1
+common_init_prompt_2 = HUMAN_COMMON_INIT_PROMPT_2
 
 # 可用智能体列表
 agent_names_list = ['需求分析师', '审核员', '测试工程师', '开发工程师']
@@ -101,36 +104,8 @@ coding_agent_init_prompt = {
 """
 }
 
-# [通用] 原始需求说明
-requirement_str = """
-将 canopy-api-v3/canopy_api_v3/core/calculation 文件夹下面的代码进行改造, 使其可以独立为单独的服务.
-改造完成后, 需要满足以下要求:
-1. 代码需要独立为单独的服务, 不能依赖 canopy-api-v3/canopy_api_v3/core/calculation 外部代码
-2. API需要使用 fastapi 框架实现.
-3. 对已有代码尽可能少的改动
-
-API主要功能为:
-1) 解析header, 识别权限
-    - 当前系统里负责解析 Header 并做权限校验的代码入口是: authorizer.py, guard.py, ctx.py
-2) 改写前端传入的json为可用于指标计算的json
-3) 指标计算主流程
-4) 将结果解析为传给前端的json
-
-能力范围：
-- 必须覆盖
-    - /api/v3/data/table_data/{target_user_id}
-    - /api/v3/data/table_data
-    - /api/v3/data/chart_data/{target_user_id}
-    - /api/v3/data/chart_data
-    - /api/v3/calculation/fetch_data
-    - /api/v3/filters/column_option
-    - /api/v3/mobile/filters/options
-- 服务内统一做这四步
-    - 解析 Authorization 并鉴权
-    - 前端 JSON 预处理（编译成 calculation profile）
-    - 执行 calculation（CalculationSessionFactory）
-    - 输出与现有前端完全兼容的 JSON
-"""
+# [人工维护] 原始需求说明, 默认使用测试/演示内容
+requirement_str = HUMAN_REQUIREMENT_PROMPT
 # [详细设计模式] 下需求分析师 智能体的初始化提示
 analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
 现在有以下需求: {requirement_str}

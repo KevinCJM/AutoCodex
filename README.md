@@ -8,16 +8,22 @@ AutoCodex 是一个“外层 Python 编排器 + 内层 Codex CLI 会话”的多
 2. 任务拆分
 3. 代码开发、审核与测试
 
-当前仓库已经针对一个具体项目做了默认配置：围绕 `canopy-api-v3` 的 calculation 能力拆分为独立服务。也就是说，这个仓库本质上是一个“自动化开发编排器”，不是一个开箱即用的通用框架模板。你如果要用于别的项目，第一步不是直接运行，而是先改配置。
+当前默认配置已经改成了**测试/演示场景**：
+
+- `B00_agent_config.py` 负责运行参数
+- `B04_human_prompts.py` 负责人工维护的项目输入，包括 `working_path`、产物文件名和 prompt
+- 默认 `working_path` 指向当前仓库自身，便于直接做演示验证
+
+也就是说，这个仓库本质上是一个“自动化开发编排器”，不是一个开箱即用的通用框架模板。你如果要用于别的项目，第一步不是直接运行，而是先改配置和 prompt。
 
 ## 1. 先理解这个仓库到底在做什么
 
 这个仓库本身不承载业务代码，它只负责“调度”。
 
-真正被分析、被改造、被测试的代码库，是 `B00_agent_config.py` 里的 `working_path` 指向的目标项目目录。当前默认值是：
+真正被分析、被改造、被测试的代码库，是 `B04_human_prompts.py` 里的 `HUMAN_WORKING_PATH` 指向的目标项目目录。当前默认值是：
 
 ```python
-working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
+working_path = PROJECT_ROOT
 ```
 
 因此可以把整个系统分成两层：
@@ -30,6 +36,7 @@ working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
 - 运行脚本是在 `AutoCodex` 仓库里执行。
 - 生成的文档、日志、状态文件默认都写进 `working_path` 指向的目标仓库里。
 - `codex exec --cd <working_path>` 会让目标仓库自己的 `AGENTS.md`、代码结构、测试工具、虚拟环境成为智能体的真实上下文。
+- 默认的人工可编辑 prompt 和项目变量已经从 `B00_agent_config.py` 拆到了 `B04_human_prompts.py`。
 
 ## 2. 整体架构
 
@@ -113,6 +120,7 @@ working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
 | `A02_task_workflow.py` | 任务拆解与多角色评审 |
 | `A03_coding_agent_workflow.py` | 开发、审核、测试的迭代闭环 |
 | `B00_agent_config.py` | 全局配置中心，最重要的文件 |
+| `B04_human_prompts.py` | 人工维护的项目输入配置，默认提供测试/演示变量与 prompt |
 | `B01_codex_utils.py` | 封装 `codex exec`、解析 JSON 事件流、初始化/恢复会话 |
 | `B02_log_tools.py` | 彩色打印与日志落盘 |
 | `B03_init_function_agents.py` | 初始化功能型智能体、个性化初始化、解析调度器 JSON |
@@ -129,17 +137,12 @@ working_path = "/Users/chenjunming/Desktop/Canopy/canopy-api-v3"
 ### 4.1 Python
 
 - 建议 Python 3.10+
-- 当前 prompt 里硬编码了一个 Python 解释器路径：
-
-```text
-/Users/chenjunming/Desktop/myenv_310/bin/python
-```
+- 默认测试 prompt 会建议智能体优先使用 `python3`
 
 注意：
 
-- 这个路径不是外层编排器必须使用的解释器。
-- 这是告诉“内层 Codex 智能体”在目标仓库里执行 Python 时优先用哪个解释器。
-- 如果你的环境没有这个路径，必须改 `B00_agent_config.py` 中的 `common_init_prompt_1`。
+- 这个约束来自 `B04_human_prompts.py` 中的人工 prompt。
+- 如果你的目标项目必须使用虚拟环境解释器，请修改 `B04_human_prompts.py`，而不是去改工作流逻辑。
 
 ### 4.2 Codex CLI
 
@@ -167,13 +170,13 @@ codex --version
 
 `working_path` 指向的目标仓库必须真实存在，并且是 Codex 可以读写的目录。
 
-当前默认路径是：
+当前默认路径是当前仓库根目录：
 
 ```text
-/Users/chenjunming/Desktop/Canopy/canopy-api-v3
+PROJECT_ROOT
 ```
 
-如果这个目录不存在，或者你想分析别的项目，必须先改 `working_path`。
+如果你想分析别的项目，必须先改 `B04_human_prompts.py` 里的 `HUMAN_WORKING_PATH`。
 
 ### 4.4 技能环境（可选但强相关）
 
@@ -191,26 +194,33 @@ prompt 中写入了技能标签，例如：
 2. 替换成你环境里已有的技能名。
 3. 直接删除这些技能前缀。
 
-## 5. 最重要的配置文件：`B00_agent_config.py`
+## 5. 最重要的配置入口：`B00_agent_config.py` + `B04_human_prompts.py`
 
-如果你只读一个文件，请先读这个文件。
+现在配置被拆成两层：
+
+- `B00_agent_config.py`
+  - 放运行逻辑、模型配置、会话重试参数、prompt 拼装逻辑
+- `B04_human_prompts.py`
+  - 放人工需要按项目背景改写的项目变量和 prompt
+
+如果你只想改“工作目录、产物文件名、项目背景、代码理解范围、原始需求”，优先改 `B04_human_prompts.py`。
 
 ### 5.1 必改配置
 
 | 配置项 | 当前含义 | 是否通常需要修改 |
 | --- | --- | --- |
-| `working_path` | 目标项目目录，也是文档/日志/状态文件落盘目录 | 是 |
-| `common_init_prompt_1` | 给所有智能体的通用约束，包含内层 Python 解释器路径 | 是 |
-| `common_init_prompt_2` | 给所有智能体的代码理解入口说明，当前完全绑定 `canopy-api-v3` | 是 |
-| `requirement_str` | 原始业务需求，当前写死为“指标计算服务独立化” | 是 |
+| `HUMAN_WORKING_PATH` | `B04_human_prompts.py` 中的目标项目目录，也是文档/日志/状态文件落盘目录 | 是 |
+| `HUMAN_DESIGN_MD` | `B04_human_prompts.py` 中的详细设计文档名 | 是 |
+| `HUMAN_TASK_MD` | `B04_human_prompts.py` 中的任务拆分文档名 | 是 |
+| `HUMAN_TEST_PLAN_MD` | `B04_human_prompts.py` 中的测试计划文档名 | 是 |
+| `HUMAN_COMMON_INIT_PROMPT_1` | `B04_human_prompts.py` 中的通用人工约束 | 是 |
+| `HUMAN_COMMON_INIT_PROMPT_2` | `B04_human_prompts.py` 中的代码理解范围说明 | 是 |
+| `HUMAN_REQUIREMENT_PROMPT` | `B04_human_prompts.py` 中的原始需求 prompt | 是 |
 
 ### 5.2 常改配置
 
 | 配置项 | 作用 |
 | --- | --- |
-| `design_md` | 详细设计文档名 |
-| `task_md` | 任务拆分文档名 |
-| `test_plan_md` | 测试计划文档名 |
 | `REQUIREMENT_CLARIFICATION_MD` | 需求澄清记录文档名 |
 | `AGENT_MODEL_EFFORT_CONFIG` | 每个智能体的模型和推理强度 |
 | `working_timeout` | 单次 `codex exec` 超时时间 |
@@ -219,32 +229,29 @@ prompt 中写入了技能标签，例如：
 
 ### 5.3 当前默认配置不是“通用模板”
 
-当前默认配置做了很强的场景绑定，例如：
-
-- 指定了目标项目绝对路径
-- 指定了代码理解入口文件
-- 指定了一个具体改造任务
-- 指定了输出文档名称
-
-所以你要迁移到新项目时，推荐至少改成下面这种形态：
+当前默认配置已经切成“运行参数”和“人工 prompt”两块，所以你要迁移到新项目时，推荐至少改成下面这种形态：
 
 ```python
-working_path = "/absolute/path/to/your-project"
-design_md = "详细设计.md"
-task_md = "任务拆分.md"
-test_plan_md = "测试计划.md"
+# B04_human_prompts.py
+HUMAN_WORKING_PATH = "/absolute/path/to/your-project"
+HUMAN_DESIGN_MD = "详细设计.md"
+HUMAN_TASK_MD = "任务拆分.md"
+HUMAN_TEST_PLAN_MD = "测试计划.md"
+```
 
-common_init_prompt_1 = """记住:
+```python
+# B04_human_prompts.py
+HUMAN_COMMON_INIT_PROMPT_1 = """记住:
 1) 使用中文进行对话和文档编写;
-2) 使用 "/absolute/path/to/venv/bin/python" 命令来执行python代码
+2) 使用 "/absolute/path/to/venv/bin/python" 命令来执行 Python 代码
 """
 
-common_init_prompt_2 = """了解代码架构, 主要是:
-1) 从你的主入口文件理解系统全链路
-2) 从测试入口或核心模块理解关键执行路径
+HUMAN_COMMON_INIT_PROMPT_2 = """了解当前项目架构, 主要是:
+1) 从主入口文件理解系统全链路
+2) 从核心流程与测试入口理解关键执行路径
 """
 
-requirement_str = """
+HUMAN_REQUIREMENT_PROMPT = """
 这里改成你的真实需求说明。
 """
 ```
@@ -254,12 +261,15 @@ requirement_str = """
 推荐顺序如下：
 
 1. 打开 `B00_agent_config.py`
-2. 修改 `working_path`
-3. 修改 `common_init_prompt_1` 中的 Python 路径
-4. 修改 `common_init_prompt_2` 中的代码入口说明
-5. 修改 `requirement_str`
-6. 确认目标仓库可读写
-7. 确认 `codex --version` 能执行
+2. 只检查模型、超时、重试参数是否符合预期
+3. 打开 `B04_human_prompts.py`
+4. 修改 `HUMAN_WORKING_PATH`
+5. 修改 `HUMAN_DESIGN_MD` / `HUMAN_TASK_MD` / `HUMAN_TEST_PLAN_MD`
+6. 修改 `HUMAN_COMMON_INIT_PROMPT_1`
+7. 修改 `HUMAN_COMMON_INIT_PROMPT_2`
+8. 修改 `HUMAN_REQUIREMENT_PROMPT`
+9. 确认目标仓库可读写
+10. 确认 `codex --version` 能执行
 
 建议再做一次快速检查：
 
@@ -362,9 +372,9 @@ python3 A00_main.py
 
 当前默认文件名分别是：
 
-- `指标计算服务独立详细设计.md`
-- `任务拆分.md`
-- `测试计划.md`
+- `示例详细设计.md`
+- `示例任务拆分.md`
+- `示例测试计划.md`
 - `需求澄清记录.md`
 
 ### 9.2 日志类产物
@@ -539,14 +549,15 @@ PY
 
 如果你想把它迁移到自己的项目，推荐按下面步骤做：
 
-1. 先只改 `B00_agent_config.py`
-2. 把 `working_path` 改到你的目标仓库
-3. 把 `common_init_prompt_2` 改成你的代码入口说明
-4. 把 `requirement_str` 改成你的真实需求
-5. 先单独跑 A01，确认能稳定产出详细设计
-6. 再跑 A02，确认任务单结构符合你的开发节奏
-7. 最后再跑 A03，让开发闭环落地
-8. 等流程稳定后，再考虑用 `A00_main.py` 一键串起来
+1. 先改 `B04_human_prompts.py` 里的 `HUMAN_WORKING_PATH`
+2. 再改 `HUMAN_DESIGN_MD` / `HUMAN_TASK_MD` / `HUMAN_TEST_PLAN_MD`
+3. 再改三段人工 prompt
+4. 把代码理解范围改成你的目标仓库入口说明
+5. 把原始需求改成你的真实需求
+6. 先单独跑 A01，确认能稳定产出详细设计
+7. 再跑 A02，确认任务单结构符合你的开发节奏
+8. 最后再跑 A03，让开发闭环落地
+9. 等流程稳定后，再考虑用 `A00_main.py` 一键串起来
 
 ## 13. 常见问题
 
@@ -558,9 +569,9 @@ PY
 
 因为 `codex exec` 使用了 `--cd <working_path>`。对内层 Codex 来说，目标仓库才是当前工作目录。
 
-### 13.3 为什么 agent 跑测试时报 Python 路径错误？
+### 13.3 为什么 agent 跑测试时用了错误的 Python 解释器？
 
-通常是 `common_init_prompt_1` 里的 Python 路径写死成了作者本机路径，你没有改。
+通常是你在 `B04_human_prompts.py` 里没有把 `HUMAN_COMMON_INIT_PROMPT_1` 改成目标项目真正需要的解释器约束。
 
 ### 13.4 为什么恢复失败说找不到可解析 JSON？
 
@@ -601,8 +612,8 @@ python3 A00_main.py
 ## 15. 当前版本的几个关键信息
 
 - 这个仓库当前没有 Python 三方依赖清单
-- 当前默认目标项目是 `canopy-api-v3`
-- 当前默认需求是“指标计算服务独立化”
+- 当前默认目标项目是当前仓库自身，用于测试/演示
+- 当前默认需求是“拆分人工 prompt 与运行参数”的测试场景
 - 当前恢复能力最完整的是 A01 和 A02
 - A03 恢复脚本可用，但 CLI 参数暴露较少
 

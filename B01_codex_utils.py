@@ -6,6 +6,7 @@
 @Descriptions: codex exec 工具函数
 """
 import json
+import os
 import subprocess
 from subprocess import TimeoutExpired
 
@@ -212,14 +213,14 @@ def resume_codex(thread_id, folder_path, prompt, model_name="gpt-5.1-codex-mini"
 
 
 if __name__ == "__main__":
-    cd_path = r'/Users/chenjunming/Desktop'
-    init_prompt = """记住: 使用中文进行对话和文档编写"""
+    cd_path = os.path.dirname(os.path.abspath(__file__))
+    init_prompt = """记住: 使用中文进行对话和文档编写。后续我会做一个简单的恢复测试。"""
     _, msg, session_id = init_codex(init_prompt, cd_path)
     print(msg)
-    resume_prompt = """记住: 北极熊和小白兔在洞里睡觉, 小熊猫来找他们但是却找不到."""
+    resume_prompt = """请记住一个测试事实: AutoCodex 是一个多智能体编排器。"""
     _, msg, _ = resume_codex(session_id, cd_path, resume_prompt,
                              "gpt-5.1-codex-mini", "low", 300)
-    resume_prompt = """谁来找小白兔? 小白兔在哪? 谁和小白兔在一起? 小白兔在做什么?"""
+    resume_prompt = """刚刚让你记住的测试事实是什么? 请用一句话回答。"""
     print(msg)
     _, msg, _ = resume_codex(session_id, cd_path, resume_prompt,
                              "gpt-5.1-codex-mini", "low", 300)

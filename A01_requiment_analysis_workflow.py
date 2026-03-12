@@ -210,7 +210,7 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 {ANALYST_NAME}提问时必须使用触发词: {HUMAN_QUESTION_TRIGGER}
 示例:
 ```
-{HUMAN_QUESTION_TRIGGER} 计算服务的通信方式是 HTTP 还是 gRPC?
+{HUMAN_QUESTION_TRIGGER} 这个测试项目当前优先支持命令行运行还是 HTTP API 运行?
 ```
 要求:
 - 问题必须明确、具体, 一次只问一个关键问题.
