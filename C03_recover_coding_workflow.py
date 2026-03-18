@@ -8,7 +8,7 @@
 import json
 import os
 import re
-import sys
+import argparse
 from datetime import timedelta
 
 from A03_coding_agent_workflow import base_director_prompt, prepare_agent_prompt
@@ -497,5 +497,31 @@ def recover_workflow(
         _save_state(state_path, state)
 
 
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description="恢复 A03 代码开发工作流")
+    parser.add_argument("--state-path", default=None, help="状态文件路径")
+    parser.add_argument("--log-dir", default=None, help="日志目录，默认使用 working_path")
+    parser.add_argument("--max-log-days", default=3, type=int, help="日志回溯天数")
+    parser.add_argument("--no-prefer-checkpoint", action="store_true", help="不优先使用 checkpoint")
+    parser.add_argument("--strict-json", action="store_true", help="启用严格调度器 JSON 解析")
+    parser.add_argument(
+        "--allow-reinit-on-missing-session",
+        action="store_true",
+        help="缺失 session_id 时允许重建智能体会话",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="仅重建状态，不执行恢复")
+    return parser
+
+
 if __name__ == "__main__":
-    recover_workflow(dry_run="--dry-run" in sys.argv)
+    args = _build_arg_parser().parse_args()
+    result = recover_workflow(
+        state_path=args.state_path,
+        log_dir=args.log_dir,
+        prefer_checkpoint=not args.no_prefer_checkpoint,
+        max_log_days=args.max_log_days,
+        strict_json=args.strict_json,
+        allow_reinit_on_missing_session=args.allow_reinit_on_missing_session,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
