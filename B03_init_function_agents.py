@@ -58,12 +58,22 @@ def custom_init_agent(agent_name, session_id, custom_agent_prompt):
 
 def parse_director_response(massage, log_file):
     try:
-        return json.loads(massage)
+        parsed = json.loads(massage)
     except json.JSONDecodeError as exc:
         with print_lock:
             log_message(
                 log_file_path=log_file,
                 message=f"调度器返回非JSON，无法解析: {exc}\n原始返回:\n{massage}",
+                color=Colors.RED,
+            )
+        raise
+    try:
+        return normalize_director_payload(parsed)
+    except ValueError as exc:
+        with print_lock:
+            log_message(
+                log_file_path=log_file,
+                message=f"调度器返回JSON，但结构不合法: {exc}\n原始返回:\n{massage}",
                 color=Colors.RED,
             )
         raise

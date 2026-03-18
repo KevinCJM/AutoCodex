@@ -6,8 +6,11 @@
 @Descriptions: 智能体配置参数
 """
 
+import json
+import os
 import threading
 import time
+import tempfile
 from datetime import datetime
 
 from B01_codex_utils import init_codex, resume_codex
@@ -25,6 +28,8 @@ from B04_human_prompts import (
 )
 
 print_lock = threading.Lock()
+DIRECTOR_NAME = "调度器"
+DIRECTOR_OUTPUT_KEYS = ("success", "需求分析师", "审核员", "测试工程师", "开发工程师")
 
 now = datetime.now()
 today_str = f"{now.year}{now.month:02d}{now.day:02d}"
@@ -61,6 +66,76 @@ common_init_prompt_2 = HUMAN_COMMON_INIT_PROMPT_2
 
 # 可用智能体列表
 agent_names_list = ['需求分析师', '审核员', '测试工程师', '开发工程师']
+
+
+def _build_director_output_schema():
+    all_properties = {
+        key: {
+            "type": "string",
+        }
+        for key in DIRECTOR_OUTPUT_KEYS
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": all_properties,
+        "required": list(DIRECTOR_OUTPUT_KEYS),
+    }
+
+
+def ensure_director_output_schema():
+    schema_path = os.path.join(tempfile.gettempdir(), "autocodex_director_output_schema.json")
+    schema = _build_director_output_schema()
+    need_write = True
+    if os.path.exists(schema_path):
+        try:
+            with open(schema_path, "r", encoding="utf-8") as f:
+                need_write = json.load(f) != schema
+        except (json.JSONDecodeError, OSError):
+            need_write = True
+    if need_write:
+        with open(schema_path, "w", encoding="utf-8") as f:
+            json.dump(schema, f, ensure_ascii=False, indent=2)
+    return schema_path
+
+
+def normalize_director_payload(payload, allow_nested_success=True):
+    if not isinstance(payload, dict):
+        raise ValueError("调度器返回的JSON必须是对象")
+
+    allowed_keys = set(DIRECTOR_OUTPUT_KEYS)
+    unknown_keys = [key for key in payload.keys() if key not in allowed_keys]
+    if unknown_keys:
+        raise ValueError(f"调度器返回了未知字段: {unknown_keys}")
+
+    normalized = {}
+    for key in DIRECTOR_OUTPUT_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if value is None:
+            text = ""
+        elif isinstance(value, str):
+            text = value.strip()
+        else:
+            raise ValueError(f"调度器字段 {key} 的值必须是字符串")
+        if text:
+            normalized[key] = text
+
+    if not normalized:
+        raise ValueError("调度器返回的JSON归一化后为空")
+    if "success" in normalized and len(normalized) != 1:
+        raise ValueError("调度器返回格式非法: success 不能与其他字段同时出现")
+    if allow_nested_success and "success" in normalized:
+        success_text = normalized["success"]
+        if success_text.startswith("{") and success_text.endswith("}"):
+            try:
+                nested_payload = json.loads(success_text)
+            except json.JSONDecodeError:
+                nested_payload = None
+            if isinstance(nested_payload, dict):
+                return normalize_director_payload(nested_payload, allow_nested_success=False)
+    return normalized
 
 # [开发模式] 下的测试工程师智能体初始化提示词
 coding_test_agent_init_prompt = f"""你是一个专业的python测试工程师. 
@@ -147,6 +222,7 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
             f"AGENT_MODEL_EFFORT_CONFIG 配置不完整: {agent_name}. "
             f"当前配置: {agent_runtime_cfg}"
         )
+    output_schema_path = ensure_director_output_schema() if agent_name == DIRECTOR_NAME else None
 
     # 记录用户输入的提示信息到日志文件
     with print_lock:
@@ -163,7 +239,8 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                                             folder_path=working_path,
                                             model_name=model_name,
                                             reasoning_effort=reasoning_effort,
-                                            timeout=working_timeout
+                                            timeout=working_timeout,
+                                            output_schema_path=output_schema_path,
                                             )
             if session_id and msg and str(msg[0]).strip():
                 break
@@ -192,7 +269,8 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                                      prompt=prompt,
                                      model_name=model_name,
                                      reasoning_effort=reasoning_effort,
-                                     timeout=working_timeout
+                                     timeout=working_timeout,
+                                     output_schema_path=output_schema_path,
                                      )
             if msg and str(msg[0]).strip():
                 break

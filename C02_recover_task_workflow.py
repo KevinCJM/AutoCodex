@@ -86,8 +86,13 @@ def _find_latest_json_output(entries, agent_name, strict_json):
         if not parsed:
             continue
         msg_dict = _try_parse_json(parsed["message"], strict_json=strict_json)
-        if msg_dict:
-            return parsed, msg_dict
+        if not msg_dict:
+            continue
+        try:
+            msg_dict = normalize_director_payload(msg_dict)
+        except ValueError:
+            continue
+        return parsed, msg_dict
     return None, None
 
 
@@ -368,6 +373,11 @@ def recover_task_workflow(
             session_id=director_session_id,
         )
         msg_dict = _try_parse_json(msg, strict_json=strict_json)
+        if msg_dict:
+            try:
+                msg_dict = normalize_director_payload(msg_dict)
+            except ValueError:
+                msg_dict = None
         if not msg_dict:
             _log(director_log_path, f"调度器返回非JSON，无法解析:\n{msg}", color=Colors.RED)
             raise RuntimeError("调度器输出无法解析为JSON，恢复中断。")

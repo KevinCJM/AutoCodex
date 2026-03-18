@@ -137,7 +137,14 @@ def handle_events(events):
 
 
 # 初始化一个 codex 对话 session
-def init_codex(prompt, folder_path=None, model_name="gpt-5.1-codex-mini", reasoning_effort="low", timeout=300):
+def init_codex(
+        prompt,
+        folder_path=None,
+        model_name="gpt-5.1-codex-mini",
+        reasoning_effort="low",
+        timeout=300,
+        output_schema_path=None,
+):
     """
     初始化一个 codex 对话 session。
 
@@ -158,8 +165,10 @@ def init_codex(prompt, folder_path=None, model_name="gpt-5.1-codex-mini", reason
         "--skip-git-repo-check",
         "--json", "--full-auto",
         "--cd", folder_path,
-        prompt
     ]
+    if output_schema_path:
+        init_cmd.extend(["--output-schema", output_schema_path])
+    init_cmd.append(prompt)
     # 运行命令并解析结果
     events, errs, return_code = run_codex(init_cmd, timeout=timeout)
     # 返回处理结果 (信息列表, 智能体的回答, session_ID)
@@ -177,7 +186,15 @@ def init_codex(prompt, folder_path=None, model_name="gpt-5.1-codex-mini", reason
 
 
 # 恢复一个已经存在的 codex 对话 session
-def resume_codex(thread_id, folder_path, prompt, model_name="gpt-5.1-codex-mini", reasoning_effort="low", timeout=300):
+def resume_codex(
+        thread_id,
+        folder_path,
+        prompt,
+        model_name="gpt-5.1-codex-mini",
+        reasoning_effort="low",
+        timeout=300,
+        output_schema_path=None,
+):
     """
     恢复Codex会话并执行指定的提示
 
@@ -203,9 +220,10 @@ def resume_codex(thread_id, folder_path, prompt, model_name="gpt-5.1-codex-mini"
         "--skip-git-repo-check",
         "--json", "--full-auto",
         "--cd", folder_path,
-        "resume", thread_id,
-        prompt
     ]
+    if output_schema_path:
+        init_cmd.extend(["--output-schema", output_schema_path])
+    init_cmd.extend(["resume", thread_id, prompt])
     # 运行命令并解析结果
     events, errs, return_code = run_codex(init_cmd, timeout=timeout)
     # 处理结果 (信息列表, 智能体的回答, session_ID)
