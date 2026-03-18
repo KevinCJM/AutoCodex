@@ -31,6 +31,7 @@ agent_skills_dict = {
     '测试工程师': ['$Business Analyst'],
     '开发工程师': ['$Product Manager'],
 }
+DIRECTOR_SUCCESS_TEXT = "任务拆分完成"
 
 
 # [任务拆分模式] 调度智能体的 prompt 主体
@@ -63,7 +64,7 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 ---
 2) 收集 审核员智能体, 测试工程师智能体, 开发工程师智能体 的审核结果.
 
-2.1) 如果所有智能体都没有提出问题或者有疑问点, 则认为该任务开发完成, 直接到步骤5, 返回 {{"success": "任务拆分完成"}}
+2.1) 如果所有智能体都没有提出问题或者有疑问点, 则认为该任务开发完成, 直接到步骤5, 返回 {{"success": "{DIRECTOR_SUCCESS_TEXT}"}}
 
 2.2) 如果有任一智能体提出错误点或者有疑问点, 则认为该需求详细设计未完成. 需要通知 需求分析师智能体 进行修复. prompt 模板如下:
 ```
@@ -121,14 +122,14 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 ---
 4) 收集 审核员智能体, 测试工程师智能体, 开发工程师智能体 的审核结果.
 
-4.1) 如果所有智能体都没有提出问题或者有疑问点, 则认为 任务拆解 已经完成, 直接到步骤5, 返回 {{"success": "任务拆分完成"}}
+4.1) 如果所有智能体都没有提出问题或者有疑问点, 则认为 任务拆解 已经完成, 直接到步骤5, 返回 {{"success": "{DIRECTOR_SUCCESS_TEXT}"}}
 
 4.2) 如果有任一智能体提出错误点或者有疑问点, 则认为该需求详细设计未完成. 需要通知 需求分析师智能体 进行修复. 回到 2.2)
 
 ---
 5) 当所有智能体都认为当前需求分析与详细设计没有问题了, 则结束整个流程. 返回如下JSON:
 ```
-{{"success": "任务拆分完成"}}
+{{"success": "{DIRECTOR_SUCCESS_TEXT}"}}
 ```
 
 ---
@@ -145,6 +146,8 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 - 5个字段必须全部出现
 - 当前不使用的字段必须填空字符串 ""
 - 如果流程结束, 只能填写 success, 其他4个字段必须为空字符串
+- 如果 success 非空, 它的值必须精确等于 "{DIRECTOR_SUCCESS_TEXT}"
+- 如果当前只是准备读取、分析、规划下一步, 绝不能填写 success
 - 如果要调度智能体, success 必须为空字符串, 其余需要调度的智能体字段填写 prompt, 不调度的智能体字段填空字符串
 
 ---
@@ -192,7 +195,7 @@ def main():
     init_director_prompt = base_director_prompt + init_director_prompt
     msg, director_session_id = run_agent(director_agent_name, director_log_file_path,
                                          init_director_prompt, init_yn=True, session_id=None)
-    msg_dict = parse_director_response(msg, director_log_file_path)
+    msg_dict = parse_director_response(msg, director_log_file_path, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
     first_agent_name = list(msg_dict.keys())[0]
 
     ''' 3) 调用 各个功能型智能体 ------------------------------------------------------------------------------------- '''
@@ -242,7 +245,7 @@ def main():
         # 调用 调度器智能体
         msg, session_id = run_agent(director_agent_name, director_log_file_path, doing_director_prompt,
                                     init_yn=False, session_id=director_session_id)
-        msg_dict = parse_director_response(msg, director_log_file_path)
+        msg_dict = parse_director_response(msg, director_log_file_path, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
         first_agent_name = list(msg_dict.keys())[0]
 
 

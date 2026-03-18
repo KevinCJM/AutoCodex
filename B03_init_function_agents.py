@@ -56,7 +56,7 @@ def custom_init_agent(agent_name, session_id, custom_agent_prompt):
     return agent_name, session_id
 
 
-def parse_director_response(massage, log_file):
+def parse_director_response(massage, log_file, allowed_success_values=None):
     try:
         parsed = json.loads(massage)
     except json.JSONDecodeError as exc:
@@ -68,7 +68,7 @@ def parse_director_response(massage, log_file):
             )
         raise
     try:
-        return normalize_director_payload(parsed)
+        return normalize_director_payload(parsed, allowed_success_values=allowed_success_values)
     except ValueError as exc:
         with print_lock:
             log_message(

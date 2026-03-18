@@ -12,7 +12,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 
-from A03_coding_agent_workflow import base_director_prompt, prepare_agent_prompt
+from A03_coding_agent_workflow import DIRECTOR_SUCCESS_TEXT, base_director_prompt, prepare_agent_prompt
 from B00_agent_config import *
 from B02_log_tools import Colors, log_message
 from B03_init_function_agents import init_agent
@@ -131,7 +131,7 @@ def _find_latest_json_output(entries, agent_name, strict_json, session_id=None):
         if not msg_dict:
             continue
         try:
-            msg_dict = normalize_director_payload(msg_dict)
+            msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
         except ValueError:
             continue
         return parsed, msg_dict
@@ -217,6 +217,16 @@ def _load_state(state_path):
         return json.load(f)
 
 
+def _normalize_loaded_state(state):
+    if not state:
+        return None
+    msg_dict = state.get("msg_dict")
+    if not msg_dict:
+        return state
+    state["msg_dict"] = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
+    return state
+
+
 def _save_state(state_path, state):
     if not state_path:
         return
@@ -247,8 +257,11 @@ def _build_director_retry_prompt(last_director_prompt):
 
 ---
 补充要求:
-你上一条回复没有返回合法 JSON.
+你上一条回复没有返回合法且符合调度协议的 JSON.
 这一次只能返回严格合法的 JSON, 不要返回解释、计划、思考过程、Markdown 代码块.
+- success 字段只能在整个开发流程真正完成时使用
+- 如果 success 非空, 它的值必须精确等于 "{DIRECTOR_SUCCESS_TEXT}"
+- 如果当前只是准备读取、分析、规划下一步, 必须把 prompt 放到对应智能体字段, success 必须为空字符串
 """
 
 
@@ -269,7 +282,7 @@ def _rebuild_state_from_logs(log_dir, max_log_days, strict_json):
         msg_dict = _try_parse_json(director_output["message"], strict_json=strict_json)
         if msg_dict:
             try:
-                msg_dict = normalize_director_payload(msg_dict)
+                msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
             except ValueError:
                 msg_dict = None
     if not msg_dict and director_session_id:
@@ -355,6 +368,10 @@ def recover_workflow(
     state = None
     if prefer_checkpoint:
         state = _load_state(state_path)
+        try:
+            state = _normalize_loaded_state(state)
+        except ValueError:
+            state = None
     if not state:
         state = _rebuild_state_from_logs(log_dir, max_log_days, strict_json)
     state = _backfill_agent_sessions_from_logs(state, log_dir, max_log_days)
@@ -398,7 +415,7 @@ def recover_workflow(
         msg_dict = _try_parse_json(msg, strict_json=strict_json)
         if msg_dict:
             try:
-                msg_dict = normalize_director_payload(msg_dict)
+                msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
             except ValueError:
                 msg_dict = None
         if not msg_dict:
@@ -488,7 +505,7 @@ def recover_workflow(
         msg_dict = _try_parse_json(msg, strict_json=strict_json)
         if msg_dict:
             try:
-                msg_dict = normalize_director_payload(msg_dict)
+                msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
             except ValueError:
                 msg_dict = None
         if not msg_dict:

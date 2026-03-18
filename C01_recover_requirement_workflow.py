@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 
 from A01_requiment_analysis_workflow import (
     ANALYST_NAME,
+    DIRECTOR_SUCCESS_TEXT,
     base_director_prompt,
     extract_human_question,
     prepare_agent_prompt,
@@ -96,7 +97,7 @@ def _find_latest_json_output(entries, agent_name, strict_json):
         if not msg_dict:
             continue
         try:
-            msg_dict = normalize_director_payload(msg_dict)
+            msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
         except ValueError:
             continue
         return parsed, msg_dict
@@ -179,6 +180,16 @@ def _load_state(state_path):
         return None
     with open(state_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _normalize_loaded_state(state):
+    if not state:
+        return None
+    msg_dict = state.get("msg_dict")
+    if not msg_dict:
+        return state
+    state["msg_dict"] = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
+    return state
 
 
 def _save_state(state_path, state):
@@ -301,6 +312,10 @@ def recover_requirement_workflow(
     state = None
     if prefer_checkpoint:
         state = _load_state(state_path)
+        try:
+            state = _normalize_loaded_state(state)
+        except ValueError:
+            state = None
     if not state:
         state = _rebuild_state_from_logs(log_dir, max_log_days, strict_json)
     state = _backfill_agent_sessions_from_logs(state, log_dir, max_log_days)
@@ -433,7 +448,7 @@ def recover_requirement_workflow(
         msg_dict = _try_parse_json(msg, strict_json=strict_json)
         if msg_dict:
             try:
-                msg_dict = normalize_director_payload(msg_dict)
+                msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
             except ValueError:
                 msg_dict = None
         if not msg_dict:

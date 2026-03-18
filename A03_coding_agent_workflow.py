@@ -32,6 +32,7 @@ agent_skills_dict = {
     '测试工程师': ['$Business Analyst'],
     '开发工程师': ['$Developer'],
 }
+DIRECTOR_SUCCESS_TEXT = "所有任务开发完成"
 
 
 # 调度智能体的 prompt 主体
@@ -138,7 +139,7 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 
 4) 当所有任务都开发完成后, 结束整个开发流程. 返回如下JSON:
 ```
-{{"success": "所有任务开发完成"}}
+{{"success": "{DIRECTOR_SUCCESS_TEXT}"}}
 ```
 
 ---
@@ -155,6 +156,8 @@ base_director_prompt = f"""你是一个专业的调度智能体.
 - 5个字段必须全部出现
 - 当前不使用的字段必须填空字符串 ""
 - 如果流程结束, 只能填写 success, 其他4个字段必须为空字符串
+- 如果 success 非空, 它的值必须精确等于 "{DIRECTOR_SUCCESS_TEXT}"
+- 如果当前只是准备读取、分析、规划下一步, 绝不能填写 success
 - 如果要调度智能体, success 必须为空字符串, 其余需要调度的智能体字段填写 prompt, 不调度的智能体字段填空字符串
 
 ---
@@ -209,7 +212,7 @@ def main():
     init_director_prompt = base_director_prompt + init_director_prompt
     msg, director_session_id = run_agent(director_agent_name, director_log_file_path,
                                          init_director_prompt, init_yn=True, session_id=None)
-    msg_dict = parse_director_response(msg, director_log_file_path)
+    msg_dict = parse_director_response(msg, director_log_file_path, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
     first_agent_name = list(msg_dict.keys())[0]
 
     ''' 3) 调用 各个功能型智能体 ------------------------------------------------------------------------------------- '''
@@ -259,5 +262,5 @@ def main():
         # 调用 调度器智能体
         msg, session_id = run_agent(director_agent_name, director_log_file_path,
                                     doing_director_prompt, init_yn=False, session_id=director_session_id)
-        msg_dict = parse_director_response(msg, director_log_file_path)
+        msg_dict = parse_director_response(msg, director_log_file_path, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
         first_agent_name = list(msg_dict.keys())[0]

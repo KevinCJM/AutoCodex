@@ -99,9 +99,18 @@ def ensure_director_output_schema():
     return schema_path
 
 
-def normalize_director_payload(payload, allow_nested_success=True):
+def normalize_director_payload(payload, allow_nested_success=True, allowed_success_values=None):
     if not isinstance(payload, dict):
         raise ValueError("调度器返回的JSON必须是对象")
+
+    if allowed_success_values is None:
+        normalized_success_values = None
+    elif isinstance(allowed_success_values, str):
+        normalized_success_values = {allowed_success_values.strip()}
+    else:
+        normalized_success_values = {str(value).strip() for value in allowed_success_values if str(value).strip()}
+        if not normalized_success_values:
+            normalized_success_values = None
 
     allowed_keys = set(DIRECTOR_OUTPUT_KEYS)
     unknown_keys = [key for key in payload.keys() if key not in allowed_keys]
@@ -134,7 +143,18 @@ def normalize_director_payload(payload, allow_nested_success=True):
             except json.JSONDecodeError:
                 nested_payload = None
             if isinstance(nested_payload, dict):
-                return normalize_director_payload(nested_payload, allow_nested_success=False)
+                return normalize_director_payload(
+                    nested_payload,
+                    allow_nested_success=False,
+                    allowed_success_values=normalized_success_values,
+                )
+    if "success" in normalized and normalized_success_values is not None:
+        success_text = normalized["success"]
+        if success_text not in normalized_success_values:
+            raise ValueError(
+                f"调度器 success 字段非法: {success_text!r}. "
+                f"当前阶段只允许: {sorted(normalized_success_values)}"
+            )
     return normalized
 
 # [开发模式] 下的测试工程师智能体初始化提示词

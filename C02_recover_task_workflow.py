@@ -12,7 +12,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
-from A02_task_workflow import base_director_prompt, prepare_agent_prompt
+from A02_task_workflow import DIRECTOR_SUCCESS_TEXT, base_director_prompt, prepare_agent_prompt
 from B00_agent_config import agent_names_list, run_agent, today_str, working_path
 from B02_log_tools import Colors, log_message
 from B03_init_function_agents import init_agent
@@ -90,7 +90,7 @@ def _find_latest_json_output(entries, agent_name, strict_json):
         if not msg_dict:
             continue
         try:
-            msg_dict = normalize_director_payload(msg_dict)
+            msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
         except ValueError:
             continue
         return parsed, msg_dict
@@ -173,6 +173,16 @@ def _load_state(state_path):
         return None
     with open(state_path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def _normalize_loaded_state(state):
+    if not state:
+        return None
+    msg_dict = state.get("msg_dict")
+    if not msg_dict:
+        return state
+    state["msg_dict"] = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
+    return state
 
 
 def _save_state(state_path, state):
@@ -278,6 +288,10 @@ def recover_task_workflow(
     state = None
     if prefer_checkpoint:
         state = _load_state(state_path)
+        try:
+            state = _normalize_loaded_state(state)
+        except ValueError:
+            state = None
     if not state:
         state = _rebuild_state_from_logs(log_dir, max_log_days, strict_json)
     state = _backfill_agent_sessions_from_logs(state, log_dir, max_log_days)
@@ -391,7 +405,7 @@ def recover_task_workflow(
         msg_dict = _try_parse_json(msg, strict_json=strict_json)
         if msg_dict:
             try:
-                msg_dict = normalize_director_payload(msg_dict)
+                msg_dict = normalize_director_payload(msg_dict, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
             except ValueError:
                 msg_dict = None
         if not msg_dict:
