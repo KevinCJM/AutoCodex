@@ -7,12 +7,13 @@
 """
 
 import os
+from pathlib import Path
 
 # 这个文件放“需要人类根据项目背景自行改写”的项目输入。
 # 包括工作目录、产物文件名，以及 prompt 文本。
 # 默认内容使用测试/演示场景，不包含任何公司内部仓库提示。
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = Path("/your/project/path")
 
 HUMAN_WORKING_PATH = PROJECT_ROOT
 HUMAN_DESIGN_MD = "示例详细设计.md"
