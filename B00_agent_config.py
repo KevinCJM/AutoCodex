@@ -13,6 +13,7 @@ from datetime import datetime
 from B01_codex_utils import init_codex, resume_codex
 from B02_log_tools import Colors, log_message
 from B04_human_prompts import (
+    HUMAN_AGENT_MODEL_EFFORT_CONFIG,
     HUMAN_COMMON_INIT_PROMPT_1,
     HUMAN_COMMON_INIT_PROMPT_2,
     HUMAN_DESIGN_MD,
@@ -51,14 +52,8 @@ ANALYST_NAME = "需求分析师"
 MAX_HUMAN_QA_ROUND = 100
 # [跨阶段] 人类问答,需求澄清记录文件名
 REQUIREMENT_CLARIFICATION_MD = HUMAN_REQUIREMENT_CLARIFICATION_MD
-# [通用] 智能体模型与推理强度配置（每个智能体必须单独配置）
-AGENT_MODEL_EFFORT_CONFIG = {
-    "调度器": {"model_name": "gpt-5.2", "reasoning_effort": "medium"},
-    "需求分析师": {"model_name": "gpt-5.2", "reasoning_effort": "high"},
-    "审核员": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
-    "测试工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
-    "开发工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "xhigh"},
-}
+# [人工维护] 智能体模型与推理强度配置
+AGENT_MODEL_EFFORT_CONFIG = HUMAN_AGENT_MODEL_EFFORT_CONFIG
 
 # [人工维护] 初始化提示词, 默认使用测试/演示内容
 common_init_prompt_1 = HUMAN_COMMON_INIT_PROMPT_1

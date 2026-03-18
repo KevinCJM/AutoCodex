@@ -19,6 +19,13 @@ HUMAN_DESIGN_MD = "示例详细设计.md"
 HUMAN_TASK_MD = "示例任务拆分.md"
 HUMAN_TEST_PLAN_MD = "示例测试计划.md"
 HUMAN_REQUIREMENT_CLARIFICATION_MD = "需求澄清记录.md"
+HUMAN_AGENT_MODEL_EFFORT_CONFIG = {
+    "调度器": {"model_name": "gpt-5.3-codex", "reasoning_effort": "medium"},
+    "需求分析师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
+    "审核员": {"model_name": "gpt-5.4", "reasoning_effort": "xhigh"},
+    "测试工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
+    "开发工程师": {"model_name": "gpt-5.4", "reasoning_effort": "xhigh"},
+}
 
 HUMAN_COMMON_INIT_PROMPT_1 = """记住:
 1) 使用中文进行对话和文档编写;

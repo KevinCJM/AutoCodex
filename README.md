@@ -11,7 +11,7 @@ AutoCodex 是一个“外层 Python 编排器 + 内层 Codex CLI 会话”的多
 当前默认配置已经改成了**测试/演示场景**：
 
 - `B00_agent_config.py` 负责运行参数
-- `B04_human_prompts.py` 负责人工维护的项目输入，包括 `working_path`、产物文件名和 prompt
+- `B04_human_prompts.py` 负责人工维护的项目输入，包括 `working_path`、产物文件名、各智能体模型配置和 prompt
 - 默认 `working_path` 指向当前仓库自身，便于直接做演示验证
 
 也就是说，这个仓库本质上是一个“自动化开发编排器”，不是一个开箱即用的通用框架模板。你如果要用于别的项目，第一步不是直接运行，而是先改配置和 prompt。
@@ -201,7 +201,7 @@ prompt 中写入了技能标签，例如：
 - `B00_agent_config.py`
   - 放运行逻辑、模型配置、会话重试参数、prompt 拼装逻辑
 - `B04_human_prompts.py`
-  - 放人工需要按项目背景改写的项目变量和 prompt
+  - 放人工需要按项目背景改写的项目变量、各智能体模型配置和 prompt
 
 如果你只想改“工作目录、产物文件名、项目背景、代码理解范围、原始需求”，优先改 `B04_human_prompts.py`。
 
@@ -213,16 +213,18 @@ prompt 中写入了技能标签，例如：
 | `HUMAN_DESIGN_MD` | `B04_human_prompts.py` 中的详细设计文档名 | 是 |
 | `HUMAN_TASK_MD` | `B04_human_prompts.py` 中的任务拆分文档名 | 是 |
 | `HUMAN_TEST_PLAN_MD` | `B04_human_prompts.py` 中的测试计划文档名 | 是 |
+| `HUMAN_AGENT_MODEL_EFFORT_CONFIG` | `B04_human_prompts.py` 中每个智能体的模型和推理强度 | 是 |
 | `HUMAN_COMMON_INIT_PROMPT_1` | `B04_human_prompts.py` 中的通用人工约束 | 是 |
 | `HUMAN_COMMON_INIT_PROMPT_2` | `B04_human_prompts.py` 中的代码理解范围说明 | 是 |
 | `HUMAN_REQUIREMENT_PROMPT` | `B04_human_prompts.py` 中的原始需求 prompt | 是 |
+
+`HUMAN_AGENT_MODEL_EFFORT_CONFIG` 必须覆盖运行时会用到的全部智能体名称。当前默认需要至少包含：`调度器`、`需求分析师`、`审核员`、`测试工程师`、`开发工程师`。如果缺项，运行时会在 `prepare_agent_prompt()` 中直接报错并停止。
 
 ### 5.2 常改配置
 
 | 配置项 | 作用 |
 | --- | --- |
 | `REQUIREMENT_CLARIFICATION_MD` | 需求澄清记录文档名 |
-| `AGENT_MODEL_EFFORT_CONFIG` | 每个智能体的模型和推理强度 |
 | `working_timeout` | 单次 `codex exec` 超时时间 |
 | `resume_retry_max` | 初始化/恢复失败后的最大重试次数 |
 | `resume_retry_interval` | 重试间隔秒数 |
@@ -237,6 +239,10 @@ HUMAN_WORKING_PATH = "/absolute/path/to/your-project"
 HUMAN_DESIGN_MD = "详细设计.md"
 HUMAN_TASK_MD = "任务拆分.md"
 HUMAN_TEST_PLAN_MD = "测试计划.md"
+HUMAN_AGENT_MODEL_EFFORT_CONFIG = {
+    "调度器": {"model_name": "gpt-5.2", "reasoning_effort": "medium"},
+    "开发工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "xhigh"},
+}
 ```
 
 ```python
@@ -265,11 +271,12 @@ HUMAN_REQUIREMENT_PROMPT = """
 3. 打开 `B04_human_prompts.py`
 4. 修改 `HUMAN_WORKING_PATH`
 5. 修改 `HUMAN_DESIGN_MD` / `HUMAN_TASK_MD` / `HUMAN_TEST_PLAN_MD`
-6. 修改 `HUMAN_COMMON_INIT_PROMPT_1`
-7. 修改 `HUMAN_COMMON_INIT_PROMPT_2`
-8. 修改 `HUMAN_REQUIREMENT_PROMPT`
-9. 确认目标仓库可读写
-10. 确认 `codex --version` 能执行
+6. 修改 `HUMAN_AGENT_MODEL_EFFORT_CONFIG`
+7. 修改 `HUMAN_COMMON_INIT_PROMPT_1`
+8. 修改 `HUMAN_COMMON_INIT_PROMPT_2`
+9. 修改 `HUMAN_REQUIREMENT_PROMPT`
+10. 确认目标仓库可读写
+11. 确认 `codex --version` 能执行
 
 建议再做一次快速检查：
 
