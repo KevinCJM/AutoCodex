@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 from A02_task_workflow import base_director_prompt, prepare_agent_prompt
@@ -319,7 +320,7 @@ def recover_task_workflow(
             _save_state(state_path, state)
             return {"status": "completed", "phase": "completed", "iteration": iteration}
 
-        pending_agents = []
+        pending_agent_calls = []
         for agent_name, agent_prompt in msg_dict.items():
             if agent_name not in agent_names_list:
                 raise RuntimeError(f"调度器返回了未知的智能体名称: {agent_name}")
@@ -334,16 +335,31 @@ def recover_task_workflow(
                 else:
                     raise RuntimeError(f"{agent_name} 缺失 session_id，无法恢复。")
 
-            pending_agents.append(agent_name)
             agent_log_file_path = os.path.join(log_dir, f"agent_{agent_name}_{today_str}.log")
-            msg, _ = run_agent(
-                agent_name,
-                agent_log_file_path,
-                prepare_agent_prompt(agent_name, agent_prompt),
-                init_yn=False,
-                session_id=session_id,
-            )
-            agent_responses[agent_name] = msg
+            pending_agent_calls.append({
+                "agent_name": agent_name,
+                "agent_prompt": agent_prompt,
+                "session_id": session_id,
+                "agent_log_file_path": agent_log_file_path,
+            })
+
+        pending_agents = [item["agent_name"] for item in pending_agent_calls]
+        with ThreadPoolExecutor(max_workers=max(1, len(pending_agent_calls))) as executor:
+            futures = {
+                executor.submit(
+                    run_agent,
+                    item["agent_name"],
+                    item["agent_log_file_path"],
+                    prepare_agent_prompt(item["agent_name"], item["agent_prompt"]),
+                    False,
+                    item["session_id"],
+                ): item
+                for item in pending_agent_calls
+            }
+            for future in as_completed(futures):
+                item = futures[future]
+                msg, _ = future.result()
+                agent_responses[item["agent_name"]] = msg
 
         what_agent_just_use = list(msg_dict.keys())
         what_agent_replay = ""
