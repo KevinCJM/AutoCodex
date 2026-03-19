@@ -839,7 +839,7 @@ if __name__ == "__main__":
         max_log_days=args.max_log_days,
         strict_json=args.strict_json,
         allow_reinit_on_missing_session=args.allow_reinit_on_missing_session,
-        use_fresh_sessions=True,
+        use_fresh_sessions=args.fresh_sessions,
         dry_run=args.dry_run,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
