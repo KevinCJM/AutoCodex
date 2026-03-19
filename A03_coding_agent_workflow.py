@@ -5,6 +5,8 @@
 @Author: Kevin-Chen
 @Descriptions: 代码开发 工作流
 """
+import os
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -23,9 +25,15 @@ from B00_agent_config import (
     today_str,
     working_path,
 )
+from B02_log_tools import Colors, log_message
 from B03_init_function_agents import init_agent, custom_init_agent, parse_director_response
 
 print_lock = threading.Lock()
+DIRECTOR_NAME = "调度器"
+TASK_HEADING_RE = re.compile(
+    r"^####\s+(?:\[(?P<checked>[ xX])\]\s+)?(?P<task_id>US-(?P<epic>\d+)\.\d+)\s+(?P<title>.+?)\s*$"
+)
+INVALID_COMPLETION_RETRY_MAX = 2
 
 # 各个智能体的 skills 标签
 agent_skills_dict = {
@@ -35,6 +43,113 @@ agent_skills_dict = {
     '开发工程师': ['$Developer'],
 }
 DIRECTOR_SUCCESS_TEXT = "所有任务开发完成"
+
+
+def _resolve_task_file_path(task_file_name=None):
+    task_file_name = task_file_name or task_md
+    if os.path.isabs(task_file_name):
+        return task_file_name
+    return os.path.join(working_path, task_file_name)
+
+
+def find_next_unfinished_coding_task(task_file_name=None):
+    task_file_path = _resolve_task_file_path(task_file_name)
+    if not os.path.exists(task_file_path):
+        return None
+
+    with open(task_file_path, "r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            match = TASK_HEADING_RE.match(raw_line.strip())
+            if not match:
+                continue
+
+            epic = int(match.group("epic"))
+            if epic < 1:
+                continue
+
+            title = match.group("title").strip()
+            if "条件性任务" in title:
+                continue
+
+            checked = str(match.group("checked") or "").lower() == "x"
+            if checked:
+                continue
+
+            return {
+                "task_id": match.group("task_id"),
+                "title": title,
+                "line_no": line_no,
+                "task_file_path": task_file_path,
+            }
+    return None
+
+
+def build_director_invalid_completion_retry_prompt(last_director_prompt, unfinished_task):
+    task_label = str(unfinished_task.get("task_id", "")).strip()
+    title = str(unfinished_task.get("title", "")).strip()
+    line_no = unfinished_task.get("line_no")
+    location = f"{task_md}:{line_no}" if line_no else task_md
+    task_desc = " ".join(part for part in [task_label, title] if part).strip()
+    return f"""{str(last_director_prompt or '').rstrip()}
+
+---
+补充要求:
+你上一条回复错误地返回了 "{DIRECTOR_SUCCESS_TEXT}", 但 {location} 仍存在未完成任务:
+- {task_desc}
+这一次不能结束流程.
+你必须重新阅读 {task_md}, 找到下一个未完成任务并继续调度.
+- 如果仍有未完成任务, success 必须为空字符串
+- 需要调度哪个智能体, 就把 prompt 填到哪个智能体字段
+- 最终只能输出固定字段 JSON 本身, 禁止输出解释说明
+"""
+
+
+def ensure_valid_coding_director_response(
+        msg,
+        director_session_id,
+        director_log_file_path,
+        director_prompt,
+        max_invalid_completion_retries=INVALID_COMPLETION_RETRY_MAX,
+):
+    current_msg = msg
+    current_prompt = director_prompt
+
+    for attempt in range(max_invalid_completion_retries + 1):
+        msg_dict = parse_director_response(
+            current_msg,
+            director_log_file_path,
+            allowed_success_values={DIRECTOR_SUCCESS_TEXT},
+        )
+        unfinished_task = find_next_unfinished_coding_task()
+        if "success" not in msg_dict or not unfinished_task:
+            return current_msg, msg_dict, current_prompt
+
+        blocker_desc = " ".join(
+            part for part in [unfinished_task.get("task_id", ""), unfinished_task.get("title", "")]
+            if str(part).strip()
+        )
+        with print_lock:
+            log_message(
+                log_file_path=director_log_file_path,
+                message=f"调度器误报完成，任务仍未结束: {blocker_desc}",
+                color=Colors.RED,
+            )
+        if attempt >= max_invalid_completion_retries:
+            raise RuntimeError(
+                f'调度器连续返回 "{DIRECTOR_SUCCESS_TEXT}", '
+                f"但 {task_md} 仍存在未完成任务: {blocker_desc}"
+            )
+
+        current_prompt = build_director_invalid_completion_retry_prompt(current_prompt, unfinished_task)
+        current_msg, _ = run_agent(
+            DIRECTOR_NAME,
+            director_log_file_path,
+            current_prompt,
+            init_yn=False,
+            session_id=director_session_id,
+        )
+
+    raise RuntimeError("调度器回复校验失败，无法继续。")
 
 
 # 调度智能体的 prompt 主体
@@ -223,10 +338,8 @@ def prepare_agent_prompt(agent_name, agent_prompt):
     skills_prefix = format_agent_skills(agent_name, agent_skills_dict)
     clarification_rule = f"""
 前置规则:
-1) 你必须优先阅读并参考需求澄清记录文件: {REQUIREMENT_CLARIFICATION_MD}
-2) 文件绝对路径: {working_path}/{REQUIREMENT_CLARIFICATION_MD}
-3) 若文件存在, 你的评审/开发结论必须结合澄清记录中的结论;
-4) 若文件不存在, 说明“暂无人类澄清记录”, 再基于现有信息继续任务.
+优先阅读并参考需求澄清记录文件: {REQUIREMENT_CLARIFICATION_MD}. 文件绝对路径: {working_path}/{REQUIREMENT_CLARIFICATION_MD} 
+若文件不存在则忽略
 """
     return f"{skills_prefix} {clarification_rule}\n{agent_prompt}".strip()
 
@@ -256,16 +369,20 @@ def main():
             agent_session_id_dict[a_name] = s_id
 
     ''' 2) 初始化 调度器智能体 --------------------------------------------------------------------------------------- '''
-    director_agent_name = "调度器"
-    director_log_file_path = f"{working_path}/agent_{director_agent_name}_{today_str}.log"
+    director_log_file_path = f"{working_path}/agent_{DIRECTOR_NAME}_{today_str}.log"
     init_director_prompt = f"""
     ---
     现在开始你的调度任务, 先分析 {task_md} 中下一个需要开发的任务是什么.
     """
     init_director_prompt = base_director_prompt + init_director_prompt
-    msg, director_session_id = run_agent(director_agent_name, director_log_file_path,
+    msg, director_session_id = run_agent(DIRECTOR_NAME, director_log_file_path,
                                          init_director_prompt, init_yn=True, session_id=None)
-    msg_dict = parse_director_response(msg, director_log_file_path, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
+    _, msg_dict, _ = ensure_valid_coding_director_response(
+        msg,
+        director_session_id,
+        director_log_file_path,
+        init_director_prompt,
+    )
     first_agent_name = list(msg_dict.keys())[0]
 
     ''' 3) 调用 各个功能型智能体 ------------------------------------------------------------------------------------- '''
@@ -313,7 +430,17 @@ def main():
         doing_director_prompt = base_director_prompt + doing_director_prompt
 
         # 调用 调度器智能体
-        msg, session_id = run_agent(director_agent_name, director_log_file_path,
-                                    doing_director_prompt, init_yn=False, session_id=director_session_id)
-        msg_dict = parse_director_response(msg, director_log_file_path, allowed_success_values={DIRECTOR_SUCCESS_TEXT})
+        msg, _ = run_agent(
+            DIRECTOR_NAME,
+            director_log_file_path,
+            doing_director_prompt,
+            init_yn=False,
+            session_id=director_session_id,
+        )
+        _, msg_dict, _ = ensure_valid_coding_director_response(
+            msg,
+            director_session_id,
+            director_log_file_path,
+            doing_director_prompt,
+        )
         first_agent_name = list(msg_dict.keys())[0]

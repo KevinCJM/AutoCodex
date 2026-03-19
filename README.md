@@ -151,7 +151,7 @@ working_path = PROJECT_ROOT
 脚本内部实际调用的是：
 
 ```bash
-codex exec --model <model> --config model_reasoning_effort=<effort> --skip-git-repo-check --json --full-auto --cd <working_path> <prompt>
+codex exec --model <model> --config model_reasoning_effort=<effort> --json --full-auto --cd <working_path> <prompt>
 ```
 
 因此你必须满足：
