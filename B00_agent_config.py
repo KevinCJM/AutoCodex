@@ -262,14 +262,14 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                                             timeout=working_timeout,
                                             output_schema_path=output_schema_path,
                                             )
-            if session_id and msg and str(msg[0]).strip():
+            if session_id and str(msg or "").strip():
                 break
             retry_count += 1
             if retry_count > resume_retry_max:
                 if not session_id:
-                    msg = ["init_codex 获取 session_id 失败，已达到最大重试次数。"]
+                    msg = "init_codex 获取 session_id 失败，已达到最大重试次数。"
                 else:
-                    msg = ["init_codex 未返回有效内容，已达到最大重试次数。"]
+                    msg = "init_codex 未返回有效内容，已达到最大重试次数。"
                 break
             with print_lock:
                 log_message(log_file_path=log_file_path,
@@ -292,11 +292,11 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
                                      timeout=working_timeout,
                                      output_schema_path=output_schema_path,
                                      )
-            if msg and str(msg[0]).strip():
+            if str(msg or "").strip():
                 break
             retry_count += 1
             if retry_count > resume_retry_max:
-                msg = ["resume_codex 超时或无响应，已达到最大重试次数。"]
+                msg = "resume_codex 超时或无响应，已达到最大重试次数。"
                 break
             with print_lock:
                 log_message(log_file_path=log_file_path,
@@ -310,9 +310,9 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
         log_message(log_file_path=log_file_path,
                     message=f"--{session_id}--\n--{agent_name}--\n"
                             f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                            f"{msg[0]}\n",
+                            f"{msg}\n",
                     color=Colors.GREEN)
-    return msg[0], session_id
+    return msg, session_id
 
 
 def format_agent_skills(agent_name, agent_skills_dict):
