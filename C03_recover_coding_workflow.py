@@ -27,8 +27,8 @@ print_lock = threading.Lock()
 
 DIRECTOR_NAME = "调度器"
 STATE_FILE_NAME = "workflow_state.json"
-FRESH_SESSION_SUMMARY_LIMIT = 1500
-FRESH_SESSION_AGENT_RESPONSE_LIMIT = 900
+FRESH_SESSION_SUMMARY_LIMIT = 4000
+FRESH_SESSION_AGENT_RESPONSE_LIMIT = 2500
 
 _TOKEN_RE = re.compile(r"^--(.+?)--$")
 _TIMESTAMP_TOKEN_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
@@ -337,6 +337,53 @@ def _strip_base_director_prompt(prompt):
     return prompt
 
 
+def _list_coding_task_progress():
+    task_file_path = task_md if os.path.isabs(task_md) else os.path.join(working_path, task_md)
+    if not os.path.exists(task_file_path):
+        return []
+
+    task_heading_re = re.compile(
+        r"^####\s+(?:\[(?P<checked>[ xX])\]\s+)?(?P<task_id>US-(?P<epic>\d+)\.\d+)\s+(?P<title>.+?)\s*$"
+    )
+    items = []
+    with open(task_file_path, "r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, 1):
+            match = task_heading_re.match(raw_line.strip())
+            if not match:
+                continue
+            epic = int(match.group("epic"))
+            if epic < 1:
+                continue
+            title = match.group("title").strip()
+            items.append({
+                "task_id": match.group("task_id"),
+                "title": title,
+                "line_no": line_no,
+                "checked": str(match.group("checked") or "").lower() == "x",
+                "conditional": "条件性任务" in title,
+            })
+    return items
+
+
+def _build_task_progress_snapshot():
+    items = [item for item in _list_coding_task_progress() if not item["conditional"]]
+    if not items:
+        return ""
+
+    completed = [item for item in items if item["checked"]]
+    pending = [item for item in items if not item["checked"]]
+
+    def _fmt_task(item):
+        return " ".join(part for part in [item.get("task_id", ""), item.get("title", "")] if str(part).strip())
+
+    lines = [f"- 任务进度: 已完成 {len(completed)} / {len(items)} 个任务"]
+    if completed:
+        lines.append("- 最近已完成任务: " + " | ".join(_fmt_task(item) for item in completed[-3:]))
+    if pending:
+        lines.append("- 接下来未完成任务: " + " | ".join(_fmt_task(item) for item in pending[:3]))
+    return "\n".join(lines)
+
+
 def _build_fresh_session_handoff_summary(state):
     next_task = find_next_unfinished_coding_task()
     pending_agents = state.get("pending_agents") or list((state.get("msg_dict") or {}).keys())
@@ -347,6 +394,9 @@ def _build_fresh_session_handoff_summary(state):
         f"- 当前恢复阶段: {state.get('phase')}",
         f"- 当前迭代: {int(state.get('iteration', 0))}",
     ]
+    task_progress_snapshot = _build_task_progress_snapshot()
+    if task_progress_snapshot:
+        lines.append(task_progress_snapshot)
 
     completion_blocker = state.get("completion_blocker")
     if completion_blocker:
@@ -380,17 +430,19 @@ def _build_fresh_session_handoff_summary(state):
 
 def _build_fresh_agent_prompt(agent_name, agent_prompt, state):
     handoff_summary = _build_fresh_session_handoff_summary(state)
+    test_engineer_bootstrap = ""
     extra_rule = ""
     if agent_name == "测试工程师":
+        test_engineer_bootstrap = f"{coding_test_agent_init_prompt}\n\n"
         extra_rule = (
             f"\n额外要求:\n"
-            f"- {test_plan_md} 若已存在，先阅读并沿用其当前内容，不要因为 session 重建而整份重写。\n"
+            f"- {test_plan_md} 若已存在，先阅读并沿用其当前内容，只补齐当前任务相关内容，不要整份重写。\n"
         )
     prompt_body = f"""{common_init_prompt_1}
 
 {common_init_prompt_2}
 
-{coding_agent_init_prompt[agent_name]}
+{test_engineer_bootstrap}{coding_agent_init_prompt[agent_name]}
 
 ---
 恢复上下文:
@@ -399,7 +451,8 @@ def _build_fresh_agent_prompt(agent_name, agent_prompt, state):
 执行要求:
 - 你现在接管的是一个已经跑到中途的开发流程。
 - {task_md} 中已勾选的任务视为已经完成，不要重复开发或重复审核它们。
-- 先理解当前代码库、文档和上面的恢复信息，再继续执行下面这一轮任务。{extra_rule}
+- 如果恢复摘要与代码、文档、{REQUIREMENT_CLARIFICATION_MD} 的内容冲突，以代码和文档为准。
+- 如果恢复摘要不足以支撑判断，先主动阅读相关文件与当前代码，再继续执行下面这一轮任务。{extra_rule}
 
 当前轮任务如下:
 {agent_prompt}
@@ -419,6 +472,8 @@ def _build_fresh_director_prompt(director_prompt, state):
 执行要求:
 - 这是被中断后的续跑，不是从零开始。
 - {task_md} 中已勾选任务视为已完成，不要重复调度已勾选任务。
+- 如果恢复摘要与代码、文档、{REQUIREMENT_CLARIFICATION_MD} 的内容冲突，以代码和文档为准。
+- 如果恢复摘要不足以支撑判断，先主动阅读相关文件与当前代码，再继续调度。
 - 你必须基于当前代码、任务单勾选状态、已有审查/测试输出继续调度。
 
 {prompt_tail}
@@ -784,7 +839,7 @@ if __name__ == "__main__":
         max_log_days=args.max_log_days,
         strict_json=args.strict_json,
         allow_reinit_on_missing_session=args.allow_reinit_on_missing_session,
-        use_fresh_sessions=args.fresh_sessions,
+        use_fresh_sessions=True,
         dry_run=args.dry_run,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
