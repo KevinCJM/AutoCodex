@@ -384,6 +384,13 @@ def _build_task_progress_snapshot():
     return "\n".join(lines)
 
 
+def _build_requirement_context():
+    requirement_text = str(requirement_str or "").strip()
+    if not requirement_text:
+        return ""
+    return f"原始需求如下:\n{requirement_text}"
+
+
 def _build_fresh_session_handoff_summary(state):
     next_task = find_next_unfinished_coding_task()
     pending_agents = state.get("pending_agents") or list((state.get("msg_dict") or {}).keys())
@@ -430,6 +437,7 @@ def _build_fresh_session_handoff_summary(state):
 
 def _build_fresh_agent_prompt(agent_name, agent_prompt, state):
     handoff_summary = _build_fresh_session_handoff_summary(state)
+    requirement_context = _build_requirement_context()
     test_engineer_bootstrap = ""
     extra_rule = ""
     if agent_name == "测试工程师":
@@ -443,6 +451,8 @@ def _build_fresh_agent_prompt(agent_name, agent_prompt, state):
 {common_init_prompt_2}
 
 {test_engineer_bootstrap}{coding_agent_init_prompt[agent_name]}
+
+{requirement_context}
 
 ---
 恢复上下文:
@@ -460,10 +470,39 @@ def _build_fresh_agent_prompt(agent_name, agent_prompt, state):
     return prepare_agent_prompt(agent_name, prompt_body)
 
 
+def _build_fresh_agent_init_prompt(agent_name, state):
+    handoff_summary = _build_fresh_session_handoff_summary(state)
+    requirement_context = _build_requirement_context()
+    test_engineer_bootstrap = ""
+    if agent_name == "测试工程师":
+        test_engineer_bootstrap = f"{coding_test_agent_init_prompt}\n\n"
+    prompt_body = f"""{test_engineer_bootstrap}{coding_agent_init_prompt[agent_name]}
+
+{requirement_context}
+
+---
+恢复上下文:
+{handoff_summary}
+
+恢复初始化要求:
+- 这是一次 fresh-session 恢复初始化，不是让你立即执行本轮具体任务。
+- 你需要先理解当前代码、文档、任务进度和当前阶段，再等待后续的具体任务指令。
+- {task_md} 中已勾选的任务视为已完成，不要重复开发、重复审核或重复测试。
+- 如果恢复摘要与代码、文档、{REQUIREMENT_CLARIFICATION_MD} 的内容冲突，以代码和文档为准。
+- 如果恢复摘要不足以支撑判断，后续收到任务时先主动阅读相关文件与当前代码。
+
+只回复一句: 已完成恢复初始化
+""".strip()
+    return prepare_agent_prompt(agent_name, prompt_body)
+
+
 def _build_fresh_director_prompt(director_prompt, state):
     handoff_summary = _build_fresh_session_handoff_summary(state)
+    requirement_context = _build_requirement_context()
     prompt_tail = _strip_base_director_prompt(director_prompt)
     return f"""{base_director_prompt}
+
+{requirement_context}
 
 ---
 恢复上下文:
@@ -524,6 +563,65 @@ def _run_agent_recovery_turn(agent_name, agent_prompt, state, log_dir, session_i
         session_id,
     )
     return agent_name, msg, session_id
+
+
+def _init_fresh_recovery_agents(state, log_dir):
+    log_paths = {
+        agent_name: os.path.join(log_dir, f"agent_{agent_name}_{today_str}.log")
+        for agent_name in agent_names_list
+    }
+
+    agent_session_id_dict = {}
+    with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
+        futures = {
+            executor.submit(
+                run_agent,
+                agent_name,
+                log_paths[agent_name],
+                common_init_prompt_1,
+                True,
+                None,
+            ): agent_name
+            for agent_name in agent_names_list
+        }
+        for future in as_completed(futures):
+            agent_name = futures[future]
+            _, session_id = future.result()
+            if not session_id:
+                raise RuntimeError(f"{agent_name} fresh-session 初始化失败: 未拿到 session_id")
+            agent_session_id_dict[agent_name] = session_id
+
+    with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
+        futures = {
+            executor.submit(
+                run_agent,
+                agent_name,
+                log_paths[agent_name],
+                common_init_prompt_2,
+                False,
+                agent_session_id_dict[agent_name],
+            ): agent_name
+            for agent_name in agent_names_list
+        }
+        for future in as_completed(futures):
+            future.result()
+
+    with ThreadPoolExecutor(max_workers=len(agent_names_list)) as executor:
+        futures = {
+            executor.submit(
+                run_agent,
+                agent_name,
+                log_paths[agent_name],
+                _build_fresh_agent_init_prompt(agent_name, state),
+                False,
+                agent_session_id_dict[agent_name],
+            ): agent_name
+            for agent_name in agent_names_list
+        }
+        for future in as_completed(futures):
+            future.result()
+
+    return agent_session_id_dict
 
 
 def _rebuild_state_from_logs(log_dir, max_log_days, strict_json):
@@ -667,6 +765,27 @@ def recover_workflow(
 
     agent_session_id_dict = {} if use_fresh_sessions else dict(state.get("agent_session_id_dict", {}))
     agent_responses = state.get("agent_responses", {})
+    if use_fresh_sessions:
+        agent_session_id_dict = _init_fresh_recovery_agents(state, log_dir)
+        fresh_agent_prompts = {}
+        fresh_pending_agents = []
+        if isinstance(msg_dict, dict) and "success" not in msg_dict:
+            fresh_agent_prompts = {
+                agent_name: agent_prompt
+                for agent_name, agent_prompt in msg_dict.items()
+                if agent_name in agent_names_list
+            }
+            fresh_pending_agents = list(fresh_agent_prompts.keys())
+        agent_responses = {}
+        state.update({
+            "director_session_id": None,
+            "agent_session_id_dict": agent_session_id_dict,
+            "pending_agents": fresh_pending_agents,
+            "agent_prompts": fresh_agent_prompts,
+            "agent_responses": {},
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
+        _save_state(state_path, state)
 
     if state.get("phase") == "director_retry":
         retry_prompt = state.get("last_director_prompt")

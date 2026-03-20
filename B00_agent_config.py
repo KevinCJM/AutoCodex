@@ -37,7 +37,7 @@ today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 # 工作目录
 working_path = HUMAN_WORKING_PATH
 # 模型推理超时时间
-working_timeout = 60 * 10
+working_timeout = 60 * 30
 # 恢复会话重试次数
 resume_retry_max = 5
 # 恢复会话重试间隔时间
