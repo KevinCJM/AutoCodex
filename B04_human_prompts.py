@@ -1,7 +1,7 @@
 # -*- encoding: utf-8 -*-
 """
 @File: B04_human_prompts.py
-@Modify Time: 2026/3/11
+@Modify Time: 2026/3/20
 @Author: Kevin-Chen
 @Descriptions: 人工维护的项目输入配置
 """
@@ -10,42 +10,63 @@ import os
 from pathlib import Path
 
 # 这个文件放“需要人类根据项目背景自行改写”的项目输入。
-# 包括工作目录、产物文件名，以及 prompt 文本。
-# 默认内容使用测试/演示场景，不包含任何公司内部仓库提示。
-
-PROJECT_ROOT = Path("/your/project/path")
+# 默认情况下直接使用当前仓库根目录，便于本仓库自举验证。
+PROJECT_ROOT = Path(
+    os.environ.get("AUTOCODEX_PROJECT_ROOT", str(Path(__file__).resolve().parent))
+).resolve()
 
 HUMAN_WORKING_PATH = PROJECT_ROOT
-HUMAN_DESIGN_MD = "示例详细设计.md"
-HUMAN_TASK_MD = "示例任务拆分.md"
-HUMAN_TEST_PLAN_MD = "示例测试计划.md"
-HUMAN_REQUIREMENT_CLARIFICATION_MD = "需求澄清记录.md"
+
+# 四阶段产物与结构化状态文件
+HUMAN_REQUIREMENT_SPEC_MD = "01_requirement_spec.md"
+HUMAN_REQUIREMENT_CLARIFICATION_MD = "01_clarification.md"
+HUMAN_DESIGN_MD = "02_design.md"
+HUMAN_DESIGN_TRACE_JSON = "02_design_trace.json"
+HUMAN_TASK_MD = "03_task_plan.md"
+HUMAN_TASK_SCHEDULE_JSON = "03_schedule.json"
+HUMAN_TEST_PLAN_MD = "04_test_plan.md"
+HUMAN_DELIVERY_REPORT_MD = "04_delivery_report.md"
+HUMAN_TASK_RUN_REPORT_DIR = "04_task_runs"
+HUMAN_WORKFLOW_STATE_JSON = "workflow_state.json"
+HUMAN_WORKFLOW_EVENT_JSONL = "workflow_event.jsonl"
+
 HUMAN_AGENT_MODEL_EFFORT_CONFIG = {
-    "调度器": {"model_name": "gpt-5.3-codex", "reasoning_effort": "medium"},
-    "需求分析师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
-    "审核员": {"model_name": "gpt-5.4", "reasoning_effort": "xhigh"},
-    "测试工程师": {"model_name": "gpt-5.3-codex", "reasoning_effort": "high"},
-    "开发工程师": {"model_name": "gpt-5.4", "reasoning_effort": "xhigh"},
+    "owner": {"model_name": "gpt-5.4", "reasoning_effort": "xhigh", "turn_timeout_sec": 3600},
+    "analyst": {"model_name": "gpt-5.4", "reasoning_effort": "high", "turn_timeout_sec": 1800},
+    "tester": {"model_name": "gpt-5.4", "reasoning_effort": "xhigh", "turn_timeout_sec": 2400},
+    "auditor": {"model_name": "gpt-5.4", "reasoning_effort": "high", "turn_timeout_sec": 1800},
 }
 
 HUMAN_COMMON_INIT_PROMPT_1 = """记住:
 1) 使用中文进行对话和文档编写;
 2) 优先使用 "python3" 命令执行 Python 代码，只有项目明确要求时再切换解释器;
-3) 修改前先阅读现有实现，尽量做小步、可验证的改动
+3) 修改前先阅读现有实现，尽量做小步、可验证的改动;
+4) 你运行在 tmux + codex cli 长会话模式中，需要保持上下文连续性和阶段一致性。
 """
 
-HUMAN_COMMON_INIT_PROMPT_2 = """了解当前工作目录中的测试项目架构, 主要是:
-1) 以 A00_main.py 为总入口理解三个阶段的串联方式
-2) 深度理解 A01_requiment_analysis_workflow.py、A02_task_workflow.py、A03_coding_agent_workflow.py 的阶段职责与调度关系
-3) 深度理解 B00_agent_config.py、B01_codex_utils.py、B03_init_function_agents.py 的配置、会话管理与初始化逻辑
-4) 深度理解 C01_recover_requirement_workflow.py、C02_recover_task_workflow.py、C03_recover_coding_workflow.py 的恢复机制
+HUMAN_COMMON_INIT_PROMPT_2 = """请先建立一个轻量上下文，要求如下:
+1) 只快速确认当前工作目录的主入口、主要阶段产物文件和关键运行时模块;
+2) 此阶段不要做全面代码审查，不要长时间遍历旧模块;
+3) 后续如果具体任务需要，再按需继续深入阅读相关文件;
+4) 只需回复一句中文，确认你已经完成轻量初始化并会在后续按需继续阅读。
 """
 
 HUMAN_REQUIREMENT_PROMPT = """
-请基于当前工作目录中的 Python 项目做一次测试性质的自动化改造演练，要求如下:
-1. 保持现有三阶段工作流结构不变
-2. 将人工维护的 prompt 与运行参数解耦，便于后续替换为真实项目提示
-3. README 需要说明哪些配置属于运行参数，哪些 prompt 需要人工维护
-4. 尽量少改动既有流程控制逻辑
-5. 所有文档与输出都以演示/测试场景为准，不要假设存在公司内部仓库背景
+请将当前工作目录中的 AutoCodex 从旧的 `codex exec + director JSON` 模式，改造成 `tmux + codex cli` 长会话模式。
+
+新的目标架构必须满足:
+1. 使用 1 个 owner 主agent 负责四个连续步骤:
+   - 需求指定
+   - 详细设计
+   - 任务规划
+   - 开发与测试
+2. 使用 3 个 reviewer subagent:
+   - analyst
+   - tester
+   - auditor
+3. owner 是唯一的阶段 owner，负责真实落盘文档、修改代码、执行测试、更新任务状态。
+4. analyst / tester / auditor 在每个步骤都要从各自角度审核 owner 的阶段产物，并通过结构化 verdict token 控制是否进入下一阶段。
+5. 工作流必须以 Python 状态机推进，不再依赖 director 自报完成；需要显式写入 workflow_state.json 和 workflow_event.jsonl。
+6. 任务规划必须同时输出人类可读的 Markdown 与机器可读的 03_schedule.json，开发阶段以 JSON 计划为真值源。
+7. 整体实现应优先复用 v1/tmux_cli_tools_lib 的 runtime 能力，而不是继续围绕 codex exec 的阻塞式调用打补丁。
 """

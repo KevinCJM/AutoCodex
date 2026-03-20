@@ -1,10 +1,12 @@
 # -*- encoding: utf-8 -*-
 """
 @File: B00_agent_config.py
-@Modify Time: 2026/1/12 11:03       
+@Modify Time: 2026/3/20
 @Author: Kevin-Chen
 @Descriptions: 智能体配置参数
 """
+
+from __future__ import annotations
 
 import json
 import os
@@ -13,91 +15,235 @@ import time
 import tempfile
 from datetime import datetime
 
-from B01_codex_utils import init_codex, resume_codex
+from B01_codex_utils import (
+    get_runtime_metadata as get_codex_runtime_metadata,
+    init_codex,
+    resume_codex,
+)
 from B02_log_tools import Colors, log_message
 from B04_human_prompts import (
     HUMAN_AGENT_MODEL_EFFORT_CONFIG,
     HUMAN_COMMON_INIT_PROMPT_1,
     HUMAN_COMMON_INIT_PROMPT_2,
+    HUMAN_DELIVERY_REPORT_MD,
     HUMAN_DESIGN_MD,
-    HUMAN_REQUIREMENT_PROMPT,
+    HUMAN_DESIGN_TRACE_JSON,
     HUMAN_REQUIREMENT_CLARIFICATION_MD,
+    HUMAN_REQUIREMENT_PROMPT,
+    HUMAN_REQUIREMENT_SPEC_MD,
     HUMAN_TASK_MD,
+    HUMAN_TASK_RUN_REPORT_DIR,
+    HUMAN_TASK_SCHEDULE_JSON,
     HUMAN_TEST_PLAN_MD,
+    HUMAN_WORKFLOW_EVENT_JSONL,
+    HUMAN_WORKFLOW_STATE_JSON,
     HUMAN_WORKING_PATH,
 )
 
 print_lock = threading.Lock()
-DIRECTOR_NAME = "调度器"
-DIRECTOR_OUTPUT_KEYS = ("success", "需求分析师", "审核员", "测试工程师", "开发工程师")
+
+OWNER_AGENT_NAME = "owner"
+REVIEWER_AGENT_NAMES = ("analyst", "tester", "auditor")
+DIRECTOR_NAME = "director"
+DIRECTOR_OUTPUT_KEYS = ("success", OWNER_AGENT_NAME, *REVIEWER_AGENT_NAMES)
 
 now = datetime.now()
 today_str = f"{now.year}{now.month:02d}{now.day:02d}"
 
 # 工作目录
 working_path = HUMAN_WORKING_PATH
-# 模型推理超时时间
-working_timeout = 60 * 10
+# 默认单轮推理等待时长（秒）
+working_timeout = 60 * 30
 # 恢复会话重试次数
-resume_retry_max = 5
+resume_retry_max = 3
 # 恢复会话重试间隔时间
 resume_retry_interval = 2
 
-# 需求描述文件, 由[详细设计模式]生成,[任务拆分模式]和[开发模式]使用
+# 四阶段产物
+requirement_spec_md = HUMAN_REQUIREMENT_SPEC_MD
+REQUIREMENT_CLARIFICATION_MD = HUMAN_REQUIREMENT_CLARIFICATION_MD
 design_md = HUMAN_DESIGN_MD
-# 任务说明文件, 由[任务拆分模式]生成,[开发模式]使用
+design_trace_json = HUMAN_DESIGN_TRACE_JSON
 task_md = HUMAN_TASK_MD
-# [任务拆分模式/开发模式] 任务文档统一结构约束
-TASK_DOC_STRUCTURE_PROMPT = f"""`{task_md}` 必须采用“里程碑 + 任务单”两级结构:
-1) 里程碑 = 项目中的重大节点或阶段性成果, 用于表达阶段目标, 不是直接派发给开发工程师的执行动作;
-2) 任务单 = 为达到该里程碑所需的具体行动步骤, 是可直接开发、审核、测试、勾选完成的最小可执行单元.
+task_schedule_json = HUMAN_TASK_SCHEDULE_JSON
+test_plan_md = HUMAN_TEST_PLAN_MD
+delivery_report_md = HUMAN_DELIVERY_REPORT_MD
+task_run_report_dir = HUMAN_TASK_RUN_REPORT_DIR
+workflow_state_json = HUMAN_WORKFLOW_STATE_JSON
+workflow_event_jsonl = HUMAN_WORKFLOW_EVENT_JSONL
 
-强约束:
-- 文档必须先按里程碑分组, 再在每个里程碑下列出任务单;
-- 每个任务单必须且只能归属一个里程碑;
-- 任务单必须足够具体, 单次可开发、可审核、可测试、可勾选;
-- 不允许把“里程碑”与“任务单”混成同级流水列表;
-- 不允许只有里程碑没有任务单;
-- 不允许任务单跨度过大、一次覆盖多个阶段性成果;
-- 每个任务单都应写清 目标、涉及模块/文件、完成标准、验证方式;
-- 开发阶段调度时, 永远选择“某个里程碑下的具体任务单”, 绝不能直接选择里程碑本身.
+HUMAN_QUESTION_TRIGGER = "[[ASK_HUMAN]]"
+MAX_HUMAN_QA_ROUND = 100
+
+REVIEW_VERDICT_PASS = "[[ACX_VERDICT:PASS]]"
+REVIEW_VERDICT_REVISE = "[[ACX_VERDICT:REVISE]]"
+REVIEW_VERDICT_BLOCKED = "[[ACX_VERDICT:BLOCKED]]"
+REVIEW_VERDICT_ASK_HUMAN = "[[ACX_VERDICT:ASK_HUMAN]]"
+REVIEW_VERDICT_TOKENS = (
+    REVIEW_VERDICT_PASS,
+    REVIEW_VERDICT_REVISE,
+    REVIEW_VERDICT_BLOCKED,
+    REVIEW_VERDICT_ASK_HUMAN,
+)
+REVIEW_PASS_TOKEN = REVIEW_VERDICT_PASS
+OWNER_STAGE_DONE_TOKEN = "[[ACX_STAGE_DONE]]"
+DEVELOPMENT_DONE_TOKEN = "[[ACX_DEVELOPMENT_DONE]]"
+BOOTSTRAP_INIT_TOKEN = "[[ACX_INIT_READY]]"
+BOOTSTRAP_CONTEXT_TOKEN = "[[ACX_CONTEXT_READY]]"
+BOOTSTRAP_ROLE_TOKEN = "[[ACX_ROLE_READY]]"
+
+# [人工维护] 智能体模型与推理强度配置
+AGENT_MODEL_EFFORT_CONFIG = HUMAN_AGENT_MODEL_EFFORT_CONFIG
+# [人工维护] 初始化提示词
+common_init_prompt_1 = HUMAN_COMMON_INIT_PROMPT_1
+common_init_prompt_2 = HUMAN_COMMON_INIT_PROMPT_2
+# [人工维护] 原始需求说明
+requirement_str = HUMAN_REQUIREMENT_PROMPT
+
+# agent skills
+AGENT_SKILLS_DICT = {
+    OWNER_AGENT_NAME: ["$Product Manager", "$System Architect", "$Scrum Master", "$Developer"],
+    "analyst": ["$Business Analyst"],
+    "tester": ["$Developer"],
+    "auditor": ["$System Architect"],
+}
+
+agent_names_list = [OWNER_AGENT_NAME, *REVIEWER_AGENT_NAMES]
+ANALYST_NAME = OWNER_AGENT_NAME  # 兼容旧模块导入
+
+TASK_DOC_STRUCTURE_PROMPT = f"""`{task_md}` 必须与 `{task_schedule_json}` 保持一致，并同时满足:
+1) Markdown 文档用于人类阅读，JSON 用于机器调度，两者都必须更新;
+2) 文档必须先按里程碑分组，再在每个里程碑下列出任务单;
+3) 调度真值源是 `{task_schedule_json}`，不得只写 Markdown 不写 JSON;
+4) 每个任务单必须足够具体，单次可开发、可审核、可测试、可勾选;
+5) 每个任务单都必须写清目标、涉及模块/文件、完成标准、验证方式。
 
 推荐 Markdown 模板:
 ## 里程碑 M1: <名称>
-- 状态: 未开始 / 进行中 / 已完成
+- 状态: todo / doing / done
 - 阶段性成果: <该里程碑完成后应达成的结果>
 - 完成判定: <如何判断该里程碑已经达成>
 - 任务单:
   - [ ] M1-T1 <任务标题> | 目标: <做什么> | 涉及: <模块/文件> | 完成标准: <完成判定> | 验证: <测试/检查方式>
   - [ ] M1-T2 <任务标题> | 目标: <做什么> | 涉及: <模块/文件> | 完成标准: <完成判定> | 验证: <测试/检查方式>
-"""
-# [开发模式] 任务文档执行约束
-TASK_EXECUTION_PROMPT = f"""执行 `{task_md}` 时必须遵守:
-1) 里程碑只用于分组和表达阶段性成果, 不直接作为开发派发单位;
-2) 调度器必须优先选择“当前最早未完成里程碑”下的“下一个未完成任务单”;
-3) 开发、审核、测试时都必须引用具体任务单 ID, 如 `M1-T2`;
-4) 开发完成后只勾选对应任务单; 若该里程碑下任务单全部完成, 需要同步把该里程碑状态更新为“已完成”;
-5) 不允许跳过尚未完成的前置任务单.
-"""
-# 测试计划文件, 由[开发模式]生成和使用
-test_plan_md = HUMAN_TEST_PLAN_MD  # 由测试工程师智能体生成的
-# [详细设计模式] 人类问答触发词
-HUMAN_QUESTION_TRIGGER = "[[ASK_HUMAN]]"
-# [详细设计模式] 允许向人类提问的智能体名称
-ANALYST_NAME = "需求分析师"
-# [详细设计模式] 最大人类问答轮数
-MAX_HUMAN_QA_ROUND = 100
-# [跨阶段] 人类问答,需求澄清记录文件名
-REQUIREMENT_CLARIFICATION_MD = HUMAN_REQUIREMENT_CLARIFICATION_MD
-# [人工维护] 智能体模型与推理强度配置
-AGENT_MODEL_EFFORT_CONFIG = HUMAN_AGENT_MODEL_EFFORT_CONFIG
 
-# [人工维护] 初始化提示词, 默认使用测试/演示内容
-common_init_prompt_1 = HUMAN_COMMON_INIT_PROMPT_1
-common_init_prompt_2 = HUMAN_COMMON_INIT_PROMPT_2
+推荐 JSON 模板:
+```json
+{{
+  "milestones": [
+    {{
+      "milestone_id": "M1",
+      "title": "里程碑名称",
+      "status": "todo",
+      "goal": "阶段性成果",
+      "completion_criteria": ["完成判定1"],
+      "tasks": [
+        {{
+          "task_id": "M1-T1",
+          "title": "任务标题",
+          "status": "todo",
+          "objective": "做什么",
+          "files": ["path/to/file.py"],
+          "done_criteria": ["完成标准1"],
+          "verification": ["pytest ..."]
+        }}
+      ]
+    }}
+  ]
+}}
+```
+"""
 
-# 可用智能体列表
-agent_names_list = ['需求分析师', '审核员', '测试工程师', '开发工程师']
+TASK_EXECUTION_PROMPT = f"""执行 `{task_schedule_json}` / `{task_md}` 时必须遵守:
+1) 开发阶段永远以“当前最早未完成里程碑下的下一个未完成任务单”为推进单位;
+2) owner 只能处理一个具体任务单，不能跨任务单越界开发;
+3) 完成后必须同步更新:
+   - `{task_md}`
+   - `{task_schedule_json}`
+   - `{test_plan_md}`
+   - `{delivery_report_md}`
+4) 每个任务单必须生成一份 `{task_run_report_dir}/run_<task_id>.json` 运行记录;
+5) reviewer 只审核，不直接修改主体代码;
+6) 三个 reviewer 对同一个 artifact_sha 都返回 `{REVIEW_VERDICT_PASS}` 之后，才允许进入下一阶段或下一个任务单。
+"""
+
+OWNER_AGENT_INIT_PROMPT = f"""你现在是 AutoCodex 的主agent owner。
+你负责整个项目从需求到实现的四阶段闭环:
+1) 需求指定
+2) 详细设计
+3) 任务规划
+4) 开发与测试
+
+你的职责:
+1) 你是唯一 owner，负责阅读代码、编写/修改阶段文档、修改主体代码、执行测试、更新任务状态;
+2) analyst / tester / auditor 只负责审核与你对话，不直接改主体代码;
+3) 任何阶段在 reviewer 未全部通过前，禁止擅自推进到下一阶段;
+4) 原则上在“需求指定”阶段完成全部人类澄清；如果 reviewer 明确返回 `{REVIEW_VERDICT_ASK_HUMAN}`，你也可以补充向人类一次只提一个关键问题，并把结论同步回需求与澄清文档;
+5) 所有阶段都必须真实落盘文档或代码，不得只在回复里声称已完成;
+6) 开发阶段必须严格遵守 `{task_schedule_json}` 的任务顺序和 `{TASK_EXECUTION_PROMPT}`。
+
+完成角色设定后，只回复 `{BOOTSTRAP_ROLE_TOKEN}`，不要补充其它内容。
+"""
+
+REVIEWER_INIT_PROMPTS = {
+    "analyst": f"""你现在是 reviewer analyst。
+你只负责审核 owner 的阶段产物，不允许修改主体代码与阶段文档。
+你的关注点:
+1) 需求边界是否单一清晰、可验证、无隐含假设;
+2) 需求、设计、任务、实现之间是否一致，是否存在越界实现;
+3) 文档与代码是否遗漏关键信息、关键场景、失败路径或兼容性约束。
+你的输出必须以 verdict token 开头，只能使用以下四种之一:
+{REVIEW_VERDICT_PASS}
+{REVIEW_VERDICT_REVISE}
+{REVIEW_VERDICT_BLOCKED}
+{REVIEW_VERDICT_ASK_HUMAN}
+
+完成角色设定后，只回复 `{BOOTSTRAP_ROLE_TOKEN}`，不要补充其它内容。
+""",
+    "tester": f"""你现在是 reviewer tester。
+你只负责审核 owner 的阶段产物，不允许修改主体代码与阶段文档。
+你的关注点:
+1) 需求、设计、任务是否具备可测试性和可验收性;
+2) 每个任务单是否写清验证命令、测试范围、回归影响;
+3) 开发阶段的代码改动是否有对应测试证据，是否存在漏测、伪通过或缺失回归。
+你的输出必须以 verdict token 开头，只能使用以下四种之一:
+{REVIEW_VERDICT_PASS}
+{REVIEW_VERDICT_REVISE}
+{REVIEW_VERDICT_BLOCKED}
+{REVIEW_VERDICT_ASK_HUMAN}
+
+完成角色设定后，只回复 `{BOOTSTRAP_ROLE_TOKEN}`，不要补充其它内容。
+""",
+    "auditor": f"""你现在是 reviewer auditor。
+你只负责审核 owner 的阶段产物，不允许修改主体代码与阶段文档。
+你的关注点:
+1) 架构边界、状态一致性、失败路径、恢复路径、日志与可观测性是否合理;
+2) 工作流是否存在死循环、误判完成、串 session、任务重复派发等风险;
+3) 文档、JSON 真值源、代码与运行记录是否一致。
+你的输出必须以 verdict token 开头，只能使用以下四种之一:
+{REVIEW_VERDICT_PASS}
+{REVIEW_VERDICT_REVISE}
+{REVIEW_VERDICT_BLOCKED}
+{REVIEW_VERDICT_ASK_HUMAN}
+
+完成角色设定后，只回复 `{BOOTSTRAP_ROLE_TOKEN}`，不要补充其它内容。
+""",
+}
+
+# 兼容旧模块导入
+analysis_agent_init_prompt = OWNER_AGENT_INIT_PROMPT
+task_agent_init_prompt = OWNER_AGENT_INIT_PROMPT
+coding_test_agent_init_prompt = REVIEWER_INIT_PROMPTS["tester"]
+coding_agent_init_prompt = {
+    OWNER_AGENT_NAME: OWNER_AGENT_INIT_PROMPT,
+    "analyst": REVIEWER_INIT_PROMPTS["analyst"],
+    "tester": REVIEWER_INIT_PROMPTS["tester"],
+    "auditor": REVIEWER_INIT_PROMPTS["auditor"],
+    "需求分析师": REVIEWER_INIT_PROMPTS["analyst"],
+    "审核员": REVIEWER_INIT_PROMPTS["auditor"],
+    "测试工程师": REVIEWER_INIT_PROMPTS["tester"],
+    "开发工程师": OWNER_AGENT_INIT_PROMPT,
+}
 
 
 def _build_director_output_schema():
@@ -189,95 +335,32 @@ def normalize_director_payload(payload, allow_nested_success=True, allowed_succe
             )
     return normalized
 
-# [开发模式] 下的测试工程师智能体初始化提示词
-coding_test_agent_init_prompt = f"""你是一个专业的python测试工程师. 
-你需要根据 {design_md} 中的描述, 以及 {task_md} 中按“里程碑 + 任务单”组织的任务计划, 设计各个具体任务单对应的测试.
-注意: 测试设计粒度是“任务单”, 不是“里程碑”.
-要求每个任务完成后有一个对应的功能测试 (覆盖度>90%), 以及一个对应的集成测试 (覆盖度>90%). 
-根据此, 设计对应的测试用例. 写入 {test_plan_md} 文件中.
-"""
-# [开发模式] 下的各个智能体初始化提示词
-coding_agent_init_prompt = {
-    '需求分析师': f"""现在起, 你是一个专业的需求分析师, 并且十分了解python代码.
-我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改. 
-在收到我的代码修改描述后, 我需要你:
-走读修改后的新代码, 然后分析代码中的逻辑是否与 {task_md} 中所属里程碑及具体任务单一致, 是否与 {design_md} 一致.
-审核完成后说明有问题的地方, 若无问题则返回 '检查通过'. 禁止修改代码与文档. 不要返回多余的信息.
-""",
-    '审核员': f"""现在起, 你是一个专业的python代码审核员, 熟悉python的用法和语法. 
-我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改.
-在收到我的代码修改描述后, 我需要你:
-走读我修改后的新代码, 然后分析代码中是否存在错误和逻辑问题. 是否与 {task_md} 中所属里程碑及具体任务单、以及 {design_md} 保持逻辑一致.
-审核完成后说明有问题的地方, 若无问题则返回 '审核通过'. 禁止修改代码与文档. 不要返回多余的信息.
-""",
-    '测试工程师': f"""现在起, 你是一个专业的python测试工程师, 熟悉python的用法和语法. 
-我正在进行代码开发. 我**待会儿**会告诉你我刚刚做了什么修改. 
-在收到我的代码修改描述后, 我需要你:
-走读我修改后的新代码, 分析代码中是否存在错误和逻辑问题. 是否与 {task_md} 中所属里程碑及具体任务单一致, 是否与 {design_md} 一致.
-然后根据 {test_plan_md} 执行测试. 审核以及测试完成后说明有问题的地方, 若无问题则返回 '测试通过'. 不要返回多余的信息.
-禁止修改主体代码, 但是可以创建和修改测试用代码. 所有与测试相关的工作都需要由你来做. 
-""",
-    '开发工程师': f"""现在起, 你是一个专业的Python开发工程师.
-我待会儿会按照 {task_md} 中“里程碑 -> 任务单”的结构, 一步步让你执行某个里程碑下的具体任务单开发.
-在收到我的任务安排后, 你需要你:
-根据 {design_md} 以及 {task_md} 中所属里程碑和具体任务单的描述, 进行对应任务的开发.
-开发完成后, 你需要重新走读自己开发的新代码, 检查是否与需求对齐, 是否与任务描述一致, 检查是否存在逻辑错误.
-完成检查后, 你需要设计单元测试用例, 进行自测.
-开发, 审核, 自测全部完成后在 {task_md} 中勾选掉对应的任务单; 若该里程碑下任务单已全部完成, 同步把该里程碑状态更新为“已完成”. 然后返回简要说明你具体修改了什么. 不要返回多余的信息.
-"""
-}
 
-# [人工维护] 原始需求说明, 默认使用测试/演示内容
-requirement_str = HUMAN_REQUIREMENT_PROMPT
-# [详细设计模式] 下需求分析师 智能体的初始化提示
-analysis_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Product Manager
-现在有以下需求: {requirement_str}
-
-根据以上需求补充, 审视当前代码. 进行代码改造的详细设计.
-将详细设计写入 {design_md} 中.
-"""
-# [任务拆分模式] 下需求分析师 智能体的初始化提示
-task_agent_init_prompt = f"""现在起, 你是一个专业的需求分析师 和 产品经理. $Scrum Master
-现在有以下需求: {requirement_str}
-
-当前已经根据需求进行了详细设计, 并且写了详细设计文档: {design_md}
-根据详细设计 {design_md} 拆分任务单. 将写入 {task_md} 中.
-
-{TASK_DOC_STRUCTURE_PROMPT}
-
-你的任务不是简单罗列待办事项, 而是:
-1) 先识别项目应该拆成哪些里程碑;
-2) 再为每个里程碑设计达到该阶段性成果所需的具体任务单;
-3) 确保任务单顺序合理、粒度可执行、验收可判断、验证可落地;
-4) 确保后续开发阶段可以按“里程碑顺序 + 任务单顺序”直接推进.
-"""
+def get_agent_runtime_info(agent_name):
+    agent_runtime_cfg = AGENT_MODEL_EFFORT_CONFIG.get(agent_name) or {}
+    model_name = str(agent_runtime_cfg.get("model_name", "gpt-5.4")).strip() or "gpt-5.4"
+    reasoning_effort = str(agent_runtime_cfg.get("reasoning_effort", "high")).strip() or "high"
+    return get_codex_runtime_metadata(
+        folder_path=working_path,
+        agent_name=agent_name,
+        model_name=model_name,
+        reasoning_effort=reasoning_effort,
+    )
 
 
-# 运行智能代理函数
-def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
+def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None, required_token=None, reply_validator=None):
     """
     运行智能代理函数
-
-    Args:
-        agent_name (str): 智能代理的名称
-        log_file_path (str): 日志文件路径，用于记录运行过程中的消息
-        prompt (str): 提示信息，传递给智能代理的输入内容
-        init_yn (bool, optional): 是否初始化新会话，默认为True表示新建会话，False表示恢复现有会话
-        session_id (str, optional): 会话ID，当init_yn为False时必须提供有效的会话ID
-    Returns:
-        str: 返回当前会话的ID，用于后续的会话管理
-    Raises:
-        ValueError: 当 init_yn 为 False 且 session_id 为空时抛出异常
     """
-    # 解析当前智能体对应的模型与推理强度（强校验：必须显式配置）
     agent_runtime_cfg = AGENT_MODEL_EFFORT_CONFIG.get(agent_name)
     if not agent_runtime_cfg:
         raise ValueError(
             f"AGENT_MODEL_EFFORT_CONFIG 缺少智能体配置: {agent_name}. "
-            f"请在 B00_agent_config.py 中显式配置 model_name 和 reasoning_effort."
+            f"请在 B04_human_prompts.py 中显式配置 model_name 和 reasoning_effort."
         )
     model_name = str(agent_runtime_cfg.get("model_name", "")).strip()
     reasoning_effort = str(agent_runtime_cfg.get("reasoning_effort", "")).strip()
+    turn_timeout_sec = int(agent_runtime_cfg.get("turn_timeout_sec", working_timeout))
     if not model_name or not reasoning_effort:
         raise ValueError(
             f"AGENT_MODEL_EFFORT_CONFIG 配置不完整: {agent_name}. "
@@ -285,74 +368,109 @@ def run_agent(agent_name, log_file_path, prompt, init_yn=True, session_id=None):
         )
     output_schema_path = ensure_director_output_schema() if agent_name == DIRECTOR_NAME else None
 
-    # 记录用户输入的提示信息到日志文件
     with print_lock:
-        log_message(log_file_path=log_file_path,
-                    message=f"--{agent_name}--\n--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                            f"{prompt}\n",
-                    color=Colors.BLUE)
+        log_message(
+            log_file_path=log_file_path,
+            message=f"--{agent_name}--\n--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n{prompt}\n",
+            color=Colors.BLUE,
+        )
 
-    # 根据初始化标志选择不同的处理方式：新建会话或恢复会话
     if init_yn:
         retry_count = 0
         while True:
-            _, msg, session_id = init_codex(prompt=prompt,
-                                            folder_path=working_path,
-                                            model_name=model_name,
-                                            reasoning_effort=reasoning_effort,
-                                            timeout=working_timeout,
-                                            output_schema_path=output_schema_path,
-                                            )
-            if session_id and str(msg or "").strip():
+            responses, msg, session_id = init_codex(
+                prompt=prompt,
+                folder_path=working_path,
+                model_name=model_name,
+                reasoning_effort=reasoning_effort,
+                timeout=turn_timeout_sec,
+                output_schema_path=output_schema_path,
+                agent_name=agent_name,
+                required_token=required_token,
+                reply_validator=reply_validator,
+            )
+            if session_id and str(msg or "").strip() and (
+                    required_token is None or required_token in str(msg or "")
+            ) and (
+                    reply_validator is None or reply_validator(str(msg or ""))
+            ):
                 break
             retry_count += 1
             if retry_count > resume_retry_max:
                 if not session_id:
                     msg = "init_codex 获取 session_id 失败，已达到最大重试次数。"
+                elif required_token and required_token not in str(msg or ""):
+                    msg = f"init_codex 未返回期望 token {required_token}，已达到最大重试次数。"
                 else:
                     msg = "init_codex 未返回有效内容，已达到最大重试次数。"
                 break
             with print_lock:
-                log_message(log_file_path=log_file_path,
-                            message=f"--{session_id}--\n--{agent_name}--\n"
-                                    f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                                    f"init_codex 未返回有效内容或 session_id 为空，准备重试 {retry_count}/{resume_retry_max}\n"
-                                    f"msg: {msg}",
-                            color=Colors.YELLOW)
+                log_message(
+                    log_file_path=log_file_path,
+                    message=(
+                        f"--{session_id}--\n--{agent_name}--\n"
+                        f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
+                        f"init_codex 未返回有效内容或 session_id 为空，准备重试 {retry_count}/{resume_retry_max}\n"
+                        f"responses: {responses}\nmsg: {msg}"
+                    ),
+                    color=Colors.YELLOW,
+                )
             time.sleep(resume_retry_interval)
     else:
         if session_id is None:
             raise ValueError("resume 模式下, session_id 不能为空")
         retry_count = 0
         while True:
-            _, msg, _ = resume_codex(thread_id=session_id,
-                                     folder_path=working_path,
-                                     prompt=prompt,
-                                     model_name=model_name,
-                                     reasoning_effort=reasoning_effort,
-                                     timeout=working_timeout,
-                                     output_schema_path=output_schema_path,
-                                     )
-            if str(msg or "").strip():
+            responses, msg, _ = resume_codex(
+                thread_id=session_id,
+                folder_path=working_path,
+                prompt=prompt,
+                model_name=model_name,
+                reasoning_effort=reasoning_effort,
+                timeout=turn_timeout_sec,
+                output_schema_path=output_schema_path,
+                agent_name=agent_name,
+                required_token=required_token,
+                reply_validator=reply_validator,
+            )
+            if str(msg or "").strip() and (
+                    required_token is None or required_token in str(msg or "")
+            ) and (
+                    reply_validator is None or reply_validator(str(msg or ""))
+            ):
                 break
             retry_count += 1
             if retry_count > resume_retry_max:
-                msg = "resume_codex 超时或无响应，已达到最大重试次数。"
+                if required_token and required_token not in str(msg or ""):
+                    msg = f"resume_codex 未返回期望 token {required_token}，已达到最大重试次数。"
+                else:
+                    msg = "resume_codex 超时或无响应，已达到最大重试次数。"
                 break
             with print_lock:
-                log_message(log_file_path=log_file_path,
-                            message=f"--{session_id}--\n--{agent_name}--\n"
-                                    f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                                    f"resume_codex 超时或无响应，准备重试 {retry_count}/{resume_retry_max}\n",
-                            color=Colors.YELLOW)
+                log_message(
+                    log_file_path=log_file_path,
+                    message=(
+                        f"--{session_id}--\n--{agent_name}--\n"
+                        f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
+                        f"resume_codex 超时或无响应，准备重试 {retry_count}/{resume_retry_max}\n"
+                        f"responses: {responses}\n"
+                    ),
+                    color=Colors.YELLOW,
+                )
             time.sleep(resume_retry_interval)
-    # 记录会话结果到日志文件
+
+    runtime_info = get_agent_runtime_info(agent_name)
+    runtime_summary = json.dumps(runtime_info, ensure_ascii=False, indent=2)
     with print_lock:
-        log_message(log_file_path=log_file_path,
-                    message=f"--{session_id}--\n--{agent_name}--\n"
-                            f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
-                            f"{msg}\n",
-                    color=Colors.GREEN)
+        log_message(
+            log_file_path=log_file_path,
+            message=(
+                f"--{session_id}--\n--{agent_name}--\n"
+                f"--{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}--\n"
+                f"{msg}\n\n[runtime]\n{runtime_summary}\n"
+            ),
+            color=Colors.GREEN,
+        )
     return msg, session_id
 
 

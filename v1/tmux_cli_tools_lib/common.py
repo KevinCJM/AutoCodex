@@ -63,13 +63,31 @@ USER_PREFIX_PATTERN = r"^(?:You\b|›[^\S\n]*\S)"
 WAITING_PROMPT_PATTERN = r"^(?:Approve|Allow)\b.*\b(?:y/n|yes/no|yes|no)\b"
 ERROR_PATTERN = r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|panic:)"
 TUI_FOOTER_PATTERN = r"(?:\?\s+for shortcuts|context left|\d+%\s+left)"
-TUI_PROGRESS_PATTERN = r"•.*\(\d+s"
+TUI_PROGRESS_PATTERN = r"•.*\((?:\d+[hms]\s*)+•\s*esc(?:\s+to(?:\s+interrupt)?)?"
 CODEX_WELCOME_PATTERN = r"OpenAI Codex"
 CLAUDE_WELCOME_PATTERN = r"Claude Code"
 GEMINI_WELCOME_PATTERN = r"Gemini CLI"
 CODEX_TRUST_PROMPT_PATTERNS = (
     r"allow Codex to work in this folder",
     r"Do you trust the contents of this directory\?",
+)
+CODEX_MODEL_SELECTION_PROMPT_PATTERNS = (
+    r"Introducing GPT-5\.4",
+    r"Choose how you'd like Codex to proceed",
+    r"Try new model",
+    r"Use existing model",
+)
+CODEX_UPDATE_PROMPT_PATTERNS = (
+    r"Update available!",
+    r"Update now",
+    r"Skip until next version",
+    r"Press enter to continue",
+)
+CODEX_QUEUED_MESSAGE_PATTERNS = (
+    r"Messages to be submitted after next tool call",
+    r"queued message",
+    r"press esc to interrupt(?: and send immediately)?",
+    r"tab to queue message",
 )
 CLAUDE_SPINNER_CHARS = "✱✲✳✴✵✶✷✸✹✺✻✼✽✾✿❀❁❂❃❇❈❉❊❋✢✣✤✥✦✧✨⊛⊕⊙◉◎◍⁂⁕※⍟☼★☆"
 CLAUDE_SPINNER_ACTIVITY_PATTERN = re.compile(
@@ -95,7 +113,6 @@ class TerminalStatus(str, Enum):
     ERROR = "error"
 
 
-@dataclass
 class CliBackend(str, Enum):
     """这是当前支持的 CLI 后端类型。"""
 
@@ -117,6 +134,7 @@ class AgentCliConfig:
     reasoning_effort: str | None = None
     sandbox_mode: str | None = None
     approval_mode: str | None = None
+    developer_instructions: str | None = None
     disable_features: tuple[str, ...] = ()
     extra_args: tuple[str, ...] = ()
 
@@ -352,6 +370,12 @@ class AgentCliConfig:
             self.resolved_approval_mode(),
             "--no-alt-screen",
         ]
+        developer_instructions = str(self.developer_instructions or "").strip()
+        if developer_instructions:
+            escaped_prompt = (
+                developer_instructions.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+            )
+            args.extend(["-c", f'developer_instructions="{escaped_prompt}"'])
         for feature in self.disable_features or ("shell_snapshot",):
             args.extend(["--disable", feature])
         args.extend(self.extra_args)
@@ -415,6 +439,7 @@ class CodexCliConfig(AgentCliConfig):
         reasoning_effort: str = "xhigh",
         sandbox_mode: str = "danger-full-access",
         approval_mode: str = "never",
+        developer_instructions: str | None = None,
         disable_features: tuple[str, ...] = ("shell_snapshot",),
         extra_args: tuple[str, ...] = (),
     ):
@@ -424,6 +449,7 @@ class CodexCliConfig(AgentCliConfig):
             reasoning_effort=reasoning_effort,
             sandbox_mode=sandbox_mode,
             approval_mode=approval_mode,
+            developer_instructions=developer_instructions,
             disable_features=disable_features,
             extra_args=extra_args,
         )
@@ -642,4 +668,3 @@ class DebouncedStateMachine:
             self.pending_since = 0.0
 
         return self.confirmed_state
-

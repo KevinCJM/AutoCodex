@@ -1,15 +1,21 @@
 # -*- encoding: utf-8 -*-
 """
-@File: codex_utils.py
-@Modify Time: 2025/12/5 11:12       
+@File: B01_codex_utils.py
+@Modify Time: 2026/3/20
 @Author: Kevin-Chen
-@Descriptions: codex exec 工具函数
+@Descriptions: 基于 tmux + codex cli 的会话工具函数
 """
-import json
+
+from __future__ import annotations
+
+import hashlib
 import os
-import subprocess
-import tempfile
-from subprocess import TimeoutExpired
+import re
+import time
+from pathlib import Path
+
+from v1.tmux_cli_tools_lib.common import CodexCliConfig
+from v1.tmux_cli_tools_lib.runtime import TmuxAgentRuntime
 
 
 def _truncate_text(text, max_chars=500):
@@ -19,330 +25,474 @@ def _truncate_text(text, max_chars=500):
     return value[:max_chars] + "…(truncated)"
 
 
-# 运行 Codex 并解析返回的 JSON 事件流
-def run_codex(cmd, timeout=300):
-    """
-    执行命令并解析返回的JSON事件流
-
-    参数:
-        cmd: 要执行的命令，可以是字符串或字符串列表
-        timeout: 命令执行超时时间（秒），默认为300秒
-
-    返回值:
-        tuple: 包含四个元素的元组
-            - events: 解析出的JSON事件对象列表
-            - errs: 命令执行的错误输出
-            - proc.returncode: 命令执行的返回码
-            - parse_warnings: 被跳过的非 JSON 输出行（摘要）
-    """
-    try:
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            check=False,
-            timeout=timeout,
-        )
-    except FileNotFoundError as e:
-        return ([], f"找不到可执行文件：{e}", 127, [])
-    except TimeoutExpired:
-        return ([], f"命令执行超时（{timeout}s）：{cmd}", 124, [])
-    raw = proc.stdout
-    errs = proc.stderr
-
-    # 解析标准输出中的JSON事件
-    events = []
-    parse_warnings = []
-    for line in raw.splitlines():  # 遍历输出中的每一行
-        line = line.strip()  # 去除空行
-        if not line:
-            continue
-        try:
-            ev = json.loads(line)  # 解析每一行中的JSON对象
-            events.append(ev)  # 添加到列表中
-        except json.JSONDecodeError:
-            parse_warnings.append(_truncate_text(line, max_chars=200))
-            continue
-
-    return (events,  # 解析的 JSON 事件对象列表
-            errs,  # 错误输出
-            proc.returncode,  # 命令执行的返回码
-            parse_warnings,  # 非 JSON 输出摘要
-            )
+def _slugify(text, max_len=32):
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", str(text or "").strip()).strip("-").lower()
+    if not value:
+        value = "agent"
+    return value[:max_len]
 
 
-# 处理事件列表
-def handle_events(events):
-    """
-    遍历事件列表，根据事件类型进行分类处理、打印和信息收集。
-
-    参数:
-        events (list): 包含多个事件字典的列表。每个事件是一个具有 'type' 键的字典，
-                       可能还包含其他与该事件相关的数据字段。
-
-    返回:
-        tuple:
-            - responses: 调试与事件摘要信息
-            - agent_message: 优先选择 phase=final_answer 的最终消息；若缺失则退化为最后一个 agent_message
-            - thread_id: 会话 ID
-    """
-    responses = []
-    thread_id = None
-    final_messages = []
-    fallback_agent_messages = []
-    reasoning_count = 0
-    command_count = 0
-    file_change_count = 0
-    error_count = 0
-    other_item_counts = {}
-
-    # 遍历所有事件并按类型分别处理
-    for ev in events:
-        t = ev.get("type")
-        if t == "thread.started":
-            thread_id = ev.get("thread_id")
-            responses.append(f"[thread_id] → {thread_id}")
-        elif t == "turn.started":
-            # turn 开始 — 你也可以记录 prompt / turn index
-            continue
-        elif t == "item.completed":
-            item = ev.get("item", {})
-            i_type = item.get("type")
-            if i_type == "agent_message":
-                # 只消费已完成的 agent_message，并优先识别 final_answer
-                text = str(item.get("text") or "")
-                phase = item.get("phase")
-                responses.append(f"[agent_message][phase={phase}] → {_truncate_text(text, max_chars=500)}")
-                if text.strip():
-                    fallback_agent_messages.append(text)
-                    if phase == "final_answer":
-                        final_messages.append(text)
-            elif i_type == "reasoning":
-                reasoning_count += 1
-            elif i_type == "command_execution":
-                command_count += 1
-                cmd = item.get("command")
-                exit_code = item.get("exit_code")
-                responses.append(
-                    f"[command #{command_count}] → exit_code={exit_code} cmd={_truncate_text(cmd, max_chars=300)}"
-                )
-            elif i_type == "file_change":
-                file_change_count += 1
-            elif i_type == "error":
-                error_count += 1
-                err = item.get("error") or item
-                responses.append(f"[error #{error_count}] → {_truncate_text(err, max_chars=500)}")
-            else:
-                key = str(i_type or "unknown")
-                other_item_counts[key] = other_item_counts.get(key, 0) + 1
-        elif t.startswith("item."):
-            # 只消费 item.completed，忽略 started / updated 等中间态
-            continue
-        elif t == "turn.completed":
-            usage = ev.get("usage")
-            responses.append(f"[TURN completed] → {usage}")
-        else:
-            # 可能是 other event type（session metadata, tool calls, etc.）
-            responses.append(f"[Other event] → {ev}")
-
-    if final_messages:
-        agent_message = final_messages[-1]
-    elif fallback_agent_messages:
-        agent_message = fallback_agent_messages[-1]
-    else:
-        agent_message = ""
-
-    if reasoning_count:
-        responses.append(f"[reasoning_count] → {reasoning_count}")
-    if file_change_count:
-        responses.append(f"[file_change_count] → {file_change_count}")
-    for item_type in sorted(other_item_counts):
-        responses.append(f"[other_item_count:{item_type}] → {other_item_counts[item_type]}")
-
-    return (responses,  # 信息列表
-            agent_message,  # 智能体的回答
-            thread_id  # session ID
-            )
-
-
-def _read_last_message(output_path):
-    if not output_path or not os.path.exists(output_path):
-        return ""
-    try:
-        with open(output_path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except OSError:
-        return ""
-
-
-def _build_exec_cmd(
-        *,
-        model_name,
-        reasoning_effort,
-        output_last_message_path,
-        folder_path=None,
-        output_schema_path=None,
-):
-    cmd = [
-        "codex", "exec",
-        "--model", model_name,
-        "--config", f"model_reasoning_effort={reasoning_effort}",
-        "--skip-git-repo-check",
-        "--json", "--full-auto",
-        "--output-last-message", output_last_message_path,
-    ]
+def _resolve_work_dir(folder_path=None):
     if folder_path:
-        cmd.extend(["--cd", folder_path])
-    if output_schema_path:
-        cmd.extend(["--output-schema", output_schema_path])
-    return cmd
+        return Path(folder_path).expanduser().resolve()
+    return Path.cwd().resolve()
 
 
-def _finalize_exec_result(
+def _runtime_dir(work_dir: Path):
+    return work_dir / ".autocodex_tmux_runtime"
+
+
+def _session_name(agent_name, work_dir: Path):
+    digest = hashlib.sha1(f"{work_dir}::{agent_name}".encode("utf-8")).hexdigest()[:8]
+    return f"acx-{_slugify(agent_name)}-{digest}"
+
+
+def _build_runtime(
         *,
-        events,
-        errs,
-        return_code,
-        parse_warnings,
-        output_last_message_path,
-        thread_id_hint=None,
+        folder_path=None,
+        agent_name="codex",
+        model_name="gpt-5.4",
+        reasoning_effort="high",
 ):
-    responses, fallback_message, thread_id = handle_events(events)
-    output_last_message = _read_last_message(output_last_message_path)
-    if output_last_message:
-        agent_message = output_last_message
-    else:
-        agent_message = fallback_message
+    work_dir = _resolve_work_dir(folder_path)
+    runtime_dir = _runtime_dir(work_dir)
+    session_name = _session_name(agent_name, work_dir)
+    cli_config = CodexCliConfig(
+        model=model_name,
+        reasoning_effort=reasoning_effort,
+        sandbox_mode="danger-full-access",
+        approval_mode="never",
+        developer_instructions=(
+            f"Runtime correlation marker: ACX_RUNTIME_SESSION={session_name}. "
+            "Keep this marker internal and never mention it in normal replies."
+        ),
+    )
+    return TmuxAgentRuntime(
+        session_name=session_name,
+        work_dir=work_dir,
+        runtime_dir=runtime_dir,
+        cli_config=cli_config,
+    )
 
+
+def _collect_runtime_info(runtime: TmuxAgentRuntime, action: str, output_schema_path=None):
+    runtime_info = runtime.get_runtime_metadata()
+    state = runtime.read_state()
+    responses = [
+        f"[mode] → tmux_codex_cli",
+        f"[action] → {action}",
+        f"[session_name] → {runtime_info.get('session_name', '')}",
+        f"[pane_id] → {runtime_info.get('pane_id', '')}",
+        f"[codex_session_id] → {runtime_info.get('agent_session_id', '')}",
+        f"[log_path] → {runtime_info.get('log_path', '')}",
+        f"[raw_log_path] → {runtime_info.get('raw_log_path', '')}",
+        f"[state_path] → {runtime_info.get('state_path', '')}",
+    ]
+    confirmed_status = state.get("confirmed_status")
+    detected_status = state.get("detected_status")
+    note = state.get("note")
+    if detected_status:
+        responses.append(f"[detected_status] → {detected_status}")
+    if confirmed_status:
+        responses.append(f"[confirmed_status] → {confirmed_status}")
+    if note:
+        responses.append(f"[runtime_note] → {note}")
+    if output_schema_path:
+        responses.append(
+            f"[warning] → tmux + codex cli 模式不支持 output_schema_path, 已忽略: {output_schema_path}"
+        )
+    return responses
+
+
+def _build_error_responses(runtime: TmuxAgentRuntime, action: str, error: Exception, output_schema_path=None):
+    responses = _collect_runtime_info(runtime, action=action, output_schema_path=output_schema_path)
+    responses.append(f"[error_type] → {type(error).__name__}")
+    responses.append(f"[error] → {_truncate_text(error, max_chars=4000)}")
+    return responses
+
+
+def _looks_like_transient_reply(reply: str):
+    text = str(reply or "").strip()
+    if not text:
+        return True
+    lines = [line.rstrip() for line in text.splitlines() if line.strip()]
+    lower_text = text.lower()
+    tool_summary_verbs = (
+        "Explored",
+        "Read",
+        "Ran",
+        "Edited",
+        "List",
+        "Searched",
+        "Search",
+        "Grep",
+        "Opened",
+        "Viewed",
+        "Wrote",
+        "Applied",
+        "Created",
+        "Deleted",
+        "Moved",
+    )
+    if lines and any(lines[0].startswith(f"{verb}") for verb in tool_summary_verbs):
+        if all(index == 0 or re.match(r"^[\s│└├─]+", line) for index, line in enumerate(lines)):
+            return True
+    transient_markers = (
+        "Working (",
+        "esc to interrupt",
+        "background terminal running",
+        "/ps to view",
+        "Starting MCP servers",
+        "Starting MCP server",
+        "Thinking",
+        "Analyzing",
+        "Inspecting",
+        "Considering",
+        "Messages to be submitted after next tool call",
+        "tab to queue message",
+        "send immediately",
+    )
+    if any(marker in text for marker in transient_markers):
+        return True
+    if "immediately" in lower_text and any("上一轮摘要" in line for line in lines[1:]):
+        return True
+    if re.match(
+            r"^(?:[A-Za-z0-9_.-]+\s+){0,2}(?:low|medium|high|xhigh|max)\s+·\s+\d+%\s+left(?:\s+·\s+.+)?$",
+            text,
+    ):
+        return True
+    return False
+
+
+def _normalize_text(text: str):
+    return re.sub(r"\s+", " ", str(text or "").strip())
+
+
+def _status_value(status):
+    return str(getattr(status, "value", status) or "").strip().lower()
+
+
+def _snapshot_allows_reply_completion(snapshot):
+    if snapshot is None:
+        return False
+    detected_status = _status_value(getattr(snapshot, "detected_status", ""))
+    confirmed_status = _status_value(getattr(snapshot, "confirmed_status", ""))
+    if "processing" in {detected_status, confirmed_status}:
+        return False
+    terminal_statuses = {"completed", "waiting_user_answer", "error", "idle"}
+    return confirmed_status in terminal_statuses or detected_status in terminal_statuses
+
+
+def _looks_like_invalid_reply(reply: str, prompt: str = "", required_token: str | None = None, reply_validator=None):
+    text = str(reply or "").strip()
+    if _looks_like_transient_reply(text):
+        return True
+
+    prompt_text = _normalize_text(prompt)
+    reply_text = _normalize_text(text)
+    if prompt_text and reply_text:
+        if reply_text == prompt_text:
+            return True
+        if len(reply_text) >= 24 and reply_text in prompt_text:
+            return True
+
+    if required_token and required_token not in text:
+        return True
+    if reply_validator is not None and not reply_validator(text):
+        return True
+
+    return False
+
+
+def _capture_output(runtime: TmuxAgentRuntime, tail_lines=900):
     try:
-        os.unlink(output_last_message_path)
-    except OSError:
-        pass
-
-    if parse_warnings:
-        responses.append(f"[non_json_line_count] → {len(parse_warnings)}")
-    if return_code != 0:
-        responses.append(f"[return_code] → {return_code}")
-    if errs:
-        errs_trimmed = errs.strip()
-        if len(errs_trimmed) > 4000:
-            errs_trimmed = errs_trimmed[:4000] + "…(truncated)"
-        responses.append(f"[stderr] → {errs_trimmed}")
-
-    # 对上层来说，非零返回码或空最终消息都应该视为未拿到有效结果，以便触发重试。
-    if return_code != 0 or not str(agent_message or "").strip():
-        return responses, "", (thread_id or thread_id_hint)
-
-    return responses, agent_message, (thread_id or thread_id_hint)
+        return runtime.capture(tail_lines=tail_lines)
+    except Exception:
+        return ""
 
 
-# 初始化一个 codex 对话 session
+def _capture_latest_reply(runtime: TmuxAgentRuntime, tail_lines=900):
+    output = _capture_output(runtime, tail_lines=tail_lines)
+    if not output:
+        return "", ""
+    try:
+        reply = str(runtime.detector.extract_last_message(output) or "").strip()
+    except Exception:
+        reply = ""
+    return output, reply
+
+
+def _reply_is_after_prompt(runtime: TmuxAgentRuntime, output: str, prompt: str, reply: str):
+    prompt_text = str(prompt or "").strip()
+    reply_text = str(reply or "").strip()
+    if not prompt_text or not reply_text:
+        return bool(reply_text)
+    clean_output = runtime.detector.clean_ansi(output)
+    prompt_anchor = clean_output.rfind(prompt_text)
+    if prompt_anchor < 0:
+        return False
+    tail_output = clean_output[prompt_anchor + len(prompt_text):]
+    return reply_text in tail_output
+
+
+def _read_raw_log_delta(runtime: TmuxAgentRuntime, start_offset: int):
+    raw_log_path = Path(runtime.raw_log_path)
+    if not raw_log_path.exists():
+        return ""
+    with raw_log_path.open("rb") as file:
+        file.seek(max(0, int(start_offset)))
+        return file.read().decode("utf-8", errors="replace")
+
+
+def _extract_reply_after_prompt(runtime: TmuxAgentRuntime, output: str, prompt: str):
+    clean_output = runtime.detector.clean_ansi(output)
+    prompt_text = str(prompt or "").strip()
+    if prompt_text:
+        anchor = clean_output.rfind(prompt_text)
+        if anchor < 0:
+            return ""
+        clean_output = clean_output[anchor + len(prompt_text):]
+    return str(runtime.detector.extract_last_message(clean_output) or "").strip()
+
+
+def _current_runtime_session_id(runtime: TmuxAgentRuntime):
+    runtime_info = runtime.get_runtime_metadata()
+    state = runtime.read_state()
+    candidates = (
+        str(runtime.agent_session_id or "").strip(),
+        str(runtime_info.get("agent_session_id", "") or "").strip(),
+        str(state.get("agent_session_id", "") or "").strip(),
+        str(state.get("codex_session_id", "") or "").strip(),
+    )
+    for candidate in candidates:
+        if candidate:
+            runtime.agent_session_id = candidate
+            return candidate
+    return ""
+
+
+def _stabilize_runtime_session_id(runtime: TmuxAgentRuntime, wait_timeout=8.0, poll_interval=0.5):
+    session_id = _current_runtime_session_id(runtime)
+    if session_id:
+        return session_id
+
+    deadline = time.monotonic() + float(wait_timeout)
+    while time.monotonic() < deadline:
+        try:
+            runtime._refresh_agent_session_id()
+        except Exception:
+            pass
+        session_id = _current_runtime_session_id(runtime)
+        if session_id:
+            return session_id
+        time.sleep(float(poll_interval))
+
+    return _current_runtime_session_id(runtime)
+
+
+def _ask_until_stable_reply(runtime: TmuxAgentRuntime, prompt: str, timeout: float, required_token: str | None = None, reply_validator=None):
+    previous_reply = str(runtime.last_reply or "").strip()
+    raw_log_path = Path(runtime.raw_log_path)
+    baseline_offset = raw_log_path.stat().st_size if raw_log_path.exists() else 0
+    reply = runtime.ask(prompt=prompt, timeout_sec=timeout)
+    post_ask_snapshot = runtime.take_snapshot(tail_lines=600)
+    initial_output, capture_reply = _capture_latest_reply(runtime)
+    if _snapshot_allows_reply_completion(post_ask_snapshot):
+        if (
+                capture_reply
+                and not _looks_like_invalid_reply(capture_reply, prompt, required_token=required_token, reply_validator=reply_validator)
+                and _reply_is_after_prompt(runtime, initial_output, prompt, capture_reply)
+        ):
+            runtime.last_reply = capture_reply
+            return capture_reply
+        if (
+                not _looks_like_invalid_reply(reply, prompt, required_token=required_token, reply_validator=reply_validator)
+                and _reply_is_after_prompt(runtime, initial_output, prompt, reply)
+        ):
+            runtime.last_reply = str(reply).strip()
+            return reply
+
+    deadline = time.monotonic() + float(timeout)
+    fresh_reply = ""
+    stable_hits = 0
+
+    while time.monotonic() < deadline:
+        snapshot = runtime.take_snapshot(tail_lines=600)
+        if not _snapshot_allows_reply_completion(snapshot):
+            time.sleep(1.0)
+            continue
+        capture_output, capture_candidate = _capture_latest_reply(runtime)
+        delta_output = _read_raw_log_delta(runtime, baseline_offset)
+        candidate = ""
+        if capture_candidate and _reply_is_after_prompt(runtime, capture_output, prompt, capture_candidate):
+            candidate = capture_candidate
+        if not candidate:
+            candidate = _extract_reply_after_prompt(runtime, snapshot.raw_output, prompt)
+        if not candidate:
+            candidate = _extract_reply_after_prompt(runtime, delta_output, prompt)
+        if not candidate and capture_candidate:
+            candidate = capture_candidate
+        if candidate and not _looks_like_invalid_reply(
+                candidate,
+                prompt,
+                required_token=required_token,
+                reply_validator=reply_validator,
+        ):
+            if candidate == previous_reply and not _reply_is_after_prompt(runtime, capture_output, prompt, candidate):
+                time.sleep(1.0)
+                continue
+            if candidate == fresh_reply:
+                stable_hits += 1
+            else:
+                fresh_reply = candidate
+                stable_hits = 1
+            if stable_hits >= 2:
+                runtime.last_reply = candidate
+                runtime._write_state_file(snapshot=snapshot, note="reply_ready", extra={"reply": candidate})
+                return candidate
+        time.sleep(1.0)
+    return reply
+
+
+def get_runtime_metadata(
+        *,
+        folder_path=None,
+        agent_name="codex",
+        model_name="gpt-5.4",
+        reasoning_effort="high",
+):
+    runtime = _build_runtime(
+        folder_path=folder_path,
+        agent_name=agent_name,
+        model_name=model_name,
+        reasoning_effort=reasoning_effort,
+    )
+    metadata = runtime.get_runtime_metadata()
+    metadata.update(runtime.read_state())
+    return metadata
+
+
 def init_codex(
         prompt,
         folder_path=None,
-        model_name="gpt-5.1-codex-mini",
-        reasoning_effort="low",
+        model_name="gpt-5.4",
+        reasoning_effort="high",
         timeout=300,
         output_schema_path=None,
+        agent_name="codex",
+        required_token=None,
+        reply_validator=None,
 ):
     """
-    初始化一个 codex 对话 session。
-
-    参数:
-        prompt (str): 输入的提示词或指令
-        folder_path (str | None): codex 的工作目录；为 None 时不传 --cd，使用当前进程工作目录
-        model_name (str): 使用的模型名称，默认为"gpt-5.1-codex-mini"
-        reasoning_effort (str): 推理努力程度，可选值有"low"等，默认为"low"
-        timeout (int): 命令执行超时时间（秒），默认为300秒
-    返回值:
-        tuple: 包含三个元素的元组 (信息列表, 智能体的回答, session_ID)
+    初始化一个 tmux + codex cli 长会话，并发送首条 prompt。
     """
-    # 构造codex执行命令的参数列表
-    output_last_message_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-    output_last_message_path = output_last_message_file.name
-    output_last_message_file.close()
-    init_cmd = _build_exec_cmd(
+    runtime = _build_runtime(
+        folder_path=folder_path,
+        agent_name=agent_name,
         model_name=model_name,
         reasoning_effort=reasoning_effort,
-        output_last_message_path=output_last_message_path,
-        folder_path=folder_path,
-        output_schema_path=output_schema_path,
     )
-    init_cmd.append(prompt)
-    # 运行命令并解析结果
-    events, errs, return_code, parse_warnings = run_codex(init_cmd, timeout=timeout)
-    return _finalize_exec_result(
-        events=events,
-        errs=errs,
-        return_code=return_code,
-        parse_warnings=parse_warnings,
-        output_last_message_path=output_last_message_path,
-    )
+    try:
+        runtime.restart_agent()
+        reply = _ask_until_stable_reply(
+            runtime,
+            prompt=prompt,
+            timeout=timeout,
+            required_token=required_token,
+            reply_validator=reply_validator,
+        )
+        _stabilize_runtime_session_id(runtime)
+        responses = _collect_runtime_info(runtime, action="init", output_schema_path=output_schema_path)
+        return responses, reply, runtime.agent_session_id or None
+    except Exception as error:
+        return (
+            _build_error_responses(runtime, action="init_failed", error=error, output_schema_path=output_schema_path),
+            "",
+            runtime.agent_session_id or None,
+        )
 
 
-# 恢复一个已经存在的 codex 对话 session
 def resume_codex(
         thread_id,
         folder_path,
         prompt,
-        model_name="gpt-5.1-codex-mini",
-        reasoning_effort="low",
+        model_name="gpt-5.4",
+        reasoning_effort="high",
         timeout=300,
         output_schema_path=None,
+        agent_name="codex",
+        required_token=None,
+        reply_validator=None,
 ):
     """
-    恢复Codex会话并执行指定的提示
-
-    参数:
-        thread_id (str): 会话线程ID，用于标识要恢复的会话
-        folder_path (str): 工作目录路径，命令将在该目录下执行
-        prompt (str): 要执行的提示内容
-        model_name (str, optional): 使用的模型名称，默认为"gpt-5.1-codex-mini"
-        reasoning_effort (str, optional): 推理努力程度，可选值通常为"low"/"medium"/"high"，默认为"low"
-        timeout (int, optional): 命令执行超时时间(秒)，默认为300秒
-    返回:
-        tuple: 包含处理结果的元组，通常为(信息列表, 智能体的回答, session_ID)
+    恢复一个已经存在的 tmux + codex cli 长会话，并继续发送 prompt。
     """
-    if thread_id is None:
-        return (["[error] → thread_id 为空，无法 resume；请先确保 init_codex 成功返回 thread_id。"],
-                "thread_id 为空，无法恢复会话。",
-                None)
-    # 构造codex执行命令的参数列表
-    output_last_message_file = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
-    output_last_message_path = output_last_message_file.name
-    output_last_message_file.close()
-    init_cmd = _build_exec_cmd(
+    if not thread_id:
+        return (
+            ["[error] → thread_id 为空，无法恢复 tmux + codex cli 会话。"],
+            "",
+            None,
+        )
+
+    runtime = _build_runtime(
+        folder_path=folder_path,
+        agent_name=agent_name,
         model_name=model_name,
         reasoning_effort=reasoning_effort,
-        output_last_message_path=output_last_message_path,
-        folder_path=folder_path,
-        output_schema_path=output_schema_path,
     )
-    init_cmd.extend(["resume", thread_id, prompt])
-    # 运行命令并解析结果
-    events, errs, return_code, parse_warnings = run_codex(init_cmd, timeout=timeout)
-    return _finalize_exec_result(
-        events=events,
-        errs=errs,
-        return_code=return_code,
-        parse_warnings=parse_warnings,
-        output_last_message_path=output_last_message_path,
-        thread_id_hint=thread_id,
-    )
+    runtime.agent_session_id = str(thread_id).strip()
+
+    action = "resume"
+    try:
+        if runtime.is_agent_process_running():
+            action = "reuse_running_tmux_agent"
+        else:
+            result = runtime.resume_cli_session(
+                prompt=None,
+                attach_if_running=False,
+                attach_after_resume=False,
+                timeout_sec=max(60.0, min(float(timeout), 180.0)),
+            )
+            action = result.action
+        runtime.shell_initialized = True
+        runtime.agent_initialized = True
+        reply = _ask_until_stable_reply(
+            runtime,
+            prompt=prompt,
+            timeout=timeout,
+            required_token=required_token,
+            reply_validator=reply_validator,
+        )
+        _stabilize_runtime_session_id(runtime)
+        responses = _collect_runtime_info(runtime, action=action, output_schema_path=output_schema_path)
+        return responses, reply, runtime.agent_session_id or str(thread_id).strip()
+    except Exception as error:
+        return (
+            _build_error_responses(runtime, action=f"{action}_failed", error=error, output_schema_path=output_schema_path),
+            "",
+            runtime.agent_session_id or str(thread_id).strip(),
+        )
 
 
 if __name__ == "__main__":
     cd_path = os.path.dirname(os.path.abspath(__file__))
-    init_prompt = """记住: 使用中文进行对话和文档编写。后续我会做一个简单的恢复测试。"""
-    _, msg, session_id = init_codex(init_prompt, cd_path)
+    init_prompt = "请记住：AutoCodex 已切换到 tmux + codex cli 长会话模式。"
+    _, msg, session_id = init_codex(
+        init_prompt,
+        folder_path=cd_path,
+        model_name="gpt-5.4",
+        reasoning_effort="medium",
+        timeout=120,
+        agent_name="demo",
+    )
     print(msg)
-    resume_prompt = """请记住一个测试事实: AutoCodex 是一个多智能体编排器。"""
-    _, msg, _ = resume_codex(session_id, cd_path, resume_prompt,
-                             "gpt-5.1-codex-mini", "low", 300)
-    resume_prompt = """刚刚让你记住的测试事实是什么? 请用一句话回答。"""
-    print(msg)
-    _, msg, _ = resume_codex(session_id, cd_path, resume_prompt,
-                             "gpt-5.1-codex-mini", "low", 300)
+    _, msg, _ = resume_codex(
+        session_id,
+        folder_path=cd_path,
+        prompt="刚刚让你记住的事实是什么？请用一句话回答。",
+        model_name="gpt-5.4",
+        reasoning_effort="medium",
+        timeout=120,
+        agent_name="demo",
+    )
     print(msg)
