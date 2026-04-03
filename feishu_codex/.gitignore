@@ -1,0 +1,10 @@
+.idea/
+.benchmarks/
+.pytest_cache/
+.runtime/
+.venv/
+__pycache__/
+*.pyc
+src/*.egg-info/
+src/feishu_codex_bridge.egg-info/
+.feishu_codex_config.json

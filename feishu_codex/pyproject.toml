@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "feishu-codex-bridge"
+version = "0.1.0"
+description = "Feishu to Codex bridge service with exec and tmux backends."
+readme = "README.md"
+requires-python = ">=3.9,<3.11"
+dependencies = [
+  "lark-oapi>=1.5.3,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+feishu-codex-bridge = "feishu_codex_bridge.main:main"
+feishu-codex-init = "feishu_codex_bridge.main:init_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
