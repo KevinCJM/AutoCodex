@@ -44,58 +44,6 @@ fintech_ba = f"""**角色属性：**
 """
 
 
-def _normalize_prompt_path(value: str | Path | None) -> str:
-    if not value:
-        return ""
-    return str(Path(value).expanduser().resolve())
-
-
-def _build_hitl_runtime_protocol(
-        *,
-        stage_name: str,
-        stage_status_path: str | Path | None,
-        turn_status_path: str | Path | None,
-        turn_id: str,
-        turn_phase: str,
-        hitl_round: int,
-        output_path: str | Path | None,
-        question_path: str | Path | None,
-        record_path: str | Path | None,
-        status_schema_version: str,
-) -> str:
-    stage_status_text = _normalize_prompt_path(stage_status_path)
-    if not stage_status_text:
-        return ""
-
-    output_text = _normalize_prompt_path(output_path)
-    question_text = _normalize_prompt_path(question_path)
-    record_text = _normalize_prompt_path(record_path)
-    protocol_parts = [
-        "## Runtime Protocol",
-        build_hitl_status_contract_prompt(
-            stage_status_path=stage_status_text,
-            stage_name=stage_name,
-            turn_id=turn_id,
-            hitl_round=hitl_round,
-            output_path=output_text or "<output_path>",
-            question_path=question_text or "<question_path>",
-            record_path=record_text or "<record_path>",
-            status_schema_version=status_schema_version,
-        ),
-    ]
-    turn_status_text = _normalize_prompt_path(turn_status_path)
-    if turn_status_text:
-        protocol_parts.append(
-            build_turn_status_contract_prompt(
-                turn_status_path=turn_status_text,
-                turn_id=turn_id,
-                turn_phase=turn_phase,
-                stage_status_path=stage_status_text,
-            )
-        )
-    return "\n\n".join(protocol_parts)
-
-
 # 初始化临时的 [需求读取器] 智能体, 读取 Notion 内的需求文档, 转为md的原始需求
 def get_notion_requirement(
         notion_url,
