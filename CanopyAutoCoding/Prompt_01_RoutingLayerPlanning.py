@@ -47,6 +47,8 @@ If the first bounded scan already reveals likely module families, entry points, 
 Do not spend long in planning mode after the bounded scan.
 
 After the first bounded scan, you must immediately do the first write by creating or overwriting all 4 required output files.
+After the first bounded scan, your next shell action must be a write action that creates at least one of the 4 required files.
+Do not do another read/search/list command before that first write.
 
 The first write may use grounded placeholders such as:
 
@@ -56,6 +58,7 @@ The first write may use grounded placeholders such as:
 
 Do not wait for perfect completeness before creating the files.
 Write the file skeletons first, then fill them in place.
+If you catch yourself writing a planning note instead of files, stop and write the files.
 
 This task is document generation only.
 Do not plan code changes, patches, or review workflows.
@@ -430,6 +433,7 @@ That means:
 * after the first bounded scan, create or overwrite all 4 required files before doing any further extended exploration
 * if some fields are still incomplete, write grounded placeholders first and refine them in place
 * do not stay in planning mode once the first bounded scan is finished
+* after the first bounded scan, the next shell action must be a file write, not another read/search/list command
 * if a detail is low-value for routing, do not keep digging for it
 
 This stage is successful when the 4 routing files are correctly produced, not when every visible file has been read.

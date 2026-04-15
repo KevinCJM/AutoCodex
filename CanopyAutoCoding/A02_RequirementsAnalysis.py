@@ -37,7 +37,6 @@ from Prompt_02_RequirementsAnalysis import (
     REQUIREMENTS_STATUS_SCHEMA_VERSION,
     fintech_ba,
     get_notion_requirement,
-    get_notion_requirement_hitl,
     hitl_bck,
     requirements_understand,
 )
@@ -305,6 +304,39 @@ def format_notion_failure_message(status_payload: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def build_notion_followup_prompt(
+    human_msg: str,
+    notion_url: str,
+    *,
+    original_requirement_md: str,
+    ask_human_md: str,
+    hitl_record_md: str,
+) -> str:
+    base_prompt = get_notion_requirement(
+        notion_url,
+        original_requirement_md=original_requirement_md,
+        ask_human_md=ask_human_md,
+    )
+    return f"""## Follow-up Context
+你正在继续执行同一 Notion 需求读取任务。
+
+## Human Feedback
+{human_msg}
+
+## Record File
+本轮还必须同步更新记录文件：《{hitl_record_md}》
+
+## Follow-up Requirements
+- 如果人类反馈要求补充读取子页面、关联页面、遗漏段落或特定补充范围，必须把这些补充读取要求纳入本轮处理。
+- 如果本轮成功补充读取，除了完成基础读取任务外，还要把本轮已确认事实写入《{hitl_record_md}》。
+- 如果本轮仍然失败或信息不足，除了写《{ask_human_md}》之外，还要把当前已确认事实、冲突点、待确认范围写入《{hitl_record_md}》。
+- 禁止修改源代码，禁止修改除了《{original_requirement_md}》/《{ask_human_md}》/《{hitl_record_md}》之外的文档。
+
+---
+
+{base_prompt}"""
+
+
 def cleanup_runtime_paths(paths: Sequence[str | Path]) -> tuple[str, ...]:
     removed: list[str] = []
     unique_paths: list[Path] = []
@@ -525,28 +557,17 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
     def initial_prompt_builder(context: HitlPromptContext) -> str:
         return get_notion_requirement(
             notion_url,
-            output_path=context.output_path,
-            hitl_question_path=context.question_path,
-            hitl_record_path=context.record_path,
-            stage_status_path=context.stage_status_path,
-            turn_status_path=context.turn_status_path,
-            hitl_round=context.hitl_round,
-            turn_id=context.turn_id,
-            turn_phase=context.turn_phase,
+            original_requirement_md=str(Path(context.output_path).resolve()),
+            ask_human_md=str(Path(context.question_path).resolve()),
         )
 
     def hitl_prompt_builder(human_msg: str, context: HitlPromptContext) -> str:
-        return get_notion_requirement_hitl(
+        return build_notion_followup_prompt(
             human_msg,
             notion_url,
-            context.record_path,
-            output_path=context.output_path,
-            hitl_question_path=context.question_path,
-            stage_status_path=context.stage_status_path,
-            turn_status_path=context.turn_status_path,
-            hitl_round=context.hitl_round,
-            turn_id=context.turn_id,
-            turn_phase=context.turn_phase,
+            original_requirement_md=str(Path(context.output_path).resolve()),
+            ask_human_md=str(Path(context.question_path).resolve()),
+            hitl_record_md=str(Path(context.record_path).resolve()),
         )
 
     try:
@@ -669,11 +690,6 @@ def run_requirements_analysis(
             requirements_clear_md=str(Path(context.output_path).resolve()),
             ask_human_md=str(Path(context.question_path).resolve()),
             hitl_record_md=str(Path(context.record_path).resolve()),
-            stage_status_path=context.stage_status_path,
-            turn_status_path=context.turn_status_path,
-            hitl_round=context.hitl_round,
-            turn_id=context.turn_id,
-            turn_phase=context.turn_phase,
         )
 
     def hitl_prompt_builder(human_msg: str, context: HitlPromptContext) -> str:
@@ -683,11 +699,6 @@ def run_requirements_analysis(
             hitl_record_md=str(Path(context.record_path).resolve()),
             requirements_clear_md=str(Path(context.output_path).resolve()),
             ask_human_md=str(Path(context.question_path).resolve()),
-            stage_status_path=context.stage_status_path,
-            turn_status_path=context.turn_status_path,
-            hitl_round=context.hitl_round,
-            turn_id=context.turn_id,
-            turn_phase=context.turn_phase,
         )
 
     try:

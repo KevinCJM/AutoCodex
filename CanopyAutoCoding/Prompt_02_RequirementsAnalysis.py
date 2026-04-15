@@ -8,15 +8,9 @@
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
-from textwrap import dedent
 
-from T04_common_prompt import (
-    build_hitl_status_contract_prompt,
-    build_turn_status_contract_prompt,
-    task_start_prompt,
-)
+from T04_common_prompt import task_start_prompt
 
 NOTION_STATUS_SCHEMA_VERSION = "1.0"
 NOTION_STATUS_OK = "completed"
@@ -226,4 +220,9 @@ def hitl_bck(
 
 
 if __name__ == '__main__':
-    pass
+    req_name = 'TimeFrequencyExtension'
+    print(requirements_understand(fintech_ba, init_prompt=task_start_prompt,
+                                  original_requirement_md=f'{req_name}_原始需求.md',
+                                  requirements_clear_md=f'{req_name}_需求澄清.md',
+                                  ask_human_md=f'{req_name}_与人类交流.md',
+                                  hitl_record_md=f'{req_name}_人机交互澄清记录.md'))
