@@ -100,31 +100,7 @@ def _build_hitl_runtime_protocol(
 def get_notion_requirement(
         notion_url,
         original_requirement_md='name_原始需求.md',
-        ask_human_md='name_与人类交流.md',
-        *,
-        output_path: str | Path | None = None,
-        hitl_question_path: str | Path | None = None,
-        hitl_record_path: str | Path | None = None,
-        stage_status_path: str | Path | None = None,
-        turn_status_path: str | Path | None = None,
-        hitl_round: int = 1,
-        turn_id: str = 'read_notion_requirement_1',
-        turn_phase: str = 'requirements_notion_read',
-):
-    original_requirement_md = output_path or original_requirement_md
-    ask_human_md = hitl_question_path or ask_human_md
-    runtime_protocol = _build_hitl_runtime_protocol(
-        stage_name="requirements_notion_intake",
-        stage_status_path=stage_status_path,
-        turn_status_path=turn_status_path,
-        turn_id=turn_id,
-        turn_phase=turn_phase,
-        hitl_round=hitl_round,
-        output_path=original_requirement_md,
-        question_path=ask_human_md,
-        record_path=hitl_record_path,
-        status_schema_version=NOTION_STATUS_SCHEMA_VERSION,
-    )
+        ask_human_md='name_与人类交流.md'):
     get_notion_requirement_prompt = f"""## TASK
 $notion-api-token-ops
 完整读取指定的 Notion 文档. 目标 URL: {notion_url}
@@ -147,78 +123,7 @@ $notion-api-token-ops
 - 禁止修改源代码, 禁止修改除了《{ask_human_md}》和《{original_requirement_md}》之外的文档
 - 如果返回 `完成` 那么《{ask_human_md}》是一个空文件
 - 如果返回 `失败` 那么《{ask_human_md}》是一个非空文件"""
-    if runtime_protocol:
-        get_notion_requirement_prompt = f"""{get_notion_requirement_prompt}
-
-{runtime_protocol}"""
     return get_notion_requirement_prompt
-
-
-def get_notion_requirement_hitl(
-        human_msg,
-        notion_url,
-        requirement_name_or_record_path,
-        hitl_record_md: str | Path | None = None,
-        *,
-        output_path: str | Path | None = None,
-        hitl_question_path: str | Path | None = None,
-        stage_status_path: str | Path | None = None,
-        turn_status_path: str | Path | None = None,
-        hitl_round: int = 1,
-        turn_id: str = 'read_notion_requirement_1',
-        turn_phase: str = 'requirements_notion_read',
-) -> str:
-    if hitl_record_md is None:
-        requirement_name = ""
-        record_path = requirement_name_or_record_path
-    else:
-        requirement_name = str(requirement_name_or_record_path or "").strip()
-        record_path = hitl_record_md
-
-    output_text = output_path or 'name_原始需求.md'
-    question_text = hitl_question_path or 'name_与人类交流.md'
-    record_text = record_path or 'name_需求录入_HITL记录.md'
-    runtime_protocol = _build_hitl_runtime_protocol(
-        stage_name="requirements_notion_intake",
-        stage_status_path=stage_status_path,
-        turn_status_path=turn_status_path,
-        turn_id=turn_id,
-        turn_phase=turn_phase,
-        hitl_round=hitl_round,
-        output_path=output_text,
-        question_path=question_text,
-        record_path=record_text,
-        status_schema_version=NOTION_STATUS_SCHEMA_VERSION,
-    )
-    requirement_hint = f"\n- 当前需求标识: {requirement_name}" if requirement_name else ""
-    prompt = f"""## Context
-你正在继续读取 Notion 需求文档，上一轮读取后收到了来自人类的新补充或修正信息。请基于这些信息继续完善《{output_text}》的读取结果。目标 URL: {notion_url}
-{requirement_hint}
-
-## Human Feedback
-[HITL HUMAN MSG START]
-{human_msg}
-[HITL HUMAN MSG END]
-
-## Current Files
-- 原始需求输出文件: 《{output_text}》
-- HITL 问题文件: 《{question_text}》
-- HITL 记录文件: 《{record_text}》
-
-## Required Action
-1. 基于人类反馈继续读取或修正该 Notion 页面内容。
-2. 若信息已经足够，覆盖写入《{output_text}》，并清空《{question_text}》。
-3. 若仍存在阻断，覆盖写入《{question_text}》说明仍需人类补充的点，并更新《{record_text}》记录已确认事实与待确认边界。
-
-## Output Rules
-- 只能返回 `完成` 或 `HITL`
-- 禁止修改源代码
-- 禁止修改除了《{output_text}》/《{question_text}》/《{record_text}》之外的文件"""
-    if runtime_protocol:
-        prompt = f"""{prompt}
-
-{runtime_protocol}"""
-    return prompt
 
 
 # 输出协议: 要么写入 <需求澄清>, 要么写入 <与人类交流>
@@ -263,26 +168,9 @@ def requirements_understand(
         original_requirement_md='name_原始需求.md',
         requirements_clear_md='name_需求澄清.md',
         ask_human_md='name_与人类交流.md',
-        hitl_record_md='name_人机交互澄清记录.md',
-        stage_status_path: str | Path | None = None,
-        turn_status_path: str | Path | None = None,
-        hitl_round: int = 1,
-        turn_id: str = 'requirements_analysis_1',
-        turn_phase: str = 'requirements_analysis',
+        hitl_record_md='name_人机交互澄清记录.md'
 ):
     output_protocol_prompt = output_protocol(requirements_clear_md, ask_human_md)
-    runtime_protocol = _build_hitl_runtime_protocol(
-        stage_name="requirements_analysis",
-        stage_status_path=stage_status_path,
-        turn_status_path=turn_status_path,
-        turn_id=turn_id,
-        turn_phase=turn_phase,
-        hitl_round=hitl_round,
-        output_path=requirements_clear_md,
-        question_path=ask_human_md,
-        record_path=hitl_record_md,
-        status_schema_version=REQUIREMENTS_STATUS_SCHEMA_VERSION,
-    )
     requirements_understand_prompt = f"""## 角色定位
 {ba_desc}
 
@@ -319,8 +207,6 @@ def requirements_understand(
 - 只要进入 HITL，必须新建或更新《{hitl_record_md}》，记录当前已确认事实、冲突点、待确认边界。
 - 若当前尚无已确认事实，也必须让《{hitl_record_md}》存在，并至少写入当前阻断点摘要。
 
-{runtime_protocol}
-
 ---
 
 {init_prompt}"""
@@ -341,18 +227,6 @@ def hitl_bck(
         turn_phase: str = 'requirements_analysis',
 ):
     output_protocol_prompt = output_protocol(requirements_clear_md, ask_human_md)
-    runtime_protocol = _build_hitl_runtime_protocol(
-        stage_name="requirements_analysis",
-        stage_status_path=stage_status_path,
-        turn_status_path=turn_status_path,
-        turn_id=turn_id,
-        turn_phase=turn_phase,
-        hitl_round=hitl_round,
-        output_path=requirements_clear_md,
-        question_path=ask_human_md,
-        record_path=hitl_record_md,
-        status_schema_version=REQUIREMENTS_STATUS_SCHEMA_VERSION,
-    )
     hitl_bck_prompt = f"""## Context
 你正在处理上一轮基于 原始需求《{original_requirement_md}》和代码分析 提出需求缺口后，人类返回的反馈信息。
 你需要充当一个严格的信息过滤器与状态机，解析人类意图，并在必要时继续追问，直至需求信息 100% 闭环。
@@ -404,9 +278,7 @@ def hitl_bck(
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
 * 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
-* 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。
-
-{runtime_protocol}"""
+* 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。"""
     return hitl_bck_prompt
 
 
