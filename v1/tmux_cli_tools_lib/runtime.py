@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -12,6 +13,7 @@ from pathlib import Path
 
 from .common import (
     BLOCKED_WORKDIRS,
+    CODEX_QUEUED_MESSAGE_PATTERNS,
     SHELL_COMMANDS,
     AgentCliConfig,
     CliBackend,
@@ -114,6 +116,14 @@ class TmuxAgentRuntime:
         if str(resolved) in BLOCKED_WORKDIRS:
             raise ValueError(f"Working directory is not allowed: {resolved}")
         return resolved
+
+    @staticmethod
+    def _paths_equivalent(left: str | Path, right: str | Path) -> bool:
+        """比较两个路径是否指向同一位置，兼容 /var 与 /private/var 等别名差异。"""
+        try:
+            return Path(str(left)).expanduser().resolve() == Path(str(right)).expanduser().resolve()
+        except Exception:
+            return str(left) == str(right)
 
     def _tmux(self, *args: str, input_text: str | None = None, timeout_sec: float = 10.0) -> \
     subprocess.CompletedProcess[str]:
@@ -292,6 +302,49 @@ class TmuxAgentRuntime:
             return {}
         return {}
 
+    def _codex_session_contains_runtime_marker(self, session_file: Path, max_lines: int = 16) -> bool:
+        """检查早期 developer 指令中是否包含当前 runtime marker。"""
+        marker = self._codex_runtime_marker()
+        if not marker:
+            return False
+
+        try:
+            with session_file.open("r", encoding="utf-8", errors="ignore") as file:
+                for _ in range(max_lines):
+                    line = file.readline()
+                    if not line:
+                        break
+                    payload = json.loads(line)
+                    if payload.get("type") != "response_item":
+                        continue
+                    message = payload.get("payload") or {}
+                    if str(message.get("role", "") or "") != "developer":
+                        continue
+                    for content_item in message.get("content", []) or []:
+                        text = str(content_item.get("text", "") or "")
+                        if marker in text:
+                            return True
+        except Exception:
+            return False
+        return False
+
+    def _codex_runtime_marker(self) -> str:
+        """返回写入 Codex developer instructions 的运行时关联标记。"""
+        return f"ACX_RUNTIME_SESSION={self.session_name}"
+
+    def _codex_session_matches_runtime(self, meta: dict[str, object], session_file: Path | None = None) -> bool:
+        """判断某个 Codex session_meta 是否属于当前 runtime。"""
+        if not self._paths_equivalent(str(meta.get("cwd", "")), self.work_dir):
+            return False
+        base_instructions = meta.get("base_instructions") or {}
+        if isinstance(base_instructions, Mapping):
+            instructions_text = str(base_instructions.get("text", "") or "")
+            if self._codex_runtime_marker() in instructions_text:
+                return True
+        if session_file and self._codex_session_contains_runtime_marker(session_file):
+            return True
+        return False
+
     def _discover_latest_codex_session_id(self, started_after: float | None = None) -> str:
         """
         根据工作目录反查最近的 Codex session_id。
@@ -303,7 +356,8 @@ class TmuxAgentRuntime:
 
         best_path: Path | None = None
         best_mtime = -1.0
-        work_dir = str(self.work_dir)
+        fallback_path: Path | None = None
+        fallback_mtime = -1.0
         for session_file in self._iter_recent_codex_session_files():
             stat = session_file.stat()
             if started_after is not None and stat.st_mtime + 2 < started_after:
@@ -311,15 +365,21 @@ class TmuxAgentRuntime:
             meta = self._read_codex_session_meta(session_file)
             if not meta:
                 continue
-            if str(meta.get("cwd", "")) != work_dir:
-                continue
             session_id = str(meta.get("id", "") or "")
             if not session_id:
                 continue
-            if stat.st_mtime > best_mtime:
+            if self._codex_session_matches_runtime(meta, session_file=session_file) and stat.st_mtime > best_mtime:
                 best_mtime = stat.st_mtime
                 best_path = session_file
+                continue
+            if not self._paths_equivalent(str(meta.get("cwd", "")), self.work_dir):
+                continue
+            if stat.st_mtime > fallback_mtime:
+                fallback_mtime = stat.st_mtime
+                fallback_path = session_file
 
+        if best_path is None:
+            best_path = fallback_path
         if best_path is None:
             return ""
 
@@ -370,7 +430,7 @@ class TmuxAgentRuntime:
             meta = self._read_claude_session_meta(session_file)
             if not meta:
                 continue
-            if str(meta.get("cwd", "")) != work_dir:
+            if not self._paths_equivalent(str(meta.get("cwd", "")), work_dir):
                 continue
             session_id = str(meta.get("id", "") or "")
             if not session_id:
@@ -448,7 +508,7 @@ class TmuxAgentRuntime:
             meta = self._read_gemini_session_meta(session_file)
             if not meta:
                 continue
-            if str(meta.get("cwd", "")) != work_dir:
+            if not self._paths_equivalent(str(meta.get("cwd", "")), work_dir):
                 continue
             session_id = str(meta.get("id", "") or "")
             if not session_id:
@@ -802,6 +862,64 @@ class TmuxAgentRuntime:
             return ""
         return self.raw_log_path.read_text(encoding="utf-8", errors="replace")
 
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        """压缩空白，便于在 tmux 捕获文本里做 prompt 锚点匹配。"""
+        return re.sub(r"\s+", " ", str(text or "")).strip()
+
+    def _prompt_anchor_candidates(self, message: str, max_lines: int = 3, max_chars: int = 80) -> list[str]:
+        """为当前 prompt 提取少量稳定锚点，避免全量长文本在 TUI 中匹配失败。"""
+        anchors: list[str] = []
+        for line in str(message or "").splitlines():
+            normalized = self._normalize_text(line)
+            if not normalized:
+                continue
+            fragment = normalized[:max_chars].strip()
+            if len(fragment) < 8:
+                continue
+            if fragment not in anchors:
+                anchors.append(fragment)
+            if len(anchors) >= max_lines:
+                break
+        if anchors:
+            return anchors
+
+        fallback = self._normalize_text(message)[:max_chars].strip()
+        return [fallback] if fallback else []
+
+    def _output_mentions_prompt(self, text: str, prompt: str) -> bool:
+        """判断当前输出里是否已经出现本轮 prompt 的可识别锚点。"""
+        normalized_output = self._normalize_text(text)
+        if not normalized_output:
+            return False
+        return any(anchor in normalized_output for anchor in self._prompt_anchor_candidates(prompt))
+
+    def _read_raw_log_size(self) -> int:
+        """读取 raw log 当前字节大小，便于识别新一轮消息是否已落到终端流中。"""
+        try:
+            return self.raw_log_path.stat().st_size
+        except FileNotFoundError:
+            return 0
+
+    def _read_raw_log_delta(self, start_offset: int) -> str:
+        """读取从指定偏移量开始新增的 raw log 内容。"""
+        if not self.raw_log_path.exists():
+            return ""
+        with self.raw_log_path.open("rb") as file:
+            file.seek(max(0, int(start_offset)))
+            return file.read().decode("utf-8", errors="replace")
+
+    def _has_queued_submission_ui(self, text: str) -> bool:
+        """识别 Codex 将消息暂存到下一次 tool call 的队列提示。"""
+        return any(re.search(pattern, str(text or ""), re.IGNORECASE) for pattern in CODEX_QUEUED_MESSAGE_PATTERNS)
+
+    def _extract_reply_if_ready(self, output: str) -> str:
+        """尝试提取当前 pane 的最后答复；如果还不到稳定答复阶段则返回空串。"""
+        try:
+            return str(self.detector.extract_last_message(output) or "").strip()
+        except Exception:
+            return ""
+
     def wait_for_shell_ready(self, timeout_sec: float = 12.0, require_work_dir: bool = True) -> None:
         """
         等待 shell 真正可用。
@@ -864,6 +982,93 @@ class TmuxAgentRuntime:
         self.send_text("echo ready", enter_count=1)
         time.sleep(1.5)
 
+    def _wait_for_agent_ready(
+            self,
+            *,
+            started_after: float | None,
+            timeout_sec: float,
+            action_label: str,
+            trust_note: str,
+            update_note: str,
+            model_note: str,
+            ready_note: str,
+            ready_extra: Mapping[str, object] | None = None,
+    ) -> SessionSnapshot:
+        """
+        等待当前 pane 中的 CLI 真正进入可交互状态。
+
+        这里统一处理启动/恢复阶段可能出现的拦截式提示，例如工作区信任确认或模型升级选择菜单。
+        """
+        agent_name = self.cli_config.display_name()
+        deadline = time.monotonic() + timeout_sec
+        last_trust_ack = 0.0
+        last_update_ack = 0.0
+        last_model_ack = 0.0
+
+        while time.monotonic() < deadline:
+            if not self.target_exists():
+                raise RuntimeError(f"tmux pane exited while {agent_name} was {action_label}")
+
+            snapshot = self.take_snapshot(tail_lines=220)
+            if snapshot.pane_dead:
+                raise RuntimeError(f"tmux pane died while {agent_name} was {action_label}:\n{snapshot.raw_output}")
+
+            now = time.monotonic()
+            if self.detector.has_trust_prompt(snapshot.clean_output):
+                if now - last_trust_ack > 1.0:
+                    self.send_special_key("Enter")
+                    last_trust_ack = now
+                    self._append_clean_log_snapshot(trust_note, snapshot=snapshot)
+                time.sleep(0.5)
+                continue
+
+            if self.detector.has_update_prompt(snapshot.clean_output):
+                if now - last_update_ack > 1.0:
+                    self.send_special_key("Down")
+                    time.sleep(0.1)
+                    self.send_special_key("Down")
+                    time.sleep(0.1)
+                    self.send_special_key("Enter")
+                    last_update_ack = now
+                    self._append_clean_log_snapshot(update_note, snapshot=snapshot)
+                time.sleep(0.5)
+                continue
+
+            if self.detector.has_model_selection_prompt(snapshot.clean_output):
+                if now - last_model_ack > 1.0:
+                    self.send_special_key("Down")
+                    time.sleep(0.1)
+                    self.send_special_key("Enter")
+                    last_model_ack = now
+                    self._append_clean_log_snapshot(model_note, snapshot=snapshot)
+                time.sleep(0.5)
+                continue
+
+            if snapshot.confirmed_status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
+                if (
+                    snapshot.current_command in self.cli_config.expected_current_commands()
+                    or self.detector.has_welcome_banner(snapshot.clean_output)
+                ):
+                    if started_after is None:
+                        self._refresh_agent_session_id()
+                    else:
+                        self._refresh_agent_session_id(started_after=started_after)
+                    self._append_clean_log_snapshot(ready_note, snapshot=snapshot)
+                    if ready_extra:
+                        self._write_state_file(snapshot=snapshot, note=ready_note, extra=dict(ready_extra))
+                    else:
+                        self._write_state_file(snapshot=snapshot, note=ready_note)
+                    self.agent_initialized = True
+                    return snapshot
+
+            if snapshot.current_command in SHELL_COMMANDS and self.detector.looks_like_shell_prompt(
+                    snapshot.clean_output):
+                raise RuntimeError(f"{agent_name} exited back to shell while {action_label}.\n{snapshot.raw_output}")
+
+            time.sleep(0.5)
+
+        raise RuntimeError(f"Timed out waiting for {agent_name} while {action_label}.\n{self.capture(240)}")
+
     def prepare_shell(self, recreate: bool = False, rerun_prelaunch: bool = False) -> SessionSnapshot:
         """
         准备一个可用的 tmux shell 环境。
@@ -889,48 +1094,17 @@ class TmuxAgentRuntime:
 
         启动期间如果出现工作区信任提示，会自动确认默认项；如果 CLI 直接掉回 shell，会明确抛错。
         """
-        agent_name = self.cli_config.display_name()
         launch_started_at = time.time()
         self.send_text(self.cli_config.build_command(), enter_count=1)
-        deadline = time.monotonic() + timeout_sec
-        last_trust_ack = 0.0
-
-        while time.monotonic() < deadline:
-            if not self.target_exists():
-                raise RuntimeError(f"tmux pane exited while {agent_name} was starting")
-
-            snapshot = self.take_snapshot(tail_lines=220)
-            if snapshot.pane_dead:
-                raise RuntimeError(f"tmux pane died while {agent_name} was starting:\n{snapshot.raw_output}")
-
-            if self.detector.has_trust_prompt(snapshot.clean_output):
-                now = time.monotonic()
-                if now - last_trust_ack > 1.0:
-                    self.send_special_key("Enter")
-                    last_trust_ack = now
-                    self._append_clean_log_snapshot("trust_prompt_ack", snapshot=snapshot)
-                time.sleep(0.5)
-                continue
-
-            if snapshot.confirmed_status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
-                if (
-                    snapshot.current_command in self.cli_config.expected_current_commands()
-                    or self.detector.has_welcome_banner(snapshot.clean_output)
-                ):
-                    self._refresh_agent_session_id(started_after=launch_started_at)
-                    self._append_clean_log_snapshot("agent_ready", snapshot=snapshot)
-                    self._write_state_file(snapshot=snapshot, note="agent_ready")
-                    self.agent_initialized = True
-                    return snapshot
-
-            # 如果已经明确回到 shell prompt，说明 CLI 启动失败或提前退出了。
-            if snapshot.current_command in SHELL_COMMANDS and self.detector.looks_like_shell_prompt(
-                    snapshot.clean_output):
-                raise RuntimeError(f"{agent_name} exited back to shell before becoming ready.\n{snapshot.raw_output}")
-
-            time.sleep(0.5)
-
-        raise RuntimeError(f"Timed out waiting for {agent_name} to become ready.\n{self.capture(240)}")
+        return self._wait_for_agent_ready(
+            started_after=launch_started_at,
+            timeout_sec=timeout_sec,
+            action_label="starting",
+            trust_note="trust_prompt_ack",
+            update_note="update_prompt_skip",
+            model_note="model_selection_prompt_ack",
+            ready_note="agent_ready",
+        )
 
     def ensure_agent_ready(self, recreate_session: bool = False) -> SessionSnapshot:
         """
@@ -951,9 +1125,27 @@ class TmuxAgentRuntime:
 
         if self.agent_initialized and self.target_exists():
             snapshot = self.take_snapshot(tail_lines=220)
-            if snapshot.current_command in self.cli_config.expected_current_commands():
+            if (
+                snapshot.current_command in self.cli_config.expected_current_commands()
+                and snapshot.confirmed_status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}
+                and not self.detector.has_trust_prompt(snapshot.clean_output)
+                and not self.detector.has_model_selection_prompt(snapshot.clean_output)
+            ):
                 return snapshot
             self.agent_initialized = False
+
+        if self.target_exists():
+            snapshot = self.take_snapshot(tail_lines=220)
+            if snapshot.current_command in self.cli_config.expected_current_commands():
+                return self._wait_for_agent_ready(
+                    started_after=None,
+                    timeout_sec=60.0,
+                    action_label="becoming ready",
+                    trust_note="ready_trust_prompt_ack",
+                    update_note="ready_update_prompt_skip",
+                    model_note="ready_model_selection_prompt_ack",
+                    ready_note="agent_ready",
+                )
 
         return self.launch_agent()
 
@@ -975,7 +1167,6 @@ class TmuxAgentRuntime:
         if not self.agent_session_id:
             raise RuntimeError(f"No recorded {self.cli_config.display_name()} session_id found for resume")
 
-        agent_name = self.cli_config.display_name()
         resume_started_at = time.time()
         resume_command = self.cli_config.build_resume_command(
             session_id=self.agent_session_id,
@@ -983,50 +1174,19 @@ class TmuxAgentRuntime:
             prompt=prompt,
         )
         self.send_text(resume_command, enter_count=1)
-        deadline = time.monotonic() + timeout_sec
-        last_trust_ack = 0.0
-
-        while time.monotonic() < deadline:
-            if not self.target_exists():
-                raise RuntimeError(f"tmux pane exited while {agent_name} was resuming")
-
-            snapshot = self.take_snapshot(tail_lines=220)
-            if snapshot.pane_dead:
-                raise RuntimeError(f"tmux pane died while {agent_name} was resuming:\n{snapshot.raw_output}")
-
-            if self.detector.has_trust_prompt(snapshot.clean_output):
-                now = time.monotonic()
-                if now - last_trust_ack > 1.0:
-                    self.send_special_key("Enter")
-                    last_trust_ack = now
-                    self._append_clean_log_snapshot("resume_trust_prompt_ack", snapshot=snapshot)
-                time.sleep(0.5)
-                continue
-
-            if snapshot.confirmed_status in {TerminalStatus.IDLE, TerminalStatus.COMPLETED}:
-                if (
-                    snapshot.current_command in self.cli_config.expected_current_commands()
-                    or self.detector.has_welcome_banner(snapshot.clean_output)
-                ):
-                    self._refresh_agent_session_id(started_after=resume_started_at)
-                    self.agent_initialized = True
-                    self._append_clean_log_snapshot("agent_resumed", snapshot=snapshot)
-                    self._write_state_file(
-                        snapshot=snapshot,
-                        note="agent_resumed",
-                        extra={
-                            "resume_action": "resume_in_shell",
-                            **self._build_session_id_payload(),
-                        },
-                    )
-                    return snapshot
-
-            if snapshot.current_command in SHELL_COMMANDS and self.detector.looks_like_shell_prompt(snapshot.clean_output):
-                raise RuntimeError(f"{agent_name} returned to shell while resuming.\n{snapshot.raw_output}")
-
-            time.sleep(0.5)
-
-        raise RuntimeError(f"Timed out waiting for {agent_name} resume.\n{self.capture(240)}")
+        return self._wait_for_agent_ready(
+            started_after=resume_started_at,
+            timeout_sec=timeout_sec,
+            action_label="resuming",
+            trust_note="resume_trust_prompt_ack",
+            update_note="resume_update_prompt_skip",
+            model_note="resume_model_selection_prompt_ack",
+            ready_note="agent_resumed",
+            ready_extra={
+                "resume_action": "resume_in_shell",
+                **self._build_session_id_payload(),
+            },
+        )
 
     def resume_cli_session(
         self,
@@ -1178,30 +1338,45 @@ class TmuxAgentRuntime:
 
         如果消息发出后长时间仍停留在 idle，会补发一次 Enter，处理某些输入框把第一次 Enter 当作结束多行输入的问题。
         """
+        baseline_raw_offset = self._read_raw_log_size()
         self.last_prompt = message
         self.send_text(message, enter_count=self.cli_config.submit_enter_count())
         deadline = time.monotonic() + timeout_sec
         extra_enter_sent = False
         submit_started_at = time.monotonic()
+        submission_observed = False
 
         while time.monotonic() < deadline:
             snapshot = self.take_snapshot(tail_lines=320)
             if snapshot.pane_dead:
                 raise RuntimeError(f"tmux pane died after sending message:\n{snapshot.raw_output}")
 
-            if snapshot.detected_status == TerminalStatus.PROCESSING:
+            raw_delta = self._read_raw_log_delta(baseline_raw_offset)
+            prompt_visible = self._output_mentions_prompt(snapshot.clean_output, message) or self._output_mentions_prompt(
+                raw_delta,
+                message,
+            )
+            queued_submission = self._has_queued_submission_ui(snapshot.clean_output) or self._has_queued_submission_ui(
+                raw_delta,
+            )
+            submission_observed = submission_observed or prompt_visible or queued_submission
+
+            if snapshot.detected_status == TerminalStatus.PROCESSING and (submission_observed or raw_delta.strip()):
                 self._append_clean_log_snapshot("message_processing", snapshot=snapshot)
                 self._write_state_file(snapshot=snapshot, note="message_processing")
                 return snapshot
 
-            if snapshot.confirmed_status in {
-                TerminalStatus.COMPLETED,
-                TerminalStatus.WAITING_USER_ANSWER,
-                TerminalStatus.ERROR,
-            }:
-                self._append_clean_log_snapshot("message_terminal_state", snapshot=snapshot)
-                self._write_state_file(snapshot=snapshot, note="message_terminal_state")
-                return snapshot
+            if snapshot.confirmed_status == TerminalStatus.COMPLETED:
+                if submission_observed and self._extract_reply_if_ready(snapshot.raw_output):
+                    self._append_clean_log_snapshot("message_terminal_state", snapshot=snapshot)
+                    self._write_state_file(snapshot=snapshot, note="message_terminal_state")
+                    return snapshot
+
+            if snapshot.confirmed_status in {TerminalStatus.WAITING_USER_ANSWER, TerminalStatus.ERROR}:
+                if submission_observed or raw_delta.strip():
+                    self._append_clean_log_snapshot("message_terminal_state", snapshot=snapshot)
+                    self._write_state_file(snapshot=snapshot, note="message_terminal_state")
+                    return snapshot
 
             if (
                     snapshot.confirmed_status == TerminalStatus.IDLE
@@ -1212,6 +1387,14 @@ class TmuxAgentRuntime:
                 extra_enter_sent = True
                 self._append_clean_log_snapshot("extra_enter_sent", snapshot=snapshot)
                 self._write_state_file(snapshot=snapshot, note="extra_enter_sent")
+
+            if snapshot.confirmed_status in {
+                TerminalStatus.COMPLETED,
+                TerminalStatus.WAITING_USER_ANSWER,
+                TerminalStatus.ERROR,
+            } and not submission_observed:
+                time.sleep(0.5)
+                continue
 
             time.sleep(0.5)
 
@@ -1225,6 +1408,9 @@ class TmuxAgentRuntime:
         deadline = time.monotonic() + timeout_sec
         seen_processing = False
         last_snapshot: SessionSnapshot | None = None
+        completed_candidate_key: tuple[str, int] | None = None
+        completed_candidate_since = 0.0
+        reply_settle_sec = max(1.0, self.state_minimum_sec)
 
         while time.monotonic() < deadline:
             snapshot = self.take_snapshot(tail_lines=500)
@@ -1234,17 +1420,32 @@ class TmuxAgentRuntime:
 
             if snapshot.detected_status == TerminalStatus.PROCESSING or snapshot.confirmed_status == TerminalStatus.PROCESSING:
                 seen_processing = True
+                completed_candidate_key = None
+                completed_candidate_since = 0.0
+                time.sleep(0.5)
+                continue
 
-            if snapshot.confirmed_status in {
-                TerminalStatus.COMPLETED,
-                TerminalStatus.WAITING_USER_ANSWER,
-                TerminalStatus.ERROR,
-            }:
-                # 一旦曾经进入 processing，再看到终态时就可以认为本轮交互已经收束。
-                if seen_processing or snapshot.confirmed_status != TerminalStatus.COMPLETED:
-                    self._append_clean_log_snapshot("reply_terminal_state", snapshot=snapshot)
-                    self._write_state_file(snapshot=snapshot, note="reply_terminal_state")
-                    return snapshot
+            if snapshot.confirmed_status in {TerminalStatus.WAITING_USER_ANSWER, TerminalStatus.ERROR}:
+                self._append_clean_log_snapshot("reply_terminal_state", snapshot=snapshot)
+                self._write_state_file(snapshot=snapshot, note="reply_terminal_state")
+                return snapshot
+
+            if snapshot.confirmed_status == TerminalStatus.COMPLETED:
+                reply = self._extract_reply_if_ready(snapshot.raw_output)
+                if reply and (seen_processing or snapshot.detected_status == TerminalStatus.COMPLETED):
+                    candidate_key = (reply, self._read_raw_log_size())
+                    if candidate_key != completed_candidate_key:
+                        completed_candidate_key = candidate_key
+                        completed_candidate_since = snapshot.timestamp
+                    elif snapshot.timestamp - completed_candidate_since >= reply_settle_sec:
+                        self._append_clean_log_snapshot("reply_terminal_state", snapshot=snapshot)
+                        self._write_state_file(snapshot=snapshot, note="reply_terminal_state")
+                        return snapshot
+                    time.sleep(0.5)
+                    continue
+
+            completed_candidate_key = None
+            completed_candidate_since = 0.0
 
             time.sleep(0.5)
 

@@ -58,7 +58,8 @@ $notion-api-token-ops
 ```md
 - 以 bullet 格式写明Notion文档信息获取失败的原因
 ```
-2. 返回 `失败`
+2. 在《{original_requirement_md}》中覆盖写入空数据
+3. 返回 `失败`
 
 ## 要求
 - 只能返回 "完成", 禁止返回其他文字
