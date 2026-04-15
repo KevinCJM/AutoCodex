@@ -219,12 +219,7 @@ def hitl_bck(
         original_requirement_md='name_原始需求.md',
         hitl_record_md='name_人机交互澄清记录.md',
         requirements_clear_md='name_需求澄清.md',
-        ask_human_md='name_与人类交流.md',
-        stage_status_path: str | Path | None = None,
-        turn_status_path: str | Path | None = None,
-        hitl_round: int = 1,
-        turn_id: str = 'requirements_analysis_1',
-        turn_phase: str = 'requirements_analysis',
+        ask_human_md='name_与人类交流.md'
 ):
     output_protocol_prompt = output_protocol(requirements_clear_md, ask_human_md)
     hitl_bck_prompt = f"""## Context
