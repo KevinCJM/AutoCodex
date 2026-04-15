@@ -62,9 +62,9 @@ $notion-api-token-ops
 
 ## 要求
 - 只能返回 "完成", 禁止返回其他文字
-- 禁止修改源代码, 禁止修改除了《{ask_human_md}》和《{original_requirement_md}》之外的文档
-- 如果返回 `完成` 那么《{ask_human_md}》是一个空文件
-- 如果返回 `失败` 那么《{ask_human_md}》是一个非空文件"""
+- 禁止修改源代码, 禁止修改除了《{ask_human_md}》和《{original_requirement_md}》之外的文档;
+- 如果返回 `完成` 那么《{ask_human_md}》是一个空文件,《{original_requirement_md}》是非空文件;
+- 如果返回 `失败` 那么《{ask_human_md}》是一个非空文件,《{original_requirement_md}》是空文件."""
     return get_notion_requirement_prompt
 
 
@@ -226,3 +226,26 @@ if __name__ == '__main__':
                                   requirements_clear_md=f'{req_name}_需求澄清.md',
                                   ask_human_md=f'{req_name}_与人类交流.md',
                                   hitl_record_md=f'{req_name}_人机交互澄清记录.md'))
+    from T01_tools import write_dict_to_json
+
+    the_data = {
+        "需求获取": {
+            "需求获取": False
+        },
+        "需求澄清": {
+            "需求澄清": False
+        },
+        "需求评审": {
+            "需求评审": True
+        },
+        "详细设计": {
+            "详细设计": False
+        },
+        "任务拆分": {
+            "任务拆分": False
+        }
+    }
+    requirement_name = 'TimeFrequencyExtension'
+    the_dir = '/Users/chenjunming/Desktop/v3_dev/canopy-api-v3'
+    write_dict_to_json(file_path=f'{the_dir}/{requirement_name}_开发前期.json',
+                       data=the_data)
