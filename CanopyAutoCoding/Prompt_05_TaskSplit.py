@@ -225,7 +225,8 @@ def task_md_to_json(task_md='name_任务单.md', task_json='name_任务单.json'
     "M2-T1": false,
     "M2-T2": false
   }}
-}}"""
+}}
+```"""
     return task_md_to_json_prompt
 
 
@@ -248,6 +249,7 @@ def re_task_md_to_json(task_md='name_任务单.md', task_json='name_任务单.js
     "M2-T2": false
   }}
 }}
+```
 
 重新解析《{task_md}》覆盖输出到《{task_json}》"""
     print(re_task_md_to_json_prompt)
@@ -257,10 +259,10 @@ if __name__ == '__main__':
     from T04_common_prompt import check_reviewer_job
     from T01_tools import create_empty_json_files, is_standard_task_initial_json, task_done, get_markdown_content
 
-    requirement_name = 'RealLifeCost'
-    the_dir = '/Users/chenjunming/Desktop/Canopy/canopy-api-v3'
+    requirement_name = 'TimeFrequencyExtension'
+    the_dir = '/Users/chenjunming/Desktop/v3_dev/canopy-api-v3'
     t_name = "任务拆分"
-    agent_n_list = ['C', 'CC', 'G']
+    agent_n_list = ['C1', 'C2']
 
     # 1) 生成任务单
     # print(task_split(task_md=f'{requirement_name}_任务单.md', detail_design_md=f'{requirement_name}_详细设计.md',
@@ -268,20 +270,20 @@ if __name__ == '__main__':
     #                  original_requirement_md=f'{requirement_name}_原始需求.md',
     #                  requirements_clear_md=f'{requirement_name}_需求澄清.md'))
 
-    # 2) 审核任务单
-    a_desc = "你是一个专业的架构师, 擅长分析需求与代码直接的映射关系. 能够将复杂的代码理解为需求逻辑, 能够将复杂的需求逻辑理解为直观的代码."
+    # # 2) 审核任务单
+    # a_desc = "你是一个专业的架构师, 擅长分析需求与代码直接的映射关系. 能够将复杂的代码理解为需求逻辑, 能够将复杂的需求逻辑理解为直观的代码."
     # print(review_task(a_desc, t_name,
     #                   original_requirement_md=f'{requirement_name}_原始需求.md',
     #                   requirements_clear_md=f'{requirement_name}_需求澄清.md',
     #                   hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
     #                   task_md=f'{requirement_name}_任务单.md',
     #                   detail_design_md=f'{requirement_name}_详细设计.md',
-    #                   task_review_md=f'{requirement_name}_任务单评审记录_C.md',
-    #                   task_review_json=f'{requirement_name}_评审记录_C.json'))
+    #                   task_review_md=f'{requirement_name}_任务单评审记录_C2.md',
+    #                   task_review_json=f'{requirement_name}_评审记录_C2.json'))
 
     # 3) 检查审核员有没有按提示词要求更新
     check_res = check_reviewer_job(agent_n_list,
-                                   directory="/Users/chenjunming/Desktop/Canopy/canopy-api-v3",
+                                   directory=the_dir,
                                    task_name=t_name,
                                    json_pattern=f"{requirement_name}_评审记录_*.json",
                                    md_pattern=f"{requirement_name}_任务单评审记录_*.md")
@@ -293,8 +295,8 @@ if __name__ == '__main__':
             print('-' * 100)
 
     # 判断是否所有评审都通过: 1)合并所有md, 2)判断总md是否为空, 3)判断所有json是否true
-    pass_bool = task_done(directory="/Users/chenjunming/Desktop/Canopy/canopy-api-v3",
-                          file_path='/Users/chenjunming/Desktop/Canopy/canopy-api-v3/RealLifeCost_开发前期.json',
+    pass_bool = task_done(directory=the_dir,
+                          file_path=f'{the_dir}/{requirement_name}_开发前期.json',
                           task_name=t_name,
                           json_pattern=f"{requirement_name}_评审记录_*.json",
                           md_pattern=f"{requirement_name}_任务单评审记录_*.md",
@@ -303,20 +305,21 @@ if __name__ == '__main__':
     if pass_bool:
         print(f"{t_name}阶段, 全部评审通过", '\n', '-' * 100, '\n')
         print(task_md_to_json(task_md=f'{requirement_name}_任务单.md', task_json=f'{requirement_name}_任务单.json'))
-        if not is_standard_task_initial_json('/Users/chenjunming/Desktop/Canopy/canopy-api-v3/RealLifeCost_任务单.json'):
-            print(re_task_md_to_json(f'{requirement_name}_任务单.md', f'{requirement_name}_任务单.json'))
+
+        '''判断 xx_任务单.json 是否符合要求 '''
+        # if not is_standard_task_initial_json(f'{the_dir}/{requirement_name}_任务单.json'):
+        #     print(re_task_md_to_json(f'{requirement_name}_任务单.md', f'{requirement_name}_任务单.json'))
     else:
         print(f"{t_name}阶段, 评审未通过", '\n', '-' * 100, '\n')
 
         # # 读取评审建议, 让需求分析师改
-        # ba_msg = get_markdown_content('/Users/chenjunming/Desktop/Canopy/canopy-api-v3/RealLifeCost_任务单评审记录.md')
+        # ba_msg = get_markdown_content(f'{the_dir}/{requirement_name}_任务单评审记录.md')
         # print(modify_task(ba_msg,
         #                   task_md=f'{requirement_name}_任务单.md', ask_human_md=f'{requirement_name}_与人类交流.md',
         #                   what_just_change=f'{requirement_name}_需求分析师反馈.md'))
 
         # 读取改造总结, 让审核员再次审核
-        m_summary = get_markdown_content(
-            '/Users/chenjunming/Desktop/Canopy/canopy-api-v3/RealLifeCost_需求分析师反馈.md')
+        # m_summary = get_markdown_content(f'{the_dir}/{requirement_name}_需求分析师反馈.md')
         # print(again_review_task(m_summary, task_md=f'{requirement_name}_任务单.md',
-        #                         task_review_md=f'{requirement_name}_任务单评审记录_G.md',
-        #                         task_review_json=f'{requirement_name}_评审记录_G.json'))
+        #                         task_review_md=f'{requirement_name}_任务单评审记录_C2.md',
+        #                         task_review_json=f'{requirement_name}_评审记录_C2.json'))
