@@ -146,9 +146,17 @@ def requirements_understand(
 {output_protocol_prompt}
 
 ## HITL 文档同步要求
-- 只要进入 HITL，必须覆盖写入《{ask_human_md}》。
+- 只要进入 HITL，必须覆盖写入《{ask_human_md}》, 保证《{ask_human_md}》不为空。
 - 只要进入 HITL，必须新建或更新《{hitl_record_md}》，记录当前已确认事实、冲突点、待确认边界。
-- 若当前尚无已确认事实，也必须让《{hitl_record_md}》存在，并至少写入当前阻断点摘要。
+- 无论是否进入 HITL 或者有没有已经确认的事实《{ask_human_md}》和《{hitl_record_md}》必须存在, 可以为空
+
+## 约束
+* 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
+* 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
+* 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
+    * 如果输出 `信息足够` 那么《{hitl_record_md}》必须为空
+    * 如果输出 `HITL` 那么《{hitl_record_md}》必须为非空
+* 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。
 
 ---
 
@@ -212,10 +220,12 @@ def hitl_bck(
    - [唯一] 绝对的“单一真理来源”。若人类变更逻辑，必须物理删除旧记录，事实严禁冲突。
    - [AI优先] 使用机器易读的高信息密度方式, 以使AI能理解为记录目的。
 
-## 严格约束
+## 约束
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
 * 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
+    * 如果输出 `信息足够` 那么《{hitl_record_md}》必须为空
+    * 如果输出 `HITL` 那么《{hitl_record_md}》必须为非空
 * 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。"""
     return hitl_bck_prompt
 
