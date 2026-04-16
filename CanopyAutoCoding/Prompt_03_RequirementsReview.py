@@ -14,6 +14,7 @@ from pathlib import Path
 from T04_common_prompt import (
     main_agent_workflow_after_review, task_start_prompt, state_machine_output
 )
+from Prompt_02_RequirementsAnalysis import output_protocol, fintech_ba
 
 # [审核器] 人格定位提示词 (系统设置的智能体,仅用于需求澄清)
 auditor = f"""* 角色属性：逻辑网关 / 确定性校验器 / 审核器
@@ -153,38 +154,65 @@ def requirements_review_reply(ba_reply, task_name="需求评审", *,
 
 {state_machine_output_prompt}
 
-**注意**: 只能回答 `未通过` 或 `审核通过`. 
+**注意**: 
+* 只能回答 `未通过` 或 `审核通过`. 
 * 如果是 `未通过` 则《{requirement_review_md}》内一定要有未解决的点, 
 * 如果是 `审核通过` 则《{requirement_review_md}》内的问题一定要全部解决完毕."""
     return requirements_review_reply_prompt
+
+
+# 需求分析师初始化
+def resume_ba(
+        ba_desc=fintech_ba,
+        init_prompt=task_start_prompt,
+        original_requirement_md='name_原始需求.md',
+        requirements_clear_md='name_需求澄清.md',
+        hitl_record_md='name_人机交互澄清记录.md'
+):
+    requirements_understand_prompt = f"""## 角色定位
+{ba_desc}
+
+## Context & Scope
+- 系统已经基于代码现状以及《{original_requirement_md}》和《{hitl_record_md}》生成《{requirements_clear_md}》。 
+- 你负责对《{original_requirement_md}》和《{requirements_clear_md}》进行代码级的需求拆解。你必须像审计员一样理解代码与需求之间的关系。
+- 核心目标：理解业务变更点与代码逻辑的精准映射，确保“信息与逻辑闭环”，准备向用户答疑。
+
+## 约束
+- 禁止修改任何文档
+- 在完成上述理解后, 只允许回复 `准备完毕`
+
+---
+
+{init_prompt}"""
+    return requirements_understand_prompt
 
 
 if __name__ == '__main__':
     from T04_common_prompt import check_reviewer_job
     from T01_tools import create_empty_json_files, merge_review_records, task_done, get_markdown_content
 
-    requirement_name = 'TimeSeries'
+    requirement_name = 'TimeFrequencyExtension'
     the_dir = '/Users/chenjunming/Desktop/v3_dev/canopy-api-v3'
     t_name = "需求评审"
-    agent_n_list = ['C', 'CC', 'G', 'Q']
+    agent_n_list = ['C1', 'C2']
 
     # 1) 创建空的审核结果JSON文件
-    create_empty_json_files(directory=the_dir,
-                            name_list=agent_n_list,
-                            pattern=f'{requirement_name}_评审记录_*.json'
-                            )
+    # create_empty_json_files(directory=the_dir,
+    #                         name_list=agent_n_list,
+    #                         pattern=f'{requirement_name}_评审记录_*.json'
+    #                         )
 
     # 2) 审核初始化
     print(requirements_review_init(auditor_desc=auditor, init_prompt=task_start_prompt,
                                    original_requirement_md=f'{requirement_name}_原始需求.md',
                                    hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
                                    requirements_clear_md=f'{requirement_name}_需求澄清.md',
-                                   requirement_review_md=f'{requirement_name}_需求评审记录_Q.md',
-                                   requirement_review_json=f'{requirement_name}_评审记录_Q.json'))
+                                   requirement_review_md=f'{requirement_name}_需求评审记录_C2.md',
+                                   requirement_review_json=f'{requirement_name}_评审记录_C2.json'))
 
     # # 3) 检查审核员有没有按提示词要求更新
     # check_res = check_reviewer_job(agent_n_list,
-    #                                directory="/Users/chenjunming/Desktop/Canopy/canopy-api-v3",
+    #                                directory=the_dir,
     #                                task_name=t_name,
     #                                json_pattern=f"{requirement_name}_评审记录_*.json",
     #                                md_pattern=f"{requirement_name}_需求评审记录_*.md")
@@ -195,18 +223,28 @@ if __name__ == '__main__':
     #         print('-' * 100)
     #
     # # 判断是否所有评审都通过: 1)合并所有md, 2)判断总md是否为空, 3)判断所有json是否true
-    # pass_bool = task_done(directory="/Users/chenjunming/Desktop/Canopy/canopy-api-v3",
-    #                       file_path='/Users/chenjunming/Desktop/Canopy/canopy-api-v3/RealLifeCose_开发前期.json',
+    # pass_bool = task_done(directory=the_dir,
+    #                       file_path=f'{the_dir}/{requirement_name}_开发前期.json',
     #                       task_name=t_name,
     #                       json_pattern=f"{requirement_name}_评审记录_*.json",
     #                       md_pattern=f"{requirement_name}_需求评审记录_*.md",
     #                       md_output_name=f"{requirement_name}_需求评审记录.md")
     #
     # if pass_bool:
-    #     print(f"{t_name}阶段, 全部评审通过")
+    #     print(f"{t_name}阶段, 全部评审通过", '\n', '-' * 100, '\n')
     # else:
-    #     print(f"{t_name}阶段, 评审未通过")
-    #     ba_msg = get_markdown_content('/Users/chenjunming/Desktop/Canopy/canopy-api-v3/RealLifeCost_需求评审记录.md')
-    #     print(requirements_review_reply(ba_msg, t_name, requirement_review_md=f'{requirement_name}_需求评审记录_Q.md',
-    #                                     requirement_review_json=f'{requirement_name}_评审记录_Q.json',
+    #     print(f"{t_name}阶段, 评审未通过", '\n', '-' * 100, '\n')
+    #
+    #     '''告诉需求分析师,评审结果'''
+    #     # ba_msg = get_markdown_content(f'{the_dir}/{requirement_name}_需求评审记录.md')
+    #     # print(review_feedback(ba_msg, original_requirement_md=f'{requirement_name}_原始需求.md',
+    #     #                       ask_human_md=f'{requirement_name}_与人类交流.md',
+    #     #                       hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
+    #     #                       requirements_clear_md=f'{requirement_name}_需求澄清.md',
+    #     #                       what_just_change=f'{requirement_name}_需求分析师反馈.md'))
+    #
+    #     ba_msg = get_markdown_content(f'{the_dir}/{requirement_name}_需求分析师反馈.md')
+    #     print(requirements_review_reply(ba_msg, t_name,
+    #                                     requirement_review_md=f'{requirement_name}_需求评审记录_C2.md',
+    #                                     requirement_review_json=f'{requirement_name}_评审记录_C2.json',
     #                                     requirements_clear_md=f'{requirement_name}_需求澄清.md'))
