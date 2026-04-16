@@ -1093,6 +1093,16 @@ def _command_to_dict(result: CommandResult) -> dict[str, object]:
     }
 
 
+def _command_failure_reason(prefix: str, result: CommandResult) -> str:
+    detail = clean_ansi(result.clean_output or result.raw_output or "").strip()
+    if not detail:
+        return prefix
+    detail = " ".join(detail.split())
+    if len(detail) > 240:
+        detail = f"{detail[:237]}..."
+    return f"{prefix}: {detail}"
+
+
 def create_batch_runtime(run_id: str | None = None, runtime_root: str | Path | None = None) -> tuple[str, Path]:
     actual_run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
     base_root = Path(runtime_root or DEFAULT_RUNTIME_ROOT).expanduser().resolve()
@@ -1447,8 +1457,14 @@ def run_directory_initialization_with_worker(
         nonlocal current_turn_id, current_turn_phase, current_turn_status_path, current_turn_baseline_hashes
         current_turn_id = create_turn_id()
         current_turn_phase = PHASE_ROUTING_LAYER_CREATE
-        current_turn_baseline_hashes = {}
-        contract = build_contract(current_turn_id, current_turn_phase, ROUTING_LAYER_REQUIRED_FILES)
+        current_turn_baseline_hashes = capture_artifact_hashes(target_dir, ROUTING_LAYER_REQUIRED_FILES)
+        contract = build_contract(
+            current_turn_id,
+            current_turn_phase,
+            ROUTING_LAYER_REQUIRED_FILES,
+            baseline_artifact_hashes=current_turn_baseline_hashes,
+            require_artifact_change=bool(current_turn_baseline_hashes),
+        )
         reset_turn_runtime_dir(worker.runtime_dir, current_turn_id)
         current_turn_status_path = str(contract.status_path)
         sync_state("create_running", note="create_routing_layer")
@@ -1465,7 +1481,7 @@ def run_directory_initialization_with_worker(
             )
             run_store.append_event("turn_finished", work_dir=str(target_dir), label="create_routing_layer")
         if not create_result.ok:
-            return fail("create_command_failed")
+            return fail(_command_failure_reason("create_command_failed", create_result))
         try:
             validate_contract(contract)
         except Exception as error:
@@ -1510,7 +1526,7 @@ def run_directory_initialization_with_worker(
                 label=f"audit_routing_layer_{round_index}",
             )
         if not audit_result.ok:
-            return fail("audit_command_failed")
+            return fail(_command_failure_reason("audit_command_failed", audit_result))
         try:
             validate_contract(contract)
         except Exception as error:
@@ -1557,7 +1573,7 @@ def run_directory_initialization_with_worker(
                 label=f"refine_routing_layer_{current_round}",
             )
         if not refine_result.ok:
-            return fail("refine_command_failed")
+            return fail(_command_failure_reason("refine_command_failed", refine_result))
         try:
             validate_contract(contract)
         except Exception as error:
@@ -1575,7 +1591,13 @@ def run_directory_initialization_with_worker(
             return None
 
         if current_turn_phase == PHASE_ROUTING_LAYER_CREATE:
-            contract = build_contract(current_turn_id, current_turn_phase, ROUTING_LAYER_REQUIRED_FILES)
+            contract = build_contract(
+                current_turn_id,
+                current_turn_phase,
+                ROUTING_LAYER_REQUIRED_FILES,
+                baseline_artifact_hashes=current_turn_baseline_hashes,
+                require_artifact_change=bool(current_turn_baseline_hashes),
+            )
             status_path = Path(current_turn_status_path).expanduser().resolve()
             if status_path != contract.status_path:
                 contract = TurnFileContract(

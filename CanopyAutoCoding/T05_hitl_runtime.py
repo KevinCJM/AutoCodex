@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from T02_tmux_agents import DEFAULT_COMMAND_TIMEOUT_SEC, TurnFileContract, TurnFileResult
+from T09_terminal_ops import collect_multiline_input, message
 
 
 HITL_STATUS_SCHEMA_VERSION = "1.0"
@@ -113,58 +115,351 @@ def _collect_artifact_paths(node: object) -> list[str]:
     return flattened
 
 
+def _write_json_atomic(path: str | Path, payload: dict[str, object]) -> Path:
+    target_path = Path(path).expanduser().resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = target_path.with_name(f".{target_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+    return target_path
+
+
+def _read_non_empty_text(file_path: str | Path) -> str:
+    path = Path(file_path).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        return ""
+    return path.read_text(encoding="utf-8").strip()
+
+
+def _build_hitl_artifact_hashes(paths: list[str]) -> dict[str, str]:
+    artifact_hashes: dict[str, str] = {}
+    for item in paths:
+        resolved = Path(item).expanduser().resolve()
+        if not resolved.exists() or not resolved.is_file():
+            raise FileNotFoundError(f"HITL 状态文件引用的文档不存在: {resolved}")
+        artifact_hashes[str(resolved)] = build_prefixed_sha256(resolved)
+    return artifact_hashes
+
+
+def _infer_hitl_status(
+    *,
+    stage_name: str,
+    turn_id: str,
+    hitl_round: int,
+    output_path: str | Path,
+    question_path: str | Path,
+    record_path: str | Path,
+) -> dict[str, object]:
+    output_file = Path(output_path).expanduser().resolve()
+    question_file = Path(question_path).expanduser().resolve()
+    record_file = Path(record_path).expanduser().resolve()
+
+    output_text = _read_non_empty_text(output_file)
+    question_text = _read_non_empty_text(question_file)
+    record_text = _read_non_empty_text(record_file)
+
+    if stage_name == "requirements_notion_intake":
+        if output_text:
+            referenced_paths = [str(output_file)]
+            if record_text:
+                referenced_paths.append(str(record_file))
+            return {
+                "schema_version": HITL_STATUS_SCHEMA_VERSION,
+                "stage": stage_name,
+                "turn_id": turn_id,
+                "hitl_round": hitl_round,
+                "status": HITL_STATUS_COMPLETED,
+                "summary": "done",
+                "output_path": str(output_file),
+                "question_path": "",
+                "record_path": str(record_file) if record_text else "",
+                "artifact_hashes": _build_hitl_artifact_hashes(referenced_paths),
+                "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        if question_text:
+            if record_text:
+                return {
+                    "schema_version": HITL_STATUS_SCHEMA_VERSION,
+                    "stage": stage_name,
+                    "turn_id": turn_id,
+                    "hitl_round": hitl_round,
+                    "status": HITL_STATUS_HITL,
+                    "summary": "need hitl",
+                    "output_path": "",
+                    "question_path": str(question_file),
+                    "record_path": str(record_file),
+                    "artifact_hashes": _build_hitl_artifact_hashes([str(question_file), str(record_file)]),
+                    "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                }
+            referenced_paths = [str(question_file)]
+            return {
+                "schema_version": HITL_STATUS_SCHEMA_VERSION,
+                "stage": stage_name,
+                "turn_id": turn_id,
+                "hitl_round": hitl_round,
+                "status": HITL_STATUS_ERROR,
+                "summary": question_text.splitlines()[0].strip() or "notion_read_failed",
+                "output_path": "",
+                "question_path": str(question_file),
+                "record_path": "",
+                "artifact_hashes": _build_hitl_artifact_hashes(referenced_paths),
+                "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        raise FileNotFoundError("尚未观察到可判定的 Notion 需求读取产物")
+
+    if question_text and record_text:
+        return {
+            "schema_version": HITL_STATUS_SCHEMA_VERSION,
+            "stage": stage_name,
+            "turn_id": turn_id,
+            "hitl_round": hitl_round,
+            "status": HITL_STATUS_HITL,
+            "summary": "need hitl",
+            "output_path": "",
+            "question_path": str(question_file),
+            "record_path": str(record_file),
+            "artifact_hashes": _build_hitl_artifact_hashes([str(question_file), str(record_file)]),
+            "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+
+    if output_text:
+        referenced_paths = [str(output_file)]
+        if record_text:
+            referenced_paths.append(str(record_file))
+        return {
+            "schema_version": HITL_STATUS_SCHEMA_VERSION,
+            "stage": stage_name,
+            "turn_id": turn_id,
+            "hitl_round": hitl_round,
+            "status": HITL_STATUS_COMPLETED,
+            "summary": "done",
+            "output_path": str(output_file),
+            "question_path": "",
+            "record_path": str(record_file) if record_text else "",
+            "artifact_hashes": _build_hitl_artifact_hashes(referenced_paths),
+            "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+
+    if question_text and not record_text:
+        raise FileNotFoundError(f"HITL 提问文件已生成，但缺少记录文件: {record_file}")
+
+    raise FileNotFoundError(f"尚未观察到可判定的阶段产物: {stage_name}")
+
+
+def _materialize_hitl_status_file(
+    status_path: str | Path,
+    *,
+    stage_name: str,
+    turn_id: str,
+    hitl_round: int,
+    output_path: str | Path,
+    question_path: str | Path,
+    record_path: str | Path,
+) -> Path:
+    payload = _infer_hitl_status(
+        stage_name=stage_name,
+        turn_id=turn_id,
+        hitl_round=hitl_round,
+        output_path=output_path,
+        question_path=question_path,
+        record_path=record_path,
+    )
+    return _write_json_atomic(status_path, payload)
+
+
+def _build_turn_status_payload(
+    *,
+    turn_id: str,
+    phase: str,
+    stage_status_path: str | Path,
+    output_path: str | Path,
+    question_path: str | Path,
+    record_path: str | Path,
+) -> dict[str, object]:
+    stage_status_file = Path(stage_status_path).expanduser().resolve()
+    output_file = Path(output_path).expanduser().resolve()
+    question_file = Path(question_path).expanduser().resolve()
+    record_file = Path(record_path).expanduser().resolve()
+
+    artifacts: dict[str, str] = {"stage_status": str(stage_status_file)}
+    artifact_hashes = {str(stage_status_file): build_prefixed_sha256(stage_status_file)}
+    for key, file_path in (
+        ("output", output_file),
+        ("question", question_file),
+        ("record", record_file),
+    ):
+        if not file_path.exists() or not file_path.is_file():
+            continue
+        if not file_path.read_text(encoding="utf-8").strip():
+            continue
+        artifacts[key] = str(file_path)
+        artifact_hashes[str(file_path)] = build_prefixed_sha256(file_path)
+    return {
+        "schema_version": TURN_STATUS_SCHEMA_VERSION,
+        "turn_id": turn_id,
+        "phase": phase,
+        "status": "done",
+        "artifacts": artifacts,
+        "artifact_hashes": artifact_hashes,
+        "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+
+
+def _materialize_turn_status_file(
+    status_path: str | Path,
+    *,
+    turn_id: str,
+    phase: str,
+    stage_status_path: str | Path,
+    output_path: str | Path,
+    question_path: str | Path,
+    record_path: str | Path,
+) -> Path:
+    payload = _build_turn_status_payload(
+        turn_id=turn_id,
+        phase=phase,
+        stage_status_path=stage_status_path,
+        output_path=output_path,
+        question_path=question_path,
+        record_path=record_path,
+    )
+    return _write_json_atomic(status_path, payload)
+
+
 def build_turn_status_contract(
     *,
     turn_status_path: str | Path,
     turn_id: str,
     turn_phase: str,
     stage_status_path: str | Path,
+    stage_name: str | None = None,
+    hitl_round: int | None = None,
+    output_path: str | Path | None = None,
+    question_path: str | Path | None = None,
+    record_path: str | Path | None = None,
 ) -> TurnFileContract:
     expected_stage_status = str(Path(stage_status_path).expanduser().resolve())
 
     def validator(path: Path) -> TurnFileResult:
         status_path = Path(path).expanduser().resolve()
+        validation_error: Exception | None = None
         if not status_path.exists():
-            raise FileNotFoundError(f"缺少 turn_status.json: {status_path}")
-        payload = json.loads(status_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("turn_status.json 必须是 JSON 对象")
-        if str(payload.get("schema_version", "")).strip() != TURN_STATUS_SCHEMA_VERSION:
-            raise ValueError("turn_status.json schema_version 非法")
-        if str(payload.get("turn_id", "")).strip() != turn_id:
-            raise ValueError("turn_status.json turn_id 非法")
-        if str(payload.get("phase", "")).strip() != turn_phase:
-            raise ValueError("turn_status.json phase 非法")
-        if str(payload.get("status", "")).strip().lower() != "done":
-            raise ValueError("turn_status.json status 非法")
-        parse_iso_timestamp(payload.get("written_at", ""))
-        artifacts = payload.get("artifacts", {})
-        if not isinstance(artifacts, dict):
-            raise ValueError("turn_status.json artifacts 必须是对象")
-        stage_status_in_payload = str(artifacts.get("stage_status", "")).strip()
-        if stage_status_in_payload != expected_stage_status:
-            raise ValueError("turn_status.json stage_status 非法")
-        artifact_paths = _collect_artifact_paths(artifacts)
-        artifact_hashes = payload.get("artifact_hashes", {})
-        if not isinstance(artifact_hashes, dict):
-            raise ValueError("turn_status.json artifact_hashes 必须是对象")
-        validated_hashes: dict[str, str] = {}
-        for artifact_path_text in artifact_paths:
-            artifact_path = Path(artifact_path_text).expanduser().resolve()
-            if not artifact_path.exists() or not artifact_path.is_file():
-                raise FileNotFoundError(f"turn_status.json 引用的文件不存在: {artifact_path}")
-            expected_hash = str(artifact_hashes.get(str(artifact_path), "")).strip()
-            actual_hash = build_prefixed_sha256(artifact_path)
-            if expected_hash != actual_hash:
-                raise ValueError(f"turn_status.json artifact_hashes 不匹配: {artifact_path}")
-            validated_hashes[str(artifact_path)] = actual_hash
-        return TurnFileResult(
-            status_path=str(status_path),
-            payload=payload,
-            artifact_paths={f"artifact_{index}": item for index, item in enumerate(artifact_paths, start=1)},
-            artifact_hashes=validated_hashes,
-            validated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+            validation_error = FileNotFoundError(f"缺少 turn_status.json: {status_path}")
+        else:
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                validation_error = ValueError("turn_status.json 必须是 JSON 对象")
+            else:
+                if str(payload.get("schema_version", "")).strip() != TURN_STATUS_SCHEMA_VERSION:
+                    validation_error = ValueError("turn_status.json schema_version 非法")
+                elif str(payload.get("turn_id", "")).strip() != turn_id:
+                    validation_error = ValueError("turn_status.json turn_id 非法")
+                elif str(payload.get("phase", "")).strip() != turn_phase:
+                    validation_error = ValueError("turn_status.json phase 非法")
+                elif str(payload.get("status", "")).strip().lower() != "done":
+                    validation_error = ValueError("turn_status.json status 非法")
+                else:
+                    parse_iso_timestamp(payload.get("written_at", ""))
+                    artifacts = payload.get("artifacts", {})
+                    if not isinstance(artifacts, dict):
+                        validation_error = ValueError("turn_status.json artifacts 必须是对象")
+                    else:
+                        stage_status_in_payload = str(artifacts.get("stage_status", "")).strip()
+                        if stage_status_in_payload != expected_stage_status:
+                            validation_error = ValueError("turn_status.json stage_status 非法")
+                        else:
+                            artifact_paths = _collect_artifact_paths(artifacts)
+                            artifact_hashes = payload.get("artifact_hashes", {})
+                            if not isinstance(artifact_hashes, dict):
+                                validation_error = ValueError("turn_status.json artifact_hashes 必须是对象")
+                            else:
+                                validated_hashes: dict[str, str] = {}
+                                for artifact_path_text in artifact_paths:
+                                    artifact_path = Path(artifact_path_text).expanduser().resolve()
+                                    if not artifact_path.exists() or not artifact_path.is_file():
+                                        validation_error = FileNotFoundError(
+                                            f"turn_status.json 引用的文件不存在: {artifact_path}"
+                                        )
+                                        break
+                                    expected_hash = str(artifact_hashes.get(str(artifact_path), "")).strip()
+                                    actual_hash = build_prefixed_sha256(artifact_path)
+                                    if expected_hash != actual_hash:
+                                        validation_error = ValueError(
+                                            f"turn_status.json artifact_hashes 不匹配: {artifact_path}"
+                                        )
+                                        break
+                                    validated_hashes[str(artifact_path)] = actual_hash
+                                if validation_error is None:
+                                    return TurnFileResult(
+                                        status_path=str(status_path),
+                                        payload=payload,
+                                        artifact_paths={
+                                            f"artifact_{index}": item
+                                            for index, item in enumerate(artifact_paths, start=1)
+                                        },
+                                        artifact_hashes=validated_hashes,
+                                        validated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
+                                    )
+
+        if not all((stage_name, hitl_round is not None, output_path, question_path, record_path)):
+            raise validation_error or FileNotFoundError(f"缺少 turn_status.json: {status_path}")
+
+        stage_decision: HitlStatusDecision | None = None
+        stage_validation_error: Exception | None = None
+        try:
+            stage_decision = validate_hitl_status_file(
+                stage_status_path,
+                expected_stage=str(stage_name),
+                expected_turn_id=turn_id,
+                expected_hitl_round=int(hitl_round),
+                expected_output_path=output_path,
+                expected_question_path=question_path,
+                expected_record_path=record_path,
+            )
+        except Exception as error:  # noqa: BLE001
+            stage_validation_error = error
+
+        if stage_decision is None:
+            try:
+                materialized_stage_status_path = _materialize_hitl_status_file(
+                    stage_status_path,
+                    stage_name=str(stage_name),
+                    turn_id=turn_id,
+                    hitl_round=int(hitl_round),
+                    output_path=output_path,
+                    question_path=question_path,
+                    record_path=record_path,
+                )
+                stage_decision = validate_hitl_status_file(
+                    materialized_stage_status_path,
+                    expected_stage=str(stage_name),
+                    expected_turn_id=turn_id,
+                    expected_hitl_round=int(hitl_round),
+                    expected_output_path=output_path,
+                    expected_question_path=question_path,
+                    expected_record_path=record_path,
+                )
+            except Exception:
+                if validation_error is not None:
+                    raise validation_error
+                if stage_validation_error is not None:
+                    raise stage_validation_error
+                raise
+
+        materialized_turn_status_path = _materialize_turn_status_file(
+            status_path,
+            turn_id=turn_id,
+            phase=turn_phase,
+            stage_status_path=stage_decision.status_path,
+            output_path=output_path,
+            question_path=question_path,
+            record_path=record_path,
         )
+        return validator(materialized_turn_status_path)
 
     return TurnFileContract(
         turn_id=turn_id,
@@ -267,22 +562,14 @@ def validate_hitl_status_file(
 def collect_terminal_hitl_response(question_path: str | Path, *, hitl_round: int) -> str:
     question_file = Path(question_path).expanduser().resolve()
     question_text = question_file.read_text(encoding="utf-8").strip()
-    print()
-    print(f"HITL 第 {hitl_round} 轮，需要人工补充信息")
-    print(f"问题文档: {question_file}")
-    print(question_text or "(问题文档为空)")
-    print("请输入你的回复，单独一行输入 EOF 结束:")
-    while True:
-        lines: list[str] = []
-        while True:
-            line = input()
-            if line == "EOF":
-                break
-            lines.append(line)
-        text = "\n".join(lines).strip()
-        if text:
-            return text
-        print("回复不能为空，请重新输入，单独一行输入 EOF 结束:")
+    message()
+    message(f"HITL 第 {hitl_round} 轮，需要人工补充信息")
+    message(f"问题文档: {question_file}")
+    message(question_text or "(问题文档为空)")
+    return collect_multiline_input(
+        title=f"HITL 第 {hitl_round} 轮回复",
+        empty_retry_message="回复不能为空，请重新输入。",
+    )
 
 
 def run_hitl_agent_loop(
@@ -321,6 +608,7 @@ def run_hitl_agent_loop(
         turn_id = f"{label_prefix}_{hitl_round}"
         turn_status_path = turns_dir / turn_id / "turn_status.json"
         turn_status_path.parent.mkdir(parents=True, exist_ok=True)
+        question_file.write_text("", encoding="utf-8")
         context = HitlPromptContext(
             stage_name=stage_name,
             hitl_round=hitl_round,
@@ -342,6 +630,11 @@ def run_hitl_agent_loop(
             turn_id=turn_id,
             turn_phase=turn_phase,
             stage_status_path=status_file,
+            stage_name=stage_name,
+            hitl_round=hitl_round,
+            output_path=output_file,
+            question_path=question_file,
+            record_path=record_file,
         )
         if on_agent_turn_started is not None:
             on_agent_turn_started(context, worker)

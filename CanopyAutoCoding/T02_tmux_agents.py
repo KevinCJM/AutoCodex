@@ -18,11 +18,12 @@ import subprocess
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 from contextlib import contextmanager
 from urllib.parse import urlparse
 from T04_common_prompt import TASK_DONE_MARKER, build_task_completion_runtime_prompt
@@ -32,6 +33,28 @@ DEFAULT_RUNTIME_ROOT = Path(__file__).resolve().parent / ".agent_init_runtime"
 DEFAULT_COMMAND_TIMEOUT_SEC = 60 * 20
 DEFAULT_PROXY_HOST = "127.0.0.1"
 TERMINAL_ACTIVITY_IDLE_WINDOW_SEC = 1.5
+TASK_COMPLETION_NUDGE_IDLE_SEC = 60.0
+TASK_COMPLETION_NUDGE_GRACE_SEC = 25.0
+TASK_COMPLETION_NUDGE_MAX_COUNT = 2
+WORKER_DEATH_ERROR_MARKERS = (
+    "tmux pane died",
+    "tmux pane exited",
+    "agent exited back to shell",
+    "missing_session",
+    "pane_dead",
+)
+PROVIDER_AUTH_ERROR_MARKERS = (
+    "api error: 401",
+    "401 invalid access token",
+    "401 unauthorized",
+    "invalid access token",
+    "token expired",
+    "access token expired",
+    "token has expired",
+)
+AGENT_READY_TIMEOUT_ERROR_MARKERS = (
+    "timed out waiting for agent ready",
+)
 TIMEOUT_EXIT_CODE = -1
 GENERIC_ERROR_EXIT_CODE = 1
 PROXY_ENV_KEYS = (
@@ -161,6 +184,9 @@ RUNTIME_NOISE_PATTERNS = (
     r"^(?:gemini|claude|codex|qwen|kimi)(?:[-_.a-z0-9]+)?$",
 )
 
+_LIVE_WORKERS: "weakref.WeakSet[TmuxBatchWorker]" = weakref.WeakSet()
+_LIVE_WORKERS_LOCK = threading.RLock()
+
 
 class Vendor(str, Enum):
     CODEX = "codex"
@@ -194,6 +220,31 @@ class ProviderPhase(str, Enum):
 class WrapperState(str, Enum):
     READY = "READY"
     NOT_READY = "NOT_READY"
+
+
+def _register_live_worker(worker: "TmuxBatchWorker") -> None:
+    with _LIVE_WORKERS_LOCK:
+        _LIVE_WORKERS.add(worker)
+
+
+def list_registered_tmux_workers() -> list["TmuxBatchWorker"]:
+    with _LIVE_WORKERS_LOCK:
+        return list(_LIVE_WORKERS)
+
+
+def cleanup_registered_tmux_workers(*, reason: str = "process_exit") -> list[str]:
+    cleaned_sessions: list[str] = []
+    for worker in list_registered_tmux_workers():
+        try:
+            if not worker.session_exists():
+                continue
+            session_name = worker.request_kill()
+            if session_name:
+                cleaned_sessions.append(session_name)
+                worker._log_event("process_cleanup_kill", reason=reason, session_name=session_name)
+        except Exception:
+            continue
+    return sorted(set(cleaned_sessions))
 
 
 @dataclass(frozen=True)
@@ -242,6 +293,47 @@ class TurnFileContract:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status_path", Path(self.status_path).expanduser().resolve())
+
+
+@dataclass(frozen=True)
+class TaskResultFile:
+    result_path: str
+    payload: dict[str, object]
+    artifact_paths: dict[str, str]
+    artifact_hashes: dict[str, str]
+    validated_at: str
+
+
+@dataclass(frozen=True)
+class TaskResultContract:
+    turn_id: str
+    phase: str
+    task_kind: str
+    mode: str
+    expected_statuses: tuple[str, ...]
+    stage_name: str = ""
+    turn_status_path: Path | None = None
+    stage_status_path: Path | None = None
+    required_artifacts: dict[str, Path] = field(default_factory=dict)
+    optional_artifacts: dict[str, Path] = field(default_factory=dict)
+    artifact_rules: dict[str, object] = field(default_factory=dict)
+    retry_policy: dict[str, object] = field(default_factory=dict)
+    resume_policy: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "turn_status_path", _resolve_optional_path(self.turn_status_path))
+        object.__setattr__(self, "stage_status_path", _resolve_optional_path(self.stage_status_path))
+        object.__setattr__(
+            self,
+            "required_artifacts",
+            {key: Path(value).expanduser().resolve() for key, value in self.required_artifacts.items()},
+        )
+        object.__setattr__(
+            self,
+            "optional_artifacts",
+            {key: Path(value).expanduser().resolve() for key, value in self.optional_artifacts.items()},
+        )
+        object.__setattr__(self, "expected_statuses", tuple(str(item).strip() for item in self.expected_statuses if str(item).strip()))
 
 
 class TmuxBackend:
@@ -464,11 +556,57 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def is_worker_death_error(error: BaseException | str) -> bool:
+    message = str(error or "").strip().lower()
+    if not message:
+        return False
+    return any(marker in message for marker in WORKER_DEATH_ERROR_MARKERS)
+
+
+def is_provider_auth_error(error: BaseException | str) -> bool:
+    message = str(error or "").strip().lower()
+    if not message:
+        return False
+    return any(marker in message for marker in PROVIDER_AUTH_ERROR_MARKERS)
+
+
+def is_agent_ready_timeout_error(error: BaseException | str) -> bool:
+    message = str(error or "").strip().lower()
+    if not message:
+        return False
+    return any(marker in message for marker in AGENT_READY_TIMEOUT_ERROR_MARKERS)
+
+
+def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -> bool:
+    try:
+        worker.request_restart()
+        worker.ensure_agent_ready(timeout_sec=timeout_sec)
+        return True
+    except Exception:
+        return False
+
+
 def _slugify(text: str, max_len: int = 40) -> str:
     value = re.sub(r"[^a-zA-Z0-9]+", "-", str(text or "").strip()).strip("-").lower()
     if not value:
         value = "worker"
     return value[:max_len]
+
+
+def _resolve_optional_path(path: str | Path | None) -> Path | None:
+    text = str(path or "").strip()
+    if not text:
+        return None
+    return Path(text).expanduser().resolve()
+
+
+def _build_prefixed_sha256(path: str | Path) -> str:
+    target = Path(path).expanduser().resolve()
+    digest = hashlib.sha256()
+    with target.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def clean_ansi(text: str) -> str:
@@ -750,8 +888,12 @@ class CodexOutputDetector(BaseOutputDetector):
         if base_phase in {ProviderPhase.SHELL, ProviderPhase.ERROR, ProviderPhase.UNKNOWN,
                           ProviderPhase.COMPLETED_RESPONSE}:
             return base_phase
+        ready_visible = self._contains_any(visible_text or text, CODEX_READY_PATTERNS)
+        processing_visible = self._contains_any(visible_text or recent_log or text, CODEX_PROCESSING_PATTERNS)
         if self._contains_any(visible_text or text, CODEX_TRUST_PROMPT_PATTERNS):
             return ProviderPhase.AUTH_PROMPT
+        if ready_visible and not processing_visible and not self._contains_any(visible_text or text, CODEX_STARTING_PATTERNS):
+            return ProviderPhase.WAITING_INPUT
         if self._contains_any(visible_text or text, CODEX_UPDATE_PROMPT_PATTERNS) or self._contains_any(
             visible_text or text,
             CODEX_MODEL_SELECTION_PROMPT_PATTERNS,
@@ -759,9 +901,9 @@ class CodexOutputDetector(BaseOutputDetector):
             return ProviderPhase.UPDATE_PROMPT
         if self._contains_any(visible_text or text, CODEX_STARTING_PATTERNS):
             return ProviderPhase.BOOTING if observation.current_command else ProviderPhase.UNKNOWN
-        if self._contains_any(visible_text or recent_log or text, CODEX_PROCESSING_PATTERNS):
+        if processing_visible:
             return ProviderPhase.PROCESSING
-        if self._contains_any(visible_text or text, CODEX_READY_PATTERNS):
+        if ready_visible:
             return ProviderPhase.WAITING_INPUT
         return ProviderPhase.PROCESSING
 
@@ -777,6 +919,9 @@ class CodexOutputDetector(BaseOutputDetector):
             if idle_match:
                 content = content[:idle_match.start()]
             return super().extract_last_message(content)
+        idle_match = re.search(r"^\s*(?:❯|›|codex>)(?:\s|$)", clean_output, re.MULTILINE)
+        if idle_match:
+            clean_output = clean_output[:idle_match.start()]
         return super().extract_last_message(clean_output)
 
 
@@ -1100,7 +1245,9 @@ class TmuxBatchWorker:
         self.transcript_path = self.runtime_dir / "transcript.md"
         self.pane_id = existing_pane_id
         self.send_lock = threading.Lock()
+        self.state_lock = threading.RLock()
         self.results: list[CommandResult] = []
+        self.health_supervisor: HealthSupervisor | None = None
         self.agent_ready = False
         self.recoverable = True
         self.last_reply = ""
@@ -1111,6 +1258,8 @@ class TmuxBatchWorker:
         self.provider_phase = ProviderPhase.UNKNOWN
         self.wrapper_state = WrapperState.NOT_READY
         self.current_task_status_path = ""
+        self.current_task_manifest_path = ""
+        self.current_task_result_path = ""
         self.current_task_completion_command = ""
         self.current_task_runtime_status = ""
         self._phase_candidate = ProviderPhase.UNKNOWN
@@ -1120,6 +1269,12 @@ class TmuxBatchWorker:
         self.last_terminal_changed_at = ""
         self.terminal_recently_changed = False
         self._last_terminal_change_monotonic = 0.0
+        self.current_task_completion_nudge_count = 0
+        self.current_task_completion_nudge_at = ""
+        self._current_task_last_nudge_monotonic = 0.0
+        self.task_completion_nudge_idle_sec = TASK_COMPLETION_NUDGE_IDLE_SEC
+        self.task_completion_nudge_grace_sec = TASK_COMPLETION_NUDGE_GRACE_SEC
+        self.task_completion_nudge_max_count = TASK_COMPLETION_NUDGE_MAX_COUNT
         self._last_boot_action_signature = ""
         self._last_boot_action_at = 0.0
         self.launch_command = self.config.build_launch_command(self.work_dir)
@@ -1135,8 +1290,16 @@ class TmuxBatchWorker:
             self.current_path = str(existing_state.get("current_path", ""))
             self.last_heartbeat_at = str(existing_state.get("last_heartbeat_at", ""))
             self.current_task_status_path = str(existing_state.get("current_task_status_path", ""))
+            self.current_task_manifest_path = str(existing_state.get("current_task_manifest_path", ""))
+            self.current_task_result_path = str(existing_state.get("current_task_result_path", ""))
             self.current_task_completion_command = str(existing_state.get("current_task_completion_command", ""))
             self.current_task_runtime_status = str(existing_state.get("current_task_runtime_status", ""))
+            self.current_task_completion_nudge_count = int(
+                existing_state.get("current_task_completion_nudge_count", 0)
+            )
+            self.current_task_completion_nudge_at = str(
+                existing_state.get("current_task_completion_nudge_at", "")
+            )
             self.last_terminal_signature = str(existing_state.get("last_terminal_signature", ""))
             self.last_terminal_changed_at = str(existing_state.get("last_terminal_changed_at", ""))
             self.terminal_recently_changed = bool(existing_state.get("terminal_recently_changed", False))
@@ -1150,6 +1313,7 @@ class TmuxBatchWorker:
                     str(existing_state.get("wrapper_state", WrapperState.NOT_READY.value)))
             except ValueError:
                 self.wrapper_state = WrapperState.NOT_READY
+        _register_live_worker(self)
 
     def _tmux(self, *args: str, input_text: str | None = None, timeout_sec: float = 10.0) -> \
     subprocess.CompletedProcess[str]:
@@ -1175,9 +1339,10 @@ class TmuxBatchWorker:
         return read_text_tail(self.transcript_path, max_lines=max_lines)
 
     def read_state(self) -> dict[str, object]:
-        if not self.state_path.exists():
-            return {}
-        return json.loads(self.state_path.read_text(encoding="utf-8"))
+        with self.state_lock:
+            if not self.state_path.exists():
+                return {}
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
 
     def runtime_metadata(self) -> dict[str, str]:
         return {
@@ -1240,12 +1405,33 @@ class TmuxBatchWorker:
         with self.log_path.open("a", encoding="utf-8") as file:
             file.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
+    def _ensure_health_supervisor_started(self) -> None:
+        if self.health_supervisor is not None:
+            return
+        self.health_supervisor = HealthSupervisor(
+            self._refresh_health_state_nonintrusive,
+            interval_sec=2.0,
+            thread_name=f"worker-health-{self.instance_id}",
+        )
+        self.health_supervisor.start()
+
+    def _stop_health_supervisor(self) -> None:
+        if self.health_supervisor is None:
+            return
+        supervisor = self.health_supervisor
+        self.health_supervisor = None
+        supervisor.stop()
+
     def create_session(self) -> str:
         if self.session_exists():
+            self._stop_health_supervisor()
             self.backend.kill_session(self.session_name)
 
         self._reset_terminal_activity()
+        self._reset_task_completion_nudge_state()
         self.current_task_status_path = ""
+        self.current_task_manifest_path = ""
+        self.current_task_result_path = ""
         self.current_task_completion_command = ""
         self.current_task_runtime_status = ""
         self.pane_id = self.backend.create_session(
@@ -1257,6 +1443,8 @@ class TmuxBatchWorker:
         self._tmux("set-option", "-t", self.session_name, "allow-rename", "off")
         self._tmux("set-window-option", "-t", f"{self.session_name}:0", "automatic-rename", "off")
         self._start_pipe_logging()
+        self._ensure_health_supervisor_started()
+        self._refresh_health_state_nonintrusive()
         self._log_event("session_created", pane_id=self.pane_id, session_name=self.session_name)
         self._write_state(WorkerStatus.READY, note="session_created")
         return self.pane_id
@@ -1328,65 +1516,149 @@ class TmuxBatchWorker:
         return self.provider_phase
 
     def _write_state(self, status: WorkerStatus, *, note: str, extra: dict[str, object] | None = None) -> None:
-        previous = self.read_state()
-        payload: dict[str, object] = {
-            "worker_id": self.worker_id,
-            "session_name": self.session_name,
-            "pane_id": self.pane_id,
-            "work_dir": str(self.work_dir),
-            "status": status.value,
-            "note": note,
-            "updated_at": _now_iso(),
-            "config": self.config.to_summary(),
-            "log_path": str(self.log_path),
-            "raw_log_path": str(self.raw_log_path),
-            "transcript_path": str(self.transcript_path),
-            "agent_ready": self.agent_ready,
-            "last_reply": self.last_reply,
-            "state_revision": int(previous.get("state_revision", 0)) + 1,
-            "last_writer": "TmuxBatchWorker",
-            "workflow_stage": str(previous.get("workflow_stage", "pending")),
-            "workflow_round": int(previous.get("workflow_round", 0)),
-            "provider_phase": self.provider_phase.value,
-            "wrapper_state": self.wrapper_state.value,
-            "health_status": str(previous.get("health_status", "unknown")),
-            "health_note": str(previous.get("health_note", "")),
-            "retry_count": int(previous.get("retry_count", 0)),
-            "last_log_offset": self.last_log_offset,
-            "auto_recovery_mode": str(previous.get("auto_recovery_mode", "standard")),
-            "recoverable": self.recoverable,
-            "result_status": str(previous.get("result_status", "pending")),
-            "current_command": self.current_command or str(previous.get("current_command", "")),
-            "current_path": self.current_path or str(previous.get("current_path", "")),
-            "last_turn_token": str(previous.get("last_turn_token", "")),
-            "last_prompt_hash": str(previous.get("last_prompt_hash", "")),
-            "last_heartbeat_at": self.last_heartbeat_at or str(previous.get("last_heartbeat_at", "")),
-            "current_turn_id": str(previous.get("current_turn_id", "")),
-            "current_turn_phase": str(previous.get("current_turn_phase", "")),
-            "current_turn_status_path": str(previous.get("current_turn_status_path", "")),
-            "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
-            "current_task_completion_command": self.current_task_completion_command or str(previous.get("current_task_completion_command", "")),
-            "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
-            "last_terminal_signature": self.last_terminal_signature,
-            "last_terminal_changed_at": self.last_terminal_changed_at,
-            "terminal_recently_changed": self.terminal_recently_changed,
-        }
-        if extra:
-            payload.update(extra)
-        tmp_path = self.state_path.with_suffix(".tmp")
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp_path.replace(self.state_path)
+        with self.state_lock:
+            previous = self.read_state()
+            payload: dict[str, object] = {
+                "worker_id": self.worker_id,
+                "session_name": self.session_name,
+                "pane_id": self.pane_id,
+                "work_dir": str(self.work_dir),
+                "status": status.value,
+                "note": note,
+                "updated_at": _now_iso(),
+                "config": self.config.to_summary(),
+                "log_path": str(self.log_path),
+                "raw_log_path": str(self.raw_log_path),
+                "transcript_path": str(self.transcript_path),
+                "agent_ready": self.agent_ready,
+                "last_reply": self.last_reply,
+                "state_revision": int(previous.get("state_revision", 0)) + 1,
+                "last_writer": "TmuxBatchWorker",
+                "workflow_stage": str(previous.get("workflow_stage", "pending")),
+                "workflow_round": int(previous.get("workflow_round", 0)),
+                "provider_phase": self.provider_phase.value,
+                "wrapper_state": self.wrapper_state.value,
+                "health_status": str(previous.get("health_status", "unknown")),
+                "health_note": str(previous.get("health_note", "")),
+                "retry_count": int(previous.get("retry_count", 0)),
+                "last_log_offset": self.last_log_offset,
+                "auto_recovery_mode": str(previous.get("auto_recovery_mode", "standard")),
+                "recoverable": self.recoverable,
+                "result_status": str(previous.get("result_status", "pending")),
+                "current_command": self.current_command or str(previous.get("current_command", "")),
+                "current_path": self.current_path or str(previous.get("current_path", "")),
+                "last_turn_token": str(previous.get("last_turn_token", "")),
+                "last_prompt_hash": str(previous.get("last_prompt_hash", "")),
+                "last_heartbeat_at": self.last_heartbeat_at or str(previous.get("last_heartbeat_at", "")),
+                "current_turn_id": str(previous.get("current_turn_id", "")),
+                "current_turn_phase": str(previous.get("current_turn_phase", "")),
+                "current_turn_status_path": str(previous.get("current_turn_status_path", "")),
+                "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
+                "current_task_manifest_path": self.current_task_manifest_path or str(previous.get("current_task_manifest_path", "")),
+                "current_task_result_path": self.current_task_result_path or str(previous.get("current_task_result_path", "")),
+                "current_task_completion_command": self.current_task_completion_command or str(previous.get("current_task_completion_command", "")),
+                "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
+                "current_task_completion_nudge_count": self.current_task_completion_nudge_count,
+                "current_task_completion_nudge_at": self.current_task_completion_nudge_at,
+                "last_terminal_signature": self.last_terminal_signature,
+                "last_terminal_changed_at": self.last_terminal_changed_at,
+                "terminal_recently_changed": self.terminal_recently_changed,
+            }
+            if extra:
+                payload.update(extra)
+            tmp_path = self.state_path.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp_path.replace(self.state_path)
         self._log_event("state_changed", status=status.value, note=note)
+
+    def _build_passive_health_snapshot(self) -> WorkerHealthSnapshot:
+        observed_at = _now_iso()
+        session_exists, visible_text, current_command, current_path, pane_dead = self._capture_pane_snapshot(
+            tail_lines=120
+        )
+        if not session_exists:
+            return WorkerHealthSnapshot(
+                session_exists=False,
+                health_status="missing_session",
+                health_note="missing_session",
+                provider_phase=self.provider_phase.value,
+                last_heartbeat_at=observed_at,
+                last_log_offset=self.last_log_offset,
+                current_command=self.current_command,
+                current_path=self.current_path,
+                pane_id=self.pane_id,
+                session_name=self.session_name,
+            )
+        passive_observation = WorkerObservation(
+            visible_text=visible_text,
+            raw_log_delta="",
+            raw_log_tail="",
+            current_command=current_command,
+            current_path=current_path,
+            pane_dead=pane_dead,
+            session_exists=session_exists,
+            log_mtime=0.0,
+            observed_at=observed_at,
+        )
+        phase = self.detector.classify_phase(passive_observation)
+        if is_provider_auth_error(visible_text):
+            health_status = "provider_auth_error"
+            health_note = "provider_auth_error"
+        else:
+            health_status = "pane_dead" if pane_dead else "alive"
+            health_note = phase.value
+        return WorkerHealthSnapshot(
+            session_exists=True,
+            health_status=health_status,
+            health_note=health_note,
+            provider_phase=phase.value,
+            last_heartbeat_at=observed_at,
+            last_log_offset=self.last_log_offset,
+            current_command=current_command or self.current_command,
+            current_path=current_path or self.current_path,
+            pane_id=self.pane_id,
+            session_name=self.session_name,
+        )
+
+    def _refresh_health_state_nonintrusive(self) -> WorkerHealthSnapshot:
+        snapshot = self._build_passive_health_snapshot()
+        with self.state_lock:
+            previous = self.read_state()
+            health_changed = (
+                str(previous.get("health_status", "unknown")) != snapshot.health_status
+                or str(previous.get("health_note", "")) != snapshot.health_note
+                or str(previous.get("current_command", "")) != snapshot.current_command
+                or str(previous.get("current_path", "")) != snapshot.current_path
+            )
+            if health_changed:
+                payload = dict(previous)
+                payload.update(
+                    {
+                        "health_status": snapshot.health_status,
+                        "health_note": snapshot.health_note,
+                        "current_command": snapshot.current_command,
+                        "current_path": snapshot.current_path,
+                        "last_heartbeat_at": snapshot.last_heartbeat_at,
+                    }
+                )
+                tmp_path = self.state_path.with_suffix(".tmp")
+                tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp_path.replace(self.state_path)
+        return snapshot
 
     def request_restart(self) -> str:
         if self.session_exists():
+            self._stop_health_supervisor()
             self.backend.kill_session(self.session_name)
         self.agent_ready = False
         self.recoverable = True
         self.provider_phase = ProviderPhase.RECOVERING
         self.wrapper_state = WrapperState.NOT_READY
         self._reset_terminal_activity()
+        self._reset_task_completion_nudge_state()
         self.current_task_status_path = ""
+        self.current_task_manifest_path = ""
+        self.current_task_result_path = ""
         self.current_task_completion_command = ""
         self.current_task_runtime_status = ""
         self._log_event("manual_restart_requested", session_name=self.session_name)
@@ -1394,13 +1666,17 @@ class TmuxBatchWorker:
 
     def request_kill(self) -> str:
         if self.session_exists():
+            self._stop_health_supervisor()
             self.backend.kill_session(self.session_name)
         self.agent_ready = False
         self.recoverable = False
         self.provider_phase = ProviderPhase.ERROR
         self.wrapper_state = WrapperState.NOT_READY
         self._reset_terminal_activity()
+        self._reset_task_completion_nudge_state()
         self.current_task_status_path = ""
+        self.current_task_manifest_path = ""
+        self.current_task_result_path = ""
         self.current_task_completion_command = ""
         self.current_task_runtime_status = ""
         self._log_event("manual_kill_requested", session_name=self.session_name)
@@ -1412,6 +1688,8 @@ class TmuxBatchWorker:
             auto_relaunch: bool = False,
             relaunch_timeout_sec: float = 30.0,
     ) -> WorkerHealthSnapshot:
+        if not auto_relaunch:
+            return self._refresh_health_state_nonintrusive()
         session_exists = self.session_exists()
         health_status = "alive" if session_exists else "missing_session"
         health_note = self.provider_phase.value if session_exists else "missing_session"
@@ -1506,7 +1784,7 @@ class TmuxBatchWorker:
 
         while time.monotonic() < deadline:
             observation = self.observe(tail_lines=320)
-            if not observation.session_exists or not self.target_exists():
+            if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for prompt submission")
             if observation.pane_dead:
                 raise RuntimeError(f"tmux pane died after sending prompt:\n{self.capture_visible(160)}")
@@ -1563,20 +1841,22 @@ class TmuxBatchWorker:
 
         while time.monotonic() < deadline:
             observation = self.observe(tail_lines=220)
-            if not observation.session_exists or not self.target_exists():
+            if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for turn artifacts")
             if observation.pane_dead:
                 raise RuntimeError(f"tmux pane died while waiting for turn artifacts:\n{self.capture_visible(160)}")
-
-            if observation.current_command in SHELL_COMMANDS:
-                self.agent_ready = False
-                raise RuntimeError(
-                    f"agent exited back to shell while waiting for turn artifacts:\n{observation.visible_text}")
 
             status_done_seen = self._track_task_completion_signal(
                 task_status_path=task_status_path,
                 status_done_seen=status_done_seen,
             )
+            if self._maybe_send_task_completion_nudge(
+                current_command=observation.current_command,
+                visible_text=observation.visible_text,
+                task_status_path=task_status_path,
+            ):
+                time.sleep(0.5)
+                continue
 
             try:
                 file_result = contract.validator(contract.status_path)
@@ -1607,10 +1887,92 @@ class TmuxBatchWorker:
                     status_path=str(contract.status_path),
                 )
                 return file_result
+            if observation.current_command in SHELL_COMMANDS:
+                self.agent_ready = False
+                raise RuntimeError(
+                    f"agent exited back to shell while waiting for turn artifacts:\n{observation.visible_text}")
             time.sleep(0.5)
 
         raise TimeoutError(
             f"等待 turn 文件结果超时: phase={contract.phase} status_path={contract.status_path}\n"
+            f"{clean_ansi(self.capture_visible(200))[-4000:]}"
+        )
+
+    def wait_for_task_result(
+            self,
+            *,
+            contract: TaskResultContract,
+            task_status_path: Path | None,
+            result_path: Path,
+            timeout_sec: float,
+    ) -> TaskResultFile:
+        deadline = time.monotonic() + timeout_sec
+        stable_signature: tuple[object, ...] | None = None
+        stable_hits = 0
+        status_done_seen = task_status_path is None
+
+        while time.monotonic() < deadline:
+            observation = self.observe(tail_lines=220)
+            if not observation.session_exists:
+                raise RuntimeError("tmux pane exited while waiting for task result")
+            if observation.pane_dead:
+                raise RuntimeError(f"tmux pane died while waiting for task result:\n{self.capture_visible(160)}")
+
+            status_done_seen = self._track_task_completion_signal(
+                task_status_path=task_status_path,
+                status_done_seen=status_done_seen,
+            )
+            if self._maybe_send_task_completion_nudge(
+                current_command=observation.current_command,
+                visible_text=observation.visible_text,
+                task_status_path=task_status_path,
+            ):
+                time.sleep(0.5)
+                continue
+
+            try:
+                result_file = self._validate_task_result_file(
+                    contract=contract,
+                    result_path=result_path,
+                )
+            except Exception:
+                stable_signature = None
+                stable_hits = 0
+                time.sleep(0.5)
+                continue
+
+            result_stat = result_path.stat()
+            signature = (
+                result_stat.st_size,
+                result_stat.st_mtime,
+                str(result_file.payload.get("status", "")),
+                tuple(sorted(result_file.artifact_hashes.items())),
+            )
+            if signature == stable_signature:
+                stable_hits += 1
+            else:
+                stable_signature = signature
+                stable_hits = 1
+
+            self.last_heartbeat_at = observation.observed_at
+            if stable_hits >= 2 and status_done_seen:
+                self._log_event(
+                    "task_result_ready",
+                    turn_id=contract.turn_id,
+                    phase=contract.phase,
+                    result_path=str(result_path),
+                    status=str(result_file.payload.get("status", "")),
+                )
+                return result_file
+            if observation.current_command in SHELL_COMMANDS:
+                self.agent_ready = False
+                raise RuntimeError(
+                    f"agent exited back to shell while waiting for task result:\n{observation.visible_text}"
+                )
+            time.sleep(0.5)
+
+        raise TimeoutError(
+            f"等待任务结果超时: phase={contract.phase} result_path={result_path}\n"
             f"{clean_ansi(self.capture_visible(200))[-4000:]}"
         )
 
@@ -1620,7 +1982,7 @@ class TmuxBatchWorker:
         stable_count = 0
         while time.monotonic() < deadline:
             observation = self.observe(tail_lines=120)
-            if not observation.session_exists or not self.target_exists():
+            if not observation.session_exists:
                 raise RuntimeError("tmux pane exited before shell became ready")
             current_command = observation.current_command
             current_path = observation.current_path
@@ -1724,6 +2086,12 @@ class TmuxBatchWorker:
     def _build_task_status_path(self, *, label: str, attempt: int) -> Path:
         return self._task_runtime_dir() / f"{self._build_task_runtime_basename(label=label, attempt=attempt)}.json"
 
+    def _build_task_manifest_path(self, *, label: str, attempt: int) -> Path:
+        return self._task_runtime_dir() / f"{self._build_task_runtime_basename(label=label, attempt=attempt)}_manifest.json"
+
+    def _build_task_result_path(self, *, label: str, attempt: int) -> Path:
+        return self._task_runtime_dir() / f"{self._build_task_runtime_basename(label=label, attempt=attempt)}_result.json"
+
     def _task_completion_helper_module_path(self) -> Path:
         return Path(__file__).resolve().parent / "T07_task_completion.py"
 
@@ -1738,22 +2106,63 @@ class TmuxBatchWorker:
             label: str,
             attempt: int,
             task_status_path: Path,
+            manifest_path: Path | None = None,
     ) -> tuple[Path, str]:
         helper_path = self._build_task_completion_helper_path(label=label, attempt=attempt)
         helper_module = self._task_completion_helper_module_path()
         python_executable = shlex.quote(SYSTEM_PYTHON_PATH)
+        manifest_args = (
+            f"--manifest-path {shlex.quote(str(manifest_path))}"
+            if manifest_path is not None else
+            f"--task-status-path {shlex.quote(str(task_status_path))}"
+        )
         script_body = f"""#!/bin/sh
 set -eu
 status="done"
 if [ "${{1:-}}" = "--status" ]; then
   status="${{2:-done}}"
 fi
-exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {shlex.quote(str(task_status_path))} --status "$status"
+exec {python_executable} {shlex.quote(str(helper_module))} {manifest_args} --status "$status"
 """
         helper_path.write_text(script_body, encoding="utf-8")
         helper_path.chmod(0o755)
         command = f"{shlex.quote(str(helper_path))} --status done"
         return helper_path, command
+
+    def _write_task_manifest_file(
+            self,
+            *,
+            task_status_path: Path,
+            manifest_path: Path,
+            result_path: Path,
+            contract: TaskResultContract,
+    ) -> None:
+        payload = {
+            "schema_version": "1.0",
+            "stage_name": contract.stage_name,
+            "turn_id": contract.turn_id,
+            "phase": contract.phase,
+            "task_kind": contract.task_kind,
+            "mode": contract.mode,
+            "task_status_path": str(task_status_path.resolve()),
+            "result_path": str(result_path.resolve()),
+            "turn_status_path": str(contract.turn_status_path.resolve()) if contract.turn_status_path else "",
+            "stage_status_path": str(contract.stage_status_path.resolve()) if contract.stage_status_path else "",
+            "required_artifacts": {
+                key: str(path.resolve()) for key, path in contract.required_artifacts.items()
+            },
+            "optional_artifacts": {
+                key: str(path.resolve()) for key, path in contract.optional_artifacts.items()
+            },
+            "artifact_rules": contract.artifact_rules,
+            "retry_policy": contract.retry_policy,
+            "resume_policy": contract.resume_policy,
+        }
+        target = manifest_path.expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_suffix(target.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(target)
 
     @staticmethod
     def _write_task_status_file(path: str | Path, *, status: str) -> None:
@@ -1778,6 +2187,69 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
             return "done"
         return ""
 
+    @staticmethod
+    def _read_task_result_file(path: str | Path) -> dict[str, Any]:
+        target = Path(path).expanduser().resolve()
+        if not target.exists():
+            return {}
+        try:
+            payload = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _validate_task_result_file(
+            self,
+            *,
+            contract: TaskResultContract,
+            result_path: Path,
+    ) -> TaskResultFile:
+        payload = self._read_task_result_file(result_path)
+        if not payload:
+            raise FileNotFoundError(f"缺少 result.json: {result_path}")
+        if str(payload.get("schema_version", "")).strip() != "1.0":
+            raise ValueError("result.json schema_version 非法")
+        if str(payload.get("turn_id", "")).strip() != contract.turn_id:
+            raise ValueError("result.json turn_id 非法")
+        if str(payload.get("phase", "")).strip() != contract.phase:
+            raise ValueError("result.json phase 非法")
+        if str(payload.get("task_kind", "")).strip() != contract.task_kind:
+            raise ValueError("result.json task_kind 非法")
+        status = str(payload.get("status", "")).strip()
+        if contract.expected_statuses and status not in contract.expected_statuses:
+            raise ValueError(f"result.json status 非法: {status}")
+        if not isinstance(payload.get("summary", ""), str):
+            raise ValueError("result.json summary 必须是字符串")
+        artifacts = payload.get("artifacts", {})
+        artifact_hashes = payload.get("artifact_hashes", {})
+        if not isinstance(artifacts, dict):
+            raise ValueError("result.json artifacts 必须是对象")
+        if not isinstance(artifact_hashes, dict):
+            raise ValueError("result.json artifact_hashes 必须是对象")
+        for alias, required_path in contract.required_artifacts.items():
+            resolved_required = str(required_path.resolve())
+            actual_path = str(artifacts.get(alias, "")).strip()
+            if not actual_path:
+                raise ValueError(f"result.json 缺少必填 artifact: {alias}")
+            if str(Path(actual_path).expanduser().resolve()) != resolved_required:
+                raise ValueError(f"result.json artifact 路径非法: {alias}")
+        for alias, artifact_path in artifacts.items():
+            resolved = Path(str(artifact_path)).expanduser().resolve()
+            if not resolved.exists():
+                raise FileNotFoundError(f"result.json 引用的文件不存在: {resolved}")
+            expected_hash = str(artifact_hashes.get(str(resolved), "")).strip()
+            if not expected_hash:
+                raise ValueError(f"result.json 缺少 artifact_hashes: {resolved}")
+            if expected_hash != _build_prefixed_sha256(resolved):
+                raise ValueError(f"result.json artifact_hashes 不匹配: {resolved}")
+        return TaskResultFile(
+            result_path=str(result_path.resolve()),
+            payload=payload,
+            artifact_paths={str(key): str(value) for key, value in artifacts.items()},
+            artifact_hashes={str(key): str(value) for key, value in artifact_hashes.items()},
+            validated_at=_now_iso(),
+        )
+
     def _track_task_completion_signal(
             self,
             *,
@@ -1793,6 +2265,86 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                 self._log_event("task_status_done", task_status_path=str(task_status_path))
                 return True
         return status_done_seen
+
+    def _reset_task_completion_nudge_state(self) -> None:
+        self.current_task_completion_nudge_count = 0
+        self.current_task_completion_nudge_at = ""
+        self._current_task_last_nudge_monotonic = 0.0
+
+    def _terminal_idle_duration_sec(self) -> float:
+        if not self.last_terminal_signature or not self._last_terminal_change_monotonic:
+            return 0.0
+        return max(0.0, time.monotonic() - self._last_terminal_change_monotonic)
+
+    def _build_task_completion_nudge_prompt(self, complete_task_command: str) -> str:
+        return (
+            "仅当你已经完成当前任务但尚未收尾时：执行以下命令并立刻停止；"
+            "否则继续当前任务，不要回复。\n"
+            f"{complete_task_command}"
+        )
+
+    def _maybe_send_task_completion_nudge(
+            self,
+            *,
+            current_command: str,
+            visible_text: str,
+            task_status_path: Path | None,
+    ) -> bool:
+        if task_status_path is None:
+            return False
+        if self.current_task_runtime_status != "running":
+            return False
+        if self.current_task_completion_nudge_count >= self.task_completion_nudge_max_count:
+            return False
+        if not self.current_task_completion_command:
+            return False
+        if not self._agent_running(current_command):
+            return False
+        if visible_text and self._visible_indicates_agent_starting(visible_text):
+            return False
+
+        ready_visible = self._phase_accepts_followup_prompt(self.provider_phase)
+        if visible_text and self._visible_indicates_agent_ready(visible_text):
+            ready_visible = True
+        if not ready_visible:
+            return False
+        if self.terminal_recently_changed:
+            return False
+        if self._terminal_idle_duration_sec() < self.task_completion_nudge_idle_sec:
+            return False
+
+        now_monotonic = time.monotonic()
+        if (
+            self._current_task_last_nudge_monotonic
+            and now_monotonic - self._current_task_last_nudge_monotonic < self.task_completion_nudge_grace_sec
+        ):
+            return False
+
+        self._send_text(self._build_task_completion_nudge_prompt(self.current_task_completion_command))
+        self.current_task_completion_nudge_count += 1
+        self.current_task_completion_nudge_at = _now_iso()
+        self._current_task_last_nudge_monotonic = now_monotonic
+        self.wrapper_state = WrapperState.NOT_READY
+        self._log_event(
+            "task_completion_nudge_sent",
+            task_status_path=str(task_status_path),
+            nudge_count=self.current_task_completion_nudge_count,
+        )
+        self._write_state(
+            WorkerStatus.RUNNING,
+            note="task_completion_nudge",
+            extra={
+                "result_status": "running",
+                "current_task_status_path": str(task_status_path),
+                "current_task_manifest_path": self.current_task_manifest_path,
+                "current_task_result_path": self.current_task_result_path,
+                "current_task_completion_command": self.current_task_completion_command,
+                "current_task_runtime_status": self.current_task_runtime_status,
+                "current_task_completion_nudge_count": self.current_task_completion_nudge_count,
+                "current_task_completion_nudge_at": self.current_task_completion_nudge_at,
+            },
+        )
+        return True
 
     @staticmethod
     def _build_terminal_signature(terminal_text: str) -> str:
@@ -1834,6 +2386,13 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
         if not recent_output.strip():
             return False
         if self.config.vendor == Vendor.CODEX:
+            if (
+                    any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS)
+                    and not any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_STARTING_PATTERNS)
+                    and not any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_TRUST_PROMPT_PATTERNS)
+                    and not any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_MODEL_SELECTION_PROMPT_PATTERNS)
+            ):
+                return False
             return any(
                 re.search(pattern, recent_output, re.IGNORECASE)
                 for pattern in (
@@ -1866,15 +2425,22 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
             recent_output = "\n".join(str(visible_text or "").splitlines()[-120:])
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_TRUST_PROMPT_PATTERNS):
                 return False
-            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_UPDATE_PROMPT_PATTERNS):
-                return False
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in
                    CODEX_MODEL_SELECTION_PROMPT_PATTERNS):
                 return False
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_STARTING_PATTERNS):
                 return False
-            return any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in
-                       CODEX_READY_PATTERNS)
+            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_PROCESSING_PATTERNS):
+                return False
+            ready_detected = any(
+                re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE)
+                for pattern in CODEX_READY_PATTERNS
+            )
+            if ready_detected:
+                return True
+            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_UPDATE_PROMPT_PATTERNS):
+                return False
+            return False
         if self.config.vendor == Vendor.GEMINI:
             recent_output = "\n".join(str(visible_text or "").splitlines()[-120:])
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_TRUST_PROMPT_PATTERNS):
@@ -1927,7 +2493,7 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
         stable_count = 0
         while time.monotonic() < deadline:
             observation = self.observe(tail_lines=220)
-            if not observation.session_exists or not self.target_exists():
+            if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while agent was starting")
             if observation.pane_dead:
                 raise RuntimeError(f"tmux pane died while agent was starting:\n{self.capture_visible(120)}")
@@ -1992,6 +2558,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                 with self.launch_coordinator.startup_slot(self.config.vendor):
                     if not self.pane_id or not self.target_exists():
                         self.create_session()
+                    else:
+                        self._ensure_health_supervisor_started()
                     self._wait_for_shell_ready()
                     self.provider_phase = ProviderPhase.BOOTING
                     self.wrapper_state = WrapperState.NOT_READY
@@ -2012,6 +2580,7 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                     break
                 if self.session_exists():
                     try:
+                        self._stop_health_supervisor()
                         self.backend.kill_session(self.session_name)
                     except Exception:
                         pass
@@ -2020,6 +2589,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
             raise last_error
 
     def ensure_agent_ready(self, timeout_sec: float = 60.0) -> None:
+        if self.session_exists() and self.pane_id:
+            self._ensure_health_supervisor_started()
         if not self.pane_id or not self.target_exists():
             self.provider_phase = ProviderPhase.RECOVERING
             self.wrapper_state = WrapperState.NOT_READY
@@ -2260,6 +2831,36 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
             return self._strip_turn_token(reply, turn_token)
         return ""
 
+    def _extract_required_token_reply_without_turn_token(
+            self,
+            observation: WorkerObservation,
+            *,
+            required_tokens: Sequence[str],
+    ) -> str:
+        if not required_tokens:
+            return ""
+        phase = self.detector.classify_phase(observation)
+        if phase not in {
+            ProviderPhase.WAITING_INPUT,
+            ProviderPhase.IDLE_READY,
+            ProviderPhase.COMPLETED_RESPONSE,
+        }:
+            return ""
+        candidate_sources = [observation.visible_text, observation.raw_log_tail]
+        for source in candidate_sources:
+            if not source:
+                continue
+            try:
+                reply = self.detector.extract_last_message(source)
+            except Exception:
+                continue
+            lines = clean_ansi(reply).splitlines()
+            for line in reversed(lines):
+                token = _extract_protocol_token_from_line(line, required_tokens)
+                if token:
+                    return token
+        return ""
+
     def _wait_for_turn_reply(
             self,
             *,
@@ -2275,7 +2876,7 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
         status_done_seen = task_status_path is None
         while time.monotonic() < deadline:
             observation = self.observe(tail_lines=500)
-            if not observation.session_exists or not self.target_exists():
+            if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for reply")
             if observation.pane_dead:
                 raise RuntimeError(f"tmux pane died while waiting for reply:\n{self.capture_visible(160)}")
@@ -2290,6 +2891,13 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                 task_status_path=task_status_path,
                 status_done_seen=status_done_seen,
             )
+            if self._maybe_send_task_completion_nudge(
+                current_command=current_command,
+                visible_text=visible,
+                task_status_path=task_status_path,
+            ):
+                time.sleep(0.4)
+                continue
 
             reply = self._extract_reply_from_observation(
                 observation,
@@ -2302,6 +2910,13 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
             if not resolved_reply and baseline_reply:
                 time.sleep(0.4)
                 continue
+            if not resolved_reply and status_done_seen:
+                fallback_reply = self._extract_required_token_reply_without_turn_token(
+                    observation,
+                    required_tokens=required_tokens,
+                )
+                if fallback_reply:
+                    resolved_reply = fallback_reply
             if not resolved_reply:
                 time.sleep(0.4)
                 continue
@@ -2329,20 +2944,38 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
             prompt: str,
             required_tokens: Sequence[str] = (),
             completion_contract: TurnFileContract | None = None,
+            result_contract: TaskResultContract | None = None,
             timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
     ) -> CommandResult:
         started_at = _now_iso()
         last_timeout: TimeoutError | None = None
+        self._reset_task_completion_nudge_state()
         for attempt in range(1, 3):
             turn_token = f"[[ACX_TURN:{uuid.uuid4().hex[:8]}:DONE]]"
             task_status_path = self._build_task_status_path(label=label, attempt=attempt)
+            manifest_path = self._build_task_manifest_path(label=label, attempt=attempt)
+            result_path = self._build_task_result_path(label=label, attempt=attempt)
             self._write_task_status_file(task_status_path, status="running")
+            if manifest_path.exists():
+                manifest_path.unlink()
+            if result_path.exists():
+                result_path.unlink()
+            if result_contract is not None:
+                self._write_task_manifest_file(
+                    task_status_path=task_status_path,
+                    manifest_path=manifest_path,
+                    result_path=result_path,
+                    contract=result_contract,
+                )
             _, complete_task_command = self._write_task_completion_helper(
                 label=label,
                 attempt=attempt,
                 task_status_path=task_status_path,
+                manifest_path=manifest_path if result_contract is not None else None,
             )
             self.current_task_status_path = str(task_status_path)
+            self.current_task_manifest_path = str(manifest_path) if result_contract is not None else ""
+            self.current_task_result_path = str(result_path) if result_contract is not None else ""
             self.current_task_completion_command = complete_task_command
             self.current_task_runtime_status = "running"
             submitted_prompt = self._build_turn_prompt(
@@ -2351,7 +2984,7 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                 required_tokens,
                 task_status_path=task_status_path,
                 complete_task_command=complete_task_command,
-                include_turn_protocol=completion_contract is None,
+                include_turn_protocol=completion_contract is None and result_contract is None,
             )
             prompt_hash = hashlib.sha1(submitted_prompt.encode("utf-8")).hexdigest()[:12]
             self._append_transcript(f"{label} / prompt", f"```text\n{submitted_prompt}\n```")
@@ -2367,6 +3000,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                     "current_turn_phase": completion_contract.phase if completion_contract else "",
                     "current_turn_status_path": str(completion_contract.status_path) if completion_contract else "",
                     "current_task_status_path": str(task_status_path),
+                    "current_task_manifest_path": self.current_task_manifest_path,
+                    "current_task_result_path": self.current_task_result_path,
                     "current_task_completion_command": complete_task_command,
                     "current_task_runtime_status": "running",
                     "result_status": "running",
@@ -2390,6 +3025,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                         "current_command": self.current_command,
                         "current_path": self.current_path,
                         "current_task_status_path": str(task_status_path),
+                        "current_task_manifest_path": self.current_task_manifest_path,
+                        "current_task_result_path": self.current_task_result_path,
                         "current_task_completion_command": complete_task_command,
                         "current_task_runtime_status": "running",
                         "retry_count": attempt - 1,
@@ -2412,6 +3049,15 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                         ensure_ascii=False,
                         indent=2,
                     )
+                elif result_contract is not None:
+                    self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=min(timeout_sec, 20.0))
+                    task_result = self.wait_for_task_result(
+                        contract=result_contract,
+                        task_status_path=task_status_path,
+                        result_path=result_path,
+                        timeout_sec=timeout_sec,
+                    )
+                    reply = json.dumps(task_result.payload, ensure_ascii=False, indent=2)
                 else:
                     reply = self._wait_for_turn_reply(
                         baseline_reply=baseline_reply,
@@ -2451,6 +3097,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                         "current_turn_phase": completion_contract.phase if completion_contract else "",
                         "current_turn_status_path": str(completion_contract.status_path) if completion_contract else "",
                         "current_task_status_path": str(task_status_path),
+                        "current_task_manifest_path": self.current_task_manifest_path,
+                        "current_task_result_path": self.current_task_result_path,
                         "current_task_completion_command": complete_task_command,
                         "current_task_runtime_status": self.current_task_runtime_status,
                     },
@@ -2472,6 +3120,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                             "retry_count": attempt,
                             "result_status": "running",
                             "current_task_status_path": str(task_status_path),
+                            "current_task_manifest_path": self.current_task_manifest_path,
+                            "current_task_result_path": self.current_task_result_path,
                             "current_task_completion_command": complete_task_command,
                             "current_task_runtime_status": self.current_task_runtime_status,
                         },
@@ -2499,6 +3149,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                         "result_status": "failed",
                         "retry_count": attempt,
                         "current_task_status_path": str(task_status_path),
+                        "current_task_manifest_path": self.current_task_manifest_path,
+                        "current_task_result_path": self.current_task_result_path,
                         "current_task_completion_command": complete_task_command,
                         "current_task_runtime_status": self.current_task_runtime_status,
                     },
@@ -2530,6 +3182,8 @@ exec {python_executable} {shlex.quote(str(helper_module))} --task-status-path {s
                         "result_status": "failed",
                         "retry_count": attempt - 1,
                         "current_task_status_path": str(task_status_path),
+                        "current_task_manifest_path": self.current_task_manifest_path,
+                        "current_task_result_path": self.current_task_result_path,
                         "current_task_completion_command": complete_task_command,
                         "current_task_runtime_status": self.current_task_runtime_status,
                     },

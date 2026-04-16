@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from T02_tmux_agents import AgentRunConfig
+from T02_tmux_agents import AgentRunConfig, cleanup_registered_tmux_workers
 from T03_agent_init_workflow import (
     BatchInitResult,
     RoutingCleanupResult,
@@ -28,7 +28,14 @@ from T03_agent_init_workflow import (
     resolve_target_selection,
     run_batch_initialization,
 )
-from T06_terminal_progress import SingleLineSpinnerMonitor, TERMINAL_SPINNER_FRAMES
+from T09_terminal_ops import (
+    SingleLineSpinnerMonitor,
+    TERMINAL_SPINNER_FRAMES,
+    message,
+    maybe_launch_tui,
+    prompt_select_option,
+    prompt_with_default,
+)
 
 
 VENDOR_CHOICES = ("codex", "claude", "gemini", "qwen", "kimi")
@@ -56,6 +63,7 @@ MODEL_CHOICES_BY_VENDOR = {
     "kimi": ("kimi-k2", "kimi-k2-turbo"),
 }
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
+PROXY_PRESET_CHOICES = ("", "10900", "7890")
 EFFORT_CHOICES_BY_MODEL = {
     vendor: {model: EFFORT_CHOICES for model in models}
     for vendor, models in MODEL_CHOICES_BY_VENDOR.items()
@@ -76,6 +84,16 @@ class CliRequest:
     auto_confirm: bool
 
 
+@dataclass(frozen=True)
+class RoutingStageResult:
+    project_dir: str
+    skipped: bool
+    exit_code: int
+    batch_result: BatchInitResult | None = None
+    killed_sessions: tuple[str, ...] = ()
+    cleanup_result: RoutingCleanupResult | None = None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AGENT初始化阶段：tmux + coding agent 路由层初始化")
     parser.add_argument("--project-dir", help="项目工作目录")
@@ -88,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-refine-rounds", type=int, default=3, help="最大 refine 轮数")
     parser.add_argument("--resume-run", default="", help="恢复已有 run_id，仅供 B01 控制台使用")
     parser.add_argument("--yes", action="store_true", help="跳过最终确认")
+    parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
 
 
@@ -143,26 +162,13 @@ def split_target_dirs_text(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
 
 
-def prompt_with_default(prompt_text: str, default: str = "", allow_empty: bool = False) -> str:
-    suffix = f" [{default}]" if default else ""
-    while True:
-        value = input(f"{prompt_text}{suffix}: ").strip()
-        if value:
-            return value
-        if default:
-            return default
-        if allow_empty:
-            return ""
-        print("输入不能为空，请重试。")
-
-
 def prompt_project_dir(default: str = "") -> str:
     while True:
         candidate = prompt_with_default("项目工作目录", default)
         try:
             return str(resolve_existing_directory(candidate))
         except Exception as error:
-            print(f"目录无效: {error}")
+            message(f"目录无效: {error}")
 
 
 def prompt_target_dirs(defaults: Sequence[str] = ()) -> tuple[str, ...]:
@@ -172,71 +178,102 @@ def prompt_target_dirs(defaults: Sequence[str] = ()) -> tuple[str, ...]:
 
 
 def prompt_vendor(default: str = "codex") -> str:
-    print("可选厂商:")
-    for index, vendor in enumerate(VENDOR_CHOICES, start=1):
-        models = ", ".join(MODEL_CHOICES_BY_VENDOR[vendor])
-        print(f"  {index}. {vendor} | models: {models}")
-    while True:
-        candidate = prompt_with_default("选择厂商", default)
-        try:
-            return normalize_vendor_choice(candidate)
-        except ValueError as error:
-            print(error)
+    options = [
+        (vendor, f"{vendor} | models: {', '.join(MODEL_CHOICES_BY_VENDOR[vendor])}")
+        for vendor in VENDOR_CHOICES
+    ]
+    candidate = prompt_select_option(
+        title="可选厂商:",
+        options=options,
+        default_value=normalize_vendor_choice(default),
+        prompt_text="选择厂商",
+    )
+    return normalize_vendor_choice(candidate)
 
 
 def prompt_model(vendor: str, default: str | None = None) -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
     models = MODEL_CHOICES_BY_VENDOR[normalized_vendor]
     actual_default = default or DEFAULT_MODEL_BY_VENDOR[normalized_vendor]
-    print(f"{normalized_vendor} 可选模型:")
-    for index, model in enumerate(models, start=1):
-        efforts = "/".join(EFFORT_CHOICES_BY_MODEL[normalized_vendor][model])
-        print(f"  {index}. {model} | efforts: {efforts}")
-    while True:
-        candidate = prompt_with_default("选择模型", actual_default)
-        try:
-            return normalize_model_choice(normalized_vendor, candidate)
-        except ValueError as error:
-            print(error)
+    options = [
+        (model, f"{model} | efforts: {'/'.join(EFFORT_CHOICES_BY_MODEL[normalized_vendor][model])}")
+        for model in models
+    ]
+    candidate = prompt_select_option(
+        title=f"{normalized_vendor} 可选模型:",
+        options=options,
+        default_value=normalize_model_choice(normalized_vendor, actual_default),
+        prompt_text="选择模型",
+    )
+    return normalize_model_choice(normalized_vendor, candidate)
 
 
 def prompt_effort(vendor: str, model: str, default: str = "high") -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
     normalized_model = normalize_model_choice(normalized_vendor, model)
     allowed = EFFORT_CHOICES_BY_MODEL[normalized_vendor][normalized_model]
-    print(f"{normalized_model} 可选推理强度:")
-    for index, effort in enumerate(allowed, start=1):
-        print(f"  {index}. {effort}")
-    while True:
-        candidate = prompt_with_default("选择推理强度", default)
-        try:
-            return normalize_effort_choice(normalized_vendor, normalized_model, candidate)
-        except ValueError as error:
-            print(error)
+    candidate = prompt_select_option(
+        title=f"{normalized_model} 可选推理强度:",
+        options=[(effort, effort) for effort in allowed],
+        default_value=normalize_effort_choice(normalized_vendor, normalized_model, default),
+        prompt_text="选择推理强度",
+    )
+    return normalize_effort_choice(normalized_vendor, normalized_model, candidate)
+
+
+def prompt_proxy_port(default: str = "") -> str:
+    normalized_default = str(default or "").strip()
+    has_preset_default = normalized_default in PROXY_PRESET_CHOICES
+    default_value = normalized_default if has_preset_default else "__custom__"
+    options = (
+        ("", "(none)"),
+        ("10900", "10900"),
+        ("7890", "7890"),
+        ("__custom__", "自定义输入"),
+    )
+    candidate = prompt_select_option(
+        title="选择代理端口:",
+        options=options,
+        default_value=default_value,
+        prompt_text="选择代理端口",
+    )
+    if candidate != "__custom__":
+        return candidate
+    return prompt_with_default("代理端口或完整代理 URL，可留空", normalized_default, allow_empty=True)
 
 
 def prompt_run_init(default: bool = True) -> bool:
-    default_text = "yes" if default else "no"
-    while True:
-        candidate = prompt_with_default("是否执行 AGENT初始化 (yes/no)", default_text)
-        try:
-            return normalize_run_init_choice(candidate)
-        except ValueError as error:
-            print(error)
+    candidate = prompt_select_option(
+        title="是否执行 AGENT初始化:",
+        options=(("yes", "yes"), ("no", "no")),
+        default_value="yes" if default else "no",
+        prompt_text="是否执行 AGENT初始化",
+    )
+    return normalize_run_init_choice(candidate)
 
 
 def prompt_confirmation(summary_text: str, *, force_yes: bool = False) -> bool:
-    print("\n执行摘要:")
-    print(summary_text)
+    message("\n执行摘要:")
+    message(summary_text)
     if not force_yes:
-        decision = prompt_with_default("确认开始执行? (yes/no)", "yes")
+        decision = prompt_select_option(
+            title="确认开始执行?",
+            options=(("yes", "yes"), ("no", "no")),
+            default_value="yes",
+            prompt_text="确认开始执行",
+        )
         return normalize_run_init_choice(decision)
 
     while True:
-        decision = prompt_with_default("确认开始执行? (yes only)", "yes")
+        decision = prompt_select_option(
+            title="确认开始执行? (yes only)",
+            options=(("yes", "yes"), ("no", "no")),
+            default_value="yes",
+            prompt_text="确认开始执行",
+        )
         if normalize_run_init_choice(decision):
             return True
-        print("当前项目路由层文件缺失，必须执行初始化。请输入 yes 继续。")
+        message("当前项目路由层文件缺失，必须执行初始化。请输入 yes 继续。")
 
 
 def collect_cli_request(args: argparse.Namespace) -> CliRequest:
@@ -263,7 +300,7 @@ def collect_cli_request(args: argparse.Namespace) -> CliRequest:
     project_missing_files = tuple(missing_routing_layer_files(project_dir))
     run_init = requested_run_init
     if not requested_run_init and project_missing_files:
-        print("当前项目路由层文件缺失, 强制执行路由初始化")
+        message("当前项目路由层文件缺失, 强制执行路由初始化")
         run_init = True
 
     target_dirs = tuple(args.target_dir or ())
@@ -277,7 +314,7 @@ def collect_cli_request(args: argparse.Namespace) -> CliRequest:
         model_default = DEFAULT_MODEL_BY_VENDOR[vendor]
         model = args.model or prompt_model(vendor, model_default)
         reasoning_effort = args.effort or ("high" if parameter_mode else prompt_effort(vendor, model, "high"))
-        proxy_port = args.proxy_port or ("" if parameter_mode else prompt_with_default("代理端口或完整代理 URL，可留空", "", allow_empty=True))
+        proxy_port = args.proxy_port or ("" if parameter_mode else prompt_proxy_port(""))
     else:
         vendor = normalize_vendor_choice(args.vendor or "codex")
         model = args.model or DEFAULT_MODEL_BY_VENDOR[vendor]
@@ -578,7 +615,7 @@ class TerminalProgressMonitor:
             )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
     if getattr(args, "resume_run", ""):
@@ -587,21 +624,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     config, selection = prepare_batch_request(request)
 
     if not selection.should_run:
-        print("当前项目路由层已完备，跳过路由初始化。")
-        print(render_requirements_stage_placeholder([]))
-        return 0
+        message("当前项目路由层已完备，跳过路由初始化。")
+        message(render_requirements_stage_placeholder([]))
+        return RoutingStageResult(
+            project_dir=request.project_dir,
+            skipped=True,
+            exit_code=0,
+            cleanup_result=RoutingCleanupResult(),
+        )
 
     preflight_summary = render_preflight_summary(request, config, selection)
     force_confirmation = bool(selection.project_missing_files)
     if not request.auto_confirm and not prompt_confirmation(preflight_summary, force_yes=force_confirmation):
-        print("已取消执行。")
-        return 0
+        message("已取消执行。")
+        return RoutingStageResult(
+            project_dir=request.project_dir,
+            skipped=True,
+            exit_code=0,
+            cleanup_result=RoutingCleanupResult(),
+        )
 
     progress_monitor: TerminalProgressMonitor | None = None
 
     def handle_workers_prepared(run_store: RunStore, live_workers, immediate_results) -> None:
         nonlocal progress_monitor
-        print(
+        message(
             render_runtime_start_summary(
                 run_store=run_store,
                 live_workers=live_workers,
@@ -627,16 +674,36 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         if progress_monitor is not None:
             progress_monitor.stop()
-    print(format_batch_summary(batch_result))
+    message(format_batch_summary(batch_result))
     run_store = RunStore.load(
         run_id=batch_result.run_id,
         runtime_root=Path(batch_result.runtime_dir).parent,
     )
     killed_sessions = kill_run_tmux_sessions(run_store=run_store)
     cleanup_result = cleanup_routing_stage_artifacts(batch_result=batch_result)
-    print(render_requirements_stage_placeholder(killed_sessions, cleanup_result))
-    return determine_exit_code(batch_result)
+    message(render_requirements_stage_placeholder(killed_sessions, cleanup_result))
+    return RoutingStageResult(
+        project_dir=request.project_dir,
+        skipped=False,
+        exit_code=determine_exit_code(batch_result),
+        batch_result=batch_result,
+        killed_sessions=tuple(killed_sessions),
+        cleanup_result=cleanup_result,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    redirected, launch = maybe_launch_tui(argv, route="routing", action="stage.a01.start")
+    if redirected:
+        return int(launch)
+    return run_routing_stage(list(launch)).exit_code
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        cleaned_sessions = cleanup_registered_tmux_workers(reason="keyboard_interrupt")
+        if cleaned_sessions:
+            message(f"\n已清理 tmux 会话: {', '.join(cleaned_sessions)}")
+        raise SystemExit(130)

@@ -29,7 +29,6 @@ from A01_Routing_LayerPlanning import (
     prompt_project_dir,
     prompt_target_dirs,
     prompt_vendor,
-    prompt_with_default,
     render_noop_summary,
     render_preflight_summary,
 )
@@ -38,6 +37,14 @@ from T02_tmux_agents import (
     HealthSupervisor,
     TmuxBatchWorker,
     TmuxRuntimeController,
+    cleanup_registered_tmux_workers,
+)
+from T09_terminal_ops import (
+    maybe_launch_tui,
+    message,
+    prompt_command_line,
+    prompt_with_default,
+    prompt_yes_no as terminal_prompt_yes_no,
 )
 from T03_agent_init_workflow import (
     BatchInitResult,
@@ -88,13 +95,7 @@ class WorkerTarget:
 
 
 def prompt_yes_no(prompt_text: str, default: bool = False) -> bool:
-    default_text = "yes" if default else "no"
-    while True:
-        value = prompt_with_default(f"{prompt_text} (yes/no)", default_text)
-        try:
-            return normalize_run_init_choice(value)
-        except ValueError as error:
-            print(error)
+    return normalize_run_init_choice("yes" if terminal_prompt_yes_no(prompt_text, default) else "no")
 
 
 def collect_b01_request(args: argparse.Namespace) -> CliRequest:
@@ -121,7 +122,7 @@ def collect_b01_request(args: argparse.Namespace) -> CliRequest:
     project_missing_files = tuple(missing_routing_layer_files(project_dir))
     run_init = requested_run_init
     if not requested_run_init and project_missing_files:
-        print("当前项目路由层文件缺失, 强制执行路由初始化")
+        message("当前项目路由层文件缺失, 强制执行路由初始化")
         run_init = True
 
     target_dirs = tuple(args.target_dir or ())
@@ -647,6 +648,14 @@ class AgentInitControlCenter:
         )
 
     def transition_to_requirements_phase(self, batch_result: BatchInitResult) -> str:
+        if any(item.status == "failed" for item in batch_result.results):
+            return "\n".join(
+                [
+                    "路由层初始化存在失败目录，当前不进入需求分析阶段。",
+                    "请继续使用 attach / transcript / retry 排查后再推进。",
+                ]
+            )
+
         if self._requirements_placeholder_entered:
             return "\n".join(
                 [
@@ -683,9 +692,9 @@ class AgentInitControlCenter:
 
 def run_terminal_control_loop(control_center: AgentInitControlCenter) -> BatchInitResult:
     control_center.start()
-    print(render_control_help())
-    print()
-    print(control_center.render_status())
+    message(render_control_help())
+    message()
+    message(control_center.render_status())
 
     final_result: BatchInitResult | None = None
 
@@ -693,70 +702,70 @@ def run_terminal_control_loop(control_center: AgentInitControlCenter) -> BatchIn
         nonlocal final_result
         if final_result is None:
             return
-        print()
-        print(control_center.transition_to_requirements_phase(final_result))
+        message()
+        message(control_center.transition_to_requirements_phase(final_result))
 
     while True:
         if control_center.all_done() and final_result is None:
             final_result = control_center.wait_until_complete()
-            print("\n全部目录执行完成。\n")
-            print(render_control_help())
-            print()
-            print(control_center.render_status())
-            print()
+            message("\n全部目录执行完成。\n")
+            message(render_control_help())
+            message()
+            message(control_center.render_status())
+            message()
             from A01_Routing_LayerPlanning import format_batch_summary
 
-            print(format_batch_summary(final_result))
+            message(format_batch_summary(final_result))
             announce_stage_transition()
 
-        command = parse_control_command(input("\nB01> "))
+        command = parse_control_command(prompt_command_line("B01>", ""))
         if command.action == "help":
-            print(render_control_help())
+            message(render_control_help())
             continue
         if command.action == "status":
-            print(control_center.render_status())
+            message(control_center.render_status())
             continue
         if command.action == "attach":
             try:
                 control_center.attach(command.argument)
             except Exception as error:
-                print(f"attach 失败: {error}")
+                message(f"attach 失败: {error}")
             continue
         if command.action == "transcript":
             try:
-                print(control_center.show_transcript(command.argument))
+                message(control_center.show_transcript(command.argument))
             except Exception as error:
-                print(f"读取 transcript 失败: {error}")
+                message(f"读取 transcript 失败: {error}")
             continue
         if command.action == "detach":
             try:
                 session_name = control_center.detach(command.argument)
-                print(f"已请求 detach: {session_name}")
+                message(f"已请求 detach: {session_name}")
             except Exception as error:
-                print(f"detach 失败: {error}")
+                message(f"detach 失败: {error}")
             continue
         if command.action == "restart":
             try:
                 session_name = control_center.restart_worker(command.argument)
                 final_result = None
-                print(f"已请求 restart: {session_name}")
+                message(f"已请求 restart: {session_name}")
             except Exception as error:
-                print(f"restart 失败: {error}")
+                message(f"restart 失败: {error}")
             continue
         if command.action == "kill":
             try:
                 session_name = control_center.kill_worker(command.argument)
-                print(f"已请求 kill: {session_name}")
+                message(f"已请求 kill: {session_name}")
             except Exception as error:
-                print(f"kill 失败: {error}")
+                message(f"kill 失败: {error}")
             continue
         if command.action == "retry":
             try:
                 session_name = control_center.retry_worker(command.argument)
                 final_result = None
-                print(f"已重新提交 worker: {session_name}")
+                message(f"已重新提交 worker: {session_name}")
             except Exception as error:
-                print(f"retry 失败: {error}")
+                message(f"retry 失败: {error}")
             continue
         if command.action == "wait":
             if final_result is None:
@@ -764,19 +773,19 @@ def run_terminal_control_loop(control_center: AgentInitControlCenter) -> BatchIn
                     final_result = control_center.wait_until_complete()
                     from A01_Routing_LayerPlanning import format_batch_summary
 
-                    print(format_batch_summary(final_result))
+                    message(format_batch_summary(final_result))
                     announce_stage_transition()
                 except Exception as error:
-                    print(error)
+                    message(error)
             else:
-                print("全部目录已完成。")
+                message("全部目录已完成。")
             continue
         if command.action == "resume":
             if not control_center.can_switch_runs():
-                print("当前 run 尚未完成，不能切换到其他 run。")
+                message("当前 run 尚未完成，不能切换到其他 run。")
                 continue
             if not command.argument:
-                print("请提供 run_id。")
+                message("请提供 run_id。")
                 continue
             try:
                 next_center = AgentInitControlCenter.from_existing_run(
@@ -784,27 +793,30 @@ def run_terminal_control_loop(control_center: AgentInitControlCenter) -> BatchIn
                     max_refine_rounds=control_center.max_refine_rounds,
                 )
             except Exception as error:
-                print(f"resume 失败: {error}")
+                message(f"resume 失败: {error}")
                 continue
             control_center.close()
             control_center = next_center
             final_result = None
             control_center.start()
-            print(f"已切换到 run: {control_center.run_id}")
-            print(control_center.render_status())
+            message(f"已切换到 run: {control_center.run_id}")
+            message(control_center.render_status())
             continue
         if command.action == "exit":
             if final_result is None:
-                print("任务仍在运行。当前实现不支持后台脱离，请先使用 wait，或 attach 到某个会话观察执行。")
+                message("任务仍在运行。当前实现不支持后台脱离，请先使用 wait，或 attach 到某个会话观察执行。")
                 continue
             control_center.close()
             return final_result
-        print(f"未知命令: {command.action}")
+        message(f"未知命令: {command.action}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    redirected, launch = maybe_launch_tui(argv, route="control", action="control.b01.open")
+    if redirected:
+        return int(launch)
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(list(launch))
     if getattr(args, "resume_run", ""):
         control_center = AgentInitControlCenter.from_existing_run(
             run_id=args.resume_run,
@@ -829,14 +841,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not selection.should_run:
         from A01_Routing_LayerPlanning import render_requirements_stage_placeholder
 
-        print("当前项目路由层已完备，跳过路由初始化。")
-        print(render_requirements_stage_placeholder([]))
+        message("当前项目路由层已完备，跳过路由初始化。")
+        message(render_requirements_stage_placeholder([]))
         return 0
 
     preflight_summary = render_preflight_summary(request, config, selection)
     force_confirmation = bool(selection.project_missing_files)
     if not request.auto_confirm and not prompt_confirmation(preflight_summary, force_yes=force_confirmation):
-        print("已取消执行。")
+        message("已取消执行。")
         return 0
 
     control_center = AgentInitControlCenter.create_new(
@@ -849,4 +861,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        cleaned_sessions = cleanup_registered_tmux_workers(reason="keyboard_interrupt")
+        if cleaned_sessions:
+            message(f"\n已清理 tmux 会话: {', '.join(cleaned_sessions)}")
+        raise SystemExit(130)
