@@ -998,24 +998,25 @@ def build_audit_prompt(
         routing_audit_status_pass: str,
         routing_audit_status_fail: str,
 ) -> str:
-    return (
-        f"{routing_layer_file_audit}\n\n"
-        "Audit file output requirements:\n"
-        f"- This is audit round `{int(audit_round)}`.\n"
-        f"- You must write the detailed audit record into `{routing_audit_record_file}` in the current working directory.\n"
-        f"- You must write the machine status file into `{routing_audit_status_file}` in the current working directory.\n"
-        f"- In `{routing_audit_status_file}`, write valid JSON with exactly these required fields:\n"
-        "{\n"
-        '  "schema_version": "1.0",\n'
-        '  "stage": "routing_layer_audit",\n'
-        f'  "audit_round": {int(audit_round)},\n'
-        f'  "status": "{routing_audit_status_pass}" | "{routing_audit_status_fail}",\n'
-        f'  "review_record_path": "{routing_audit_record_file}"\n'
-        "}\n"
-        f"- If the audit passes, `{routing_audit_record_file}` must still be overwritten with a minimal record that states the pass result.\n"
-        f"- If the audit fails, write the final AI-to-AI bullet audit into `{routing_audit_record_file}`.\n"
-        f"- `{routing_audit_status_file}` is the single source of truth for pass/fail.\n"
-    )
+    base_prompt = routing_layer_file_audit() if callable(routing_layer_file_audit) else str(routing_layer_file_audit)
+    return f"""{str(base_prompt).strip()}
+
+Audit file output requirements:
+- This is audit round `{int(audit_round)}`.
+- You must write the detailed audit record into `{routing_audit_record_file}` in the current working directory.
+- You must write the machine status file into `{routing_audit_status_file}` in the current working directory.
+- In `{routing_audit_status_file}`, write valid JSON with exactly these required fields:
+{{
+  "schema_version": "1.0",
+  "stage": "routing_layer_audit",
+  "audit_round": {int(audit_round)},
+  "status": "{routing_audit_status_pass}" | "{routing_audit_status_fail}",
+  "review_record_path": "{routing_audit_record_file}"
+}}
+- If the audit passes, `{routing_audit_record_file}` must still be overwritten with a minimal record that states the pass result.
+- If the audit fails, write the final AI-to-AI bullet audit into `{routing_audit_record_file}`.
+- `{routing_audit_status_file}` is the single source of truth for pass/fail.
+"""
 
 
 def build_refine_prompt(
@@ -1025,16 +1026,16 @@ def build_refine_prompt(
 ) -> str:
     base_prompt = routing_layer_refine(str(audit_record_path)) if callable(routing_layer_refine) else str(
         routing_layer_refine)
-    return (
-        f"{str(base_prompt).strip()}\n\n"
-        "执行约束:\n"
-        "- 只允许修改当前工作目录内的 4 个路由层文件。\n"
-        f"- 必须读取 `{audit_record_path}` 作为本轮唯一审核依据。\n"
-        f"- 不要修改 `{audit_record_path}` 或 `{routing_audit_status_file}`。\n"
-        "- 这一次调用只做单次修复，不要启动 subagent，不要自发继续审核，不要进入循环。\n"
-        "- 下一轮审核由外层 Python 编排器负责。\n"
-        "- 如果审核意见与现有文件冲突，以审核记录中可执行且在 scope 内的结构修复为准。\n"
-    )
+    return f"""{str(base_prompt).strip()}
+
+执行约束:
+- 只允许修改当前工作目录内的 4 个路由层文件。
+- 必须读取 `{audit_record_path}` 作为本轮唯一审核依据。
+- 不要修改 `{audit_record_path}` 或 `{routing_audit_status_file}`。
+- 这一次调用只做单次修复，不要启动 subagent，不要自发继续审核，不要进入循环。
+- 下一轮审核由外层 Python 编排器负责。
+- 如果审核意见与现有文件冲突，以审核记录中可执行且在 scope 内的结构修复为准。
+"""
 
 
 if __name__ == '__main__':

@@ -230,6 +230,67 @@ def hitl_bck(
     return hitl_bck_prompt
 
 
+# 恢复
+def resume_requirements_understand(
+        ba_desc, *,
+        init_prompt=task_start_prompt,
+        original_requirement_md='name_原始需求.md',
+        requirements_clear_md='name_需求澄清.md',
+        ask_human_md='name_与人类交流.md',
+        hitl_record_md='name_人机交互澄清记录.md'
+):
+    output_protocol_prompt = output_protocol(requirements_clear_md, ask_human_md)
+    requirements_understand_prompt = f"""## 角色定位
+{ba_desc}
+
+## Context & Scope
+- 目前已经有《{requirements_clear_md}》, 你的工作是基于代码现状以及《{requirements_clear_md}》和《{hitl_record_md}》分析《{requirements_clear_md}》。 
+    - 如果你认为《{requirements_clear_md}》不准确可以进行修改, 或者你认为信息不足时可以发起 HITL。
+- 你负责对《{original_requirement_md}》进行代码级的需求拆解。你必须像审计员一样审视代码与需求之间的裂痕。
+- 核心目标：实现业务变更点与代码逻辑的精准映射，确保“信息与逻辑闭环”。
+
+## Mission Logic: 最小化与闭环
+1. **最小化改动**：只识别实现目标所必须的最短路径，严禁任何形式的技术债修复或功能扩展。
+2. **边界管控**：若不扩展功能会导致逻辑中断，必须作为 HITL 疑问提出，严禁擅自做主。
+3. **信息闭环判定**：你必须确保每一个 `代码标识符 [业务含义]` 都有明确的输入、转换逻辑、输出、边界及异常处理。
+
+## Critical HITL Phase
+* 在分析过程中，你必须自问：“我是否拥有实现此功能所需的全部输入、输出、边界条件和异常处理逻辑？”
+**一旦判定信息不足，必须立即启动 HITL 流程，列出清晰的缺口清单。**
+
+## Communication Protocol (强制执行)
+与人类交流或撰写分析时，必须假设对方 **从未看过源码**：
+- **格式**：`代码标识符 [业务含义解释]`。
+- **要求**：禁止出现孤立的变量名或函数名。
+
+## Workflow: 深度审计流
+1. **扫描与映射**：对比《{original_requirement_md}》与代码，建立“业务功能 -> 代码实现”的映射。
+2. **缺口探测**：检查是否存在输入来源模糊、异常分支缺失（需求未定义错误路径）、或旧数据兼容性断层。
+3. **闭环判定**：
+   - 如果所有逻辑路径、参数来源、异常边界均已明确，足以支撑开发，进入【输出协议-无缺口状态】。
+   - 只要存在任何一丝疑问、歧义或信息缺失，立即进入【输出协议-存在缺口状态】。
+
+{output_protocol_prompt}
+
+## HITL 文档同步要求
+- 只要进入 HITL，必须覆盖写入《{ask_human_md}》, 保证《{ask_human_md}》不为空。
+- 只要进入 HITL，必须新建或更新《{hitl_record_md}》，记录当前已确认事实、冲突点、待确认边界。
+- 无论是否进入 HITL 或者有没有已经确认的事实《{ask_human_md}》和《{hitl_record_md}》必须存在, 可以为空
+
+## 约束
+* 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
+* 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
+* 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
+    * 如果输出 `信息足够` 那么《{hitl_record_md}》必须为空
+    * 如果输出 `HITL` 那么《{hitl_record_md}》必须为非空
+* 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。
+
+---
+
+{init_prompt}"""
+    return requirements_understand_prompt
+
+
 if __name__ == '__main__':
     req_name = 'TimeFrequencyExtension'
     print(requirements_understand(fintech_ba, init_prompt=task_start_prompt,
