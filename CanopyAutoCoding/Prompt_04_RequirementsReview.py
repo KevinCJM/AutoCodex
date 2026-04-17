@@ -87,7 +87,7 @@ def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
     return human_feed_bck_prompt
 
 
-# 需求分析师初始化
+# [需求分析师] resume初始化
 def resume_ba(human_msg=None, ba_desc=fintech_ba, init_prompt=task_start_prompt,
               ask_human_md='name_与人类交流.md', original_requirement_md='name_原始需求.md',
               requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
