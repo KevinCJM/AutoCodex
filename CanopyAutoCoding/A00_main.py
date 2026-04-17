@@ -14,8 +14,9 @@ from typing import Sequence
 
 from A01_Routing_LayerPlanning import prompt_project_dir
 from A01_Routing_LayerPlanning import run_routing_stage as routing_stage_main
-from A02_RequirementsAnalysis import run_requirements_stage
-from A03_RequirementsReview import run_requirements_review_stage
+from A02_RequirementIntake import run_requirement_intake_stage
+from A03_RequirementsClarification import run_requirements_clarification_stage
+from A04_RequirementsReview import run_requirements_review_stage
 from T02_tmux_agents import cleanup_registered_tmux_workers
 from T08_pre_development import (
     build_pre_development_task_record_path as shared_build_pre_development_task_record_path,
@@ -23,7 +24,7 @@ from T08_pre_development import (
     ensure_pre_development_task_record as shared_ensure_pre_development_task_record,
 )
 from T09_terminal_ops import clear_pending_tty_input
-from T09_terminal_ops import maybe_launch_tui, message
+from T09_terminal_ops import maybe_launch_tui, message, notify_stage_action_changed
 
 
 UNIMPLEMENTED_STAGES = (
@@ -102,6 +103,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     message("\n===== AGENT初始化阶段 =====")
+    notify_stage_action_changed("stage.a01.start")
     routing_result = routing_stage_main(stage_args)
     routing_exit_code = int(getattr(routing_result, "exit_code", routing_result))
     if routing_exit_code != 0:
@@ -115,9 +117,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
 
     clear_pending_tty_input()
-    message("\n===== 需求分析阶段 / 需求录入 =====")
+    message("\n===== 需求录入阶段 =====")
+    notify_stage_action_changed("stage.a02.start")
     try:
-        requirements_result = run_requirements_stage(stage_args, preserve_ba_worker=True)
+        intake_result = run_requirement_intake_stage(stage_args)
+    except Exception as error:  # noqa: BLE001
+        message(error)
+        return 1
+
+    clear_pending_tty_input()
+    clarification_stage_args = build_stage_args(
+        project_dir,
+        auto_confirm=bool(args.yes),
+        requirement_name=intake_result.requirement_name,
+    )
+    message("\n===== 需求澄清阶段 =====")
+    notify_stage_action_changed("stage.a03.start")
+    try:
+        requirements_result = run_requirements_clarification_stage(
+            clarification_stage_args,
+            preserve_ba_worker=True,
+        )
     except Exception as error:  # noqa: BLE001
         message(error)
         return 1
@@ -129,6 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         requirement_name=requirements_result.requirement_name,
     )
     message("\n===== 需求评审阶段 =====")
+    notify_stage_action_changed("stage.a04.start")
     try:
         run_requirements_review_stage(review_stage_args, ba_handoff=requirements_result.ba_handoff)
     except Exception as error:  # noqa: BLE001

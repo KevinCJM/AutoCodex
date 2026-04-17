@@ -186,6 +186,120 @@ RUNTIME_NOISE_PATTERNS = (
 
 _LIVE_WORKERS: "weakref.WeakSet[TmuxBatchWorker]" = weakref.WeakSet()
 _LIVE_WORKERS_LOCK = threading.RLock()
+_RESERVED_SESSION_NAMES: set[str] = set()
+_RESERVED_SESSION_NAMES_LOCK = threading.RLock()
+SESSION_CONSTELLATION_NAMES: tuple[str, ...] = (
+    "角木蛟",
+    "亢金龙",
+    "氐土貉",
+    "房日兔",
+    "心月狐",
+    "尾火虎",
+    "箕水豹",
+    "斗木獬",
+    "牛金牛",
+    "女土蝠",
+    "虚日鼠",
+    "危月燕",
+    "室火猪",
+    "壁水貐",
+    "奎木狼",
+    "娄金狗",
+    "胃土雉",
+    "昴日鸡",
+    "毕月乌",
+    "觜火猴",
+    "参水猿",
+    "井木犴",
+    "鬼金羊",
+    "柳土獐",
+    "星日马",
+    "张月鹿",
+    "翼火蛇",
+    "轸水蚓",
+    "天魁星",
+    "天罡星",
+    "天机星",
+    "天闲星",
+    "天勇星",
+    "天雄星",
+    "天猛星",
+    "天威星",
+    "天英星",
+    "天贵星",
+    "天富星",
+    "天满星",
+    "天孤星",
+    "天伤星",
+    "天立星",
+    "天捷星",
+    "天暗星",
+    "天佑星",
+    "天空星",
+    "天速星",
+    "天异星",
+    "天杀星",
+    "天微星",
+    "天究星",
+    "天退星",
+    "天寿星",
+    "天剑星",
+    "天平星",
+    "天罪星",
+    "天损星",
+    "天败星",
+    "天牢星",
+    "天慧星",
+    "天暴星",
+    "天哭星",
+    "天巧星",
+    "地魁星",
+    "地煞星",
+    "地勇星",
+    "地杰星",
+    "地雄星",
+    "地威星",
+    "地英星",
+    "地奇星",
+    "地猛星",
+    "地文星",
+    "地正星",
+    "地辟星",
+    "地阖星",
+    "地强星",
+    "地暗星",
+    "地轴星",
+    "地会星",
+    "地佐星",
+    "地佑星",
+    "地灵星",
+    "地兽星",
+    "地微星",
+    "地慧星",
+    "地暴星",
+    "地默星",
+    "地猖星",
+    "地狂星",
+    "地飞星",
+    "地走星",
+    "地巧星",
+    "地明星",
+    "地进星",
+    "地退星",
+    "地满星",
+    "地遂星",
+    "地周星",
+    "地隐星",
+    "地异星",
+    "地理星",
+    "地俊星",
+    "地乐星",
+    "地捷星",
+    "地速星",
+    "地镇星",
+)
+_SESSION_ALLOWED_CHARS_RE = re.compile(r"[^A-Za-z0-9\u4e00-\u9fff-]+")
+_SESSION_ROLE_REVIEWER_RE = re.compile(r"^requirements-review-r(\d+)$")
 
 
 class Vendor(str, Enum):
@@ -357,6 +471,12 @@ class TmuxBackend:
         result = self.run("has-session", "-t", session_name, check=False)
         return result.returncode == 0
 
+    def list_sessions(self) -> list[str]:
+        result = self.run("list-sessions", "-F", "#S", check=False)
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
     def create_session(self, session_name: str, work_dir: Path, command: str) -> str:
         result = self.run(
             "new-session",
@@ -525,6 +645,9 @@ class TmuxRuntimeController:
     def session_exists(self, session_name: str) -> bool:
         return bool(session_name) and self.backend.has_session(session_name)
 
+    def list_sessions(self) -> list[str]:
+        return self.backend.list_sessions()
+
     def attach_session(self, session_name: str) -> None:
         if not self.session_exists(session_name):
             raise RuntimeError(f"tmux 会话尚未创建: {session_name}")
@@ -587,10 +710,111 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
 
 
 def _slugify(text: str, max_len: int = 40) -> str:
-    value = re.sub(r"[^a-zA-Z0-9]+", "-", str(text or "").strip()).strip("-").lower()
+    raw = str(text or "").strip()
+    value = re.sub(r"[^a-zA-Z0-9]+", "-", raw).strip("-").lower()
     if not value:
-        value = "worker"
-    return value[:max_len]
+        if raw:
+            value = f"worker-{hashlib.sha1(raw.encode('utf-8')).hexdigest()[:8]}"
+        else:
+            value = "worker"
+    return value[:max_len].strip("-") or "worker"
+
+
+def _sanitize_session_fragment(text: str, *, fallback: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        value = fallback
+    value = re.sub(r"[\s/\\]+", "-", value)
+    value = _SESSION_ALLOWED_CHARS_RE.sub("-", value)
+    value = re.sub(r"-{2,}", "-", value).strip("-")
+    return value or fallback
+
+
+def _worker_role_key(worker_id: str, work_dir: str | Path) -> str:
+    worker_key = str(worker_id or "").strip().lower()
+    if not worker_key:
+        return "generic-executor"
+    if worker_key == "requirements-analyst":
+        return worker_key
+    if worker_key == "requirements-notion-reader":
+        return worker_key
+    if worker_key == "requirements-review-analyst":
+        return worker_key
+    if _SESSION_ROLE_REVIEWER_RE.fullmatch(worker_key):
+        return worker_key
+    work_dir_path = Path(work_dir).expanduser().resolve()
+    work_dir_name = work_dir_path.name.strip().lower()
+    work_dir_slug = _slugify(work_dir_name, max_len=48)
+    if worker_key in {"project", work_dir_name, work_dir_slug}:
+        return "routing-initializer"
+    return "generic-executor"
+
+
+def _worker_role_label(role_key: str) -> str:
+    if role_key == "requirements-analyst":
+        return "分析师"
+    if role_key == "requirements-notion-reader":
+        return "需求录入员"
+    if role_key == "requirements-review-analyst":
+        return "评审分析师"
+    reviewer_match = _SESSION_ROLE_REVIEWER_RE.fullmatch(role_key)
+    if reviewer_match:
+        return f"审核器-R{reviewer_match.group(1)}"
+    if role_key == "routing-initializer":
+        return "路由员"
+    return "执行者"
+
+
+def _preferred_constellation_index(work_dir: str | Path, role_key: str) -> int:
+    stable_key = f"{Path(work_dir).expanduser().resolve()}::{role_key}"
+    digest = hashlib.sha1(stable_key.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % len(SESSION_CONSTELLATION_NAMES)
+
+
+def _list_backend_session_names(backend: Any | None) -> set[str]:
+    list_sessions = getattr(backend, "list_sessions", None)
+    if not callable(list_sessions):
+        return set()
+    try:
+        return {str(name).strip() for name in list_sessions() if str(name).strip()}
+    except Exception:
+        return set()
+
+
+def _occupied_session_names(backend: Any | None = None) -> set[str]:
+    occupied = _list_backend_session_names(backend)
+    for worker in list_registered_tmux_workers():
+        name = str(getattr(worker, "session_name", "") or "").strip()
+        if name:
+            occupied.add(name)
+    return occupied
+
+
+def _reserve_session_name(
+        *,
+        worker_id: str,
+        work_dir: str | Path,
+        vendor: Vendor,
+        instance_id: str = "",
+        backend: Any | None = None,
+) -> str:
+    with _RESERVED_SESSION_NAMES_LOCK:
+        occupied = _occupied_session_names(backend)
+        occupied.update(_RESERVED_SESSION_NAMES)
+        session_name = build_session_name(
+            worker_id,
+            Path(work_dir),
+            vendor,
+            instance_id=instance_id,
+            occupied_session_names=occupied,
+        )
+        _RESERVED_SESSION_NAMES.add(session_name)
+        return session_name
+
+
+def _release_reserved_session_name(session_name: str) -> None:
+    with _RESERVED_SESSION_NAMES_LOCK:
+        _RESERVED_SESSION_NAMES.discard(str(session_name or "").strip())
 
 
 def _resolve_optional_path(path: str | Path | None) -> Path | None:
@@ -1215,6 +1439,8 @@ class TmuxBatchWorker:
             backend: TmuxBackend | None = None,
             launch_coordinator: LaunchCoordinator | None = None,
     ) -> None:
+        reserved_session_name = ""
+        self._session_name_reserved = False
         self.worker_id = _slugify(worker_id, max_len=48)
         self.work_dir = Path(work_dir).expanduser().resolve()
         if not self.work_dir.is_dir():
@@ -1233,12 +1459,17 @@ class TmuxBatchWorker:
             self.instance_id = uuid.uuid4().hex[:8]
             self.runtime_dir = self.runtime_root / f"{self.worker_id}-{self.instance_id}"
             self.runtime_dir.mkdir(parents=True, exist_ok=True)
-        self.session_name = existing_session_name or build_session_name(
-            self.worker_id,
-            self.work_dir,
-            self.config.vendor,
-            instance_id=self.instance_id,
-        )
+        if existing_session_name:
+            self.session_name = existing_session_name
+        else:
+            reserved_session_name = _reserve_session_name(
+                worker_id=self.worker_id,
+                work_dir=self.work_dir,
+                vendor=self.config.vendor,
+                instance_id=self.instance_id,
+                backend=self.backend,
+            )
+            self.session_name = reserved_session_name
         self.log_path = self.runtime_dir / "worker.log"
         self.raw_log_path = self.runtime_dir / "worker.raw.log"
         self.state_path = self.runtime_dir / "worker.state.json"
@@ -1282,6 +1513,9 @@ class TmuxBatchWorker:
             existing_state = self.read_state()
             self.pane_id = existing_pane_id or str(existing_state.get("pane_id", self.pane_id))
             self.session_name = existing_session_name or str(existing_state.get("session_name", self.session_name))
+            if reserved_session_name and self.session_name != reserved_session_name:
+                _release_reserved_session_name(reserved_session_name)
+                reserved_session_name = ""
             self.agent_ready = bool(existing_state.get("agent_ready", False))
             self.recoverable = bool(existing_state.get("recoverable", True))
             self.last_reply = str(existing_state.get("last_reply", ""))
@@ -1313,6 +1547,7 @@ class TmuxBatchWorker:
                     str(existing_state.get("wrapper_state", WrapperState.NOT_READY.value)))
             except ValueError:
                 self.wrapper_state = WrapperState.NOT_READY
+        self._session_name_reserved = bool(reserved_session_name)
         _register_live_worker(self)
 
     def _tmux(self, *args: str, input_text: str | None = None, timeout_sec: float = 10.0) -> \
@@ -1434,11 +1669,20 @@ class TmuxBatchWorker:
         self.current_task_result_path = ""
         self.current_task_completion_command = ""
         self.current_task_runtime_status = ""
-        self.pane_id = self.backend.create_session(
-            self.session_name,
-            self.work_dir,
-            self._build_shell_bootstrap_command(),
-        )
+        try:
+            self.pane_id = self.backend.create_session(
+                self.session_name,
+                self.work_dir,
+                self._build_shell_bootstrap_command(),
+            )
+        except Exception:
+            if self._session_name_reserved:
+                _release_reserved_session_name(self.session_name)
+                self._session_name_reserved = False
+            raise
+        if self._session_name_reserved:
+            _release_reserved_session_name(self.session_name)
+            self._session_name_reserved = False
         self.wrapper_state = WrapperState.NOT_READY
         self._tmux("set-option", "-t", self.session_name, "allow-rename", "off")
         self._tmux("set-window-option", "-t", f"{self.session_name}:0", "automatic-rename", "off")
@@ -3218,7 +3462,33 @@ def extract_final_protocol_token(text: str, allowed_tokens: Sequence[str]) -> st
     return _extract_protocol_token_from_line(lines[-1], allowed_tokens)
 
 
-def build_session_name(worker_id: str, work_dir: Path, vendor: Vendor, instance_id: str = "") -> str:
-    digest = hashlib.sha1(f"{work_dir}::{vendor.value}::{worker_id}".encode("utf-8")).hexdigest()[:8]
-    suffix = f"-{_slugify(instance_id, max_len=8)}" if instance_id else ""
-    return f"aginit-{vendor.value}-{_slugify(worker_id, max_len=18)}-{digest}{suffix}"
+def build_session_name(
+        worker_id: str,
+        work_dir: Path,
+        vendor: Vendor,
+        instance_id: str = "",
+        *,
+        occupied_session_names: Sequence[str] | None = None,
+) -> str:
+    del vendor
+    del instance_id
+    role_key = _worker_role_key(worker_id, work_dir)
+    role_label = _sanitize_session_fragment(_worker_role_label(role_key), fallback="执行者")
+    occupied = {str(name).strip() for name in occupied_session_names or () if str(name).strip()}
+    preferred_index = _preferred_constellation_index(work_dir, role_key)
+    for offset in range(len(SESSION_CONSTELLATION_NAMES)):
+        constellation = _sanitize_session_fragment(
+            SESSION_CONSTELLATION_NAMES[(preferred_index + offset) % len(SESSION_CONSTELLATION_NAMES)],
+            fallback="天魁星",
+        )
+        candidate = f"{role_label}-{constellation}"
+        if candidate not in occupied:
+            return candidate
+    base_constellation = _sanitize_session_fragment(SESSION_CONSTELLATION_NAMES[preferred_index], fallback="天魁星")
+    base_name = f"{role_label}-{base_constellation}"
+    suffix = 2
+    candidate = f"{base_name}-{suffix}"
+    while candidate in occupied:
+        suffix += 1
+        candidate = f"{base_name}-{suffix}"
+    return candidate

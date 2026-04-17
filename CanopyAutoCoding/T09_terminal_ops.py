@@ -47,9 +47,20 @@ class TerminalUI(Protocol):
         prompt_text: str = "请选择",
     ) -> str: ...
 
-    def prompt_multiline(self, *, title: str, empty_retry_message: str = "输入不能为空，请重试。") -> str: ...
+    def prompt_multiline(
+        self,
+        *,
+        title: str,
+        empty_retry_message: str = "输入不能为空，请重试。",
+        question_path: str | Path | None = None,
+        answer_path: str | Path | None = None,
+    ) -> str: ...
 
     def clear_pending_tty_input(self) -> None: ...
+
+    def notify_runtime_state_changed(self) -> None: ...
+
+    def notify_stage_action_changed(self, action: str) -> None: ...
 
     def create_progress_monitor(
         self,
@@ -110,7 +121,16 @@ class StdioTerminalUI:
                     return value
             self.message(f"不支持的选择: {candidate}")
 
-    def prompt_multiline(self, *, title: str, empty_retry_message: str = "输入不能为空，请重试。") -> str:
+    def prompt_multiline(
+        self,
+        *,
+        title: str,
+        empty_retry_message: str = "输入不能为空，请重试。",
+        question_path: str | Path | None = None,
+        answer_path: str | Path | None = None,
+    ) -> str:
+        _ = question_path
+        _ = answer_path
         while True:
             self.message(title)
             self.message("输入完成后单独输入 END 或 EOF 提交。")
@@ -129,6 +149,13 @@ class StdioTerminalUI:
             self.message(empty_retry_message)
 
     def clear_pending_tty_input(self) -> None:
+        return None
+
+    def notify_runtime_state_changed(self) -> None:
+        return None
+
+    def notify_stage_action_changed(self, action: str) -> None:
+        _ = action
         return None
 
     def create_progress_monitor(
@@ -224,10 +251,14 @@ class BridgeTerminalUI:
         emit_event: Callable[[str, dict[str, Any]], None],
         request_prompt: Callable[[BridgePromptRequest], dict[str, Any]],
         external_process_runner: Callable[[Sequence[str], str | None, Mapping[str, str] | None], int] | None = None,
+        state_change_notifier: Callable[[], None] | None = None,
+        stage_change_notifier: Callable[[str], None] | None = None,
     ) -> None:
         self._emit_event = emit_event
         self._request_prompt = request_prompt
         self._external_process_runner = external_process_runner
+        self._state_change_notifier = state_change_notifier
+        self._stage_change_notifier = stage_change_notifier
 
     def message(self, *objects: object, sep: str = " ", end: str = "\n", flush: bool = False) -> None:
         text = sep.join(str(item) for item in objects) + end
@@ -275,7 +306,14 @@ class BridgeTerminalUI:
             raise ValueError(f"不支持的选择: {value}")
         return value
 
-    def prompt_multiline(self, *, title: str, empty_retry_message: str = "输入不能为空，请重试。") -> str:
+    def prompt_multiline(
+        self,
+        *,
+        title: str,
+        empty_retry_message: str = "输入不能为空，请重试。",
+        question_path: str | Path | None = None,
+        answer_path: str | Path | None = None,
+    ) -> str:
         while True:
             payload = self._request_prompt(
                 BridgePromptRequest(
@@ -283,6 +321,8 @@ class BridgeTerminalUI:
                     payload={
                         "title": title,
                         "empty_retry_message": empty_retry_message,
+                        "question_path": str(Path(question_path).expanduser().resolve()) if question_path else "",
+                        "answer_path": str(Path(answer_path).expanduser().resolve()) if answer_path else "",
                     },
                 )
             )
@@ -293,6 +333,16 @@ class BridgeTerminalUI:
 
     def clear_pending_tty_input(self) -> None:
         return None
+
+    def notify_runtime_state_changed(self) -> None:
+        if self._state_change_notifier is None:
+            return None
+        self._state_change_notifier()
+
+    def notify_stage_action_changed(self, action: str) -> None:
+        if self._stage_change_notifier is None:
+            return None
+        self._stage_change_notifier(str(action).strip())
 
     def create_progress_monitor(
         self,
@@ -434,12 +484,31 @@ def prompt_command_line(prompt_text: str = "输入命令", default: str = "") ->
     return prompt_with_default(prompt_text, default, allow_empty=True)
 
 
-def collect_multiline_input(*, title: str, empty_retry_message: str = "输入不能为空，请重试。") -> str:
-    return get_terminal_ui().prompt_multiline(title=title, empty_retry_message=empty_retry_message)
+def collect_multiline_input(
+    *,
+    title: str,
+    empty_retry_message: str = "输入不能为空，请重试。",
+    question_path: str | Path | None = None,
+    answer_path: str | Path | None = None,
+) -> str:
+    return get_terminal_ui().prompt_multiline(
+        title=title,
+        empty_retry_message=empty_retry_message,
+        question_path=question_path,
+        answer_path=answer_path,
+    )
 
 
 def clear_pending_tty_input() -> None:
     get_terminal_ui().clear_pending_tty_input()
+
+
+def notify_runtime_state_changed() -> None:
+    get_terminal_ui().notify_runtime_state_changed()
+
+
+def notify_stage_action_changed(action: str) -> None:
+    get_terminal_ui().notify_stage_action_changed(action)
 
 
 def attach_external_process(
@@ -504,6 +573,8 @@ __all__ = [
     "get_terminal_ui",
     "message",
     "maybe_launch_tui",
+    "notify_runtime_state_changed",
+    "notify_stage_action_changed",
     "repo_root",
     "prompt_command_line",
     "prompt_positive_int",

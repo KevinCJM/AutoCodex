@@ -16,12 +16,15 @@ from T01_tools import write_dict_to_json
 
 
 PRE_DEVELOPMENT_STAGE_KEYS = (
-    "需求获取",
+    "需求录入",
     "需求澄清",
     "需求评审",
     "详细设计",
     "任务拆分",
 )
+PRE_DEVELOPMENT_STAGE_ALIASES = {
+    "需求获取": "需求录入",
+}
 
 
 def resolve_project_root(project_dir: str | Path) -> Path:
@@ -42,7 +45,7 @@ def sanitize_requirement_name(name: str) -> str:
 
 def build_pre_development_task_record_payload() -> dict[str, dict[str, bool]]:
     return {
-        "需求获取": {"需求获取": False},
+        "需求录入": {"需求录入": False},
         "需求澄清": {"需求澄清": False},
         "需求评审": {"需求评审": False},
         "详细设计": {"详细设计": False},
@@ -68,7 +71,19 @@ def load_pre_development_task_record(file_path: str | Path) -> dict[str, dict[st
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"开发前期记录格式非法: {path}")
-    return payload
+    normalized = build_pre_development_task_record_payload()
+    for key, section in payload.items():
+        canonical_key = PRE_DEVELOPMENT_STAGE_ALIASES.get(str(key), str(key))
+        if canonical_key not in normalized:
+            normalized[canonical_key] = section if isinstance(section, dict) else {}
+            continue
+        if isinstance(section, dict):
+            normalized_section = normalized.get(canonical_key, {})
+            for sub_key, completed in section.items():
+                canonical_sub_key = PRE_DEVELOPMENT_STAGE_ALIASES.get(str(sub_key), str(sub_key))
+                normalized_section[canonical_sub_key] = bool(completed)
+            normalized[canonical_key] = normalized_section
+    return normalized
 
 
 def update_pre_development_task_status(
@@ -78,6 +93,7 @@ def update_pre_development_task_status(
         task_key: str,
         completed: bool,
 ) -> Path:
+    task_key = PRE_DEVELOPMENT_STAGE_ALIASES.get(task_key, task_key)
     if task_key not in PRE_DEVELOPMENT_STAGE_KEYS:
         raise ValueError(f"不支持的开发前期阶段: {task_key}")
     record_path = ensure_pre_development_task_record(project_dir, requirement_name)
@@ -95,7 +111,7 @@ def mark_requirement_intake_completed(project_dir: str | Path, requirement_name:
     return update_pre_development_task_status(
         project_dir,
         requirement_name,
-        task_key="需求获取",
+        task_key="需求录入",
         completed=True,
     )
 

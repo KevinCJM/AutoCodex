@@ -241,7 +241,7 @@ def _resolve_mode_result(manifest: dict[str, Any]) -> TaskCompletionResult:
             )
         raise ValueError("需求分析师未写入《与人类交流.md》")
 
-    if mode == "a02_requirements_analysis":
+    if mode in {"a02_requirements_analysis", "a03_requirements_clarification"}:
         requirements_clear_text = _read_text(all_artifacts.get("requirements_clear"))
         ask_human_text = _read_text(all_artifacts.get("ask_human"))
         hitl_record_text = _read_text(all_artifacts.get("hitl_record"))
@@ -261,32 +261,32 @@ def _resolve_mode_result(manifest: dict[str, Any]) -> TaskCompletionResult:
             )
         raise ValueError("需求澄清未生成有效结果文件")
 
-    if mode == "a02_notion_intake":
+    if mode in {"a02_notion_intake", "a02_requirement_intake"}:
         original_requirement_text = _read_text(all_artifacts.get("original_requirement"))
         ask_human_text = _read_text(all_artifacts.get("ask_human"))
         hitl_record_text = _read_text(all_artifacts.get("hitl_record"))
         if original_requirement_text:
             return TaskCompletionResult(
                 status=TASK_RESULT_COMPLETED,
-                summary="Notion 需求获取完成",
+                summary="Notion 需求录入完成",
                 artifacts=artifacts,
                 artifact_hashes=artifact_hashes,
             )
         if ask_human_text and hitl_record_text:
             return TaskCompletionResult(
                 status=TASK_RESULT_HITL,
-                summary="Notion 需求获取需要继续 HITL",
+                summary="Notion 需求录入需要继续 HITL",
                 artifacts=artifacts,
                 artifact_hashes=artifact_hashes,
             )
         if ask_human_text:
             return TaskCompletionResult(
                 status=TASK_RESULT_ERROR,
-                summary="Notion 需求获取失败",
+                summary="Notion 需求录入失败",
                 artifacts=artifacts,
                 artifact_hashes=artifact_hashes,
             )
-        raise ValueError("Notion 需求获取未生成有效结果文件")
+        raise ValueError("Notion 需求录入未生成有效结果文件")
 
     raise ValueError(f"不支持的 manifest mode: {mode}")
 

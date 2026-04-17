@@ -435,8 +435,8 @@ def render_requirements_stage_placeholder(
         lines.append(f"已清理阶段中间文件: {cleanup_result.removed_intermediate_count}")
     if cleanup_result.removed_runtime_count:
         lines.append(f"已清理阶段运行目录: {cleanup_result.removed_runtime_count}")
-    lines.append("进入需求分析阶段（占位）")
-    lines.append("下一步请运行: python3 A02_RequirementsAnalysis.py")
+    lines.append("进入需求录入阶段（占位）")
+    lines.append("下一步请运行: python3 A02_RequirementIntake.py")
     return "\n".join(lines)
 
 

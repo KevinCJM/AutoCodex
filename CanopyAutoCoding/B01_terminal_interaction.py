@@ -745,7 +745,7 @@ class AgentInitControlCenter:
         if any(item.status == "failed" for item in batch_result.results):
             return "\n".join(
                 [
-                    "路由层初始化存在失败目录，当前不进入需求分析阶段。",
+                    "路由层初始化存在失败目录，当前不进入需求录入阶段。",
                     "请继续使用 attach / transcript / retry 排查后再推进。",
                 ]
             )
@@ -754,8 +754,8 @@ class AgentInitControlCenter:
             return "\n".join(
                 [
                     "路由层配置完成",
-                    "进入需求分析阶段（占位）",
-                    "下一步请运行: python3 A02_RequirementsAnalysis.py",
+                    "进入需求录入阶段（占位）",
+                    "下一步请运行: python3 A02_RequirementIntake.py",
                 ]
             )
 
@@ -779,8 +779,8 @@ class AgentInitControlCenter:
             lines.append(f"已清理阶段中间文件: {cleanup_result.removed_intermediate_count}")
         if cleanup_result.removed_runtime_count:
             lines.append(f"已清理阶段运行目录: {cleanup_result.removed_runtime_count}")
-        lines.append("进入需求分析阶段（占位）")
-        lines.append("下一步请运行: python3 A02_RequirementsAnalysis.py")
+        lines.append("进入需求录入阶段（占位）")
+        lines.append("下一步请运行: python3 A02_RequirementIntake.py")
         return "\n".join(lines)
 
 

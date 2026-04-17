@@ -32,17 +32,20 @@ from A01_Routing_LayerPlanning import (
     render_requirements_stage_placeholder,
 )
 from A01_Routing_LayerPlanning import run_routing_stage
-from A02_RequirementsAnalysis import (
+from A02_RequirementIntake import (
     NOTION_RUNTIME_ROOT_NAME,
     build_notion_hitl_paths,
     build_parser as build_a02_parser,
-    build_requirements_analysis_paths,
-    list_existing_requirements,
-    run_requirements_stage,
+    run_requirement_intake_stage,
 )
-from A03_RequirementsReview import (
-    REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+from A03_RequirementsClarification import (
+    REQUIREMENTS_RUNTIME_ROOT_NAME,
     build_parser as build_a03_parser,
+    run_requirements_clarification_stage,
+)
+from A04_RequirementsReview import (
+    REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+    build_parser as build_a04_parser,
     build_requirements_review_paths,
     run_requirements_review_stage,
 )
@@ -63,6 +66,10 @@ from T08_pre_development import (
     load_pre_development_task_record,
 )
 from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, use_terminal_ui
+from T12_requirements_common import (
+    build_requirements_clarification_paths,
+    list_existing_requirements,
+)
 from T10_tui_protocol import (
     PROTOCOL_VERSION,
     build_event,
@@ -146,9 +153,12 @@ class PendingPromptState:
 STAGE_LABEL_BY_ACTION = {
     "control.b01.open": "路由初始化",
     "stage.a01.start": "路由初始化",
-    "stage.a02.start": "需求录入与澄清",
-    "stage.a03.start": "需求评审",
+    "stage.a02.start": "需求录入",
+    "stage.a03.start": "需求澄清",
+    "stage.a04.start": "需求评审",
 }
+
+LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME = ".requirements_analysis_runtime"
 
 
 class ProtocolLogSink:
@@ -374,6 +384,8 @@ class TuiBackendServer:
         self._bridge_ui = BridgeTerminalUI(
             emit_event=self.emit_event,
             request_prompt=self._prompt_broker.request,
+            state_change_notifier=self._emit_all_snapshots,
+            stage_change_notifier=self._handle_runtime_stage_change,
         )
         self._workers: dict[str, threading.Thread] = {}
         self._controls: dict[str, ControlSessionState] = {}
@@ -397,6 +409,14 @@ class TuiBackendServer:
         if current is not None and current.prompt_id == str(prompt_id).strip():
             self._update_context_from_prompt_response(current, payload or {})
             self._pending_prompt = None
+
+    def _handle_runtime_stage_change(self, action: str) -> None:
+        normalized = str(action or "").strip()
+        if not normalized:
+            return
+        self._set_context(action=normalized)
+        self.emit_event("stage.changed", {"action": normalized, "status": "running"})
+        self._emit_all_snapshots()
 
     @staticmethod
     def _prompt_marker_text(prompt: PendingPromptState) -> str:
@@ -503,13 +523,15 @@ class TuiBackendServer:
         if any(not Path(path).exists() for path in routing_paths):
             return "路由初始化"
         if not requirement_name:
-            return "需求录入与澄清"
+            return "需求录入"
         try:
-            original_requirement_path, requirements_clear_path, _, _ = build_requirements_analysis_paths(project_dir, requirement_name)
+            original_requirement_path, requirements_clear_path, _, _ = build_requirements_clarification_paths(project_dir, requirement_name)
         except Exception:
-            return "需求录入与澄清"
-        if not _file_has_content(original_requirement_path) or not _file_has_content(requirements_clear_path):
-            return "需求录入与澄清"
+            return "需求录入"
+        if not _file_has_content(original_requirement_path):
+            return "需求录入"
+        if not _file_has_content(requirements_clear_path):
+            return "需求澄清"
         try:
             review_paths = build_requirements_review_paths(project_dir, requirement_name)
         except Exception:
@@ -586,6 +608,8 @@ class TuiBackendServer:
                 args = build_a02_parser().parse_args(list(argv))
             elif action == "stage.a03.start":
                 args = build_a03_parser().parse_args(list(argv))
+            elif action == "stage.a04.start":
+                args = build_a04_parser().parse_args(list(argv))
             else:
                 return
         except Exception:
@@ -730,7 +754,7 @@ class TuiBackendServer:
             if requirement_name:
                 try:
                     output_path, question_path, record_path = build_notion_hitl_paths(project_dir, requirement_name)
-                    _, requirements_clear_path, ask_human_path, hitl_record_path = build_requirements_analysis_paths(project_dir, requirement_name)
+                    _, requirements_clear_path, ask_human_path, hitl_record_path = build_requirements_clarification_paths(project_dir, requirement_name)
                     files = [
                         _build_file_snapshot(output_path, label="原始需求"),
                         _build_file_snapshot(requirements_clear_path, label="需求澄清"),
@@ -746,7 +770,15 @@ class TuiBackendServer:
                     files = [_build_file_snapshot(Path(project_dir) / f"{name}_原始需求.md", label=name) for name in list_existing_requirements(project_dir)]
                 except Exception:
                     files = []
-            workers = self._scan_runtime_workers(Path(project_dir) / NOTION_RUNTIME_ROOT_NAME)
+            for collection in (
+                self._scan_runtime_workers(Path(project_dir) / NOTION_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers(Path(project_dir) / REQUIREMENTS_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers(Path(project_dir) / LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
+            ):
+                for worker in collection:
+                    session_name = str(worker.get("session_name", "")).strip()
+                    if not session_name or all(str(item.get("session_name", "")).strip() != session_name for item in workers):
+                        workers.append(worker)
         return {
             "project_dir": project_dir,
             "requirement_name": requirement_name,
@@ -800,8 +832,8 @@ class TuiBackendServer:
         summary = title or prompt_text or "存在待处理 HITL"
         return {
             "pending": True,
-            "question_path": "",
-            "answer_path": "",
+            "question_path": str(pending.payload.get("question_path", "") or "").strip(),
+            "answer_path": str(pending.payload.get("answer_path", "") or "").strip(),
             "summary": summary,
         }
 
@@ -815,7 +847,7 @@ class TuiBackendServer:
             return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
         try:
             _, notion_question_path, notion_record_path = build_notion_hitl_paths(project_dir, requirement_name)
-            _, _, ask_human_path, hitl_record_path = build_requirements_analysis_paths(project_dir, requirement_name)
+            _, _, ask_human_path, hitl_record_path = build_requirements_clarification_paths(project_dir, requirement_name)
         except Exception:
             return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
         active_question = ask_human_path if ask_human_path.exists() and _preview_text(ask_human_path) else ""
@@ -1109,6 +1141,7 @@ class TuiBackendServer:
                     "stage.a01.start",
                     "stage.a02.start",
                     "stage.a03.start",
+                    "stage.a04.start",
                     "control.b01.open",
                     "worker.attach",
                     "worker.detach",
@@ -1178,10 +1211,15 @@ class TuiBackendServer:
         if action == "stage.a02.start":
             argv = self._argv_from_payload(payload)
             self._update_context_from_stage_args(action, argv)
-            preserve = bool(payload.get("preserve_ba_worker", False))
-            self._run_in_thread(request_id, action, lambda: run_requirements_stage(argv, preserve_ba_worker=preserve))
+            self._run_in_thread(request_id, action, lambda: run_requirement_intake_stage(argv))
             return
         if action == "stage.a03.start":
+            argv = self._argv_from_payload(payload)
+            self._update_context_from_stage_args(action, argv)
+            preserve = bool(payload.get("preserve_ba_worker", False))
+            self._run_in_thread(request_id, action, lambda: run_requirements_clarification_stage(argv, preserve_ba_worker=preserve))
+            return
+        if action == "stage.a04.start":
             argv = self._argv_from_payload(payload)
             self._update_context_from_stage_args(action, argv)
             self._run_in_thread(request_id, action, lambda: run_requirements_review_stage(argv))

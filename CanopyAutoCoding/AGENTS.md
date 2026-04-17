@@ -17,7 +17,9 @@
 ## Current Stage Mapping
 - `A00_main.py`: top-level stage entry and stage chaining.
 - `A01_Routing_LayerPlanning.py`: AGENT initialization / routing-layer setup.
-- `A02_RequirementsAnalysis.py`: requirement intake and requirement analysis workflow.
+- `A02_RequirementIntake.py`: requirement intake workflow.
+- `A03_RequirementsClarification.py`: requirement clarification workflow.
+- `A04_RequirementsReview.py`: requirement review workflow.
 - `B01_terminal_interaction.py`: terminal control surface for routing stage.
 - `T02_tmux_agents.py`: shared `tmux + coding agent` runtime.
 - `T05_hitl_runtime.py`: shared file-based HITL orchestration.
@@ -69,9 +71,9 @@
 - Audit/refine intermediate files are temporary and should be cleaned on success.
 - Routing stage success should clean routing-stage `tmux` sessions and runtime leftovers, preserving only final artifacts.
 
-## Requirement Analysis Stage Rules
+## Requirement Intake / Clarification Stage Rules
 - Requirement intake must end with `{需求名}_原始需求.md`.
-- Requirement analysis must end with `{需求名}_需求澄清.md`.
+- Requirement clarification must end with `{需求名}_需求澄清.md`.
 - HITL artifacts may be temporary, but human clarification record retention is allowed when it is part of the final analysis trace.
 - Notion intake should use a temporary agent workflow plus file protocol, not stdout parsing.
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Callable
 
 from T02_tmux_agents import DEFAULT_COMMAND_TIMEOUT_SEC, TurnFileContract, TurnFileResult
-from T09_terminal_ops import collect_multiline_input, message
+from T09_terminal_ops import collect_multiline_input, message, notify_runtime_state_changed
 
 
 HITL_STATUS_SCHEMA_VERSION = "1.0"
@@ -569,6 +569,7 @@ def collect_terminal_hitl_response(question_path: str | Path, *, hitl_round: int
     return collect_multiline_input(
         title=f"HITL 第 {hitl_round} 轮回复",
         empty_retry_message="回复不能为空，请重新输入。",
+        question_path=question_file,
     )
 
 
@@ -603,6 +604,7 @@ def run_hitl_agent_loop(
     if on_worker_starting is not None:
         on_worker_starting(worker)
     worker.ensure_agent_ready(timeout_sec=min(timeout_sec, 60.0))
+    notify_runtime_state_changed()
     if on_worker_started is not None:
         on_worker_started(worker)
 
