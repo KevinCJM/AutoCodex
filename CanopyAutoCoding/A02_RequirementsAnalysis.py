@@ -168,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy-url", default="", help="需求澄清阶段代理端口或完整代理 URL")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的原始需求文件")
     parser.add_argument("--yes", action="store_true", help="跳过非覆盖类确认")
+    parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
 
@@ -629,6 +630,11 @@ def render_notion_progress_line(*, worker: TmuxBatchWorker, requirement_name: st
     )
 
 
+def render_agent_boot_progress_line(*, tick: int) -> str:
+    spinner = TERMINAL_SPINNER_FRAMES[tick % len(TERMINAL_SPINNER_FRAMES)]
+    return f"{spinner} 智能体启动中..."
+
+
 def render_requirements_analysis_tmux_start_summary(worker: TmuxBatchWorker) -> str:
     return "\n".join(
         [
@@ -795,12 +801,32 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
         ),
         interval_sec=0.2,
     )
+    boot_progress_monitor = SingleLineSpinnerMonitor(
+        frame_builder=lambda tick: render_agent_boot_progress_line(tick=tick),
+        interval_sec=0.2,
+    )
+    boot_progress_active = False
     progress_active = False
+
+    def start_boot_progress() -> None:
+        nonlocal boot_progress_active
+        if boot_progress_active:
+            return
+        boot_progress_monitor.start()
+        boot_progress_active = True
+
+    def stop_boot_progress() -> None:
+        nonlocal boot_progress_active
+        if not boot_progress_active:
+            return
+        boot_progress_monitor.stop()
+        boot_progress_active = False
 
     def start_progress() -> None:
         nonlocal progress_active
         if progress_active:
             return
+        stop_boot_progress()
         progress_monitor.start()
         progress_active = True
 
@@ -810,6 +836,10 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
             return
         progress_monitor.stop()
         progress_active = False
+
+    def handle_worker_started(live_worker: TmuxBatchWorker) -> None:
+        stop_boot_progress()
+        message(render_notion_tmux_start_summary(live_worker))
 
     def initial_prompt_builder(context: HitlPromptContext) -> str:
         return get_notion_requirement(
@@ -841,7 +871,8 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
                 hitl_prompt_builder=hitl_prompt_builder,
                 label_prefix="read_notion_requirement",
                 turn_phase=NOTION_TURN_PHASE,
-                on_worker_started=lambda live_worker: message(render_notion_tmux_start_summary(live_worker)),
+                on_worker_starting=lambda live_worker: start_boot_progress(),
+                on_worker_started=handle_worker_started,
                 on_agent_turn_started=lambda context, live_worker: start_progress(),
                 on_agent_turn_finished=lambda context, live_worker: stop_progress(),
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -901,6 +932,7 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
         )
     finally:
         stop_progress()
+        stop_boot_progress()
         try:
             worker.request_kill()
         except Exception:
@@ -944,12 +976,32 @@ def run_requirements_analysis(
         ),
         interval_sec=0.2,
     )
+    boot_progress_monitor = SingleLineSpinnerMonitor(
+        frame_builder=lambda tick: render_agent_boot_progress_line(tick=tick),
+        interval_sec=0.2,
+    )
+    boot_progress_active = False
     progress_active = False
+
+    def start_boot_progress() -> None:
+        nonlocal boot_progress_active
+        if boot_progress_active:
+            return
+        boot_progress_monitor.start()
+        boot_progress_active = True
+
+    def stop_boot_progress() -> None:
+        nonlocal boot_progress_active
+        if not boot_progress_active:
+            return
+        boot_progress_monitor.stop()
+        boot_progress_active = False
 
     def start_progress() -> None:
         nonlocal progress_active
         if progress_active:
             return
+        stop_boot_progress()
         progress_monitor.start()
         progress_active = True
 
@@ -959,6 +1011,10 @@ def run_requirements_analysis(
             return
         progress_monitor.stop()
         progress_active = False
+
+    def handle_worker_started(live_worker: TmuxBatchWorker) -> None:
+        stop_boot_progress()
+        message(render_requirements_analysis_tmux_start_summary(live_worker))
 
     try:
         while True:
@@ -1009,7 +1065,8 @@ def run_requirements_analysis(
                     hitl_prompt_builder=hitl_prompt_builder,
                     label_prefix="requirements_analysis",
                     turn_phase=REQUIREMENTS_ANALYSIS_TURN_PHASE,
-                    on_worker_started=lambda live_worker: message(render_requirements_analysis_tmux_start_summary(live_worker)),
+                    on_worker_starting=lambda live_worker: start_boot_progress(),
+                    on_worker_started=handle_worker_started,
                     on_agent_turn_started=lambda context, live_worker: start_progress(),
                     on_agent_turn_finished=lambda context, live_worker: stop_progress(),
                     timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -1048,6 +1105,7 @@ def run_requirements_analysis(
                 )
             except Exception as error:  # noqa: BLE001
                 stop_progress()
+                stop_boot_progress()
                 auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(worker)
                 ready_timeout_error = is_agent_ready_timeout_error(error)
                 if auth_error:
@@ -1145,6 +1203,7 @@ def run_requirements_analysis(
                 raise
     finally:
         stop_progress()
+        stop_boot_progress()
         if worker is not None and not keep_worker_alive:
             try:
                 worker.request_kill()
@@ -1291,12 +1350,14 @@ def run_requirements_stage(
         request.project_dir,
         request.requirement_name,
     )
-    should_direct_reuse_requirements_clarification = should_reuse_existing_requirements_clarification(
-        request.project_dir,
-        request.requirement_name,
-        overwrite=request.overwrite,
-        interactive=stdin_is_interactive(),
-    )
+    should_direct_reuse_requirements_clarification = False
+    if has_existing_clarification:
+        should_direct_reuse_requirements_clarification = should_reuse_existing_requirements_clarification(
+            request.project_dir,
+            request.requirement_name,
+            overwrite=request.overwrite,
+            interactive=stdin_is_interactive(),
+        )
     if has_existing_clarification and should_direct_reuse_requirements_clarification:
         message("复用已有的需求澄清，直接进入下一阶段")
         analysis_result = reuse_existing_requirements_clarification(
@@ -1318,7 +1379,7 @@ def run_requirements_stage(
             preserve_ba_worker=preserve_ba_worker,
         )
     else:
-        message("将重新执行需求澄清流程，请选择需求分析师的厂商、模型、推理强度、代理端口")
+        message("执行摘要: 未检测到可复用的需求澄清，需要启动需求分析师智能体执行需求澄清；请为需求分析师选择厂商、模型、推理强度、代理端口。")
         analysis_selection = collect_requirements_analysis_agent_selection(args)
         message(render_requirements_analysis_stage_start(analysis_selection))
         analysis_result = run_requirements_analysis(

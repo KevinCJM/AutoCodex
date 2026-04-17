@@ -26,6 +26,8 @@
 ## Architectural Rules
 - Stage-specific prompts must live in their matching `Prompt_xx_*.py`.
 - Prompt fragments reused by multiple stages must live in `T04_common_prompt.py`.
+- Do not proactively modify `Prompt_xx_*.py` business prompts or `T04_common_prompt.py` business/common prompts just to inject runtime/control instructions.
+- Any system/runtime/helper prompt must be appended externally as a string suffix after the business prompt body, not written into the business prompt source itself.
 - `Axx` should orchestrate; they should not embed large prompt bodies.
 - Shared runtime behaviors belong in `Txx`, not in a single stage file.
 - Do not make business gates depend on terminal UI text when a file protocol can be used instead.

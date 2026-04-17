@@ -586,6 +586,7 @@ def run_hitl_agent_loop(
     label_prefix: str,
     turn_phase: str,
     human_input_provider: Callable[[str | Path, int], str] = collect_terminal_hitl_response,
+    on_worker_starting: Callable[[object], None] | None = None,
     on_worker_started: Callable[[object], None] | None = None,
     on_agent_turn_started: Callable[[HitlPromptContext, object], None] | None = None,
     on_agent_turn_finished: Callable[[HitlPromptContext, object], None] | None = None,
@@ -599,6 +600,8 @@ def run_hitl_agent_loop(
     turns_dir = Path(turns_root).expanduser().resolve()
     turns_dir.mkdir(parents=True, exist_ok=True)
 
+    if on_worker_starting is not None:
+        on_worker_starting(worker)
     worker.ensure_agent_ready(timeout_sec=min(timeout_sec, 60.0))
     if on_worker_started is not None:
         on_worker_started(worker)

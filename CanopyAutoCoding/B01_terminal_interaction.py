@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ from T03_agent_init_workflow import (
     load_existing_run,
     missing_routing_layer_files,
     prepare_live_workers,
+    required_routing_layer_paths,
     resolve_existing_directory,
     resolve_target_selection,
     run_directory_initialization_with_worker,
@@ -92,6 +94,68 @@ class WorkerTarget:
     session_name: str
     transcript_path: str
     live_handle: LiveWorkerHandle | None
+
+
+def _collect_snapshot_paths(node: object) -> list[str]:
+    flattened: list[str] = []
+    if isinstance(node, dict):
+        for value in node.values():
+            flattened.extend(_collect_snapshot_paths(value))
+        return flattened
+    if isinstance(node, (list, tuple, set)):
+        for value in node:
+            flattened.extend(_collect_snapshot_paths(value))
+        return flattened
+    if node is None:
+        return flattened
+    text = str(node).strip()
+    if text:
+        flattened.append(text)
+    return flattened
+
+
+def _read_turn_artifact_bundle(turn_status_path: str) -> dict[str, object]:
+    resolved = Path(turn_status_path).expanduser().resolve()
+    if not resolved.exists() or not resolved.is_file():
+        return {"artifact_paths": [], "question_path": "", "answer_path": ""}
+    try:
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {"artifact_paths": [], "question_path": "", "answer_path": ""}
+    if not isinstance(payload, dict):
+        return {"artifact_paths": [], "question_path": "", "answer_path": ""}
+    artifacts = payload.get("artifacts", {})
+    artifact_paths = [item for item in _collect_snapshot_paths(artifacts) if Path(item).exists()]
+    question_path = str(artifacts.get("question", "")).strip() if isinstance(artifacts, dict) else ""
+    answer_path = str(artifacts.get("record", "")).strip() if isinstance(artifacts, dict) else ""
+    stage_status_path = str(artifacts.get("stage_status", "")).strip() if isinstance(artifacts, dict) else ""
+    if stage_status_path:
+        stage_status_file = Path(stage_status_path).expanduser().resolve()
+        if stage_status_file.exists() and stage_status_file.is_file():
+            try:
+                stage_payload = json.loads(stage_status_file.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001
+                stage_payload = {}
+            if isinstance(stage_payload, dict):
+                question_path = str(stage_payload.get("question_path", question_path)).strip()
+                answer_path = str(stage_payload.get("record_path", answer_path)).strip()
+                output_path = str(stage_payload.get("output_path", "")).strip()
+                if output_path:
+                    artifact_paths.append(output_path)
+                if question_path:
+                    artifact_paths.append(question_path)
+                if answer_path:
+                    artifact_paths.append(answer_path)
+    deduped_paths: list[str] = []
+    for item in artifact_paths:
+        resolved_item = str(Path(item).expanduser().resolve())
+        if resolved_item not in deduped_paths:
+            deduped_paths.append(resolved_item)
+    return {
+        "artifact_paths": deduped_paths,
+        "question_path": question_path,
+        "answer_path": answer_path,
+    }
 
 
 def prompt_yes_no(prompt_text: str, default: bool = False) -> bool:
@@ -497,6 +561,36 @@ class AgentInitControlCenter:
                 )
             )
         return rows
+
+    def build_worker_snapshots(self) -> list[dict[str, object]]:
+        snapshots: list[dict[str, object]] = []
+        for row in self.build_status_rows():
+            entry = self._entry_by_dir(row.work_dir)
+            artifact_bundle = _read_turn_artifact_bundle(entry.current_turn_status_path)
+            artifact_paths = list(artifact_bundle["artifact_paths"]) if artifact_bundle["artifact_paths"] else []
+            if not artifact_paths and entry.result_status == "passed":
+                artifact_paths = [str(path.resolve()) for path in required_routing_layer_paths(row.work_dir) if path.exists()]
+            snapshots.append(
+                {
+                    "index": row.index,
+                    "work_dir": row.work_dir,
+                    "session_name": row.session_name,
+                    "status": row.status,
+                    "workflow_stage": row.workflow_stage,
+                    "provider_phase": row.provider_phase,
+                    "health_status": row.health_status,
+                    "retry_count": row.retry_count,
+                    "session_exists": row.session_exists,
+                    "note": row.note,
+                    "forced": row.forced,
+                    "transcript_path": entry.transcript_path,
+                    "turn_status_path": entry.current_turn_status_path,
+                    "question_path": str(artifact_bundle.get("question_path", "")).strip(),
+                    "answer_path": str(artifact_bundle.get("answer_path", "")).strip(),
+                    "artifact_paths": artifact_paths,
+                }
+            )
+        return snapshots
 
     def render_status(self) -> str:
         lines = [

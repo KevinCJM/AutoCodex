@@ -60,6 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", help="项目工作目录")
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--yes", action="store_true", help="传递给当前已实现阶段，跳过非关键确认")
+    parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
 

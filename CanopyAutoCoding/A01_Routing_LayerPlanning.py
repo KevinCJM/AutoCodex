@@ -106,6 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-refine-rounds", type=int, default=3, help="最大 refine 轮数")
     parser.add_argument("--resume-run", default="", help="恢复已有 run_id，仅供 B01 控制台使用")
     parser.add_argument("--yes", action="store_true", help="跳过最终确认")
+    parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
 

@@ -419,18 +419,20 @@ if __name__ == '__main__':
     #                             sub_agent_num=0))
 
     '''开发'''
-    # print(start_develop(task, hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
-    #                     requirements_clear_md='需求澄清.md', detailed_design_md=f'{requirement_name}_详细设计.md',
-    #                     task_split_md=f'{requirement_name}_任务单.md',
-    #                     what_just_dev=f'{requirement_name}_工程师开发内容.md',
-    #                     sub_agent_num=0))
+    print(start_develop(task, hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
+                        requirements_clear_md='需求澄清.md', detailed_design_md=f'{requirement_name}_详细设计.md',
+                        task_split_md=f'{requirement_name}_任务单.md',
+                        what_just_dev=f'{requirement_name}_工程师开发内容.md',
+                        sub_agent_num=0))
+    print('\n', '-' * 50, ' 开发提示词 ', '-' * 50, '\n')
 
     '''审核'''
-    # code_change_msg = get_markdown_content(f'{the_dir}/{requirement_name}_工程师开发内容.md')
+    code_change_msg = get_markdown_content(f'{the_dir}/{requirement_name}_工程师开发内容.md')
     # print(reviewer_review_code(task, code_change_msg, task_split_md=f'{requirement_name}_任务单.md',
     #                            detailed_design_md=f'{requirement_name}_详细设计.md',
     #                            review_md=f'{requirement_name}_代码评审记录_C2.md',
     #                            review_json=f'{requirement_name}_评审记录_C2.json'))
+    print('\n', '-' * 50, ' 审核提示词 ', '-' * 50, '\n')
 
     # 3) 检查审核员有没有按提示词要求更新
     check_res = check_reviewer_job(agent_n_list,
@@ -465,9 +467,9 @@ if __name__ == '__main__':
 
         '''给审核员发'''
         c_change = get_markdown_content(f'{the_dir}/{requirement_name}_工程师开发内容.md')
-        print(re_review_code(task, c_msg, c_change,
-                             task_split_md=f'{requirement_name}_任务单.md',
-                             detailed_design_md=f'{requirement_name}_详细设计.md',
-                             review_md=f'{requirement_name}_代码评审记录_C2.md',
-                             review_json=f'{requirement_name}_评审记录_C2.json'
-                             ))
+        # print(re_review_code(task, c_msg, c_change,
+        #                      task_split_md=f'{requirement_name}_任务单.md',
+        #                      detailed_design_md=f'{requirement_name}_详细设计.md',
+        #                      review_md=f'{requirement_name}_代码评审记录_C1.md',
+        #                      review_json=f'{requirement_name}_评审记录_C1.json'
+        #                      ))
