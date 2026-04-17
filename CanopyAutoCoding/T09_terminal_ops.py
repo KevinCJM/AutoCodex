@@ -45,6 +45,8 @@ class TerminalUI(Protocol):
         options: Sequence[tuple[str, str]],
         default_value: str,
         prompt_text: str = "请选择",
+        preview_path: str | Path | None = None,
+        preview_title: str = "",
     ) -> str: ...
 
     def prompt_multiline(
@@ -102,7 +104,11 @@ class StdioTerminalUI:
         options: Sequence[tuple[str, str]],
         default_value: str,
         prompt_text: str = "请选择",
+        preview_path: str | Path | None = None,
+        preview_title: str = "",
     ) -> str:
+        _ = preview_path
+        _ = preview_title
         normalized = [(str(value), str(label)) for value, label in options]
         if not normalized:
             raise ValueError("选项不能为空")
@@ -288,6 +294,8 @@ class BridgeTerminalUI:
         options: Sequence[tuple[str, str]],
         default_value: str,
         prompt_text: str = "请选择",
+        preview_path: str | Path | None = None,
+        preview_title: str = "",
     ) -> str:
         payload = self._request_prompt(
             BridgePromptRequest(
@@ -297,6 +305,8 @@ class BridgeTerminalUI:
                     "options": [{"value": value, "label": label} for value, label in options],
                     "default_value": default_value,
                     "prompt_text": prompt_text,
+                    "preview_path": str(Path(preview_path).expanduser().resolve()) if preview_path else "",
+                    "preview_title": str(preview_title or "").strip(),
                 },
             )
         )
@@ -453,21 +463,33 @@ def prompt_select_option(
     options: Sequence[tuple[str, str]],
     default_value: str,
     prompt_text: str = "请选择",
+    preview_path: str | Path | None = None,
+    preview_title: str = "",
 ) -> str:
     return get_terminal_ui().prompt_select(
         title=title,
         options=options,
         default_value=default_value,
         prompt_text=prompt_text,
+        preview_path=preview_path,
+        preview_title=preview_title,
     )
 
 
-def prompt_yes_no(prompt_text: str, default: bool = False) -> bool:
+def prompt_yes_no(
+    prompt_text: str,
+    default: bool = False,
+    *,
+    preview_path: str | Path | None = None,
+    preview_title: str = "",
+) -> bool:
     value = prompt_select_option(
         title=f"{prompt_text} (yes/no)",
         options=(("yes", "yes"), ("no", "no")),
         default_value="yes" if default else "no",
         prompt_text=prompt_text,
+        preview_path=preview_path,
+        preview_title=preview_title,
     )
     return value == "yes"
 

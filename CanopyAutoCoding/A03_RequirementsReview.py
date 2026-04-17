@@ -6,4 +6,10 @@
 @Descriptions: 兼容层，已顺延为 A04_RequirementsReview
 """
 
-from A04_RequirementsReview import *  # noqa: F401,F403
+from __future__ import annotations
+
+import sys
+
+import A04_RequirementsReview as _impl
+
+sys.modules[__name__] = _impl

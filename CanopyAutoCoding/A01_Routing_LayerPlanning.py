@@ -165,7 +165,7 @@ def split_target_dirs_text(value: str) -> list[str]:
 
 def prompt_project_dir(default: str = "") -> str:
     while True:
-        candidate = prompt_with_default("项目工作目录", default)
+        candidate = prompt_with_default("输入项目工作目录", default)
         try:
             return str(resolve_existing_directory(candidate))
         except Exception as error:
@@ -174,7 +174,7 @@ def prompt_project_dir(default: str = "") -> str:
 
 def prompt_target_dirs(defaults: Sequence[str] = ()) -> tuple[str, ...]:
     default_text = ",".join(defaults)
-    raw_value = prompt_with_default("额外目标目录，多个用逗号分隔，留空表示无", default_text, allow_empty=True)
+    raw_value = prompt_with_default("输入额外目标目录，多个用逗号分隔，可留空", default_text, allow_empty=True)
     return tuple(split_target_dirs_text(raw_value))
 
 
@@ -184,7 +184,7 @@ def prompt_vendor(default: str = "codex") -> str:
         for vendor in VENDOR_CHOICES
     ]
     candidate = prompt_select_option(
-        title="可选厂商:",
+        title="选择厂商",
         options=options,
         default_value=normalize_vendor_choice(default),
         prompt_text="选择厂商",
@@ -201,7 +201,7 @@ def prompt_model(vendor: str, default: str | None = None) -> str:
         for model in models
     ]
     candidate = prompt_select_option(
-        title=f"{normalized_vendor} 可选模型:",
+        title=f"选择 {normalized_vendor} 模型",
         options=options,
         default_value=normalize_model_choice(normalized_vendor, actual_default),
         prompt_text="选择模型",
@@ -214,7 +214,7 @@ def prompt_effort(vendor: str, model: str, default: str = "high") -> str:
     normalized_model = normalize_model_choice(normalized_vendor, model)
     allowed = EFFORT_CHOICES_BY_MODEL[normalized_vendor][normalized_model]
     candidate = prompt_select_option(
-        title=f"{normalized_model} 可选推理强度:",
+        title=f"选择 {normalized_model} 推理强度",
         options=[(effort, effort) for effort in allowed],
         default_value=normalize_effort_choice(normalized_vendor, normalized_model, default),
         prompt_text="选择推理强度",
@@ -240,7 +240,7 @@ def prompt_proxy_port(default: str = "") -> str:
     )
     if candidate != "__custom__":
         return candidate
-    return prompt_with_default("代理端口或完整代理 URL，可留空", normalized_default, allow_empty=True)
+    return prompt_with_default("输入代理端口或完整代理 URL（可留空）", normalized_default, allow_empty=True)
 
 
 def prompt_run_init(default: bool = True) -> bool:
