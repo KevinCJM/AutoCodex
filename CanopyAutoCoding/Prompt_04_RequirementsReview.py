@@ -29,19 +29,14 @@ auditor = f"""* 角色属性：逻辑网关 / 确定性校验器 / 审核器
     * 逻辑单射：确保下游 Agent 拿到的指令集是唯一的、无歧义的。"""
 
 
-# [人类] 审核需求澄清文档后,若提出疑问或建议
-def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
-                   requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
+def human_reply_sop(human_msg, *, ask_human_md='name_与人类交流.md',
+                    requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
     output_protocol_prompt = output_protocol(requirements_clear_md, ask_human_md)
-    # 将 human_msg 放在最后，并用极强的定界符包裹，防止由于 msg 过大导致的指令丢失
-    human_feed_bck_prompt = f"""## 角色定位
-你是一个【严苛的需求对齐专家】，负责处理人类反馈信息并同步工程契约。
-
-## 任务背景
+    human_reply_sop_prompt = f"""## 任务背景
 人类审核《{requirements_clear_md}》后给出了反馈。你必须解析下方的【反馈数据块】，执行逻辑对齐与文档更新。
 
 ## 反馈数据块 (Data Block)
-以下内容为人类提供的反馈信息，请基于此执行上述 SOP：
+以下内容为人类提供的反馈信息，请基于此执行下面的 SOP：
 [HUMAN MSG START]
 {human_msg}
 [HUMAN MSG END]
@@ -69,21 +64,6 @@ def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
 
 {output_protocol_prompt}
 
-## **文档撰写协议 (Documentation Protocol):**
-
-1. **《{requirements_clear_md}》撰写铁律 (面向人类):**
-   - [结构] 采用层级 Bullet，高信息密度，业务逻辑一目了然。
-   - [闭环] 强制四要素：输入 -> 规则 -> 输出 -> 异常兜底，缺一不可。
-   - [边界] 必须列出明确的“非目标/不改动范围”，遏制过度开发。
-   - [唯一] 事实 100% 对齐，消灭“可能/大概”等模糊词汇。
-   - [澄清而非设计] 本文档的目的是澄清需求, 理清需求范围, 以及开发需求所需要的信息。禁止开发设计或代码设计。
-   - 只有在所有信息完备的情况下才允许写《{requirements_clear_md}》文档
-
-2. **《{hitl_record_md}》撰写铁律 (AI-to-AI 缓存区):**
-   - [提纯] 采用 `[标签] 实体: 逻辑` 极简单行 Bullet 格式，剥离所有无效自然语言（Token 极简主义）。
-   - [唯一] 绝对的“单一真理来源”。若人类变更逻辑，必须物理删除旧记录，事实严禁冲突。
-   - [AI优先] 使用机器易读的高信息密度方式, 以使AI能理解为记录目的。
-
 ## 约束
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
@@ -91,7 +71,48 @@ def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
     * 如果输出 `信息足够` 那么《{hitl_record_md}》必须为空
     * 如果输出 `HITL` 那么《{hitl_record_md}》必须为非空
 * 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。"""
+    return human_reply_sop_prompt
+
+
+# [人类] 审核需求澄清文档后,若提出疑问或建议
+def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
+                   requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
+    human_reply_sop_prompt = human_reply_sop(human_msg, ask_human_md=ask_human_md,
+                                             requirements_clear_md=requirements_clear_md, hitl_record_md=hitl_record_md)
+    # 将 human_msg 放在最后，并用极强的定界符包裹，防止由于 msg 过大导致的指令丢失
+    human_feed_bck_prompt = f"""## 角色定位
+你是一个【严苛的需求对齐专家】，负责处理人类反馈信息并同步工程契约。
+
+{human_reply_sop_prompt}"""
     return human_feed_bck_prompt
+
+
+# 需求分析师初始化
+def resume_ba(human_msg=None, ba_desc=fintech_ba, init_prompt=task_start_prompt,
+              ask_human_md='name_与人类交流.md', original_requirement_md='name_原始需求.md',
+              requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
+    if not human_msg:
+        human_msg_prompt = """## 约束
+- 禁止修改任何文档
+- 在完成上述理解后, 只允许回复 `准备完毕`"""
+    else:
+        human_msg_prompt = human_reply_sop(human_msg, ask_human_md=ask_human_md,
+                                           requirements_clear_md=requirements_clear_md,
+                                           hitl_record_md=hitl_record_md)
+    requirements_understand_prompt = f"""## 角色定位
+{ba_desc}
+
+## Context & Scope
+- 系统已经基于代码现状以及《{original_requirement_md}》和《{hitl_record_md}》生成《{requirements_clear_md}》。 
+- 你负责对《{original_requirement_md}》和《{requirements_clear_md}》进行代码级的需求拆解。你必须像审计员一样理解代码与需求之间的关系。
+- 核心目标：理解业务变更点与代码逻辑的精准映射，确保“信息与逻辑闭环”，准备向用户答疑。
+
+{human_msg_prompt}
+
+---
+
+{init_prompt}"""
+    return requirements_understand_prompt
 
 
 # 初始化 [审核器] 智能体, 并要求审核 '需求澄清'
@@ -188,32 +209,6 @@ def requirements_review_reply(ba_reply, task_name="需求评审", *,
     return requirements_review_reply_prompt
 
 
-# 需求分析师初始化
-def resume_ba(
-        ba_desc=fintech_ba,
-        init_prompt=task_start_prompt,
-        original_requirement_md='name_原始需求.md',
-        requirements_clear_md='name_需求澄清.md',
-        hitl_record_md='name_人机交互澄清记录.md'
-):
-    requirements_understand_prompt = f"""## 角色定位
-{ba_desc}
-
-## Context & Scope
-- 系统已经基于代码现状以及《{original_requirement_md}》和《{hitl_record_md}》生成《{requirements_clear_md}》。 
-- 你负责对《{original_requirement_md}》和《{requirements_clear_md}》进行代码级的需求拆解。你必须像审计员一样理解代码与需求之间的关系。
-- 核心目标：理解业务变更点与代码逻辑的精准映射，确保“信息与逻辑闭环”，准备向用户答疑。
-
-## 约束
-- 禁止修改任何文档
-- 在完成上述理解后, 只允许回复 `准备完毕`
-
----
-
-{init_prompt}"""
-    return requirements_understand_prompt
-
-
 if __name__ == '__main__':
     from T04_common_prompt import check_reviewer_job
     from T01_tools import create_empty_json_files, merge_review_records, task_done, get_markdown_content
@@ -223,19 +218,30 @@ if __name__ == '__main__':
     t_name = "需求评审"
     agent_n_list = ['C1', 'C2']
 
-    # 1) 创建空的审核结果JSON文件
+    '''1) 创建空的审核结果JSON文件'''
     # create_empty_json_files(directory=the_dir,
     #                         name_list=agent_n_list,
     #                         pattern=f'{requirement_name}_评审记录_*.json'
     #                         )
 
-    # 2) 审核初始化
-    print(requirements_review_init(auditor_desc=auditor, init_prompt=task_start_prompt,
-                                   original_requirement_md=f'{requirement_name}_原始需求.md',
-                                   hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
-                                   requirements_clear_md=f'{requirement_name}_需求澄清.md',
-                                   requirement_review_md=f'{requirement_name}_需求评审记录_C2.md',
-                                   requirement_review_json=f'{requirement_name}_评审记录_C2.json'))
+    '''2) 人类反馈'''
+    # print(human_reply_sop(human_msg='测1212试', ask_human_md=f'{requirement_name}_与人类交流.md',
+    #                       requirements_clear_md=f'{requirement_name}_需求澄清.md',
+    #                       hitl_record_md=f'{requirement_name}_人机交互澄清记录.md'))
+    print(resume_ba(human_msg='', ba_desc=fintech_ba,
+                    init_prompt=task_start_prompt,
+                    ask_human_md=f'{requirement_name}_与人类交流.md',
+                    original_requirement_md=f'{requirement_name}_原始需求.md',
+                    requirements_clear_md=f'{requirement_name}_需求澄清.md',
+                    hitl_record_md=f'{requirement_name}_人机交互澄清记录.md'))
+
+    '''3) 审核初始化'''
+    # print(requirements_review_init(auditor_desc=auditor, init_prompt=task_start_prompt,
+    #                                original_requirement_md=f'{requirement_name}_原始需求.md',
+    #                                hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
+    #                                requirements_clear_md=f'{requirement_name}_需求澄清.md',
+    #                                requirement_review_md=f'{requirement_name}_需求评审记录_C2.md',
+    #                                requirement_review_json=f'{requirement_name}_评审记录_C2.json'))
 
     # # 3) 检查审核员有没有按提示词要求更新
     # check_res = check_reviewer_job(agent_n_list,
