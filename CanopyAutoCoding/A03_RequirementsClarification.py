@@ -143,7 +143,7 @@ def should_reuse_existing_requirements_clarification(
     if not interactive:
         return not overwrite
     message(f"检测项目内已有需求澄清: {requirements_clear_path.name}")
-    return prompt_yes_no("是否直接复用已有的需求澄清并跳入下一阶段", True)
+    return prompt_yes_no("是否直接复用已有的需求澄清并跳入需求评审阶段", True)
 
 
 def reuse_existing_requirements_clarification(project_dir: str | Path, requirement_name: str) -> RequirementsClarificationStageResult:
@@ -582,7 +582,7 @@ def run_requirements_clarification_stage(
                 overwrite=bool(args.overwrite),
                 interactive=stdin_is_interactive(),
         ):
-            message("复用已有的需求澄清，直接进入下一阶段")
+            message("复用已有的需求澄清，直接进入需求评审阶段")
             result = reuse_existing_requirements_clarification(project_dir, requirement_name)
             mark_requirement_clarification_completed(project_dir, requirement_name)
             return result

@@ -29,6 +29,7 @@ auditor = f"""* 角色属性：逻辑网关 / 确定性校验器 / 审核器
     * 逻辑单射：确保下游 Agent 拿到的指令集是唯一的、无歧义的。"""
 
 
+# 触发 [HITL] 之后的通用提示词
 def human_reply_sop(human_msg, *, ask_human_md='name_与人类交流.md',
                     requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
     output_protocol_prompt = output_protocol(requirements_clear_md, ask_human_md)
@@ -68,8 +69,8 @@ def human_reply_sop(human_msg, *, ask_human_md='name_与人类交流.md',
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
 * 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
-    * 如果输出 `信息足够` 那么《{hitl_record_md}》必须为空
-    * 如果输出 `HITL` 那么《{hitl_record_md}》必须为非空
+    * 如果输出 `信息足够` 那么《{ask_human_md}》必须为空
+    * 如果输出 `HITL` 那么《{ask_human_md}》必须为非空
 * 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。"""
     return human_reply_sop_prompt
 
@@ -171,11 +172,14 @@ def review_feedback(review_msg, *, original_requirement_md='name_原始需求.md
 
 {main_agent_workflow_after_review_prompt}
 
-## 禁令
-- 你的工作范围仅限 **业务逻辑决断** 与 **需求边界澄清**。严禁在答复或文档中进行任何“数据库表设计”、“技术架构选型”、或“代码实现论证”。
-- 禁止修改源代码, 禁止修改除了《{what_just_change}》/《{requirements_clear_md}》/《{ask_human_md}》之外的文档。
-- 如果触发 `HITL`, 则一定要写《{ask_human_md}》。
-- 只能输出 `HITL` 或 `修改完成`。"""
+## 约束
+* 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须进行追问。
+* 你的工作范围仅限 **业务逻辑决断** 与 **需求边界澄清**。严禁在答复或文档中进行任何“数据库表设计”、“技术架构选型”、或“代码实现论证”。
+* 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
+* 输出禁令: 只允许返回 `信息足够` 或 `修改完成`，禁止返回其他内容。
+    * 如果输出 `修改完成` 那么《{ask_human_md}》必须为空
+    * 如果输出 `HITL` 那么《{ask_human_md}》必须为非空
+* 修改禁令: 禁止修改除了《{what_just_change}》/《{requirements_clear_md}》/《{ask_human_md}》之外的文档或源代码。"""
     return review_feedback_prompt
 
 

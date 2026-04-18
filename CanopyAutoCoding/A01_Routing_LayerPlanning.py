@@ -14,7 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from T02_tmux_agents import AgentRunConfig, cleanup_registered_tmux_workers
+from T02_tmux_agents import (
+    AgentRunConfig,
+    TmuxRuntimeController,
+    Vendor,
+    build_session_name,
+    cleanup_registered_tmux_workers,
+    list_registered_tmux_workers,
+)
 from T03_agent_init_workflow import (
     BatchInitResult,
     RoutingCleanupResult,
@@ -178,21 +185,62 @@ def prompt_target_dirs(defaults: Sequence[str] = ()) -> tuple[str, ...]:
     return tuple(split_target_dirs_text(raw_value))
 
 
-def prompt_vendor(default: str = "codex") -> str:
+def _role_scoped_text(text: str, role_label: str = "") -> str:
+    role = str(role_label or "").strip()
+    if not role:
+        return text
+    return f"为 {role} {text}"
+
+
+def _predict_routing_role_label(
+        *,
+        project_dir: str | Path,
+        target_dirs: Sequence[str],
+        run_init: bool,
+) -> str:
+    try:
+        selection = resolve_target_selection(
+            project_dir=str(resolve_existing_directory(project_dir)),
+            target_dirs=tuple(target_dirs),
+            run_init=run_init,
+        )
+        focus_dir = selection.selected_dirs[0] if selection.selected_dirs else selection.project_dir
+        focus_path = Path(focus_dir).expanduser().resolve()
+        occupied_session_names: set[str] = set()
+        try:
+            occupied_session_names.update(TmuxRuntimeController().list_sessions())
+        except Exception:
+            pass
+        for worker in list_registered_tmux_workers():
+            session_name = str(getattr(worker, "session_name", "") or "").strip()
+            if session_name:
+                occupied_session_names.add(session_name)
+        return build_session_name(
+            focus_path.name or "project",
+            focus_path,
+            Vendor.CODEX,
+            occupied_session_names=sorted(occupied_session_names),
+        )
+    except Exception:
+        return "路由器"
+
+
+def prompt_vendor(default: str = "codex", *, role_label: str = "") -> str:
     options = [
         (vendor, f"{vendor} | models: {', '.join(MODEL_CHOICES_BY_VENDOR[vendor])}")
         for vendor in VENDOR_CHOICES
     ]
+    scoped_title = _role_scoped_text("选择厂商", role_label)
     candidate = prompt_select_option(
-        title="选择厂商",
+        title=scoped_title,
         options=options,
         default_value=normalize_vendor_choice(default),
-        prompt_text="选择厂商",
+        prompt_text=scoped_title,
     )
     return normalize_vendor_choice(candidate)
 
 
-def prompt_model(vendor: str, default: str | None = None) -> str:
+def prompt_model(vendor: str, default: str | None = None, *, role_label: str = "") -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
     models = MODEL_CHOICES_BY_VENDOR[normalized_vendor]
     actual_default = default or DEFAULT_MODEL_BY_VENDOR[normalized_vendor]
@@ -200,29 +248,31 @@ def prompt_model(vendor: str, default: str | None = None) -> str:
         (model, f"{model} | efforts: {'/'.join(EFFORT_CHOICES_BY_MODEL[normalized_vendor][model])}")
         for model in models
     ]
+    scoped_title = _role_scoped_text(f"选择 {normalized_vendor} 模型", role_label)
     candidate = prompt_select_option(
-        title=f"选择 {normalized_vendor} 模型",
+        title=scoped_title,
         options=options,
         default_value=normalize_model_choice(normalized_vendor, actual_default),
-        prompt_text="选择模型",
+        prompt_text=scoped_title,
     )
     return normalize_model_choice(normalized_vendor, candidate)
 
 
-def prompt_effort(vendor: str, model: str, default: str = "high") -> str:
+def prompt_effort(vendor: str, model: str, default: str = "high", *, role_label: str = "") -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
     normalized_model = normalize_model_choice(normalized_vendor, model)
     allowed = EFFORT_CHOICES_BY_MODEL[normalized_vendor][normalized_model]
+    scoped_title = _role_scoped_text(f"选择 {normalized_model} 推理强度", role_label)
     candidate = prompt_select_option(
-        title=f"选择 {normalized_model} 推理强度",
+        title=scoped_title,
         options=[(effort, effort) for effort in allowed],
         default_value=normalize_effort_choice(normalized_vendor, normalized_model, default),
-        prompt_text="选择推理强度",
+        prompt_text=scoped_title,
     )
     return normalize_effort_choice(normalized_vendor, normalized_model, candidate)
 
 
-def prompt_proxy_port(default: str = "") -> str:
+def prompt_proxy_port(default: str = "", *, role_label: str = "") -> str:
     normalized_default = str(default or "").strip()
     has_preset_default = normalized_default in PROXY_PRESET_CHOICES
     default_value = normalized_default if has_preset_default else "__custom__"
@@ -232,11 +282,12 @@ def prompt_proxy_port(default: str = "") -> str:
         ("7890", "7890"),
         ("__custom__", "自定义输入"),
     )
+    scoped_title = _role_scoped_text("选择代理端口", role_label)
     candidate = prompt_select_option(
-        title="选择代理端口:",
+        title=f"{scoped_title}:",
         options=options,
         default_value=default_value,
-        prompt_text="选择代理端口",
+        prompt_text=scoped_title,
     )
     if candidate != "__custom__":
         return candidate
@@ -311,11 +362,18 @@ def collect_cli_request(args: argparse.Namespace) -> CliRequest:
         target_dirs = tuple()
 
     if run_init:
-        vendor = normalize_vendor_choice(args.vendor) if args.vendor else prompt_vendor("codex")
+        routing_role_label = _predict_routing_role_label(
+            project_dir=project_dir,
+            target_dirs=target_dirs,
+            run_init=run_init,
+        )
+        vendor = normalize_vendor_choice(args.vendor) if args.vendor else prompt_vendor("codex", role_label=routing_role_label)
         model_default = DEFAULT_MODEL_BY_VENDOR[vendor]
-        model = args.model or prompt_model(vendor, model_default)
-        reasoning_effort = args.effort or ("high" if parameter_mode else prompt_effort(vendor, model, "high"))
-        proxy_port = args.proxy_port or ("" if parameter_mode else prompt_proxy_port(""))
+        model = args.model or prompt_model(vendor, model_default, role_label=routing_role_label)
+        reasoning_effort = args.effort or (
+            "high" if parameter_mode else prompt_effort(vendor, model, "high", role_label=routing_role_label)
+        )
+        proxy_port = args.proxy_port or ("" if parameter_mode else prompt_proxy_port("", role_label=routing_role_label))
     else:
         vendor = normalize_vendor_choice(args.vendor or "codex")
         model = args.model or DEFAULT_MODEL_BY_VENDOR[vendor]

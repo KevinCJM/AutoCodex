@@ -430,6 +430,8 @@ class TaskResultContract:
     stage_status_path: Path | None = None
     required_artifacts: dict[str, Path] = field(default_factory=dict)
     optional_artifacts: dict[str, Path] = field(default_factory=dict)
+    terminal_status_tokens: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    terminal_status_summaries: dict[str, str] = field(default_factory=dict)
     artifact_rules: dict[str, object] = field(default_factory=dict)
     retry_policy: dict[str, object] = field(default_factory=dict)
     resume_policy: dict[str, object] = field(default_factory=dict)
@@ -448,6 +450,24 @@ class TaskResultContract:
             {key: Path(value).expanduser().resolve() for key, value in self.optional_artifacts.items()},
         )
         object.__setattr__(self, "expected_statuses", tuple(str(item).strip() for item in self.expected_statuses if str(item).strip()))
+        object.__setattr__(
+            self,
+            "terminal_status_tokens",
+            {
+                str(status).strip(): tuple(str(token).strip() for token in tokens if str(token).strip())
+                for status, tokens in self.terminal_status_tokens.items()
+                if str(status).strip()
+            },
+        )
+        object.__setattr__(
+            self,
+            "terminal_status_summaries",
+            {
+                str(status).strip(): str(summary).strip()
+                for status, summary in self.terminal_status_summaries.items()
+                if str(status).strip() and str(summary).strip()
+            },
+        )
 
 
 class TmuxBackend:
@@ -730,6 +750,12 @@ def _sanitize_session_fragment(text: str, *, fallback: str) -> str:
     return value or fallback
 
 
+def _sanitize_task_runtime_fragment(text: str, *, fallback: str, max_len: int) -> str:
+    value = _sanitize_session_fragment(text, fallback=fallback)
+    value = value[:max_len].strip("-")
+    return value or fallback
+
+
 def _worker_role_key(worker_id: str, work_dir: str | Path) -> str:
     worker_key = str(worker_id or "").strip().lower()
     if not worker_key:
@@ -756,13 +782,24 @@ def _worker_role_label(role_key: str) -> str:
     if role_key == "requirements-notion-reader":
         return "需求录入员"
     if role_key == "requirements-review-analyst":
-        return "评审分析师"
+        return "需求分析师"
     reviewer_match = _SESSION_ROLE_REVIEWER_RE.fullmatch(role_key)
     if reviewer_match:
-        return f"审核器-R{reviewer_match.group(1)}"
+        return "审核器"
     if role_key == "routing-initializer":
-        return "路由员"
+        return "路由器"
     return "执行者"
+
+
+def _notify_runtime_state_changed_best_effort() -> None:
+    try:
+        from T09_terminal_ops import notify_runtime_state_changed
+    except Exception:
+        return
+    try:
+        notify_runtime_state_changed()
+    except Exception:
+        return
 
 
 def _preferred_constellation_index(work_dir: str | Path, role_key: str) -> int:
@@ -1814,6 +1851,7 @@ class TmuxBatchWorker:
             tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             tmp_path.replace(self.state_path)
         self._log_event("state_changed", status=status.value, note=note)
+        _notify_runtime_state_changed_best_effort()
 
     def _build_passive_health_snapshot(self) -> WorkerHealthSnapshot:
         observed_at = _now_iso()
@@ -2080,7 +2118,7 @@ class TmuxBatchWorker:
     ) -> TurnFileResult:
         deadline = time.monotonic() + timeout_sec
         stable_signature: tuple[object, ...] | None = None
-        stable_hits = 0
+        stable_since_monotonic = 0.0
         status_done_seen = task_status_path is None
 
         while time.monotonic() < deadline:
@@ -2094,19 +2132,19 @@ class TmuxBatchWorker:
                 task_status_path=task_status_path,
                 status_done_seen=status_done_seen,
             )
-            if self._maybe_send_task_completion_nudge(
-                current_command=observation.current_command,
-                visible_text=observation.visible_text,
-                task_status_path=task_status_path,
-            ):
-                time.sleep(0.5)
-                continue
 
             try:
                 file_result = contract.validator(contract.status_path)
             except Exception:
                 stable_signature = None
-                stable_hits = 0
+                stable_since_monotonic = 0.0
+                if self._maybe_send_task_completion_nudge(
+                    current_command=observation.current_command,
+                    visible_text=observation.visible_text,
+                    task_status_path=task_status_path,
+                ):
+                    time.sleep(0.5)
+                    continue
                 time.sleep(0.5)
                 continue
 
@@ -2117,13 +2155,14 @@ class TmuxBatchWorker:
                 tuple(sorted(file_result.artifact_hashes.items())),
             )
             if signature == stable_signature:
-                stable_hits += 1
+                stable_elapsed = time.monotonic() - stable_since_monotonic if stable_since_monotonic else 0.0
             else:
                 stable_signature = signature
-                stable_hits = 1
+                stable_since_monotonic = time.monotonic()
+                stable_elapsed = 0.0
 
             self.last_heartbeat_at = observation.observed_at
-            if stable_hits >= 2 and status_done_seen:
+            if stable_elapsed >= max(float(contract.quiet_window_sec), 0.0) and status_done_seen:
                 self._log_event(
                     "turn_artifacts_ready",
                     turn_id=contract.turn_id,
@@ -2131,6 +2170,30 @@ class TmuxBatchWorker:
                     status_path=str(contract.status_path),
                 )
                 return file_result
+            if (
+                    stable_elapsed >= max(float(contract.quiet_window_sec), 0.0)
+                    and not status_done_seen
+                    and self._can_finalize_turn_artifacts_without_helper(observation)
+            ):
+                if task_status_path is not None:
+                    self._write_task_status_file(task_status_path, status="done")
+                self.current_task_runtime_status = "done"
+                self.current_command = observation.current_command
+                self.current_path = observation.current_path
+                self._log_event(
+                    "turn_artifacts_ready_without_helper",
+                    turn_id=contract.turn_id,
+                    phase=contract.phase,
+                    status_path=str(contract.status_path),
+                )
+                return file_result
+            if self._maybe_send_task_completion_nudge(
+                current_command=observation.current_command,
+                visible_text=observation.visible_text,
+                task_status_path=task_status_path,
+            ):
+                time.sleep(0.5)
+                continue
             if observation.current_command in SHELL_COMMANDS:
                 self.agent_ready = False
                 raise RuntimeError(
@@ -2182,6 +2245,32 @@ class TmuxBatchWorker:
             except Exception:
                 stable_signature = None
                 stable_hits = 0
+                if not result_path.exists() and self._can_finalize_turn_artifacts_without_helper(observation):
+                    terminal_result = self._match_terminal_task_result_status(
+                        contract=contract,
+                        observation=observation,
+                    )
+                    if terminal_result is not None:
+                        matched_status, matched_summary = terminal_result
+                        result_file = self._materialize_task_result_without_helper(
+                            contract=contract,
+                            result_path=result_path,
+                            status=matched_status,
+                            summary=matched_summary,
+                        )
+                        if task_status_path is not None:
+                            self._write_task_status_file(task_status_path, status="done")
+                        self.current_task_runtime_status = "done"
+                        self.current_command = observation.current_command
+                        self.current_path = observation.current_path
+                        self._log_event(
+                            "task_result_ready_without_helper",
+                            turn_id=contract.turn_id,
+                            phase=contract.phase,
+                            result_path=str(result_path),
+                            status=matched_status,
+                        )
+                        return result_file
                 time.sleep(0.5)
                 continue
 
@@ -2323,9 +2412,17 @@ class TmuxBatchWorker:
         return path
 
     def _build_task_runtime_basename(self, *, label: str, attempt: int) -> str:
-        session_slug = _slugify(self.session_name or self.worker_id, max_len=72)
-        label_slug = _slugify(label, max_len=32)
-        return f"{session_slug}_{label_slug}_attempt_{attempt}"
+        session_fragment = _sanitize_task_runtime_fragment(
+            self.session_name or self.worker_id,
+            fallback=_slugify(self.session_name or self.worker_id, max_len=72),
+            max_len=72,
+        )
+        label_fragment = _sanitize_task_runtime_fragment(
+            label,
+            fallback=_slugify(label, max_len=32),
+            max_len=32,
+        )
+        return f"{session_fragment}_{label_fragment}_attempt_{attempt}"
 
     def _build_task_status_path(self, *, label: str, attempt: int) -> Path:
         return self._task_runtime_dir() / f"{self._build_task_runtime_basename(label=label, attempt=attempt)}.json"
@@ -2442,6 +2539,14 @@ exec {python_executable} {shlex.quote(str(helper_module))} {manifest_args} --sta
             return {}
         return payload if isinstance(payload, dict) else {}
 
+    @staticmethod
+    def _write_task_result_file(path: str | Path, payload: dict[str, Any]) -> None:
+        target = Path(path).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = target.with_suffix(target.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(target)
+
     def _validate_task_result_file(
             self,
             *,
@@ -2494,6 +2599,65 @@ exec {python_executable} {shlex.quote(str(helper_module))} {manifest_args} --sta
             validated_at=_now_iso(),
         )
 
+    @staticmethod
+    def _collect_contract_artifacts(contract: TaskResultContract) -> tuple[dict[str, str], dict[str, str]]:
+        artifacts: dict[str, str] = {}
+        artifact_hashes: dict[str, str] = {}
+        for alias, artifact_path in contract.required_artifacts.items():
+            resolved = artifact_path.expanduser().resolve()
+            if not resolved.exists():
+                raise FileNotFoundError(f"缺少必填 artifact: {resolved}")
+            artifacts[alias] = str(resolved)
+            artifact_hashes[str(resolved)] = _build_prefixed_sha256(resolved)
+        for alias, artifact_path in contract.optional_artifacts.items():
+            resolved = artifact_path.expanduser().resolve()
+            if not resolved.exists():
+                continue
+            artifacts[alias] = str(resolved)
+            artifact_hashes[str(resolved)] = _build_prefixed_sha256(resolved)
+        return artifacts, artifact_hashes
+
+    def _match_terminal_task_result_status(
+            self,
+            *,
+            contract: TaskResultContract,
+            observation: WorkerObservation,
+    ) -> tuple[str, str] | None:
+        if not contract.terminal_status_tokens:
+            return None
+        visible_message = clean_ansi(self._extract_last_message(observation.visible_text)).strip()
+        if not visible_message:
+            return None
+        for status, tokens in contract.terminal_status_tokens.items():
+            for token in tokens:
+                if token and token in visible_message:
+                    summary = contract.terminal_status_summaries.get(status, visible_message)
+                    return status, summary
+        return None
+
+    def _materialize_task_result_without_helper(
+            self,
+            *,
+            contract: TaskResultContract,
+            result_path: Path,
+            status: str,
+            summary: str,
+    ) -> TaskResultFile:
+        artifacts, artifact_hashes = self._collect_contract_artifacts(contract)
+        payload = {
+            "schema_version": "1.0",
+            "turn_id": contract.turn_id,
+            "phase": contract.phase,
+            "task_kind": contract.task_kind,
+            "status": status,
+            "summary": summary,
+            "artifacts": artifacts,
+            "artifact_hashes": artifact_hashes,
+            "written_at": _now_iso(),
+        }
+        self._write_task_result_file(result_path, payload)
+        return self._validate_task_result_file(contract=contract, result_path=result_path)
+
     def _track_task_completion_signal(
             self,
             *,
@@ -2509,6 +2673,21 @@ exec {python_executable} {shlex.quote(str(helper_module))} {manifest_args} --sta
                 self._log_event("task_status_done", task_status_path=str(task_status_path))
                 return True
         return status_done_seen
+
+    def _can_finalize_turn_artifacts_without_helper(self, observation: WorkerObservation) -> bool:
+        current_command = str(observation.current_command or "").strip()
+        if current_command in SHELL_COMMANDS:
+            return False
+        if not self._agent_running(current_command):
+            return False
+        ready_visible = self._phase_accepts_followup_prompt(self.provider_phase)
+        if observation.visible_text and self._visible_indicates_agent_ready(observation.visible_text):
+            ready_visible = True
+        if not ready_visible:
+            return False
+        if self.terminal_recently_changed:
+            return False
+        return True
 
     def _reset_task_completion_nudge_state(self) -> None:
         self.current_task_completion_nudge_count = 0

@@ -330,6 +330,60 @@ def _file_has_content(path_value: str | Path) -> bool:
         return False
 
 
+_WORKER_PHASE_VALUES = {
+    "shell",
+    "booting",
+    "auth_prompt",
+    "update_prompt",
+    "waiting_input",
+    "idle_ready",
+    "processing",
+    "completed_response",
+    "recovering",
+    "error",
+    "unknown",
+}
+
+
+def _normalize_worker_provider_phase(
+    *,
+    status: str,
+    provider_phase: str,
+    health_status: str,
+    health_note: str,
+    updated_at: str = "",
+    last_heartbeat_at: str = "",
+) -> str:
+    normalized_provider_phase = str(provider_phase or "").strip() or "unknown"
+    normalized_health_note = str(health_note or "").strip()
+    normalized_status = str(status or "").strip()
+    if normalized_health_note in _WORKER_PHASE_VALUES:
+        if normalized_status in {"succeeded", "completed"}:
+            return normalized_health_note
+        if normalized_health_note == normalized_provider_phase:
+            return normalized_provider_phase
+        provider_updated_at = _parse_iso_datetime(updated_at)
+        health_observed_at = _parse_iso_datetime(last_heartbeat_at)
+        if health_observed_at is not None and provider_updated_at is None:
+            return normalized_health_note
+        if (
+            health_observed_at is not None
+            and provider_updated_at is not None
+            and health_observed_at > provider_updated_at
+        ):
+            return normalized_health_note
+    return normalized_provider_phase
+
+
+def _parse_iso_datetime(value: str) -> dt.datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    with contextlib.suppress(ValueError):
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    return None
+
+
 def _read_worker_state_snapshot(
     state_path: str | Path,
     *,
@@ -350,13 +404,24 @@ def _read_worker_state_snapshot(
     if session_name and session_exists_resolver is not None:
         with contextlib.suppress(Exception):
             session_exists = bool(session_exists_resolver(session_name))
+    status = str(state.get("result_status") or state.get("status") or "pending").strip()
+    health_status = str(state.get("health_status", "unknown")).strip()
+    health_note = str(state.get("health_note", "")).strip()
     return {
         "session_name": session_name,
         "work_dir": str(state.get("work_dir", "")).strip(),
-        "status": str(state.get("result_status") or state.get("status") or "pending").strip(),
+        "status": status,
         "workflow_stage": str(state.get("workflow_stage", "pending")).strip(),
-        "provider_phase": str(state.get("provider_phase", "unknown")).strip(),
-        "health_status": str(state.get("health_status", "unknown")).strip(),
+        "provider_phase": _normalize_worker_provider_phase(
+            status=status,
+            provider_phase=str(state.get("provider_phase", "unknown")).strip(),
+            health_status=health_status,
+            health_note=health_note,
+            updated_at=str(state.get("updated_at", "")).strip(),
+            last_heartbeat_at=str(state.get("last_heartbeat_at", "")).strip(),
+        ),
+        "health_status": health_status,
+        "health_note": health_note,
         "retry_count": int(state.get("retry_count", 0) or 0),
         "note": str(state.get("note", "")).strip(),
         "transcript_path": str(state.get("transcript_path", "")).strip(),
@@ -365,6 +430,7 @@ def _read_worker_state_snapshot(
         "answer_path": str(turn_bundle.get("answer_path") or "").strip(),
         "artifact_paths": artifact_paths,
         "session_exists": session_exists,
+        "last_heartbeat_at": str(state.get("last_heartbeat_at", "")).strip(),
         "updated_at": str(state.get("updated_at", "")).strip(),
     }
 
@@ -384,7 +450,7 @@ class TuiBackendServer:
         self._bridge_ui = BridgeTerminalUI(
             emit_event=self.emit_event,
             request_prompt=self._prompt_broker.request,
-            state_change_notifier=self._emit_all_snapshots,
+            state_change_notifier=self._handle_runtime_state_change,
             stage_change_notifier=self._handle_runtime_stage_change,
         )
         self._workers: dict[str, threading.Thread] = {}
@@ -393,8 +459,31 @@ class TuiBackendServer:
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
         self._context = AppContext()
+        self._display_status = "ready"
+        self._display_action = ""
         self._active_control_id = ""
         self._tmux_runtime = TmuxRuntimeController()
+
+    def _emit_hitl_prompt_log(self, request: BridgePromptRequest) -> None:
+        question_path_text = str(request.payload.get("question_path", "")).strip()
+        if not question_path_text:
+            return
+        question_file = Path(question_path_text).expanduser().resolve()
+        if not question_file.exists() or not question_file.is_file():
+            return
+        try:
+            question_text = question_file.read_text(encoding="utf-8").strip()
+        except Exception:  # noqa: BLE001
+            return
+        if not question_text:
+            return
+        lines = [
+            "",
+            f"HITL 问题文档: {question_file}",
+            question_text,
+            "",
+        ]
+        self.emit_event("log.append", {"text": "\n".join(lines)})
 
     def _handle_prompt_open(self, prompt_id: str, request: BridgePromptRequest) -> None:
         self._pending_prompt = PendingPromptState(
@@ -402,6 +491,7 @@ class TuiBackendServer:
             prompt_type=str(request.prompt_type or "").strip(),
             payload=dict(request.payload),
         )
+        self._emit_hitl_prompt_log(request)
         self._emit_all_snapshots()
 
     def _handle_prompt_resolved(self, prompt_id: str, payload: Mapping[str, Any] | None = None) -> None:
@@ -415,7 +505,15 @@ class TuiBackendServer:
         if not normalized:
             return
         self._set_context(action=normalized)
-        self.emit_event("stage.changed", {"action": normalized, "status": "running"})
+        self._emit_display_stage_state(
+            preferred_status="running",
+            preferred_action=normalized,
+            force=True,
+        )
+        self._emit_all_snapshots()
+
+    def _handle_runtime_state_change(self) -> None:
+        self._emit_display_stage_state()
         self._emit_all_snapshots()
 
     @staticmethod
@@ -495,13 +593,24 @@ class TuiBackendServer:
         if session_name and not session_exists:
             with contextlib.suppress(Exception):
                 session_exists = bool(self._tmux_runtime.session_exists(session_name))
+        status = str(snapshot.get("status") or getattr(entry, "result_status", "") or "pending").strip()
+        health_status = str(snapshot.get("health_status") or getattr(entry, "health_status", "") or "unknown").strip()
+        health_note = str(snapshot.get("health_note") or getattr(entry, "health_note", "") or "").strip()
         return {
             "session_name": session_name,
             "work_dir": str(snapshot.get("work_dir") or getattr(entry, "work_dir", "") or "").strip(),
-            "status": str(snapshot.get("status") or getattr(entry, "result_status", "") or "pending").strip(),
+            "status": status,
             "workflow_stage": str(snapshot.get("workflow_stage") or getattr(entry, "workflow_stage", "") or "pending").strip(),
-            "provider_phase": str(snapshot.get("provider_phase") or getattr(entry, "provider_phase", "") or "unknown").strip(),
-            "health_status": str(snapshot.get("health_status") or getattr(entry, "health_status", "") or "unknown").strip(),
+            "provider_phase": _normalize_worker_provider_phase(
+                status=status,
+                provider_phase=str(snapshot.get("provider_phase") or getattr(entry, "provider_phase", "") or "unknown").strip(),
+                health_status=health_status,
+                health_note=health_note,
+                updated_at=str(snapshot.get("updated_at") or "").strip(),
+                last_heartbeat_at=str(snapshot.get("last_heartbeat_at") or "").strip(),
+            ),
+            "health_status": health_status,
+            "health_note": health_note,
             "retry_count": int(snapshot.get("retry_count") or getattr(entry, "retry_count", 0) or 0),
             "note": str(snapshot.get("note") or getattr(entry, "note", "") or "").strip(),
             "transcript_path": str(snapshot.get("transcript_path") or getattr(entry, "transcript_path", "") or "").strip(),
@@ -621,17 +730,22 @@ class TuiBackendServer:
         )
 
     def _update_context_from_result(self, result: Any, *, action: str) -> None:
+        resolved_action = action
+        if action == "workflow.a00.start":
+            current_action = str(self._context.current_action or "").strip()
+            if current_action and current_action != action:
+                resolved_action = current_action
         if isinstance(result, Mapping):
             self._set_context(
                 project_dir=str(result.get("project_dir", "")).strip() or None,
                 requirement_name=str(result.get("requirement_name", "")).strip() or None,
-                action=action,
+                action=resolved_action,
             )
             return
         self._set_context(
             project_dir=str(getattr(result, "project_dir", "") or "").strip() or None,
             requirement_name=str(getattr(result, "requirement_name", "") or "").strip() or None,
-            action=action,
+            action=resolved_action,
         )
 
     def _scan_runtime_workers(self, runtime_root: str | Path) -> list[dict[str, Any]]:
@@ -917,6 +1031,45 @@ class TuiBackendServer:
             },
         }
 
+    def _derive_display_stage_state(
+        self,
+        *,
+        preferred_status: str | None = None,
+        preferred_action: str | None = None,
+    ) -> tuple[str, str]:
+        action = str(preferred_action or self._context.current_action or self._display_action or "").strip()
+        explicit_status = str(preferred_status or self._display_status or "ready").strip() or "ready"
+        if explicit_status in {"failed", "error"}:
+            return action, explicit_status
+        if self._pending_prompt is not None:
+            return action, "awaiting-input"
+        if bool(self._build_hitl_snapshot().get("pending", False)):
+            return action, "awaiting-input"
+        return action, explicit_status
+
+    def _emit_display_stage_state(
+        self,
+        *,
+        preferred_status: str | None = None,
+        preferred_action: str | None = None,
+        force: bool = False,
+    ) -> None:
+        previous_action = self._display_action
+        previous_status = self._display_status
+        action, status = self._derive_display_stage_state(
+            preferred_status=preferred_status,
+            preferred_action=preferred_action,
+        )
+        if not action and status in {"ready", "booting"} and not force:
+            self._display_action = action
+            self._display_status = status
+            return
+        if not force and action == previous_action and status == previous_status:
+            return
+        self._display_action = action
+        self._display_status = status
+        self.emit_event("stage.changed", {"action": action or "idle", "status": status})
+
     def _emit_all_snapshots(self) -> None:
         self.emit_event("snapshot.app", self._build_app_snapshot())
         self.emit_event("snapshot.stage", {"route": "routing", "snapshot": self._build_routing_snapshot()})
@@ -926,34 +1079,122 @@ class TuiBackendServer:
         self.emit_event("snapshot.hitl", self._build_hitl_snapshot())
         self.emit_event("snapshot.artifacts", self._build_artifacts_snapshot())
 
-    def _run_in_thread(self, request_id: str, action: str, runner: Callable[[], Any]) -> None:
+    @staticmethod
+    def _result_exit_code(result: Any) -> int:
+        if isinstance(result, Mapping):
+            try:
+                return int(result.get("exit_code", 0))
+            except Exception:
+                return 0
+        try:
+            return int(getattr(result, "exit_code", 0))
+        except Exception:
+            return 0
+
+    def _build_requirement_intake_argv(
+        self,
+        *,
+        stage_a01_argv: Sequence[str],
+        result: Any,
+    ) -> list[str]:
+        project_dir = ""
+        if isinstance(result, Mapping):
+            project_dir = str(result.get("project_dir", "")).strip()
+        else:
+            project_dir = str(getattr(result, "project_dir", "") or "").strip()
+        try:
+            parsed = build_a01_parser().parse_args(list(stage_a01_argv))
+        except Exception:
+            parsed = None
+        if not project_dir and parsed is not None:
+            project_dir = str(getattr(parsed, "project_dir", "") or "").strip()
+        if not project_dir:
+            project_dir = str(self._context.project_dir or "").strip()
+        if not project_dir:
+            return []
+        argv = ["--project-dir", project_dir]
+        if parsed is not None and bool(getattr(parsed, "yes", False)):
+            argv.append("--yes")
+        if parsed is not None and bool(getattr(parsed, "no_tui", False)):
+            argv.append("--no-tui")
+        if parsed is not None and bool(getattr(parsed, "legacy_cli", False)):
+            argv.append("--legacy-cli")
+        return argv
+
+    def _maybe_chain_after_stage_success(
+        self,
+        *,
+        action: str,
+        argv: Sequence[str],
+        result: Any,
+    ) -> None:
+        if action != "stage.a01.start":
+            return
+        if self._result_exit_code(result) != 0:
+            return
+        followup_argv = self._build_requirement_intake_argv(stage_a01_argv=argv, result=result)
+        if not followup_argv:
+            return
+        self.emit_event("log.append", {"text": "自动进入需求录入阶段\n"})
+        self._update_context_from_stage_args("stage.a02.start", followup_argv)
+        self._run_in_thread(
+            "",
+            "stage.a02.start",
+            lambda: run_requirement_intake_stage(followup_argv),
+            argv=followup_argv,
+            respond=False,
+        )
+
+    def _run_in_thread(
+        self,
+        request_id: str,
+        action: str,
+        runner: Callable[[], Any],
+        *,
+        argv: Sequence[str] | None = None,
+        respond: bool = True,
+    ) -> None:
+        worker_key = str(request_id).strip() or f"auto-{action}-{dt.datetime.now().timestamp()}"
+
         def target() -> None:
             try:
                 with use_terminal_ui(self._bridge_ui), contextlib.redirect_stdout(self._protocol_log_sink):
-                    self.emit_event("stage.changed", {"action": action, "status": "running"})
+                    self._emit_display_stage_state(
+                        preferred_status="running",
+                        preferred_action=action,
+                        force=True,
+                    )
                     result = runner()
                 self._update_context_from_result(result, action=action)
-                self.emit_response(request_id, ok=True, payload={"result": _serialize(result)})
-                self.emit_event("stage.changed", {"action": action, "status": "completed"})
+                if respond and request_id:
+                    self.emit_response(request_id, ok=True, payload={"result": _serialize(result)})
+                self._emit_display_stage_state(preferred_status="completed", force=True)
                 self._emit_all_snapshots()
+                if argv is not None:
+                    self._maybe_chain_after_stage_success(action=action, argv=argv, result=result)
             except Exception as error:  # noqa: BLE001
-                self.emit_response(
-                    request_id,
-                    ok=False,
-                    error=str(error),
-                    payload={"traceback": traceback.format_exc()},
-                )
+                if respond and request_id:
+                    self.emit_response(
+                        request_id,
+                        ok=False,
+                        error=str(error),
+                        payload={"traceback": traceback.format_exc()},
+                    )
                 self.emit_event(
                     "error",
                     {"action": action, "message": str(error), "traceback": traceback.format_exc()},
                 )
-                self.emit_event("stage.changed", {"action": action, "status": "failed"})
+                self._emit_display_stage_state(
+                    preferred_status="failed",
+                    preferred_action=action,
+                    force=True,
+                )
                 self._emit_all_snapshots()
             finally:
-                self._workers.pop(request_id, None)
+                self._workers.pop(worker_key, None)
 
         thread = threading.Thread(target=target, name=f"tui-backend-{action}-{request_id}", daemon=True)
-        self._workers[request_id] = thread
+        self._workers[worker_key] = thread
         thread.start()
 
     def _get_control_session(self, control_id: str) -> ControlSessionState:
@@ -1169,6 +1410,7 @@ class TuiBackendServer:
                 },
             },
         )
+        self._emit_display_stage_state()
         self._emit_all_snapshots()
 
     @staticmethod
@@ -1206,7 +1448,7 @@ class TuiBackendServer:
         if action == "stage.a01.start":
             argv = self._argv_from_payload(payload)
             self._update_context_from_stage_args(action, argv)
-            self._run_in_thread(request_id, action, lambda: run_routing_stage(argv))
+            self._run_in_thread(request_id, action, lambda: run_routing_stage(argv), argv=argv)
             return
         if action == "stage.a02.start":
             argv = self._argv_from_payload(payload)

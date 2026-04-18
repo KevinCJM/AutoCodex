@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -44,20 +46,26 @@ from T02_tmux_agents import (
     AgentRunConfig,
     TaskResultContract,
     TmuxBatchWorker,
+    TmuxRuntimeController,
     TurnFileContract,
     TurnFileResult,
+    Vendor,
+    build_session_name,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
     is_provider_auth_error,
     is_worker_death_error,
+    list_registered_tmux_workers,
     try_resume_worker,
 )
 from T04_common_prompt import check_reviewer_job
 from T05_hitl_runtime import HitlPromptContext, build_prefixed_sha256, run_hitl_agent_loop
 from T09_terminal_ops import (
+    BridgeTerminalUI,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
     collect_multiline_input,
+    get_terminal_ui,
     message,
     maybe_launch_tui,
     prompt_positive_int as terminal_prompt_positive_int,
@@ -117,6 +125,18 @@ class RequirementsReviewStageResult:
     rounds_used: int
     passed: bool
     cleanup_paths: tuple[str, ...] = ()
+
+
+@dataclass
+class ReviewBaPrewarmTask:
+    handoff: RequirementsAnalystHandoff
+    project_dir: str
+    prompt: str
+    result_contract: TaskResultContract
+    payload: dict[str, object] | None = None
+    error: Exception | None = None
+    done: threading.Event = field(default_factory=threading.Event)
+    thread: threading.Thread | None = None
 
 
 class ReviewStageProgress:
@@ -185,8 +205,12 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def prompt_proxy_url(default: str = "") -> str:
-    return prompt_with_default("输入代理端口或完整代理 URL（可留空）", default, allow_empty=True)
+def prompt_proxy_url(default: str = "", *, role_label: str = "") -> str:
+    role_text = str(role_label or "").strip()
+    prompt_text = "输入代理端口或完整代理 URL（可留空）"
+    if role_text:
+        prompt_text = f"为 {role_text} {prompt_text}"
+    return prompt_with_default(prompt_text, default, allow_empty=True)
 
 
 def prompt_positive_int(prompt_text: str, default: int = 1, *, progress: ReviewStageProgress | None = None) -> int:
@@ -201,15 +225,16 @@ def prompt_review_agent_selection(
         default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
         default_proxy_url: str = "",
         *,
+        role_label: str = "",
         progress: ReviewStageProgress | None = None,
 ) -> ReviewAgentSelection:
     progress = _resolve_review_progress(progress)
     with progress.suspended() if progress is not None else nullcontext():
-        vendor = prompt_vendor(default_vendor)
+        vendor = prompt_vendor(default_vendor, role_label=role_label)
         preferred_model = default_model if default_model and vendor == default_vendor else DEFAULT_MODEL_BY_VENDOR[vendor]
-        model = prompt_model(vendor, preferred_model)
-        reasoning_effort = prompt_effort(vendor, model, default_reasoning_effort)
-        proxy_url = prompt_proxy_url(default_proxy_url)
+        model = prompt_model(vendor, preferred_model, role_label=role_label)
+        reasoning_effort = prompt_effort(vendor, model, default_reasoning_effort, role_label=role_label)
+        proxy_url = prompt_proxy_url(default_proxy_url, role_label=role_label)
     return ReviewAgentSelection(
         vendor=vendor,
         model=model,
@@ -266,6 +291,7 @@ def prompt_replacement_review_agent_selection(
             default_model=previous_selection.model,
             default_reasoning_effort=previous_selection.reasoning_effort,
             default_proxy_url=previous_selection.proxy_url,
+            role_label=role_label,
             progress=progress,
         )
         if (
@@ -305,9 +331,55 @@ def build_reviewer_artifact_paths(project_dir: str | Path, requirement_name: str
     return review_md_path, review_json_path
 
 
+def _predict_review_worker_display_name(
+        *,
+        project_dir: str | Path,
+        worker_id: str,
+        occupied_session_names: Sequence[str] = (),
+) -> str:
+    occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
+    for worker in list_registered_tmux_workers():
+        session_name = str(getattr(worker, "session_name", "") or "").strip()
+        if session_name:
+            occupied.add(session_name)
+    return build_session_name(
+        worker_id,
+        Path(project_dir).expanduser().resolve(),
+        Vendor.CODEX,
+        occupied_session_names=sorted(occupied),
+    )
+
+
+def _review_ba_display_name(
+        *,
+        project_dir: str | Path,
+        handoff: RequirementsAnalystHandoff | None = None,
+) -> str:
+    session_name = str(getattr(getattr(handoff, "worker", None), "session_name", "") or "").strip()
+    if session_name:
+        return session_name
+    return _predict_review_worker_display_name(
+        project_dir=project_dir,
+        worker_id="requirements-review-analyst",
+    )
+
+
 def _reviewer_artifact_agent_name(reviewer: ReviewerRuntime) -> str:
     session_name = str(getattr(reviewer.worker, "session_name", "") or "").strip()
     return session_name or reviewer.reviewer_name
+
+
+def _predict_reviewer_display_name(
+        *,
+        project_dir: str | Path,
+        reviewer_name: str,
+        occupied_session_names: Sequence[str] = (),
+) -> str:
+    return _predict_review_worker_display_name(
+        project_dir=project_dir,
+        worker_id=f"requirements-review-{reviewer_name.lower()}",
+        occupied_session_names=occupied_session_names,
+    )
 
 
 def create_reviewer_runtime(
@@ -335,7 +407,7 @@ def create_reviewer_runtime(
         str(worker.session_name).strip() or reviewer_name,
     )
     ensure_empty_file(review_md_path)
-    message(render_tmux_start_summary(f"审核器 {reviewer_name}", worker))
+    message(render_tmux_start_summary(str(worker.session_name).strip() or f"审核器 {reviewer_name}", worker))
     return ReviewerRuntime(
         reviewer_name=reviewer_name,
         selection=selection,
@@ -370,6 +442,55 @@ def cleanup_existing_review_artifacts(paths: dict[str, Path], requirement_name: 
         if candidate.exists() and candidate.is_file():
             candidate.unlink()
             removed.append(str(candidate.resolve()))
+    return tuple(removed)
+
+
+def cleanup_stale_review_runtime_state(
+        project_dir: str | Path,
+        *,
+        preserve_workers: Sequence[TmuxBatchWorker] = (),
+) -> tuple[str, ...]:
+    runtime_root = Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME
+    if not runtime_root.exists() or not runtime_root.is_dir():
+        return ()
+
+    preserve_runtime_dirs = {
+        Path(worker.runtime_dir).expanduser().resolve()
+        for worker in preserve_workers
+        if str(getattr(worker, "runtime_dir", "")).strip()
+    }
+    preserve_session_names = {
+        str(getattr(worker, "session_name", "")).strip()
+        for worker in preserve_workers
+        if str(getattr(worker, "session_name", "")).strip()
+    }
+    tmux_runtime = TmuxRuntimeController()
+    removed: list[str] = []
+
+    for worker_dir in sorted(path for path in runtime_root.iterdir() if path.is_dir()):
+        resolved_worker_dir = worker_dir.expanduser().resolve()
+        if resolved_worker_dir in preserve_runtime_dirs:
+            continue
+        state_path = resolved_worker_dir / "worker.state.json"
+        session_name = ""
+        if state_path.exists() and state_path.is_file():
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                session_name = str(payload.get("session_name", "")).strip()
+        if session_name and session_name not in preserve_session_names:
+            try:
+                tmux_runtime.kill_session(session_name, missing_ok=True)
+            except Exception:
+                pass
+        shutil.rmtree(resolved_worker_dir, ignore_errors=True)
+        removed.append(str(resolved_worker_dir))
+
+    if runtime_root.exists() and runtime_root.is_dir() and not any(runtime_root.iterdir()):
+        runtime_root.rmdir()
+        removed.append(str(runtime_root))
     return tuple(removed)
 
 
@@ -458,6 +579,12 @@ def build_ba_resume_result_contract(paths: dict[str, Path]) -> TaskResultContrac
             "original_requirement": paths["original_requirement_path"],
             "requirements_clear": paths["requirements_clear_path"],
             "hitl_record": paths["hitl_record_path"],
+        },
+        terminal_status_tokens={
+            "ready": ("准备完毕",),
+        },
+        terminal_status_summaries={
+            "ready": "需求分析师已进入需求评审准备态",
         },
     )
 
@@ -564,9 +691,10 @@ def run_ba_turn_with_recreation(
         except Exception as error:  # noqa: BLE001
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_handoff.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
+            ba_display_name = _review_ba_display_name(project_dir=project_dir, handoff=current_handoff)
             if auth_error:
                 selection = prompt_replacement_review_agent_selection(
-                    reason_text="检测到需求分析师仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。",
+                    reason_text=f"检测到{ba_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。",
                     previous_selection=ReviewAgentSelection(
                         current_handoff.vendor,
                         current_handoff.model,
@@ -574,11 +702,11 @@ def run_ba_turn_with_recreation(
                         current_handoff.proxy_url,
                     ),
                     force_model_change=True,
-                    role_label="需求分析师",
+                    role_label=ba_display_name,
                     progress=progress,
                 )
                 if selection is None:
-                    raise RuntimeError("需求分析师认证已失效，且用户未更换模型") from error
+                    raise RuntimeError(f"{ba_display_name}认证已失效，且用户未更换模型") from error
                 current_handoff = RequirementsAnalystHandoff(
                     worker=TmuxBatchWorker(
                         worker_id="requirements-review-analyst",
@@ -596,11 +724,11 @@ def run_ba_turn_with_recreation(
                     reasoning_effort=selection.reasoning_effort,
                     proxy_url=selection.proxy_url,
                 )
-                message(render_tmux_start_summary("需求分析师", current_handoff.worker))
+                message(render_tmux_start_summary(str(current_handoff.worker.session_name).strip() or ba_display_name, current_handoff.worker))
                 continue
             if ready_timeout_error:
                 selection = prompt_replacement_review_agent_selection(
-                    reason_text="需求分析师启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。",
+                    reason_text=f"{ba_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。",
                     previous_selection=ReviewAgentSelection(
                         current_handoff.vendor,
                         current_handoff.model,
@@ -608,11 +736,11 @@ def run_ba_turn_with_recreation(
                         current_handoff.proxy_url,
                     ),
                     force_model_change=True,
-                    role_label="需求分析师",
+                    role_label=ba_display_name,
                     progress=progress,
                 )
                 if selection is None:
-                    raise RuntimeError("需求分析师启动超时，且用户未更换模型") from error
+                    raise RuntimeError(f"{ba_display_name}启动超时，且用户未更换模型") from error
                 current_handoff = RequirementsAnalystHandoff(
                     worker=TmuxBatchWorker(
                         worker_id="requirements-review-analyst",
@@ -630,7 +758,7 @@ def run_ba_turn_with_recreation(
                     reasoning_effort=selection.reasoning_effort,
                     proxy_url=selection.proxy_url,
                 )
-                message(render_tmux_start_summary("需求分析师", current_handoff.worker))
+                message(render_tmux_start_summary(str(current_handoff.worker.session_name).strip() or ba_display_name, current_handoff.worker))
                 continue
             if is_worker_death_error(error):
                 if try_resume_worker(current_handoff.worker, timeout_sec=60.0):
@@ -641,7 +769,7 @@ def run_ba_turn_with_recreation(
                     progress=progress,
                 )
                 if replacement is None:
-                    raise RuntimeError("需求分析师已死亡，且用户未创建新的需求分析师") from error
+                    raise RuntimeError(f"{ba_display_name}已死亡，且用户未创建新的{ba_display_name}") from error
                 current_handoff = replacement
                 continue
             raise
@@ -669,16 +797,17 @@ def run_reviewer_turn_with_recreation(
         except Exception as error:  # noqa: BLE001
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
+            reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
             if auth_error:
                 selection = prompt_replacement_review_agent_selection(
-                    reason_text=f"检测到审核器 {current_reviewer.reviewer_name} 仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。",
+                    reason_text=f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。",
                     previous_selection=current_reviewer.selection,
                     force_model_change=True,
-                    role_label=f"审核器 {current_reviewer.reviewer_name}",
+                    role_label=reviewer_display_name,
                     progress=progress,
                 )
                 if selection is None:
-                    raise RuntimeError(f"审核器 {current_reviewer.reviewer_name} 认证已失效，且用户未更换模型") from error
+                    raise RuntimeError(f"{reviewer_display_name}认证已失效，且用户未更换模型") from error
                 current_reviewer = create_reviewer_runtime(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
@@ -688,14 +817,14 @@ def run_reviewer_turn_with_recreation(
                 continue
             if ready_timeout_error:
                 selection = prompt_replacement_review_agent_selection(
-                    reason_text=f"审核器 {current_reviewer.reviewer_name} 启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。",
+                    reason_text=f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。",
                     previous_selection=current_reviewer.selection,
                     force_model_change=True,
-                    role_label=f"审核器 {current_reviewer.reviewer_name}",
+                    role_label=reviewer_display_name,
                     progress=progress,
                 )
                 if selection is None:
-                    raise RuntimeError(f"审核器 {current_reviewer.reviewer_name} 启动超时，且用户未更换模型") from error
+                    raise RuntimeError(f"{reviewer_display_name}启动超时，且用户未更换模型") from error
                 current_reviewer = create_reviewer_runtime(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
@@ -713,7 +842,7 @@ def run_reviewer_turn_with_recreation(
                     progress=progress,
                 )
                 if replacement is None:
-                    raise RuntimeError(f"审核器 {current_reviewer.reviewer_name} 已死亡，且用户未创建新的审核器") from error
+                    raise RuntimeError(f"{reviewer_display_name}已死亡，且用户未创建新的{reviewer_display_name}") from error
                 current_reviewer = replacement
                 continue
             raise
@@ -753,27 +882,11 @@ def prepare_ba_handoff(
 
     if progress is not None:
         progress.set_phase("需求评审准备中")
-    message("直接进入需求评审阶段，当前没有可复用的需求分析师，将新建需求分析师")
-    selection = prompt_review_agent_selection(DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR, progress=progress)
-    message(render_review_agent_selection("进入需求评审阶段（需求分析师）", selection))
-    worker = TmuxBatchWorker(
-        worker_id="requirements-review-analyst",
-        work_dir=Path(project_dir).expanduser().resolve(),
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
-        runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
-    )
-    message(render_tmux_start_summary("需求分析师", worker))
-    handoff = RequirementsAnalystHandoff(
-        worker=worker,
-        vendor=selection.vendor,
-        model=selection.model,
-        reasoning_effort=selection.reasoning_effort,
-        proxy_url=selection.proxy_url,
+    message("当前没有可复用的需求分析师，将新建需求分析师处理评审反馈")
+    handoff = _create_review_ba_handoff(
+        project_dir=project_dir,
+        selection_title="进入需求评审阶段（需求分析师）",
+        progress=progress,
     )
     handoff, payload = run_ba_turn_with_recreation(
         handoff,
@@ -794,6 +907,118 @@ def prepare_ba_handoff(
     )
 
 
+def _build_review_ba_resume_prompt(paths: dict[str, Path]) -> str:
+    return resume_ba(
+        original_requirement_md=str(paths["original_requirement_path"].resolve()),
+        requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+        hitl_record_md=str(paths["hitl_record_path"].resolve()),
+    )
+
+
+def _start_review_ba_prewarm(
+        handoff: RequirementsAnalystHandoff | None,
+        *,
+        project_dir: str | Path,
+        paths: dict[str, Path],
+        progress: ReviewStageProgress | None = None,
+) -> ReviewBaPrewarmTask | None:
+    progress = _resolve_review_progress(progress)
+    if handoff is None:
+        return None
+    project_root = str(Path(project_dir).expanduser().resolve())
+    task = ReviewBaPrewarmTask(
+        handoff=handoff,
+        project_dir=project_root,
+        prompt=_build_review_ba_resume_prompt(paths),
+        result_contract=build_ba_resume_result_contract(paths),
+    )
+
+    def _runner() -> None:
+        try:
+            task.payload = _run_ba_turn(
+                handoff,
+                label="resume_requirements_review_ba",
+                prompt=task.prompt,
+                result_contract=task.result_contract,
+            )
+        except Exception as error:  # noqa: BLE001
+            task.error = error
+        finally:
+            task.done.set()
+
+    if progress is not None:
+        progress.set_phase("需求分析师预热中")
+    thread = threading.Thread(
+        target=_runner,
+        name="requirements-review-ba-prewarm",
+        daemon=True,
+    )
+    task.thread = thread
+    thread.start()
+    return task
+
+
+def _await_review_ba_prewarm(
+        task: ReviewBaPrewarmTask | None,
+        *,
+        paths: dict[str, Path],
+        progress: ReviewStageProgress | None = None,
+) -> RequirementsAnalystHandoff | None:
+    progress = _resolve_review_progress(progress)
+    if task is None:
+        return None
+    task.done.wait()
+    payload = task.payload or {}
+    if task.error is None and str(payload.get("status", "")).strip() == "ready":
+        return task.handoff
+    handoff, payload = run_ba_turn_with_recreation(
+        task.handoff,
+        project_dir=task.project_dir,
+        label="resume_requirements_review_ba",
+        prompt=task.prompt,
+        result_contract=task.result_contract,
+        progress=progress,
+    )
+    if str(payload.get("status", "")).strip() != "ready":
+        raise RuntimeError("需求分析师未按要求进入需求评审准备态")
+    return handoff
+
+
+def _create_review_ba_handoff(
+        *,
+        project_dir: str | Path,
+        selection_title: str,
+        progress: ReviewStageProgress | None = None,
+) -> RequirementsAnalystHandoff:
+    progress = _resolve_review_progress(progress)
+    ba_display_name = _review_ba_display_name(project_dir=project_dir)
+    selection = prompt_review_agent_selection(
+        DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+        role_label=ba_display_name,
+        progress=progress,
+    )
+    message(render_review_agent_selection(selection_title, selection))
+    worker = TmuxBatchWorker(
+        worker_id="requirements-review-analyst",
+        work_dir=Path(project_dir).expanduser().resolve(),
+        config=AgentRunConfig(
+            vendor=selection.vendor,
+            model=selection.model,
+            reasoning_effort=selection.reasoning_effort,
+            proxy_url=selection.proxy_url,
+        ),
+        runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+    )
+    message(render_tmux_start_summary(str(worker.session_name).strip() or ba_display_name, worker))
+    return RequirementsAnalystHandoff(
+        worker=worker,
+        vendor=selection.vendor,
+        model=selection.model,
+        reasoning_effort=selection.reasoning_effort,
+        proxy_url=selection.proxy_url,
+    )
+
+
 def recreate_ba_handoff(
         *,
         project_dir: str | Path,
@@ -801,8 +1026,9 @@ def recreate_ba_handoff(
         progress: ReviewStageProgress | None = None,
 ) -> RequirementsAnalystHandoff | None:
     progress = _resolve_review_progress(progress)
+    ba_display_name = _review_ba_display_name(project_dir=project_dir, handoff=previous_handoff)
     selection = prompt_replacement_review_agent_selection(
-        reason_text="检测到需求分析师已死亡，且 resume 失败。\n需要更换模型后继续当前阶段。",
+        reason_text=f"检测到{ba_display_name}已死亡，且 resume 失败。\n需要更换模型后继续当前阶段。",
         previous_selection=ReviewAgentSelection(
             previous_handoff.vendor,
             previous_handoff.model,
@@ -810,7 +1036,7 @@ def recreate_ba_handoff(
             previous_handoff.proxy_url,
         ),
         force_model_change=True,
-        role_label="需求分析师",
+        role_label=ba_display_name,
         progress=progress,
     )
     if selection is None:
@@ -826,7 +1052,7 @@ def recreate_ba_handoff(
         ),
         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
     )
-    message(render_tmux_start_summary("需求分析师", worker))
+    message(render_tmux_start_summary(str(worker.session_name).strip() or ba_display_name, worker))
     return RequirementsAnalystHandoff(
         worker=worker,
         vendor=selection.vendor,
@@ -868,17 +1094,18 @@ def recreate_reviewer_runtime(
 
 def run_human_check_loop(
         *,
-        handoff: RequirementsAnalystHandoff,
+        handoff: RequirementsAnalystHandoff | None,
         paths: dict[str, Path],
+        requirement_name: str,
         progress: ReviewStageProgress | None = None,
-) -> RequirementsAnalystHandoff:
+) -> RequirementsAnalystHandoff | None:
     progress = _resolve_review_progress(progress)
     message("进入需求评审阶段")
     message(f"请先阅读需求澄清文档: {paths['requirements_clear_path']}")
     current_handoff = handoff
     while True:
         if progress is not None:
-            progress.set_phase("等待人工确认")
+            progress.set_phase("等待人工审核")
         if not prompt_yes_no_choice(
                 "是否向需求分析师提出建议或问题",
                 False,
@@ -886,6 +1113,13 @@ def run_human_check_loop(
                 preview_path=paths["requirements_clear_path"],
                 preview_title="需求澄清文档",
         ):
+            if current_handoff is None:
+                message("当前没有可复用的需求分析师，将新建需求分析师处理后续需求评审")
+                current_handoff = _create_review_ba_handoff(
+                    project_dir=paths["project_root"],
+                    selection_title="进入需求评审阶段（需求分析师）",
+                    progress=progress,
+                )
             return current_handoff
         with progress.suspended() if progress is not None else nullcontext():
             human_msg = collect_multiline_input(
@@ -893,16 +1127,35 @@ def run_human_check_loop(
                 empty_retry_message="内容不能为空，请重新输入。",
             )
         ensure_empty_file(paths["ask_human_path"])
-        current_handoff = _run_review_clarification_continuation(
-            handoff=current_handoff,
-            paths=paths,
-            initial_prompt=human_feed_bck(
+        reuse_existing_handoff = current_handoff is not None
+        if current_handoff is None:
+            if progress is not None:
+                progress.set_phase("需求评审 / 处理人类建议")
+            current_handoff = _create_review_ba_handoff(
+                project_dir=paths["project_root"],
+                selection_title="按人类建议启动需求分析师",
+                progress=progress,
+            )
+        if reuse_existing_handoff:
+            initial_prompt = human_feed_bck(
                 human_msg,
                 ask_human_md=str(paths["ask_human_path"].resolve()),
                 requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
                 hitl_record_md=str(paths["hitl_record_path"].resolve()),
-            ),
-            label_prefix="requirements_review_human_feedback",
+            )
+        else:
+            initial_prompt = resume_ba(
+                human_msg=human_msg,
+                original_requirement_md=str(paths["original_requirement_path"].resolve()),
+                ask_human_md=str(paths["ask_human_path"].resolve()),
+                requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+                hitl_record_md=str(paths["hitl_record_path"].resolve()),
+            )
+        current_handoff = _run_review_clarification_continuation(
+            handoff=current_handoff,
+            paths=paths,
+            initial_prompt=initial_prompt,
+            label_prefix="requirements_review_human_audit",
             progress=progress,
         )
         response = get_markdown_content(paths["ask_human_path"]).strip()
@@ -917,15 +1170,17 @@ def _collect_review_hitl_response(
         question_path: str | Path,
         *,
         hitl_round: int,
+        answer_path: str | Path | None = None,
         progress: ReviewStageProgress | None = None,
 ) -> str:
     progress = _resolve_review_progress(progress)
     question_file = Path(question_path).expanduser().resolve()
     question_text = get_markdown_content(question_file).strip()
-    message()
-    message(f"需求评审阶段 HITL 第 {hitl_round} 轮，需要人工补充信息")
-    message(f"问题文档: {question_file}")
-    message(question_text or "(问题文档为空)")
+    if not isinstance(get_terminal_ui(), BridgeTerminalUI):
+        message()
+        message(f"需求评审阶段 HITL 第 {hitl_round} 轮，需要人工补充信息")
+        message(f"问题文档: {question_file}")
+        message(question_text or "(问题文档为空)")
     if progress is not None:
         progress.set_phase("需求评审 / 等待 HITL")
     with progress.suspended() if progress is not None else nullcontext():
@@ -933,6 +1188,7 @@ def _collect_review_hitl_response(
             title=f"HITL 第 {hitl_round} 轮回复",
             empty_retry_message="回复不能为空，请重新输入。",
             question_path=question_file,
+            answer_path=answer_path,
         )
 
 
@@ -982,6 +1238,7 @@ def _run_review_clarification_continuation(
         human_input_provider=lambda question_path, hitl_round: _collect_review_hitl_response(
             question_path,
             hitl_round=hitl_round,
+            answer_path=paths["hitl_record_path"],
             progress=progress,
         ),
         on_worker_starting=lambda live_worker: progress.set_phase("需求评审 / 澄清中") if progress is not None else None,
@@ -994,8 +1251,6 @@ def _run_review_clarification_continuation(
         raise RuntimeError("需求分析师未完成需求澄清闭环")
     if not get_markdown_content(paths["requirements_clear_path"]).strip():
         raise RuntimeError("需求澄清未生成有效《需求澄清.md》")
-    if get_markdown_content(paths["hitl_record_path"]).strip():
-        raise RuntimeError("需求分析师已结束 HITL，但《人机交互澄清记录.md》仍非空")
     return handoff
 
 
@@ -1011,10 +1266,21 @@ def build_reviewer_workers(
     reviewer_count = prompt_positive_int("请输入审核器数量", DEFAULT_REVIEWER_COUNT, progress=progress)
     reviewer_names = [f"R{index}" for index in range(1, reviewer_count + 1)]
     reviewers: list[ReviewerRuntime] = []
+    predicted_session_names: set[str] = set()
     for reviewer_name in reviewer_names:
-        message(f"配置审核器 {reviewer_name}")
-        selection = prompt_review_agent_selection(DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR, progress=progress)
-        message(render_review_agent_selection(f"审核器 {reviewer_name} 配置", selection))
+        reviewer_display_name = _predict_reviewer_display_name(
+            project_dir=project_dir,
+            reviewer_name=reviewer_name,
+            occupied_session_names=predicted_session_names,
+        )
+        predicted_session_names.add(reviewer_display_name)
+        message(f"配置审核器 {reviewer_display_name}")
+        selection = prompt_review_agent_selection(
+            DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+            role_label=reviewer_display_name,
+            progress=progress,
+        )
+        message(render_review_agent_selection(f"审核器 {reviewer_display_name} 配置", selection))
         reviewers.append(
             create_reviewer_runtime(
                 project_dir=project_dir,
@@ -1132,7 +1398,7 @@ def repair_reviewer_outputs(
 
 def _run_review_feedback_loop(
         *,
-        handoff: RequirementsAnalystHandoff,
+        handoff: RequirementsAnalystHandoff | None,
         reviewers: Sequence[ReviewerRuntime],
         paths: dict[str, Path],
         requirement_name: str,
@@ -1143,10 +1409,19 @@ def _run_review_feedback_loop(
     review_msg = get_markdown_content(paths["merged_review_path"]).strip()
     if not review_msg:
         raise RuntimeError("评审未通过，但合并后的需求评审记录为空")
+    current_handoff = handoff
+    if current_handoff is None:
+        current_handoff, _ = prepare_ba_handoff(
+            project_dir=paths["project_root"],
+            requirement_name=requirement_name,
+            ba_handoff=None,
+            paths=paths,
+            progress=progress,
+        )
     ensure_empty_file(paths["ask_human_path"])
     ensure_empty_file(paths["ba_feedback_path"])
     current_handoff = _run_review_clarification_continuation(
-        handoff=handoff,
+        handoff=current_handoff,
         paths=paths,
         initial_prompt=review_feedback(
             review_msg,
@@ -1246,16 +1521,27 @@ def run_requirements_review_stage(
     global _ACTIVE_REVIEW_PROGRESS
     _ACTIVE_REVIEW_PROGRESS = progress
     active_ba_handoff: RequirementsAnalystHandoff | None = None
+    pending_ba_init: ReviewBaPrewarmTask | None = None
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_paths: tuple[str, ...] = ()
     try:
-        active_ba_handoff, _ = prepare_ba_handoff(
-            project_dir=project_dir,
-            requirement_name=requirement_name,
-            ba_handoff=ba_handoff,
+        preserved_workers: tuple[TmuxBatchWorker, ...] = ()
+        if ba_handoff is not None:
+            runtime_root = Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME
+            if Path(ba_handoff.worker.runtime_root).expanduser().resolve() == runtime_root:
+                preserved_workers = (ba_handoff.worker,)
+        cleanup_stale_review_runtime_state(project_dir, preserve_workers=preserved_workers)
+        active_ba_handoff = run_human_check_loop(
+            handoff=ba_handoff,
             paths=paths,
+            requirement_name=requirement_name,
         )
-        active_ba_handoff = run_human_check_loop(handoff=active_ba_handoff, paths=paths)
+        pending_ba_init = _start_review_ba_prewarm(
+            active_ba_handoff,
+            project_dir=project_dir,
+            paths=paths,
+            progress=progress,
+        )
         cleanup_existing_review_artifacts(paths, requirement_name)
         reviewer_workers = build_reviewer_workers(project_dir=project_dir, requirement_name=requirement_name)
 
@@ -1285,6 +1571,13 @@ def run_requirements_review_stage(
                     round_index=round_index,
                 )
             else:
+                if pending_ba_init is not None:
+                    active_ba_handoff = _await_review_ba_prewarm(
+                        pending_ba_init,
+                        paths=paths,
+                        progress=progress,
+                    )
+                    pending_ba_init = None
                 active_ba_handoff, reviewer_workers = _run_review_feedback_loop(
                     handoff=active_ba_handoff,
                     reviewers=reviewer_workers,

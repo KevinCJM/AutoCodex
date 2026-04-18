@@ -17,7 +17,12 @@ from pathlib import Path
 from typing import Callable
 
 from T02_tmux_agents import DEFAULT_COMMAND_TIMEOUT_SEC, TurnFileContract, TurnFileResult
-from T09_terminal_ops import collect_multiline_input, message, notify_runtime_state_changed
+from T09_terminal_ops import (
+    BridgeTerminalUI,
+    get_terminal_ui,
+    message,
+    notify_runtime_state_changed,
+)
 
 
 HITL_STATUS_SCHEMA_VERSION = "1.0"
@@ -211,7 +216,9 @@ def _infer_hitl_status(
             }
         raise FileNotFoundError("尚未观察到可判定的 Notion 需求读取产物")
 
-    if question_text and record_text:
+    record_exists = record_file.exists() and record_file.is_file()
+
+    if question_text and record_exists:
         return {
             "schema_version": HITL_STATUS_SCHEMA_VERSION,
             "stage": stage_name,
@@ -244,7 +251,7 @@ def _infer_hitl_status(
             "written_at": datetime.now().astimezone().isoformat(timespec="seconds"),
         }
 
-    if question_text and not record_text:
+    if question_text and not record_exists:
         raise FileNotFoundError(f"HITL 提问文件已生成，但缺少记录文件: {record_file}")
 
     raise FileNotFoundError(f"尚未观察到可判定的阶段产物: {stage_name}")
@@ -347,6 +354,7 @@ def build_turn_status_contract(
     def validator(path: Path) -> TurnFileResult:
         status_path = Path(path).expanduser().resolve()
         validation_error: Exception | None = None
+        turn_result: TurnFileResult | None = None
         if not status_path.exists():
             validation_error = FileNotFoundError(f"缺少 turn_status.json: {status_path}")
         else:
@@ -394,7 +402,7 @@ def build_turn_status_contract(
                                         break
                                     validated_hashes[str(artifact_path)] = actual_hash
                                 if validation_error is None:
-                                    return TurnFileResult(
+                                    turn_result = TurnFileResult(
                                         status_path=str(status_path),
                                         payload=payload,
                                         artifact_paths={
@@ -404,8 +412,9 @@ def build_turn_status_contract(
                                         artifact_hashes=validated_hashes,
                                         validated_at=datetime.now().astimezone().isoformat(timespec="seconds"),
                                     )
-
         if not all((stage_name, hitl_round is not None, output_path, question_path, record_path)):
+            if turn_result is not None:
+                return turn_result
             raise validation_error or FileNotFoundError(f"缺少 turn_status.json: {status_path}")
 
         stage_decision: HitlStatusDecision | None = None
@@ -422,6 +431,9 @@ def build_turn_status_contract(
             )
         except Exception as error:  # noqa: BLE001
             stage_validation_error = error
+
+        if turn_result is not None and stage_decision is not None:
+            return turn_result
 
         if stage_decision is None:
             try:
@@ -536,6 +548,11 @@ def validate_hitl_status_file(
             raise ValueError("completed 状态必须指向最终输出文档")
         if not Path(output_path_text).read_text(encoding="utf-8").strip():
             raise ValueError("completed 状态的最终输出文档不能为空")
+        if question_path_text:
+            raise ValueError("completed 状态不应声明提问文档")
+        expected_question_file = Path(expected_question_text)
+        if expected_question_file.exists() and expected_question_file.read_text(encoding="utf-8").strip():
+            raise ValueError("completed 状态下提问文档必须为空")
     if status == HITL_STATUS_HITL:
         if question_path_text != expected_question_text:
             raise ValueError("hitl 状态必须指向提问文档")
@@ -562,11 +579,13 @@ def validate_hitl_status_file(
 def collect_terminal_hitl_response(question_path: str | Path, *, hitl_round: int) -> str:
     question_file = Path(question_path).expanduser().resolve()
     question_text = question_file.read_text(encoding="utf-8").strip()
-    message()
-    message(f"HITL 第 {hitl_round} 轮，需要人工补充信息")
-    message(f"问题文档: {question_file}")
-    message(question_text or "(问题文档为空)")
-    return collect_multiline_input(
+    ui = get_terminal_ui()
+    if not isinstance(ui, BridgeTerminalUI):
+        message()
+        message(f"HITL 第 {hitl_round} 轮，需要人工补充信息")
+        message(f"问题文档: {question_file}")
+        message(question_text or "(问题文档为空)")
+    return ui.prompt_multiline(
         title=f"HITL 第 {hitl_round} 轮回复",
         empty_retry_message="回复不能为空，请重新输入。",
         question_path=question_file,
@@ -655,6 +674,7 @@ def run_hitl_agent_loop(
                 on_agent_turn_finished(context, worker)
         if not result.ok:
             raise RuntimeError(result.clean_output or f"{stage_name} 阶段执行失败")
+        contract.validator(contract.status_path)
         decision = validate_hitl_status_file(
             status_file,
             expected_stage=stage_name,
