@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from T04_common_prompt import task_start_prompt
 
-
 REQUIREMENTS_STATUS_SCHEMA_VERSION = "1.0"
 REQUIREMENTS_STATUS_OK = "completed"
 REQUIREMENTS_STATUS_HITL = "hitl"
@@ -111,7 +110,7 @@ def requirements_understand(
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
 * 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
-    * 如果输出 `信息足够` 那么《{ask_human_md}》必须为空
+    * 如果输出 `信息足够` 那么《{ask_human_md}》必须为空, 且《{requirements_clear_md}》必须非空
     * 如果输出 `HITL` 那么《{ask_human_md}》必须为非空
 * 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。
 
@@ -180,7 +179,7 @@ def hitl_bck(
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
 * 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
-    * 如果输出 `信息足够` 那么《{ask_human_md}》必须为空
+    * 如果输出 `信息足够` 那么《{ask_human_md}》必须为空, 且《{requirements_clear_md}》必须非空
     * 如果输出 `HITL` 那么《{ask_human_md}》必须为非空
 * 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。"""
     return hitl_bck_prompt
@@ -236,7 +235,7 @@ def resume_requirements_understand(
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
 * 输出禁令: 只允许返回 `信息足够`/`HITL`，禁止返回其他内容。
-    * 如果输出 `信息足够` 那么《{ask_human_md}》必须为空
+    * 如果输出 `信息足够` 那么《{ask_human_md}》必须为空, 且《{requirements_clear_md}》必须非空
     * 如果输出 `HITL` 那么《{ask_human_md}》必须为非空
 * 修改禁令: 禁止修改除了《{requirements_clear_md}》/《{hitl_record_md}》/《{ask_human_md}》之外的文档或源代码。
 
@@ -244,3 +243,7 @@ def resume_requirements_understand(
 
 {init_prompt}"""
     return requirements_understand_prompt
+
+
+if __name__ == '__main__':
+    pass
