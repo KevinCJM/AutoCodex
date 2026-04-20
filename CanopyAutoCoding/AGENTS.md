@@ -22,6 +22,15 @@ Strict routing protocol for downstream agents operating inside this subtree only
 - Keep pitfall facts only in `docs/pitfalls.json`.
 - Do not use terminal prose as completion truth when file contracts exist.
 - Do not infer active stage targets from legacy filenames; confirm imports/callers first.
+- 未经用户明确允许，禁止修改业务提示词文件。你是做系统实现的，不负责擅自调整提示词。
+- 默认禁止修改以下文件：
+  - `Prompt_01_RoutingLayerPlanning.py`
+  - `Prompt_02_RequirementIntake.py`
+  - `Prompt_03_RequirementsClarification.py`
+  - `Prompt_04_RequirementsReview.py`
+  - `Prompt_05_DetailedDesign.py`
+  - `Prompt_06_TaskSplit.py`
+  - `Prompt_07_Development.py`
 
 # Default Operating Sequence
 1. Match the task in `docs/task_routes.json`.
