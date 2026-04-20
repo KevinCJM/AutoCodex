@@ -25,7 +25,6 @@ from Prompt_01_RoutingLayerPlanning import (
     build_refine_prompt as build_stage_refine_prompt,
 )
 from T02_tmux_agents import (
-    DEFAULT_RUNTIME_ROOT,
     AgentRunConfig,
     CommandResult,
     TurnFileContract,
@@ -54,6 +53,7 @@ TURN_STATUS_SCHEMA_VERSION = "1.0"
 PHASE_ROUTING_LAYER_CREATE = "routing_layer_create"
 PHASE_ROUTING_LAYER_AUDIT = "routing_layer_audit"
 PHASE_ROUTING_LAYER_REFINE = "routing_layer_refine"
+ROUTING_RUNTIME_ROOT_NAME = ".routing_init_runtime"
 RUN_MANIFEST_VERSION = 1
 FINAL_RESULT_STATUSES = {"passed", "failed", "skipped", "stale_failed"}
 
@@ -81,6 +81,33 @@ def resolve_target_path(project_dir: Path, target: str | Path) -> Path:
 def required_routing_layer_paths(work_dir: str | Path) -> list[Path]:
     root = resolve_existing_directory(work_dir)
     return [root / relative_path for relative_path in ROUTING_LAYER_REQUIRED_FILES]
+
+
+def build_routing_runtime_root(project_dir: str | Path) -> Path:
+    return resolve_existing_directory(project_dir) / ROUTING_RUNTIME_ROOT_NAME
+
+
+def resolve_routing_runtime_root(
+    *,
+    project_dir: str | Path | None = None,
+    runtime_root: str | Path | None = None,
+) -> Path:
+    if runtime_root is not None:
+        return Path(runtime_root).expanduser().resolve()
+    if project_dir is None or not str(project_dir).strip():
+        raise ValueError("当前只支持恢复当前项目内的 routing run；请传入 project_dir 或 runtime_root。")
+    return build_routing_runtime_root(project_dir)
+
+
+def list_routing_run_manifest_paths(
+    *,
+    project_dir: str | Path | None = None,
+    runtime_root: str | Path | None = None,
+) -> list[Path]:
+    root = resolve_routing_runtime_root(project_dir=project_dir, runtime_root=runtime_root)
+    if not root.exists() or not root.is_dir():
+        return []
+    return sorted(root.glob("run_*/manifest.json"), key=lambda item: item.stat().st_mtime, reverse=True)
 
 
 def missing_routing_layer_files(work_dir: str | Path) -> list[str]:
@@ -858,7 +885,11 @@ class RunStore:
         runtime_root: str | Path | None = None,
         run_id: str | None = None,
     ) -> "RunStore":
-        actual_run_id, run_root = create_batch_runtime(run_id=run_id, runtime_root=runtime_root)
+        actual_run_id, run_root = create_batch_runtime(
+            run_id=run_id,
+            project_dir=selection.project_dir,
+            runtime_root=runtime_root,
+        )
         manifest = RunManifest(
             manifest_version=RUN_MANIFEST_VERSION,
             run_id=actual_run_id,
@@ -877,8 +908,14 @@ class RunStore:
         return store
 
     @classmethod
-    def load(cls, *, run_id: str, runtime_root: str | Path | None = None) -> "RunStore":
-        run_root = Path(runtime_root or DEFAULT_RUNTIME_ROOT).expanduser().resolve() / run_id
+    def load(
+        cls,
+        *,
+        run_id: str,
+        project_dir: str | Path | None = None,
+        runtime_root: str | Path | None = None,
+    ) -> "RunStore":
+        run_root = resolve_routing_runtime_root(project_dir=project_dir, runtime_root=runtime_root) / run_id
         manifest_path = run_root / "manifest.json"
         if not manifest_path.exists():
             raise FileNotFoundError(f"未找到 run manifest: {manifest_path}")
@@ -1103,9 +1140,14 @@ def _command_failure_reason(prefix: str, result: CommandResult) -> str:
     return f"{prefix}: {detail}"
 
 
-def create_batch_runtime(run_id: str | None = None, runtime_root: str | Path | None = None) -> tuple[str, Path]:
+def create_batch_runtime(
+    run_id: str | None = None,
+    *,
+    project_dir: str | Path | None = None,
+    runtime_root: str | Path | None = None,
+) -> tuple[str, Path]:
     actual_run_id = run_id or f"run_{uuid.uuid4().hex[:8]}"
-    base_root = Path(runtime_root or DEFAULT_RUNTIME_ROOT).expanduser().resolve()
+    base_root = resolve_routing_runtime_root(project_dir=project_dir, runtime_root=runtime_root)
     run_root = base_root / actual_run_id
     run_root.mkdir(parents=True, exist_ok=True)
     return actual_run_id, run_root
@@ -1211,10 +1253,11 @@ def prepare_live_workers(
 def load_existing_run(
     *,
     run_id: str,
+    project_dir: str | Path | None = None,
     runtime_root: str | Path | None = None,
     worker_factory: Callable[..., TmuxBatchWorker] = TmuxBatchWorker,
 ) -> tuple[RunStore, TargetSelection, AgentRunConfig, list[LiveWorkerHandle], dict[str, DirectoryInitResult]]:
-    store = RunStore.load(run_id=run_id, runtime_root=runtime_root)
+    store = RunStore.load(run_id=run_id, project_dir=project_dir, runtime_root=runtime_root)
     selection = store.selection()
     config = store.config_object()
     live_workers: list[LiveWorkerHandle] = []

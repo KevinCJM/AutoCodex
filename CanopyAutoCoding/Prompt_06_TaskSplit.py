@@ -70,7 +70,7 @@ def task_split(task_md='name_任务单.md', detail_design_md='name_详细设计.
     return task_split_prompt
 
 
-# [需求分析师] 生成任务单
+# 初始化智能体
 def create_task_split_ba(ba_desc, init_prompt=task_start_prompt,
                          detail_design_md='name_详细设计.md', hitl_record_md='name_人机交互澄清记录.md',
                          original_requirement_md='name_原始需求.md', requirements_clear_md='name_需求澄清.md'):

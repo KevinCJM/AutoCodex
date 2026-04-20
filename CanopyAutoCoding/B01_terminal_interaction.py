@@ -358,6 +358,7 @@ class AgentInitControlCenter:
             cls,
             *,
             run_id: str,
+            project_dir: str | Path | None = None,
             runtime_root: str | Path | None = None,
             max_refine_rounds: int = 3,
             max_workers: int | None = None,
@@ -365,6 +366,7 @@ class AgentInitControlCenter:
     ) -> "AgentInitControlCenter":
         run_store, selection, config, live_workers, results_by_dir = load_existing_run(
             run_id=run_id,
+            project_dir=project_dir,
             runtime_root=runtime_root,
             worker_factory=worker_factory,
         )
@@ -881,9 +883,14 @@ def run_terminal_control_loop(control_center: AgentInitControlCenter) -> BatchIn
             if not command.argument:
                 message("请提供 run_id。")
                 continue
+            project_dir = str(getattr(getattr(control_center, "selection", None), "project_dir", "") or "").strip()
+            if not project_dir:
+                message("resume 失败: 当前只支持恢复当前项目内的 routing run，缺少 project_dir。")
+                continue
             try:
                 next_center = AgentInitControlCenter.from_existing_run(
                     run_id=command.argument,
+                    project_dir=project_dir,
                     max_refine_rounds=control_center.max_refine_rounds,
                 )
             except Exception as error:
@@ -912,8 +919,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(list(launch))
     if getattr(args, "resume_run", ""):
+        project_dir = (
+            str(resolve_existing_directory(args.project_dir))
+            if args.project_dir
+            else prompt_project_dir("")
+        )
         control_center = AgentInitControlCenter.from_existing_run(
             run_id=args.resume_run,
+            project_dir=project_dir,
             max_refine_rounds=max(int(args.max_refine_rounds or 3), 1),
         )
         batch_result = run_terminal_control_loop(control_center)
