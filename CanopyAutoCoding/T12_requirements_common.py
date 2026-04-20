@@ -14,6 +14,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from canopy_core.requirements_scope import (
+    CREATE_NEW_REQUIREMENT_SELECTION_VALUE,
+)
 from T03_agent_init_workflow import resolve_existing_directory
 from T09_terminal_ops import prompt_select_option, terminal_ui_is_interactive
 from T09_terminal_ops import prompt_with_default as terminal_prompt_with_default
@@ -108,11 +111,11 @@ def prompt_requirement_name_selection(project_dir: str | Path, default: str = ""
                 "可选需求:",
             ]
         ),
-        options=[*[(item, item) for item in existing], ("__create_new__", "创建新需求")],
-        default_value="__create_new__",
+        options=[*[(item, item) for item in existing], (CREATE_NEW_REQUIREMENT_SELECTION_VALUE, "创建新需求")],
+        default_value=CREATE_NEW_REQUIREMENT_SELECTION_VALUE,
         prompt_text="选择已有需求或创建新需求",
     )
-    if selected == "__create_new__":
+    if selected == CREATE_NEW_REQUIREMENT_SELECTION_VALUE:
         return RequirementNameSelection(
             requirement_name=prompt_requirement_name(default),
             reuse_existing_original_requirement=False,
