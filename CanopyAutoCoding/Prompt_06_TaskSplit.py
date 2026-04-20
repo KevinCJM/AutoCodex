@@ -70,6 +70,30 @@ def task_split(task_md='name_任务单.md', detail_design_md='name_详细设计.
     return task_split_prompt
 
 
+# [需求分析师] 生成任务单
+def create_task_split_ba(ba_desc, init_prompt=task_start_prompt,
+                         detail_design_md='name_详细设计.md', hitl_record_md='name_人机交互澄清记录.md',
+                         original_requirement_md='name_原始需求.md', requirements_clear_md='name_需求澄清.md'):
+    detailed_design_prompt = f"""## 角色定位
+{ba_desc}
+
+## 任务
+* 基于《{requirements_clear_md}》+《{original_requirement_md}》+《{hitl_record_md}》+《{detail_design_md}》理解当前需求和详细设计。
+* 基于代码现状, 理解需求与代码直接的对应关系。
+* 梳理要完成该需求所需的代码改造点, 以及各个改造点之间的前后关系。
+* 本次任务仅仅做理解, 不要修改任何源代码或文档。
+
+## 约束
+- 不要输出理解结论或其他额外说明。
+- 仅输出 `完成`, 不要输出其他文本。
+- 禁止修改任何源代码或文档。
+
+---
+
+{init_prompt}"""
+    return detailed_design_prompt
+
+
 # [审核员] 审核任务单安排
 def review_task(agent_desc, task_name='任务拆分', *, original_requirement_md='name_原始需求.md',
                 requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md',
