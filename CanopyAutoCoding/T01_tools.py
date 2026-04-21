@@ -191,6 +191,32 @@ def get_first_false_task(file_path: str | Path, encoding: str = "utf-8") -> str 
     return None
 
 
+def is_task_progress_json(file_path: str | Path, encoding: str = "utf-8") -> bool:
+    """
+    判断任务单 JSON 是否是合法的进度结构：
+    1. 根节点必须是非空 dict。
+    2. 二级节点必须是非空 dict。
+    3. 所有任务状态必须严格是 bool（允许 True/False）。
+    """
+    path = Path(file_path)
+    if not path.exists() or not path.is_file():
+        return False
+
+    try:
+        data = json.loads(path.read_text(encoding=encoding))
+        if not isinstance(data, dict) or not data:
+            return False
+        for tasks in data.values():
+            if not isinstance(tasks, dict) or not tasks:
+                return False
+            for task_status in tasks.values():
+                if not isinstance(task_status, bool):
+                    return False
+        return True
+    except (json.JSONDecodeError, UnicodeDecodeError, IOError):
+        return False
+
+
 def update_task_to_true(file_path: str | Path, target_key: str, encoding: str = "utf-8") -> bool:
     """
     将 JSON 文件中指定 task key 的值修改为 true。
