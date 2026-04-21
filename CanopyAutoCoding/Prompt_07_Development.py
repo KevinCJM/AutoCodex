@@ -460,7 +460,7 @@ if __name__ == '__main__':
     else:
         print(f"{task}阶段, 评审未通过", '\n', '-' * 100, '\n')
 
-        '''给需求分析师发'''
+        '''给开发工程师发'''
         c_msg = get_markdown_content(f'{the_dir}/{requirement_name}_代码评审记录.md')
         # print(refine_code(c_msg, task, detailed_design_md=f'{requirement_name}_详细设计.md',
         #                   what_just_dev=f'{requirement_name}_工程师开发内容.md'))
