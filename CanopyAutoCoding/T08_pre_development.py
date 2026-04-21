@@ -141,3 +141,12 @@ def mark_detailed_design_completed(project_dir: str | Path, requirement_name: st
         task_key="详细设计",
         completed=True,
     )
+
+
+def mark_task_split_completed(project_dir: str | Path, requirement_name: str) -> Path:
+    return update_pre_development_task_status(
+        project_dir,
+        requirement_name,
+        task_key="任务拆分",
+        completed=True,
+    )
