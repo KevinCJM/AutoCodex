@@ -91,26 +91,6 @@ until code verification is complete.
 
 **Output the Task Routing Assessment first, before reading implementation code.**"""
 
-TASK_DONE_MARKER = "$TASK_DONE$"
-
-
-def build_task_completion_runtime_prompt(
-        *,
-        complete_task_command: str,
-        task_status_path: str | Path | None = None,
-        done_marker: str = TASK_DONE_MARKER,
-) -> str:
-    return f"""
----
-
-# Runtime task completion protocol:
-- Complete the actual requested task first.
-- After the task is fully complete, call this exact completion helper command:
-  `{complete_task_command}`
-- Immediately stop after calling that command.
-"""
-
-
 def build_turn_status_contract_prompt(
         *,
         turn_status_path: str | Path,

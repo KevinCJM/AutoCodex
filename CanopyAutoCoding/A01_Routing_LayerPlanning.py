@@ -344,16 +344,21 @@ def collect_cli_request(args: argparse.Namespace) -> CliRequest:
         if args.project_dir
         else prompt_project_dir("")
     )
-    requested_run_init = (
-        normalize_run_init_choice(args.run_init)
-        if args.run_init
-        else (True if parameter_mode else prompt_run_init(True))
-    )
     project_missing_files = tuple(missing_routing_layer_files(project_dir))
+    if project_missing_files:
+        requested_run_init = True
+    else:
+        requested_run_init = (
+            normalize_run_init_choice(args.run_init)
+            if args.run_init
+            else (True if parameter_mode else prompt_run_init(True))
+        )
     run_init = requested_run_init
-    if not requested_run_init and project_missing_files:
+    if project_missing_files and (
+        (args.run_init and not normalize_run_init_choice(args.run_init))
+        or (not args.run_init and not parameter_mode)
+    ):
         message("当前项目路由层文件缺失, 强制执行路由初始化")
-        run_init = True
 
     target_dirs = tuple(args.target_dir or ())
     if run_init and not args.target_dir and not parameter_mode:
@@ -577,13 +582,13 @@ def render_live_progress_frame(
         if status == "stale_failed":
             status = "failed"
         workflow_stage = entry.workflow_stage or "pending"
-        provider_phase = entry.provider_phase or "unknown"
+        agent_state = entry.agent_state or "DEAD"
         health_status = entry.health_status or "unknown"
         note = entry.note or workflow_stage or "pending"
         session_name = entry.session_name or "(preparing)"
         lines.append(
             f"  {index}. {status} | {session_name} | {work_dir} | "
-            f"stage={workflow_stage} | phase={provider_phase} | health={health_status} | note={note}"
+            f"stage={workflow_stage} | state={agent_state} | health={health_status} | note={note}"
         )
     if selection.skipped_dirs:
         lines.append("skipped:")
@@ -609,8 +614,8 @@ def render_live_progress_line(
         note = "pending"
     else:
         workflow_stage = entry.workflow_stage or "pending"
-        provider_phase = entry.provider_phase or "unknown"
-        focus_label = f"{Path(focus_dir).name}:{workflow_stage}/{provider_phase}"
+        agent_state = entry.agent_state or "DEAD"
+        focus_label = f"{Path(focus_dir).name}:{workflow_stage}/{agent_state}"
         note = entry.note or workflow_stage
     return (
         f"{spinner} 路由层初始化中"

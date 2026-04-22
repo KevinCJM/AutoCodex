@@ -1,6 +1,6 @@
 from canopy_core.compat import alias_module
 
-_MODULE = alias_module(__name__, "canopy_core.runtime.task_completion")
+_MODULE = alias_module(__name__, "canopy_core.stage_kernel.development")
 
 
 if __name__ == "__main__":

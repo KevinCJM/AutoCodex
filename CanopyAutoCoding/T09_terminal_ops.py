@@ -558,6 +558,46 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parent
 
 
+def tui_package_dir() -> Path:
+    return repo_root() / "packages" / "tui"
+
+
+def _missing_tui_dependency_names() -> list[str]:
+    package_dir = tui_package_dir()
+    expected = {
+        "solid-js": package_dir / "node_modules" / "solid-js" / "package.json",
+        "@opentui/solid": package_dir / "node_modules" / "@opentui" / "solid" / "package.json",
+    }
+    return [name for name, package_json in expected.items() if not package_json.exists()]
+
+
+def ensure_tui_dependencies_installed() -> None:
+    package_dir = tui_package_dir()
+    package_json = package_dir / "package.json"
+    if not package_json.exists():
+        raise RuntimeError(f"缺少 OpenTUI package.json: {package_json}")
+    missing = _missing_tui_dependency_names()
+    if not missing:
+        return
+    message(f"检测到 OpenTUI 依赖缺失，正在执行 bun install --frozen-lockfile: {', '.join(missing)}")
+    try:
+        completed = subprocess.run(
+            ["bun", "install", "--frozen-lockfile"],
+            cwd=str(package_dir),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as error:
+        raise RuntimeError("OpenTUI 依赖缺失且未找到 bun；请先安装 Bun 或使用 --no-tui") from error
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"OpenTUI 依赖安装失败: {details or f'退出码 {completed.returncode}'}")
+    remaining = _missing_tui_dependency_names()
+    if remaining:
+        raise RuntimeError(f"OpenTUI 依赖安装后仍缺少: {', '.join(remaining)}")
+
+
 def maybe_launch_tui(
     argv: Sequence[str] | None,
     *,
@@ -568,6 +608,7 @@ def maybe_launch_tui(
     if any(item in {"-h", "--help"} for item in filtered):
         return False, filtered
     if argv is None and not no_tui and sys.stdin.isatty() and sys.stdout.isatty():
+        ensure_tui_dependencies_installed()
         command = [
             str(repo_root() / "scripts" / "canopy-tui"),
             "--route",
@@ -598,6 +639,8 @@ __all__ = [
     "notify_runtime_state_changed",
     "notify_stage_action_changed",
     "repo_root",
+    "tui_package_dir",
+    "ensure_tui_dependencies_installed",
     "prompt_command_line",
     "prompt_positive_int",
     "prompt_select_option",

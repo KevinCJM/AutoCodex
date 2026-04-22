@@ -25,6 +25,7 @@ from Prompt_01_RoutingLayerPlanning import (
     build_refine_prompt as build_stage_refine_prompt,
 )
 from T02_tmux_agents import (
+    AgentRuntimeState,
     AgentRunConfig,
     CommandResult,
     TurnFileContract,
@@ -764,6 +765,28 @@ class DirectoryInitResult:
         return asdict(self)
 
 
+def _normalize_agent_state_from_runtime_state(state: dict[str, object], fallback: str = AgentRuntimeState.DEAD.value) -> str:
+    candidate = str(state.get("agent_state", "")).strip().upper()
+    if candidate in {item.value for item in AgentRuntimeState}:
+        return candidate
+    current_command = str(state.get("current_command", "")).strip()
+    provider_phase = str(state.get("provider_phase", "")).strip().lower()
+    wrapper_state = str(state.get("wrapper_state", "")).strip().upper()
+    started = bool(state.get("agent_started", state.get("agent_ready", False)))
+    if not started and provider_phase in {"waiting_input", "idle_ready", "completed_response"}:
+        started = True
+    alive = bool(state.get("agent_alive", False))
+    if not alive:
+        alive = bool(current_command) and current_command not in {"bash", "fish", "sh", "zsh"}
+    if not alive:
+        return AgentRuntimeState.DEAD.value
+    if not started:
+        return AgentRuntimeState.STARTING.value
+    if wrapper_state == AgentRuntimeState.READY.value or provider_phase in {"waiting_input", "idle_ready", "completed_response"}:
+        return AgentRuntimeState.READY.value
+    return AgentRuntimeState.BUSY.value
+
+
 @dataclass
 class WorkerManifestEntry:
     work_dir: str
@@ -774,7 +797,9 @@ class WorkerManifestEntry:
     workflow_stage: str = "pending"
     workflow_round: int = 0
     result_status: str = "pending"
-    provider_phase: str = "unknown"
+    agent_state: str = AgentRuntimeState.DEAD.value
+    agent_alive: bool = False
+    agent_started: bool = False
     retry_count: int = 0
     last_turn_token: str = ""
     last_prompt_hash: str = ""
@@ -920,7 +945,48 @@ class RunStore:
         if not manifest_path.exists():
             raise FileNotFoundError(f"未找到 run manifest: {manifest_path}")
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-        workers = [WorkerManifestEntry(**item) for item in payload.get("workers", [])]
+        workers = [
+            WorkerManifestEntry(
+                work_dir=str(item.get("work_dir", "")),
+                session_name=str(item.get("session_name", "")),
+                runtime_dir=str(item.get("runtime_dir", "")),
+                pane_id=str(item.get("pane_id", "")),
+                forced=bool(item.get("forced", False)),
+                workflow_stage=str(item.get("workflow_stage", "pending")),
+                workflow_round=int(item.get("workflow_round", 0)),
+                result_status=str(item.get("result_status", "pending")),
+                agent_state=_normalize_agent_state_from_runtime_state(dict(item), str(item.get("agent_state", AgentRuntimeState.DEAD.value))),
+                agent_alive=bool(item.get("agent_alive", False)),
+                agent_started=bool(item.get("agent_started", item.get("agent_ready", False))),
+                retry_count=int(item.get("retry_count", 0)),
+                last_turn_token=str(item.get("last_turn_token", "")),
+                last_prompt_hash=str(item.get("last_prompt_hash", "")),
+                last_heartbeat_at=str(item.get("last_heartbeat_at", "")),
+                last_log_offset=int(item.get("last_log_offset", 0)),
+                current_command=str(item.get("current_command", "")),
+                current_path=str(item.get("current_path", "")),
+                current_turn_id=str(item.get("current_turn_id", "")),
+                current_turn_phase=str(item.get("current_turn_phase", "")),
+                current_turn_status_path=str(item.get("current_turn_status_path", "")),
+                current_turn_baseline_hashes=dict(item.get("current_turn_baseline_hashes", {})),
+                recoverable=bool(item.get("recoverable", True)),
+                health_status=str(item.get("health_status", "unknown")),
+                health_note=str(item.get("health_note", "")),
+                note=str(item.get("note", "")),
+                failure_reason=str(item.get("failure_reason", "")),
+                last_audit_token=str(item.get("last_audit_token", "")),
+                last_audit_summary=str(item.get("last_audit_summary", "")),
+                last_audit_output=str(item.get("last_audit_output", "")),
+                missing_before=list(item.get("missing_before", [])),
+                missing_after=list(item.get("missing_after", [])),
+                log_path=str(item.get("log_path", "")),
+                raw_log_path=str(item.get("raw_log_path", "")),
+                state_path=str(item.get("state_path", "")),
+                transcript_path=str(item.get("transcript_path", "")),
+            )
+            for item in payload.get("workers", [])
+            if isinstance(item, dict)
+        ]
         manifest = RunManifest(
             manifest_version=int(payload.get("manifest_version", RUN_MANIFEST_VERSION)),
             run_id=str(payload["run_id"]),
@@ -1002,7 +1068,9 @@ class RunStore:
             entry.workflow_stage = str(state.get("workflow_stage", entry.workflow_stage))
             entry.workflow_round = int(state.get("workflow_round", entry.workflow_round))
             entry.result_status = str(state.get("result_status", entry.result_status))
-        entry.provider_phase = str(state.get("provider_phase", entry.provider_phase))
+        entry.agent_state = _normalize_agent_state_from_runtime_state(state, entry.agent_state)
+        entry.agent_alive = bool(state.get("agent_alive", entry.agent_alive))
+        entry.agent_started = bool(state.get("agent_started", state.get("agent_ready", entry.agent_started)))
         entry.retry_count = int(state.get("retry_count", entry.retry_count))
         entry.last_turn_token = str(state.get("last_turn_token", entry.last_turn_token))
         entry.last_prompt_hash = str(state.get("last_prompt_hash", entry.last_prompt_hash))
@@ -1229,7 +1297,9 @@ def prepare_live_workers(
             workflow_stage="pending",
             workflow_round=0,
             result_status="pending",
-            provider_phase="unknown",
+            agent_state=AgentRuntimeState.DEAD.value,
+            agent_alive=False,
+            agent_started=False,
             recoverable=True,
             current_turn_id="",
             current_turn_phase="",

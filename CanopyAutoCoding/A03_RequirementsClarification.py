@@ -181,14 +181,23 @@ def render_requirements_clarification_progress_line(*, worker: TmuxBatchWorker, 
     except Exception:  # noqa: BLE001
         state = {}
     workflow_stage = str(state.get("workflow_stage") or state.get("current_turn_phase") or "starting").strip() or "starting"
-    provider_phase = str(state.get("provider_phase", "unknown")).strip() or "unknown"
+    agent_state = str(state.get("agent_state", "")).strip().upper()
+    if agent_state not in {"DEAD", "STARTING", "READY", "BUSY"}:
+        provider_phase = str(state.get("provider_phase", "")).strip().lower()
+        wrapper_state = str(state.get("wrapper_state", "")).strip().upper()
+        if wrapper_state == "READY" or provider_phase in {"waiting_input", "idle_ready", "completed_response"}:
+            agent_state = "READY"
+        elif provider_phase:
+            agent_state = "BUSY"
+        else:
+            agent_state = "DEAD"
     health_status = str(state.get("health_status", "unknown")).strip() or "unknown"
     note = str(state.get("note", "")).strip() or workflow_stage
     status = str(state.get("status", "running")).strip() or "running"
     spinner = TERMINAL_SPINNER_FRAMES[tick % len(TERMINAL_SPINNER_FRAMES)]
     return (
         f"{spinner} 需求澄清中"
-        f" | {requirement_name}:{status}/{provider_phase}"
+        f" | {requirement_name}:{status}/{agent_state}"
         f" | health={health_status}"
         f" | {note}"
     )

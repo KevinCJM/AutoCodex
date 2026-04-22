@@ -80,7 +80,7 @@ class SessionStatusRow:
     session_name: str
     status: str
     workflow_stage: str
-    provider_phase: str
+    agent_state: str
     health_status: str
     retry_count: int
     session_exists: bool
@@ -178,16 +178,21 @@ def collect_b01_request(args: argparse.Namespace) -> CliRequest:
         if args.project_dir
         else prompt_project_dir("")
     )
-    requested_run_init = (
-        normalize_run_init_choice(args.run_init)
-        if args.run_init
-        else (True if parameter_mode else prompt_yes_no("是否需要生成项目路由层", True))
-    )
     project_missing_files = tuple(missing_routing_layer_files(project_dir))
+    if project_missing_files:
+        requested_run_init = True
+    else:
+        requested_run_init = (
+            normalize_run_init_choice(args.run_init)
+            if args.run_init
+            else (True if parameter_mode else prompt_yes_no("是否需要生成项目路由层", True))
+        )
     run_init = requested_run_init
-    if not requested_run_init and project_missing_files:
+    if project_missing_files and (
+        (args.run_init and not normalize_run_init_choice(args.run_init))
+        or (not args.run_init and not parameter_mode)
+    ):
         message("当前项目路由层文件缺失, 强制执行路由初始化")
-        run_init = True
 
     target_dirs = tuple(args.target_dir or ())
     if run_init and not args.target_dir and not parameter_mode:
@@ -488,7 +493,7 @@ class AgentInitControlCenter:
                 handle.work_dir,
                 state_path=handle.worker.state_path,
                 preserve_workflow_fields=True,
-                provider_phase=snapshot.provider_phase,
+                agent_state=snapshot.agent_state,
                 health_status=snapshot.health_status,
                 health_note=snapshot.health_note,
                 last_heartbeat_at=snapshot.last_heartbeat_at,
@@ -518,7 +523,7 @@ class AgentInitControlCenter:
                             handle.session_name if handle else ""),
                         status=status_value,
                         workflow_stage=entry.workflow_stage,
-                        provider_phase=entry.provider_phase,
+                        agent_state=entry.agent_state,
                         health_status=entry.health_status,
                         retry_count=entry.retry_count,
                         session_exists=self.tmux_runtime.session_exists(entry.session_name),
@@ -536,7 +541,7 @@ class AgentInitControlCenter:
                         session_name=entry.session_name,
                         status=entry.result_status or "pending",
                         workflow_stage=entry.workflow_stage,
-                        provider_phase=entry.provider_phase,
+                        agent_state=entry.agent_state,
                         health_status=entry.health_status,
                         retry_count=entry.retry_count,
                         session_exists=self.tmux_runtime.session_exists(entry.session_name),
@@ -554,7 +559,7 @@ class AgentInitControlCenter:
                     status=entry.result_status if entry.result_status != "pending" else (
                                 entry.workflow_stage or "pending"),
                     workflow_stage=entry.workflow_stage,
-                    provider_phase=entry.provider_phase,
+                    agent_state=entry.agent_state,
                     health_status=entry.health_status,
                     retry_count=entry.retry_count,
                     session_exists=self.tmux_runtime.session_exists(entry.session_name or handle.session_name),
@@ -579,7 +584,7 @@ class AgentInitControlCenter:
                     "session_name": row.session_name,
                     "status": row.status,
                     "workflow_stage": row.workflow_stage,
-                    "provider_phase": row.provider_phase,
+                    "agent_state": row.agent_state,
                     "health_status": row.health_status,
                     "retry_count": row.retry_count,
                     "session_exists": row.session_exists,
@@ -607,7 +612,7 @@ class AgentInitControlCenter:
         for row in self.build_status_rows():
             lines.append(
                 f"  {row.index}. {row.status} | {row.session_name} | {row.work_dir} | "
-                f"stage={row.workflow_stage} | phase={row.provider_phase} | health={row.health_status} | "
+                f"stage={row.workflow_stage} | state={row.agent_state} | health={row.health_status} | "
                 f"retry={row.retry_count} | session_exists={row.session_exists} | note={row.note}"
             )
         if self.selection.skipped_dirs:
@@ -696,7 +701,7 @@ class AgentInitControlCenter:
             workflow_stage="pending",
             workflow_round=0,
             result_status="pending",
-            provider_phase="unknown",
+            agent_state="DEAD",
             retry_count=entry.retry_count + 1,
             recoverable=True,
             health_status="unknown",
