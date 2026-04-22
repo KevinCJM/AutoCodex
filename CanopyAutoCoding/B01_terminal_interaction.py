@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     CliRequest,
     DEFAULT_MODEL_BY_VENDOR,
@@ -202,7 +203,7 @@ def collect_b01_request(args: argparse.Namespace) -> CliRequest:
 
     if run_init:
         vendor = normalize_vendor_choice(args.vendor) if args.vendor else prompt_vendor("codex")
-        model_default = DEFAULT_MODEL_BY_VENDOR[vendor]
+        model_default = get_default_model_for_vendor(vendor)
         model = args.model or prompt_model(vendor, model_default)
         reasoning_effort = args.effort or ("high" if parameter_mode else prompt_effort(vendor, model, "high"))
 
@@ -215,7 +216,7 @@ def collect_b01_request(args: argparse.Namespace) -> CliRequest:
             proxy_port = prompt_with_default("代理端口或完整代理 URL", "", allow_empty=False) if use_proxy else ""
     else:
         vendor = normalize_vendor_choice(args.vendor or "codex")
-        model = args.model or DEFAULT_MODEL_BY_VENDOR[vendor]
+        model = args.model or get_default_model_for_vendor(vendor)
         reasoning_effort = args.effort or "high"
         proxy_port = args.proxy_port or ""
 

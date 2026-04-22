@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
     normalize_effort_choice,
@@ -101,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="需求澄清阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
-    parser.add_argument("--vendor", help="需求澄清阶段厂商: codex|claude|gemini|qwen|kimi")
+    parser.add_argument("--vendor", help="需求澄清阶段厂商: codex|claude|gemini|qwen|kimi|opencode")
     parser.add_argument("--model", help="需求澄清阶段模型名称")
     parser.add_argument("--effort", help="需求澄清阶段推理强度")
     parser.add_argument("--proxy-url", default="", help="需求澄清阶段代理端口或完整代理 URL")
@@ -216,7 +217,7 @@ def collect_requirements_clarification_agent_selection(args: argparse.Namespace)
     if model_value:
         model = normalize_model_choice(vendor, model_value)
     elif interactive:
-        model = prompt_model(vendor, DEFAULT_MODEL_BY_VENDOR[vendor])
+        model = prompt_model(vendor, get_default_model_for_vendor(vendor))
     else:
         raise RuntimeError("需求澄清阶段需要选择模型；非交互模式请传入 --vendor、--model、--effort。")
 
@@ -269,7 +270,7 @@ def prompt_recreate_requirements_clarification_agent(
         return None
     while True:
         vendor = prompt_vendor(current_vendor)
-        model = prompt_model(vendor, current_model if vendor == current_vendor else DEFAULT_MODEL_BY_VENDOR[vendor])
+        model = prompt_model(vendor, current_model if vendor == current_vendor else get_default_model_for_vendor(vendor))
         reasoning_effort = prompt_effort(vendor, model, current_reasoning_effort)
         proxy_url = prompt_proxy_url(current_proxy_url)
         if (not force_model_change) or vendor != current_vendor or model != current_model:

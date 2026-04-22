@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 from xml.etree import ElementTree
 
+from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from Prompt_02_RequirementIntake import (
     NOTION_STATUS_ERROR,
     NOTION_STATUS_HITL,
@@ -404,7 +405,7 @@ def prompt_recreate_notion_reader_selection(
         vendor = prompt_vendor(current_vendor, role_label="Notion 临时智能体")
         model = prompt_model(
             vendor,
-            current_model if vendor == current_vendor else DEFAULT_MODEL_BY_VENDOR[vendor],
+            current_model if vendor == current_vendor else get_default_model_for_vendor(vendor),
             role_label="Notion 临时智能体",
         )
         reasoning_effort = prompt_effort(

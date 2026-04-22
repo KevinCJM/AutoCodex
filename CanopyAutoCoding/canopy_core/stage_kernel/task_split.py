@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
     normalize_effort_choice,
@@ -52,6 +53,7 @@ from canopy_core.runtime.tmux_runtime import (
 from canopy_core.stage_kernel.detailed_design import (
     DetailedDesignReviewerSpec,
     build_detailed_design_paths,
+    cleanup_stale_detailed_design_runtime_state,
     collect_ba_agent_selection,
     run_detailed_design_stage,
     resolve_reviewer_specs as resolve_design_reviewer_specs,
@@ -126,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="任务拆分阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
-    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|qwen|kimi")
+    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|qwen|kimi|opencode")
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
@@ -329,7 +331,7 @@ def build_task_split_stage_argv(args: argparse.Namespace, *, project_dir: str, r
     interactive = stdin_is_interactive()
     if not interactive:
         vendor = normalize_vendor_choice(str(getattr(args, "vendor", "") or "").strip() or DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
-        model = normalize_model_choice(vendor, str(getattr(args, "model", "") or "").strip() or DEFAULT_MODEL_BY_VENDOR[vendor])
+        model = normalize_model_choice(vendor, str(getattr(args, "model", "") or "").strip() or get_default_model_for_vendor(vendor))
         effort = normalize_effort_choice(vendor, model, str(getattr(args, "effort", "") or "").strip() or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
         argv.extend(["--vendor", vendor, "--model", model, "--effort", effort])
         proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
@@ -1218,6 +1220,7 @@ def run_task_split_stage(
         if should_skip_existing_task_split(args, paths=paths, progress=progress):
             message(f"检测到已存在《{paths['task_md_path'].name}》与《{paths['task_json_path'].name}》")
             message("用户选择跳过任务拆分阶段")
+            cleanup_paths = cleanup_stale_detailed_design_runtime_state(project_dir)
             update_pre_development_task_status(project_dir, requirement_name, task_key="任务拆分", completed=True)
             message("已将任务拆分标记为完成，继续后续阶段")
             return TaskSplitStageResult(
@@ -1227,7 +1230,7 @@ def run_task_split_stage(
                 task_json_path=str(paths["task_json_path"].resolve()),
                 merged_review_path=str(paths["merged_review_path"].resolve()),
                 passed=True,
-                cleanup_paths=(),
+                cleanup_paths=cleanup_paths,
         )
         update_pre_development_task_status(project_dir, requirement_name, task_key="任务拆分", completed=False)
         cleanup_stale_task_split_runtime_state(project_dir)

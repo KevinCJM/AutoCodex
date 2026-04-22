@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
+from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
     normalize_effort_choice,
@@ -142,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="详细设计阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
-    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|qwen|kimi")
+    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|qwen|kimi|opencode")
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
@@ -511,7 +512,7 @@ def collect_ba_agent_selection(args: argparse.Namespace, *, role_label: str) -> 
             role_label=role_label,
         )
     vendor = normalize_vendor_choice(vendor_value or DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
-    model = normalize_model_choice(vendor, model_value or DEFAULT_MODEL_BY_VENDOR[vendor])
+    model = normalize_model_choice(vendor, model_value or get_default_model_for_vendor(vendor))
     reasoning_effort = normalize_effort_choice(vendor, model, effort_value or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
     return ReviewAgentSelection(
         vendor=vendor,
@@ -532,7 +533,7 @@ def build_clarification_stage_argv(args: argparse.Namespace, *, project_dir: str
     interactive = stdin_is_interactive()
     if not interactive:
         vendor = normalize_vendor_choice(str(getattr(args, "vendor", "") or "").strip() or DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
-        model = normalize_model_choice(vendor, str(getattr(args, "model", "") or "").strip() or DEFAULT_MODEL_BY_VENDOR[vendor])
+        model = normalize_model_choice(vendor, str(getattr(args, "model", "") or "").strip() or get_default_model_for_vendor(vendor))
         effort = normalize_effort_choice(vendor, model, str(getattr(args, "effort", "") or "").strip() or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
         argv.extend(["--vendor", vendor, "--model", model, "--effort", effort])
         proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
@@ -1404,6 +1405,7 @@ def run_detailed_design_stage(
     progress = ReviewStageProgress()
     paths = ensure_detailed_design_inputs(args, project_dir=project_dir, requirement_name=requirement_name)
     active_ba_handoff: RequirementsAnalystHandoff | None = None
+    pending_discard_ba_handoff: RequirementsAnalystHandoff | None = None
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_paths: tuple[str, ...] = ()
     reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec] = {}
@@ -1474,7 +1476,7 @@ def run_detailed_design_stage(
                 progress=progress,
             )
         else:
-            _discard_unused_ba_handoff(ba_handoff)
+            pending_discard_ba_handoff = ba_handoff
             reviewer_specs = resolve_reviewer_specs(args, progress=progress)
             reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
             reviewer_workers = build_reviewer_workers(
@@ -1546,6 +1548,9 @@ def run_detailed_design_stage(
                 if not review_msg:
                     raise RuntimeError("详设评审未通过，但合并后的详设评审记录为空")
                 if active_ba_handoff is None:
+                    if pending_discard_ba_handoff is not None:
+                        _discard_unused_ba_handoff(pending_discard_ba_handoff)
+                        pending_discard_ba_handoff = None
                     active_ba_handoff, _ = prepare_design_ba_handoff(
                         args,
                         project_dir=project_dir,
@@ -1658,6 +1663,9 @@ def run_detailed_design_stage(
                 md_files=review_md_files,
             )
             if passed:
+                if pending_discard_ba_handoff is not None:
+                    _discard_unused_ba_handoff(pending_discard_ba_handoff)
+                    pending_discard_ba_handoff = None
                 mark_detailed_design_completed(project_dir, requirement_name)
                 result_ba_handoff = active_ba_handoff if preserve_workers else None
                 result_reviewer_handoff = _export_reviewer_handoff(
@@ -1685,6 +1693,8 @@ def run_detailed_design_stage(
 
         raise RuntimeError(f"详细设计评审超过最大轮数 {MAX_DETAILED_DESIGN_REVIEW_ROUNDS}，仍未全部通过")
     except Exception:
+        if pending_discard_ba_handoff is not None:
+            _discard_unused_ba_handoff(pending_discard_ba_handoff)
         _shutdown_workers(
             active_ba_handoff,
             reviewer_workers,

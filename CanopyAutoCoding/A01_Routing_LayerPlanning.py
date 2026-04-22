@@ -14,6 +14,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
+from canopy_core.runtime.vendor_catalog import (
+    LEGACY_DEFAULT_MODEL_BY_VENDOR,
+    VENDOR_ORDER as CATALOG_VENDOR_ORDER,
+    get_default_model_for_vendor,
+    get_model_choices,
+    get_normalized_effort_choices,
+    get_vendor_inventory,
+)
 from T02_tmux_agents import (
     AgentRunConfig,
     TmuxRuntimeController,
@@ -45,36 +53,22 @@ from T09_terminal_ops import (
 )
 
 
-VENDOR_CHOICES = ("codex", "claude", "gemini", "qwen", "kimi")
+VENDOR_CHOICES = CATALOG_VENDOR_ORDER
 VENDOR_ALIASES = {
     "1": "codex",
     "2": "claude",
     "3": "gemini",
     "4": "qwen",
     "5": "kimi",
+    "6": "opencode",
     "claude code": "claude",
     "claude-code": "claude",
+    "open code": "opencode",
+    "open-code": "opencode",
 }
-DEFAULT_MODEL_BY_VENDOR = {
-    "codex": "gpt-5.4",
-    "claude": "sonnet",
-    "gemini": "auto",
-    "qwen": "qwen3-coder",
-    "kimi": "kimi-k2",
-}
-MODEL_CHOICES_BY_VENDOR = {
-    "codex": ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"),
-    "claude": ("sonnet", "opus", "haiku"),
-    "gemini": ("auto", "pro", "flash"),
-    "qwen": ("qwen3-coder", "qwen3-coder-plus", "qwen3-235b-a22b", "qwen3-32b"),
-    "kimi": ("kimi-k2", "kimi-k2-turbo"),
-}
+DEFAULT_MODEL_BY_VENDOR = dict(LEGACY_DEFAULT_MODEL_BY_VENDOR)
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 PROXY_PRESET_CHOICES = ("", "10900", "7890")
-EFFORT_CHOICES_BY_MODEL = {
-    vendor: {model: EFFORT_CHOICES for model in models}
-    for vendor, models in MODEL_CHOICES_BY_VENDOR.items()
-}
 RUN_INIT_CHOICES = ("yes", "no")
 
 
@@ -105,9 +99,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AGENT初始化阶段：tmux + coding agent 路由层初始化")
     parser.add_argument("--project-dir", help="项目工作目录")
     parser.add_argument("--target-dir", action="append", default=[], help="额外目标目录，可重复传入")
-    parser.add_argument("--vendor", help="厂商: codex|claude|gemini|qwen|kimi")
+    parser.add_argument("--vendor", help="厂商: codex|claude|gemini|qwen|kimi|opencode")
     parser.add_argument("--model", help="模型名称")
-    parser.add_argument("--effort", choices=EFFORT_CHOICES, help="推理强度")
+    parser.add_argument("--effort", help="推理强度")
     parser.add_argument("--proxy-port", default="", help="代理端口或完整代理 URL")
     parser.add_argument("--run-init", choices=RUN_INIT_CHOICES, help="是否执行 AGENT初始化: yes|no")
     parser.add_argument("--max-refine-rounds", type=int, default=3, help="最大 refine 轮数")
@@ -128,7 +122,8 @@ def normalize_vendor_choice(value: str | None) -> str:
 
 def normalize_model_choice(vendor: str, value: str | None) -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
-    models = MODEL_CHOICES_BY_VENDOR[normalized_vendor]
+    inventory = get_vendor_inventory(normalized_vendor)
+    models = tuple(item.model_id for item in get_model_choices(normalized_vendor))
     text = str(value or "").strip()
     if not text:
         raise ValueError("模型不能为空")
@@ -136,15 +131,22 @@ def normalize_model_choice(vendor: str, value: str | None) -> str:
         index = int(text)
         if 1 <= index <= len(models):
             return models[index - 1]
+    if normalized_vendor == "opencode" and text == "default":
+        resolved_default = get_default_model_for_vendor(normalized_vendor)
+        if resolved_default:
+            return resolved_default
     if text in models:
         return text
-    raise ValueError(f"{normalized_vendor} 不支持的模型: {value}")
+    if not inventory.installed:
+        raise ValueError(f"{normalized_vendor} 未安装，无法选择模型")
+    available = ", ".join(models[:12])
+    raise ValueError(f"{normalized_vendor} 不支持的模型: {value}; 已扫描模型: {available or 'none'}")
 
 
 def normalize_effort_choice(vendor: str, model: str, value: str | None) -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
     normalized_model = normalize_model_choice(normalized_vendor, model)
-    allowed = EFFORT_CHOICES_BY_MODEL[normalized_vendor][normalized_model]
+    allowed = get_normalized_effort_choices(normalized_vendor, normalized_model)
     text = str(value or "").strip().lower()
     if text.isdigit():
         index = int(text)
@@ -226,15 +228,24 @@ def _predict_routing_role_label(
 
 
 def prompt_vendor(default: str = "codex", *, role_label: str = "") -> str:
-    options = [
-        (vendor, f"{vendor} | models: {', '.join(MODEL_CHOICES_BY_VENDOR[vendor])}")
-        for vendor in VENDOR_CHOICES
-    ]
+    options = []
+    installed_defaults = [vendor for vendor in VENDOR_CHOICES if get_vendor_inventory(vendor).installed]
+    actual_default = normalize_vendor_choice(default if default in VENDOR_CHOICES else "codex")
+    if actual_default not in installed_defaults and installed_defaults:
+        actual_default = installed_defaults[0]
+    for vendor in VENDOR_CHOICES:
+        inventory = get_vendor_inventory(vendor)
+        label = (
+            f"{vendor} | installed={'yes' if inventory.installed else 'no'}"
+            f" | default={inventory.default_model or 'unknown'}"
+            f" | models={len(inventory.models)}"
+        )
+        options.append((vendor, label))
     scoped_title = _role_scoped_text("选择厂商", role_label)
     candidate = prompt_select_option(
         title=scoped_title,
         options=options,
-        default_value=normalize_vendor_choice(default),
+        default_value=actual_default,
         prompt_text=scoped_title,
     )
     return normalize_vendor_choice(candidate)
@@ -242,11 +253,22 @@ def prompt_vendor(default: str = "codex", *, role_label: str = "") -> str:
 
 def prompt_model(vendor: str, default: str | None = None, *, role_label: str = "") -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
-    models = MODEL_CHOICES_BY_VENDOR[normalized_vendor]
-    actual_default = default or DEFAULT_MODEL_BY_VENDOR[normalized_vendor]
+    inventory = get_vendor_inventory(normalized_vendor)
+    if not inventory.installed:
+        raise ValueError(f"{normalized_vendor} 未安装，无法选择模型")
+    models = get_model_choices(normalized_vendor)
+    if not models:
+        raise ValueError(f"{normalized_vendor} 没有可用模型")
+    actual_default = default or get_default_model_for_vendor(normalized_vendor)
     options = [
-        (model, f"{model} | efforts: {'/'.join(EFFORT_CHOICES_BY_MODEL[normalized_vendor][model])}")
-        for model in models
+        (
+            item.model_id,
+            f"{item.model_id}"
+            f" | efforts: {'/'.join(item.reasoning.normalized_reasoning_levels or ('high',))}"
+            f"{' | synthetic' if item.synthetic else ''}"
+            f"{' | fallback' if item.source_kind == 'legacy_fallback' else ''}",
+        )
+        for item in models
     ]
     scoped_title = _role_scoped_text(f"选择 {normalized_vendor} 模型", role_label)
     candidate = prompt_select_option(
@@ -261,7 +283,7 @@ def prompt_model(vendor: str, default: str | None = None, *, role_label: str = "
 def prompt_effort(vendor: str, model: str, default: str = "high", *, role_label: str = "") -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
     normalized_model = normalize_model_choice(normalized_vendor, model)
-    allowed = EFFORT_CHOICES_BY_MODEL[normalized_vendor][normalized_model]
+    allowed = get_normalized_effort_choices(normalized_vendor, normalized_model)
     scoped_title = _role_scoped_text(f"选择 {normalized_model} 推理强度", role_label)
     candidate = prompt_select_option(
         title=scoped_title,
@@ -373,16 +395,23 @@ def collect_cli_request(args: argparse.Namespace) -> CliRequest:
             run_init=run_init,
         )
         vendor = normalize_vendor_choice(args.vendor) if args.vendor else prompt_vendor("codex", role_label=routing_role_label)
-        model_default = DEFAULT_MODEL_BY_VENDOR[vendor]
-        model = args.model or prompt_model(vendor, model_default, role_label=routing_role_label)
-        reasoning_effort = args.effort or (
-            "high" if parameter_mode else prompt_effort(vendor, model, "high", role_label=routing_role_label)
+        model_default = get_default_model_for_vendor(vendor)
+        model = normalize_model_choice(
+            vendor,
+            args.model or prompt_model(vendor, model_default, role_label=routing_role_label),
+        )
+        reasoning_effort = normalize_effort_choice(
+            vendor,
+            model,
+            args.effort or (
+                "high" if parameter_mode else prompt_effort(vendor, model, "high", role_label=routing_role_label)
+            ),
         )
         proxy_port = args.proxy_port or ("" if parameter_mode else prompt_proxy_port("", role_label=routing_role_label))
     else:
         vendor = normalize_vendor_choice(args.vendor or "codex")
-        model = args.model or DEFAULT_MODEL_BY_VENDOR[vendor]
-        reasoning_effort = args.effort or "high"
+        model = normalize_model_choice(vendor, args.model or get_default_model_for_vendor(vendor))
+        reasoning_effort = normalize_effort_choice(vendor, model, args.effort or "high")
         proxy_port = args.proxy_port or ""
     max_refine_rounds = int(args.max_refine_rounds or 3)
     if max_refine_rounds < 1:

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from typing import Sequence
 
+from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A02_RequirementIntake import (
     INPUT_TYPE_CHOICES,
     DEFAULT_NOTION_EFFORT,
@@ -249,7 +250,7 @@ def collect_requirements_analysis_agent_selection(args) -> RequirementsClarifica
     if model_value:
         model = normalize_model_choice(vendor, model_value)
     elif interactive:
-        model = prompt_model(vendor, DEFAULT_MODEL_BY_VENDOR[vendor])
+        model = prompt_model(vendor, get_default_model_for_vendor(vendor))
     else:
         raise RuntimeError("需求澄清阶段需要选择模型；非交互模式请传入 --vendor、--model、--effort。")
 

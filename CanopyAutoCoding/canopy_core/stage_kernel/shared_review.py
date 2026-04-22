@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
+from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
     prompt_effort,
@@ -138,7 +139,7 @@ def prompt_review_agent_selection(
     progress = resolve_review_progress(progress)
     with progress.suspended() if progress is not None else nullcontext():
         vendor = prompt_vendor(default_vendor, role_label=role_label)
-        preferred_model = default_model if default_model and vendor == default_vendor else DEFAULT_MODEL_BY_VENDOR[vendor]
+        preferred_model = default_model if default_model and vendor == default_vendor else get_default_model_for_vendor(vendor)
         model = prompt_model(vendor, preferred_model, role_label=role_label)
         reasoning_effort = prompt_effort(vendor, model, default_reasoning_effort, role_label=role_label)
         proxy_url = prompt_proxy_url(default_proxy_url, role_label=role_label)

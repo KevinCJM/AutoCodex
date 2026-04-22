@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Sequence
 from contextlib import contextmanager
 from urllib.parse import urlparse
+from canopy_core.runtime.vendor_catalog import LaunchResolution, resolve_launch
 from canopy_core.runtime.contracts import (
     TASK_STATUS_DONE,
     TASK_STATUS_RUNNING,
@@ -142,6 +143,25 @@ QWEN_READY_PATTERNS = (
 QWEN_INPUT_BOX_PATTERNS = (
     r"输入您的消息或\s*@\s*文件路径",
     r"^输入您的消息$",
+)
+OPENCODE_WAITING_INPUT_PATTERNS = (
+    r"Ask anything\.\.\.",
+)
+OPENCODE_IDLE_READY_PATTERNS = (
+    r"ctrl\+p commands",
+)
+OPENCODE_PROCESSING_PATTERNS = (
+    r"\besc interrupt\b",
+)
+OPENCODE_BOOTING_PATTERNS = (
+    r"Performing one time database migration",
+    r"Database migration complete",
+)
+OPENCODE_FOOTER_PATTERNS = (
+    r"ctrl\+p commands$",
+    r"^tab agents\b",
+    r"Build\s+·",
+    r"^[╹▀]+$",
 )
 KIMI_NOT_READY_PATTERNS = (
     r'LLM not set, send "/login" to login',
@@ -325,6 +345,7 @@ class Vendor(str, Enum):
     GEMINI = "gemini"
     QWEN = "qwen"
     KIMI = "kimi"
+    OPENCODE = "opencode"
 
 
 class WorkerStatus(str, Enum):
@@ -1041,30 +1062,44 @@ def build_proxy_env(proxy_url: str) -> dict[str, str]:
     }
 
 
-def build_reasoning_note(vendor: Vendor, effort: str) -> str:
-    effort = normalize_effort(effort)
-    if vendor == Vendor.CODEX:
-        return f"reasoning_effort={effort}"
-    if vendor == Vendor.CLAUDE:
-        mapped = {"low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max"}[effort]
-        return f"reasoning_effort={effort}; claude_effort={mapped}"
-    if vendor == Vendor.GEMINI:
-        mapped = "flash" if effort in {"low", "medium"} else "pro"
-        return f"reasoning_effort={effort}; gemini_model_family={mapped}"
+def build_reasoning_note(
+        vendor: Vendor,
+        effort: str,
+        *,
+        model: str = "",
+        resolution: LaunchResolution | None = None,
+) -> str:
+    resolved = resolution or resolve_launch(vendor.value, model, effort)
+    parts = [
+        f"reasoning_effort={resolved.normalized_effort}",
+        f"reasoning_mode={resolved.reasoning_control_mode}",
+        f"catalog_source={resolved.catalog_source_kind}",
+    ]
+    if resolved.native_reasoning_level:
+        parts.append(f"native_reasoning={resolved.native_reasoning_level}")
+    if vendor == Vendor.CLAUDE and resolved.native_reasoning_level:
+        parts.append(f"claude_effort={resolved.native_reasoning_level}")
+    if vendor == Vendor.GEMINI and resolved.reasoning_control_mode == "model_family_routing":
+        parts.append(f"gemini_model_family={resolved.resolved_model}")
     if vendor == Vendor.QWEN:
-        return f"reasoning_effort={effort}; qwen_prompt_hint=true"
-    if vendor == Vendor.KIMI:
-        thinking = "off" if effort == "low" else "on"
-        return f"reasoning_effort={effort}; kimi_thinking={thinking}"
-    return f"reasoning_effort={effort}"
+        parts.append("qwen_prompt_hint=true")
+    if vendor == Vendor.KIMI and resolved.native_reasoning_level:
+        thinking = "off" if resolved.native_reasoning_level == "thinking_off" else "on"
+        parts.append(f"kimi_thinking={thinking}")
+    if vendor == Vendor.OPENCODE:
+        parts.append(f"opencode_model={resolved.resolved_model}")
+        if resolved.resolved_variant:
+            parts.append(f"opencode_variant={resolved.resolved_variant}")
+    return "; ".join(parts)
 
 
 def build_prompt_header(vendor: Vendor, model: str, effort: str) -> str:
-    note = build_reasoning_note(vendor, effort)
+    resolution = resolve_launch(vendor.value, model, effort)
+    note = build_reasoning_note(vendor, effort, model=model, resolution=resolution)
     return (
         "[Agent Runtime Context]\n"
         f"- vendor: {vendor.value}\n"
-        f"- model: {model}\n"
+        f"- model: {resolution.resolved_model}\n"
         f"- {note}\n"
         "- execution_mode: tmux_interactive_conversation\n"
         "- keep_scope_strict: true\n"
@@ -1320,6 +1355,43 @@ class KimiOutputDetector(BaseOutputDetector):
         return super().extract_last_message("\n".join(lines))
 
 
+class OpenCodeOutputDetector(BaseOutputDetector):
+    def classify_phase(self, observation: WorkerObservation) -> ProviderPhase:
+        visible_text = self.current_visible_text(observation)
+        recent_log = self.recent_log_text(observation)
+        base_phase = super().classify_phase(observation)
+        if base_phase in {
+            ProviderPhase.SHELL,
+            ProviderPhase.ERROR,
+            ProviderPhase.UNKNOWN,
+            ProviderPhase.COMPLETED_RESPONSE,
+        }:
+            return base_phase
+        if self._contains_any(visible_text, OPENCODE_PROCESSING_PATTERNS):
+            return ProviderPhase.PROCESSING
+        if self._contains_any(visible_text, OPENCODE_WAITING_INPUT_PATTERNS):
+            return ProviderPhase.WAITING_INPUT
+        if self._contains_any(visible_text, OPENCODE_IDLE_READY_PATTERNS):
+            return ProviderPhase.IDLE_READY
+        if self._contains_any(visible_text or recent_log, OPENCODE_BOOTING_PATTERNS):
+            return ProviderPhase.BOOTING
+        if self._contains_any(recent_log, OPENCODE_WAITING_INPUT_PATTERNS):
+            return ProviderPhase.WAITING_INPUT
+        return ProviderPhase.BOOTING if observation.current_command else ProviderPhase.UNKNOWN
+
+    def extract_last_message(self, output: str) -> str:
+        clean_output = clean_ansi(output)
+        lines: list[str] = []
+        for line in clean_output.splitlines():
+            normalized = line.strip()
+            if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in OPENCODE_FOOTER_PATTERNS):
+                continue
+            if re.search(r"Thinking:", normalized, re.IGNORECASE):
+                continue
+            lines.append(line)
+        return super().extract_last_message("\n".join(lines))
+
+
 def build_output_detector(vendor: Vendor) -> BaseOutputDetector:
     if vendor == Vendor.CODEX:
         return CodexOutputDetector()
@@ -1331,6 +1403,8 @@ def build_output_detector(vendor: Vendor) -> BaseOutputDetector:
         return QwenOutputDetector()
     if vendor == Vendor.KIMI:
         return KimiOutputDetector()
+    if vendor == Vendor.OPENCODE:
+        return OpenCodeOutputDetector()
     raise ValueError(f"不支持的厂商: {vendor}")
 
 
@@ -1341,6 +1415,14 @@ class AgentRunConfig:
     reasoning_effort: str = "high"
     proxy_url: str = ""
     extra_args: tuple[str, ...] = ()
+    resolved_model: str = ""
+    resolved_variant: str = ""
+    reasoning_control_mode: str = ""
+    catalog_source_kind: str = ""
+    catalog_confidence: str = ""
+    native_reasoning_level: str = ""
+    supports_reasoning: bool = False
+    resolution_notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vendor", normalize_vendor(self.vendor))
@@ -1349,18 +1431,32 @@ class AgentRunConfig:
         object.__setattr__(self, "model", str(self.model or "").strip())
         if not self.model:
             raise ValueError("model 不能为空")
+        resolution = resolve_launch(self.vendor.value, self.model, self.reasoning_effort)
+        object.__setattr__(self, "resolved_model", resolution.resolved_model)
+        object.__setattr__(self, "resolved_variant", resolution.resolved_variant)
+        object.__setattr__(self, "reasoning_control_mode", resolution.reasoning_control_mode)
+        object.__setattr__(self, "catalog_source_kind", resolution.catalog_source_kind)
+        object.__setattr__(self, "catalog_confidence", resolution.confidence)
+        object.__setattr__(self, "native_reasoning_level", resolution.native_reasoning_level)
+        object.__setattr__(self, "supports_reasoning", resolution.supports_reasoning)
+        object.__setattr__(self, "resolution_notes", resolution.notes)
 
     def with_prompt_header(self, prompt: str) -> str:
         header = build_prompt_header(self.vendor, self.model, self.reasoning_effort)
         return f"{header}\n\n{str(prompt or '').strip()}".strip()
 
     def to_summary(self) -> dict[str, str]:
+        resolution = resolve_launch(self.vendor.value, self.model, self.reasoning_effort)
         return {
             "vendor": self.vendor.value,
             "model": self.model,
+            "resolved_model": self.resolved_model,
+            "resolved_variant": self.resolved_variant,
             "reasoning_effort": self.reasoning_effort,
+            "reasoning_control_mode": self.reasoning_control_mode,
+            "catalog_source_kind": self.catalog_source_kind,
             "proxy_url": self.proxy_url,
-            "reasoning_note": build_reasoning_note(self.vendor, self.reasoning_effort),
+            "reasoning_note": build_reasoning_note(self.vendor, self.reasoning_effort, model=self.model, resolution=resolution),
         }
 
     def expected_current_commands(self) -> tuple[str, ...]:
@@ -1371,23 +1467,22 @@ class AgentRunConfig:
             Vendor.CLAUDE: ("claude", "node"),
             Vendor.GEMINI: ("gemini", "node"),
             Vendor.QWEN: ("qwen", "node"),
+            Vendor.OPENCODE: ("opencode", "node"),
         }[self.vendor]
 
     def submit_enter_count(self) -> int:
         return 2 if self.vendor == Vendor.CODEX else 1
 
     def build_launch_command(self, work_dir: Path) -> str:
+        resolution = resolve_launch(self.vendor.value, self.model, self.reasoning_effort)
         args: list[str] = []
         if self.vendor == Vendor.CODEX:
-            effort = {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "xhigh"}[
-                self.reasoning_effort
-            ]
             args = [
                 "codex",
                 "--model",
-                self.model,
+                resolution.resolved_model,
                 "--config",
-                f'model_reasoning_effort="{effort}"',
+                f'model_reasoning_effort="{resolution.native_reasoning_level or "high"}"',
                 "--sandbox",
                 "danger-full-access",
                 "--ask-for-approval",
@@ -1397,26 +1492,20 @@ class AgentRunConfig:
                 "--no-alt-screen",
             ]
         elif self.vendor == Vendor.CLAUDE:
-            effort = {"low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max"}[
-                self.reasoning_effort
-            ]
             args = [
                 "claude",
                 "--model",
-                self.model,
+                resolution.resolved_model,
                 "--permission-mode",
                 "bypassPermissions",
                 "--effort",
-                effort,
+                resolution.native_reasoning_level or "high",
             ]
         elif self.vendor == Vendor.GEMINI:
-            gemini_model = self.model
-            if self.model.lower() in {"auto", "default"}:
-                gemini_model = "flash" if self.reasoning_effort in {"low", "medium"} else "pro"
             args = [
                 "gemini",
                 "--model",
-                gemini_model,
+                resolution.resolved_model,
                 "--approval-mode",
                 "yolo",
             ]
@@ -1424,7 +1513,7 @@ class AgentRunConfig:
             args = [
                 "qwen",
                 "--model",
-                self.model,
+                resolution.resolved_model,
                 "--approval-mode",
                 "yolo",
             ]
@@ -1436,13 +1525,23 @@ class AgentRunConfig:
                 "--work-dir",
                 str(work_dir),
                 "--model",
-                self.model,
+                resolution.resolved_model,
                 "--yolo",
             ]
-            if self.reasoning_effort == "low":
+            if resolution.native_reasoning_level == "thinking_off":
                 args.append("--no-thinking")
             else:
                 args.append("--thinking")
+        elif self.vendor == Vendor.OPENCODE:
+            args = [
+                "opencode",
+                str(work_dir),
+                "--pure",
+                "--model",
+                resolution.resolved_model,
+            ]
+            if resolution.resolved_variant:
+                args.extend(["--variant", resolution.resolved_variant])
         else:
             raise ValueError(f"不支持的厂商: {self.vendor}")
 
@@ -2751,6 +2850,10 @@ class TmuxBatchWorker:
             return AgentRuntimeState.READY.value
         if self._title_indicates_busy(pane_title):
             return AgentRuntimeState.BUSY.value
+        if self.config.vendor == Vendor.OPENCODE and observation is not None:
+            visible_source = observation.visible_text or observation.raw_log_tail
+            if self._visible_indicates_agent_ready(visible_source):
+                return AgentRuntimeState.READY.value
         return AgentRuntimeState.BUSY.value
 
     def get_agent_state(self, observation: WorkerObservation | None = None) -> AgentRuntimeState:
@@ -2798,6 +2901,8 @@ class TmuxBatchWorker:
                     *GEMINI_NOT_READY_PATTERNS,
                 )
             )
+        if self.config.vendor == Vendor.OPENCODE:
+            return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in OPENCODE_BOOTING_PATTERNS)
         if self.config.vendor == Vendor.KIMI:
             return any(
                 re.search(pattern, recent_output, re.IGNORECASE)
@@ -2830,6 +2935,15 @@ class TmuxBatchWorker:
             return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_INPUT_BOX_PATTERNS + GEMINI_READY_PATTERNS)
         if self.config.vendor == Vendor.QWEN:
             return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in QWEN_INPUT_BOX_PATTERNS + QWEN_READY_PATTERNS)
+        if self.config.vendor == Vendor.OPENCODE:
+            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in OPENCODE_BOOTING_PATTERNS):
+                return False
+            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in OPENCODE_PROCESSING_PATTERNS):
+                return False
+            return any(
+                re.search(pattern, recent_output, re.IGNORECASE)
+                for pattern in OPENCODE_WAITING_INPUT_PATTERNS + OPENCODE_IDLE_READY_PATTERNS
+            )
         if self.config.vendor == Vendor.KIMI:
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in KIMI_NOT_READY_PATTERNS):
                 return False
@@ -2849,6 +2963,8 @@ class TmuxBatchWorker:
         if self.terminal_recently_changed:
             return WrapperState.NOT_READY
         if self.agent_started and self._title_indicates_ready(self.last_pane_title):
+            return WrapperState.READY
+        if self.config.vendor == Vendor.OPENCODE and self.agent_started and self._visible_indicates_agent_ready(visible_text):
             return WrapperState.READY
         return WrapperState.NOT_READY
 
@@ -2882,6 +2998,12 @@ class TmuxBatchWorker:
 
             if self._agent_running(current_command):
                 ready_signature = observation.pane_title if self._title_indicates_ready(observation.pane_title) else ""
+                if (
+                    not ready_signature
+                    and self.config.vendor == Vendor.OPENCODE
+                    and self._visible_indicates_agent_ready(observation.visible_text or observation.raw_log_tail)
+                ):
+                    ready_signature = "opencode-visible-ready"
                 if ready_signature and ready_signature == previous_ready_signature:
                     stable_count += 1
                 else:
