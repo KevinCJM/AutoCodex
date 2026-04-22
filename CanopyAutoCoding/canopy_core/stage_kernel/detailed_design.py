@@ -1,0 +1,1722 @@
+# -*- encoding: utf-8 -*-
+"""
+@File: A05_DetailedDesign.py
+@Modify Time: 2026/4/18
+@Author: Kevin-Chen
+@Descriptions: 详细设计阶段
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+from collections import Counter
+from contextlib import nullcontext
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, Sequence
+
+from A01_Routing_LayerPlanning import (
+    DEFAULT_MODEL_BY_VENDOR,
+    normalize_effort_choice,
+    normalize_model_choice,
+    normalize_vendor_choice,
+)
+from A03_RequirementsClarification import run_requirements_clarification_stage
+from canopy_core.prompt_contracts.common import check_reviewer_job
+from canopy_core.prompt_contracts.detailed_design import (
+    again_review_detailed_design,
+    create_detailed_design_ba,
+    detailed_design,
+    hitl_relpy,
+    modify_detailed_design,
+    review_detailed_design,
+)
+from canopy_core.runtime.contracts import TaskResultContract, TurnFileContract, TurnFileResult
+from canopy_core.runtime.hitl import build_prefixed_sha256
+from canopy_core.runtime.tmux_runtime import (
+    DEFAULT_COMMAND_TIMEOUT_SEC,
+    AgentRunConfig,
+    TmuxBatchWorker,
+    TmuxRuntimeController,
+    Vendor,
+    build_session_name,
+    cleanup_registered_tmux_workers,
+    is_agent_ready_timeout_error,
+    is_provider_auth_error,
+    is_turn_artifact_contract_error,
+    is_worker_death_error,
+    list_registered_tmux_workers,
+)
+from canopy_core.stage_kernel.reviewer_orchestration import (
+    repair_reviewer_round_outputs,
+    run_parallel_reviewer_round,
+    shutdown_stage_workers,
+)
+from canopy_core.stage_kernel.death_orchestration import (
+    ensure_active_reviewers,
+    run_main_phase_with_death_handling,
+    run_reviewer_phase_with_death_handling,
+)
+from canopy_core.stage_kernel.shared_review import (
+    MAX_REVIEWER_REPAIR_ATTEMPTS,
+    ReviewAgentHandoff,
+    ReviewAgentSelection,
+    ReviewStageProgress,
+    ReviewerRuntime,
+    ensure_empty_file,
+    prompt_positive_int,
+    prompt_replacement_review_agent_selection,
+    prompt_review_agent_selection,
+    prompt_yes_no_choice,
+    render_review_agent_selection,
+    render_tmux_start_summary,
+    worker_has_provider_auth_error,
+)
+from T01_tools import get_markdown_content, is_file_empty, task_done
+from T08_pre_development import (
+    build_pre_development_task_record_path,
+    ensure_pre_development_task_record,
+    mark_detailed_design_completed,
+    update_pre_development_task_status,
+)
+from T09_terminal_ops import (
+    BridgeTerminalUI,
+    collect_multiline_input,
+    get_terminal_ui,
+    maybe_launch_tui,
+    message,
+    prompt_select_option,
+    prompt_with_default,
+)
+from T12_requirements_common import (
+    DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+    DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+    DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+    RequirementsAnalystHandoff,
+    build_requirements_clarification_paths,
+    prompt_project_dir,
+    prompt_requirement_name_selection,
+    sanitize_requirement_name,
+    stdin_is_interactive,
+)
+
+
+DETAILED_DESIGN_TASK_NAME = "详细设计"
+DETAILED_DESIGN_RUNTIME_ROOT_NAME = ".detailed_design_runtime"
+MAX_DETAILED_DESIGN_REVIEW_ROUNDS = 5
+MAX_DETAILED_DESIGN_HITL_ROUNDS = 8
+PLACEHOLDER_NEXT_STEP = "下一步进入任务拆分阶段（待接入）"
+
+DEFAULT_REVIEWER_PROMPTS: dict[str, str] = {
+    "开发工程师": "你是详细设计审计中的开发工程师。重点检查实现可行性、模块边界、代码落点、最小改动路径、是否引入非必要重构。",
+    "测试工程师": "你是详细设计审计中的测试工程师。重点检查边界条件、异常处理、可测试性、验收覆盖、回归风险与遗漏场景。",
+    "架构师": "你是详细设计审计中的架构师。重点检查系统边界、依赖影响、契约兼容、扩展约束，以及是否保持最小改动。",
+    "审核员": "你是详细设计审计中的审核员。重点检查需求对齐、文档一致性、契约兼容、越界内容，以及四问原则是否被违反。",
+}
+DEFAULT_REVIEWER_ROLE_NAMES: tuple[str, ...] = tuple(DEFAULT_REVIEWER_PROMPTS.keys())
+ExistingDetailedDesignMode = Literal["skip", "review_existing", "rerun"]
+
+
+@dataclass(frozen=True)
+class DetailedDesignReviewerSpec:
+    role_name: str
+    role_prompt: str
+    reviewer_key: str = ""
+
+
+@dataclass(frozen=True)
+class DetailedDesignStageResult:
+    project_dir: str
+    requirement_name: str
+    detailed_design_path: str
+    merged_review_path: str
+    passed: bool
+    cleanup_paths: tuple[str, ...] = ()
+    ba_handoff: RequirementsAnalystHandoff | None = None
+    reviewer_handoff: tuple[ReviewAgentHandoff, ...] = ()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="详细设计阶段")
+    parser.add_argument("--project-dir", help="项目目录")
+    parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|qwen|kimi")
+    parser.add_argument("--model", help="需求分析师模型名称")
+    parser.add_argument("--effort", help="需求分析师推理强度")
+    parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
+    parser.add_argument("--reuse-review-ba", action="store_true", help="优先复用需求评审阶段的需求分析师")
+    parser.add_argument("--rebuild-review-ba", action="store_true", help="强制重建需求分析师")
+    parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖详设评审角色列表")
+    parser.add_argument("--reviewer-role-prompt", action="append", default=[], help="重复传入以覆盖对应角色提示词")
+    parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
+    parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
+    parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
+    return parser
+
+
+def build_detailed_design_paths(project_dir: str | Path, requirement_name: str) -> dict[str, Path]:
+    project_root = Path(project_dir).expanduser().resolve()
+    safe_name = sanitize_requirement_name(requirement_name)
+    original_requirement_path, requirements_clear_path, ask_human_path, hitl_record_path = (
+        build_requirements_clarification_paths(project_root, requirement_name)
+    )
+    return {
+        "project_root": project_root,
+        "original_requirement_path": original_requirement_path,
+        "requirements_clear_path": requirements_clear_path,
+        "ask_human_path": ask_human_path,
+        "hitl_record_path": hitl_record_path,
+        "pre_development_path": build_pre_development_task_record_path(project_root, requirement_name),
+        "detailed_design_path": project_root / f"{safe_name}_详细设计.md",
+        "merged_review_path": project_root / f"{safe_name}_详设评审记录.md",
+        "ba_feedback_path": project_root / f"{safe_name}_需求分析师反馈.md",
+    }
+
+
+def build_reviewer_artifact_paths(project_dir: str | Path, requirement_name: str, reviewer_name: str) -> tuple[Path, Path]:
+    project_root = Path(project_dir).expanduser().resolve()
+    safe_name = sanitize_requirement_name(requirement_name)
+    artifact_agent_name = sanitize_requirement_name(reviewer_name)
+    review_md_path = project_root / f"{safe_name}_详设评审记录_{artifact_agent_name}.md"
+    review_json_path = project_root / f"{safe_name}_评审记录_{artifact_agent_name}.json"
+    return review_md_path, review_json_path
+
+
+def cleanup_existing_detailed_design_artifacts(
+    paths: dict[str, Path],
+    requirement_name: str,
+    *,
+    clear_detailed_design: bool = True,
+) -> tuple[str, ...]:
+    project_root = paths["project_root"]
+    safe_name = sanitize_requirement_name(requirement_name)
+    removed: list[str] = []
+    for pattern in (
+        f"{safe_name}_评审记录_*.json",
+        f"{safe_name}_详设评审记录_*.md",
+    ):
+        for candidate in project_root.glob(pattern):
+            if candidate.is_file():
+                candidate.unlink()
+                removed.append(str(candidate.resolve()))
+    for candidate in (
+        paths["merged_review_path"],
+        paths["ba_feedback_path"],
+        paths["ask_human_path"],
+    ):
+        if candidate.exists() and candidate.is_file():
+            candidate.write_text("", encoding="utf-8")
+            removed.append(str(candidate.resolve()))
+    if clear_detailed_design and paths["detailed_design_path"].exists() and paths["detailed_design_path"].is_file():
+        paths["detailed_design_path"].write_text("", encoding="utf-8")
+        removed.append(str(paths["detailed_design_path"].resolve()))
+    return tuple(dict.fromkeys(removed))
+
+
+def cleanup_stale_detailed_design_runtime_state(project_dir: str | Path) -> tuple[str, ...]:
+    runtime_root = Path(project_dir).expanduser().resolve() / DETAILED_DESIGN_RUNTIME_ROOT_NAME
+    if not runtime_root.exists() or not runtime_root.is_dir():
+        return ()
+    tmux_runtime = TmuxRuntimeController()
+    removed: list[str] = []
+    for worker_dir in sorted(path for path in runtime_root.iterdir() if path.is_dir()):
+        state_path = worker_dir / "worker.state.json"
+        session_name = ""
+        if state_path.exists():
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = {}
+            if isinstance(payload, dict):
+                session_name = str(payload.get("session_name", "")).strip()
+        if session_name:
+            try:
+                tmux_runtime.kill_session(session_name, missing_ok=True)
+            except Exception:
+                pass
+        shutil.rmtree(worker_dir, ignore_errors=True)
+        removed.append(str(worker_dir.resolve()))
+    if runtime_root.exists() and runtime_root.is_dir() and not any(runtime_root.iterdir()):
+        runtime_root.rmdir()
+        removed.append(str(runtime_root.resolve()))
+    return tuple(removed)
+
+
+def build_detailed_design_reviewer_worker_id(role_name: str) -> str:
+    return f"detailed-design-review-{str(role_name).strip()}"
+
+
+def _predict_worker_display_name(
+    *,
+    project_dir: str | Path,
+    worker_id: str,
+    occupied_session_names: Sequence[str] = (),
+) -> str:
+    occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
+    for worker in list_registered_tmux_workers():
+        session_name = str(getattr(worker, "session_name", "") or "").strip()
+        if session_name:
+            occupied.add(session_name)
+    return build_session_name(
+        worker_id,
+        Path(project_dir).expanduser().resolve(),
+        Vendor.CODEX,
+        occupied_session_names=sorted(occupied),
+    )
+
+
+def _detailed_design_ba_display_name(
+    *,
+    project_dir: str | Path,
+    handoff: RequirementsAnalystHandoff | None = None,
+) -> str:
+    session_name = str(getattr(getattr(handoff, "worker", None), "session_name", "") or "").strip()
+    if session_name:
+        return session_name
+    return _predict_worker_display_name(
+        project_dir=project_dir,
+        worker_id="detailed-design-analyst",
+    )
+
+
+def _reviewer_artifact_agent_name(reviewer: ReviewerRuntime) -> str:
+    worker = getattr(reviewer, "worker", None)
+    session_name = str(getattr(worker, "session_name", "") or "").strip()
+    reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
+    return session_name or reviewer_name
+
+
+def _predict_reviewer_display_name(
+    *,
+    project_dir: str | Path,
+    role_name: str,
+    occupied_session_names: Sequence[str] = (),
+) -> str:
+    return _predict_worker_display_name(
+        project_dir=project_dir,
+        worker_id=build_detailed_design_reviewer_worker_id(role_name),
+        occupied_session_names=occupied_session_names,
+    )
+
+
+def _is_live_ba_handoff(handoff: RequirementsAnalystHandoff | None) -> bool:
+    if handoff is None:
+        return False
+    session_name = str(getattr(handoff.worker, "session_name", "") or "").strip()
+    if not session_name:
+        return False
+    session_exists = getattr(handoff.worker, "session_exists", None)
+    if callable(session_exists):
+        try:
+            return bool(session_exists())
+        except Exception:
+            return False
+    return True
+
+
+def _reviewer_default_selection() -> ReviewAgentSelection:
+    return ReviewAgentSelection(
+        vendor=DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+        model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+        reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+        proxy_url="",
+    )
+
+
+def _reviewer_spec_identity(reviewer_spec: DetailedDesignReviewerSpec) -> str:
+    return str(reviewer_spec.reviewer_key or reviewer_spec.role_name).strip()
+
+
+def _default_prompt_for_role(role_name: str) -> str:
+    return DEFAULT_REVIEWER_PROMPTS.get(
+        role_name,
+        "",
+    )
+
+
+def _finalize_reviewer_specs(specs: Sequence[DetailedDesignReviewerSpec]) -> list[DetailedDesignReviewerSpec]:
+    role_counts = Counter(str(item.role_name).strip() for item in specs if str(item.role_name).strip())
+    role_seen: Counter[str] = Counter()
+    finalized: list[DetailedDesignReviewerSpec] = []
+    for item in specs:
+        role_name = str(item.role_name).strip()
+        role_prompt = str(item.role_prompt).strip()
+        if not role_name:
+            raise RuntimeError("审核智能体角色定义不能为空。")
+        if not role_prompt:
+            raise RuntimeError(f"{role_name} 的角色定义提示词不能为空。")
+        reviewer_key = str(item.reviewer_key).strip()
+        if not reviewer_key:
+            role_seen[role_name] += 1
+            if role_counts[role_name] > 1:
+                reviewer_key = f"{role_name}#{role_seen[role_name]}"
+            else:
+                reviewer_key = role_name
+        finalized.append(
+            DetailedDesignReviewerSpec(
+                role_name=role_name,
+                role_prompt=role_prompt,
+                reviewer_key=reviewer_key,
+            )
+        )
+    return finalized
+
+
+def _review_progress_context(progress: ReviewStageProgress | None):
+    return progress.suspended() if progress is not None else nullcontext()
+
+
+def _prompt_reviewer_select(
+    *,
+    title: str,
+    options: Sequence[tuple[str, str]],
+    default_value: str,
+    prompt_text: str,
+    progress: ReviewStageProgress | None = None,
+) -> str:
+    with _review_progress_context(progress):
+        return prompt_select_option(
+            title=title,
+            options=options,
+            default_value=default_value,
+            prompt_text=prompt_text,
+        )
+
+
+def _prompt_reviewer_text(
+    prompt_text: str,
+    *,
+    default: str = "",
+    allow_empty: bool = False,
+    progress: ReviewStageProgress | None = None,
+) -> str:
+    with _review_progress_context(progress):
+        return prompt_with_default(prompt_text, default, allow_empty=allow_empty).strip()
+
+
+def collect_interactive_reviewer_specs(*, progress: ReviewStageProgress | None = None) -> list[DetailedDesignReviewerSpec]:
+    if progress is not None:
+        progress.set_phase("详细设计 / 配置审核器")
+    reviewer_count = prompt_positive_int(
+        "请输入详细设计审核智能体数量",
+        len(DEFAULT_REVIEWER_ROLE_NAMES),
+        progress=progress,
+    )
+    collected_specs: list[DetailedDesignReviewerSpec] = []
+    default_roles = list(DEFAULT_REVIEWER_ROLE_NAMES)
+    for index in range(1, reviewer_count + 1):
+        default_role_name = default_roles[(index - 1) % len(default_roles)]
+        role_source = _prompt_reviewer_select(
+            title=f"第 {index} 个审核智能体 - 角色定义来源",
+            options=(
+                ("default", "默认角色"),
+                ("custom", "自定义角色"),
+            ),
+            default_value="default",
+            prompt_text=f"选择第 {index} 个审核智能体的角色定义来源",
+            progress=progress,
+        )
+        if role_source == "default":
+            role_name = _prompt_reviewer_select(
+                title=f"第 {index} 个审核智能体 - 选择默认角色定义",
+                options=tuple((item, item) for item in default_roles),
+                default_value=default_role_name,
+                prompt_text=f"选择第 {index} 个审核智能体的默认角色定义",
+                progress=progress,
+            )
+        else:
+            role_name = _prompt_reviewer_text(
+                f"输入第 {index} 个审核智能体的自定义角色定义",
+                progress=progress,
+            )
+        default_prompt = _default_prompt_for_role(role_name)
+        if default_prompt:
+            prompt_source = _prompt_reviewer_select(
+                title=f"第 {index} 个审核智能体 - 角色定义提示词来源",
+                options=(
+                    ("default", "默认提示词"),
+                    ("custom", "自定义提示词"),
+                ),
+                default_value="default",
+                prompt_text=f"选择第 {index} 个审核智能体的角色定义提示词来源",
+                progress=progress,
+            )
+            if prompt_source == "default":
+                role_prompt = default_prompt
+            else:
+                role_prompt = _prompt_reviewer_text(
+                    f"输入第 {index} 个审核智能体的自定义角色定义提示词",
+                    default=default_prompt,
+                    progress=progress,
+                )
+        else:
+            role_prompt = _prompt_reviewer_text(
+                f"输入第 {index} 个审核智能体的自定义角色定义提示词",
+                progress=progress,
+            )
+        collected_specs.append(
+            DetailedDesignReviewerSpec(
+                role_name=role_name,
+                role_prompt=role_prompt,
+            )
+        )
+    return _finalize_reviewer_specs(collected_specs)
+
+
+def resolve_reviewer_specs(
+    args: argparse.Namespace,
+    *,
+    progress: ReviewStageProgress | None = None,
+) -> list[DetailedDesignReviewerSpec]:
+    role_names = [str(item).strip() for item in getattr(args, "reviewer_role", []) if str(item).strip()]
+    prompt_values = [str(item).strip() for item in getattr(args, "reviewer_role_prompt", []) if str(item).strip()]
+    if stdin_is_interactive() and not role_names and not prompt_values:
+        return collect_interactive_reviewer_specs(progress=progress)
+    if role_names and prompt_values and len(prompt_values) != len(role_names):
+        raise RuntimeError("--reviewer-role-prompt 数量必须与 --reviewer-role 数量一致。")
+    if not role_names:
+        role_names = list(DEFAULT_REVIEWER_ROLE_NAMES)
+        if prompt_values and len(prompt_values) != len(role_names):
+            raise RuntimeError("--reviewer-role-prompt 数量必须与默认角色数量一致。")
+    specs: list[DetailedDesignReviewerSpec] = []
+    for index, role_name in enumerate(role_names):
+        default_prompt = _default_prompt_for_role(role_name)
+        if prompt_values:
+            if len(prompt_values) == len(role_names):
+                role_prompt = prompt_values[index]
+            else:
+                role_prompt = prompt_values[index]
+        elif default_prompt:
+            role_prompt = default_prompt
+        else:
+            raise RuntimeError(f"自定义角色 {role_name} 必须同时提供对应的角色定义提示词。")
+        specs.append(DetailedDesignReviewerSpec(role_name=role_name, role_prompt=role_prompt))
+    return _finalize_reviewer_specs(specs)
+
+
+def collect_ba_agent_selection(args: argparse.Namespace, *, role_label: str) -> ReviewAgentSelection:
+    interactive = stdin_is_interactive()
+    vendor_value = str(getattr(args, "vendor", "") or "").strip()
+    model_value = str(getattr(args, "model", "") or "").strip()
+    effort_value = str(getattr(args, "effort", "") or "").strip()
+    proxy_value = str(getattr(args, "proxy_url", "") or "").strip()
+    if interactive and not any((vendor_value, model_value, effort_value, proxy_value)):
+        return prompt_review_agent_selection(
+            DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+            default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+            default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+            default_proxy_url="",
+            role_label=role_label,
+        )
+    vendor = normalize_vendor_choice(vendor_value or DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
+    model = normalize_model_choice(vendor, model_value or DEFAULT_MODEL_BY_VENDOR[vendor])
+    reasoning_effort = normalize_effort_choice(vendor, model, effort_value or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
+    return ReviewAgentSelection(
+        vendor=vendor,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        proxy_url=proxy_value,
+    )
+
+
+def build_clarification_stage_argv(args: argparse.Namespace, *, project_dir: str, requirement_name: str) -> list[str]:
+    argv = ["--project-dir", project_dir, "--requirement-name", requirement_name]
+    if getattr(args, "yes", False):
+        argv.append("--yes")
+    if getattr(args, "no_tui", False):
+        argv.append("--no-tui")
+    if getattr(args, "legacy_cli", False):
+        argv.append("--legacy-cli")
+    interactive = stdin_is_interactive()
+    if not interactive:
+        vendor = normalize_vendor_choice(str(getattr(args, "vendor", "") or "").strip() or DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
+        model = normalize_model_choice(vendor, str(getattr(args, "model", "") or "").strip() or DEFAULT_MODEL_BY_VENDOR[vendor])
+        effort = normalize_effort_choice(vendor, model, str(getattr(args, "effort", "") or "").strip() or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
+        argv.extend(["--vendor", vendor, "--model", model, "--effort", effort])
+        proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
+        if proxy_url:
+            argv.extend(["--proxy-url", proxy_url])
+    return argv
+
+
+def ensure_detailed_design_inputs(args: argparse.Namespace, *, project_dir: str, requirement_name: str) -> dict[str, Path]:
+    paths = build_detailed_design_paths(project_dir, requirement_name)
+    if not get_markdown_content(paths["original_requirement_path"]).strip():
+        raise RuntimeError(f"缺少原始需求文档: {paths['original_requirement_path']}")
+    if not get_markdown_content(paths["requirements_clear_path"]).strip():
+        message(f"缺少需求澄清文档，先自动执行需求澄清阶段: {paths['requirements_clear_path'].name}")
+        clarification_argv = build_clarification_stage_argv(
+            args,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
+        run_requirements_clarification_stage(clarification_argv, preserve_ba_worker=False)
+    paths = build_detailed_design_paths(project_dir, requirement_name)
+    if not get_markdown_content(paths["requirements_clear_path"]).strip():
+        raise RuntimeError(f"缺少需求澄清文档: {paths['requirements_clear_path']}")
+    ensure_pre_development_task_record(project_dir, requirement_name)
+    return paths
+
+
+def decide_existing_detailed_design_mode(
+    args: argparse.Namespace,
+    *,
+    paths: dict[str, Path],
+    progress: ReviewStageProgress | None = None,
+) -> ExistingDetailedDesignMode:
+    if bool(getattr(args, "yes", False)) or not stdin_is_interactive():
+        return "rerun"
+    detailed_design_text = get_markdown_content(paths["detailed_design_path"]).strip()
+    if not detailed_design_text:
+        return "rerun"
+    if progress is not None:
+        progress.set_phase("详细设计 / 已有文档处理")
+    with _review_progress_context(progress):
+        return prompt_select_option(
+            title=f"检测到已存在《{paths['detailed_design_path'].name}》",
+            options=(
+                ("skip", "跳过详细设计阶段"),
+                ("review_existing", "直接评审现有详细设计"),
+                ("rerun", "从头重跑并重新生成详细设计"),
+            ),
+            default_value="rerun",
+            prompt_text="请选择处理方式",
+            preview_path=paths["detailed_design_path"],
+            preview_title="现有详细设计",
+        )
+
+
+def decide_ba_strategy(
+    args: argparse.Namespace,
+    *,
+    project_dir: str | Path,
+    ba_handoff: RequirementsAnalystHandoff | None,
+) -> str:
+    if getattr(args, "rebuild_review_ba", False):
+        return "rebuild"
+    if getattr(args, "reuse_review_ba", False):
+        return "reuse"
+    if ba_handoff is None:
+        return "rebuild"
+    if not stdin_is_interactive() or bool(getattr(args, "yes", False)):
+        return "reuse"
+    if prompt_yes_no_choice(
+        "是否复用需求评审阶段的需求分析师继续详细设计阶段",
+        True,
+    ):
+        return "reuse"
+    return "rebuild"
+
+
+def create_design_ba_handoff(
+    *,
+    project_dir: str | Path,
+    selection: ReviewAgentSelection,
+) -> RequirementsAnalystHandoff:
+    project_root = Path(project_dir).expanduser().resolve()
+    worker = TmuxBatchWorker(
+        worker_id="detailed-design-analyst",
+        work_dir=project_root,
+        config=AgentRunConfig(
+            vendor=selection.vendor,
+            model=selection.model,
+            reasoning_effort=selection.reasoning_effort,
+            proxy_url=selection.proxy_url,
+        ),
+        runtime_root=project_root / DETAILED_DESIGN_RUNTIME_ROOT_NAME,
+    )
+    message(render_tmux_start_summary(str(worker.session_name).strip() or "需求分析师", worker))
+    return RequirementsAnalystHandoff(
+        worker=worker,
+        vendor=selection.vendor,
+        model=selection.model,
+        reasoning_effort=selection.reasoning_effort,
+        proxy_url=selection.proxy_url,
+    )
+
+
+def prepare_design_ba_handoff(
+    args: argparse.Namespace,
+    *,
+    project_dir: str | Path,
+    ba_handoff: RequirementsAnalystHandoff | None,
+) -> tuple[RequirementsAnalystHandoff, bool]:
+    strategy = decide_ba_strategy(args, project_dir=project_dir, ba_handoff=ba_handoff)
+    if strategy == "reuse" and _is_live_ba_handoff(ba_handoff):
+        message("复用需求评审阶段的需求分析师继续生成详细设计")
+        return ba_handoff, False
+    if strategy == "reuse":
+        message("请求复用需求评审阶段的需求分析师，但当前没有可复用的 live worker，将回退为重建需求分析师")
+    role_label = _detailed_design_ba_display_name(project_dir=project_dir)
+    selection = collect_ba_agent_selection(args, role_label=role_label)
+    message(render_review_agent_selection("进入详细设计阶段（需求分析师）", selection))
+    new_handoff = create_design_ba_handoff(project_dir=project_dir, selection=selection)
+    if ba_handoff is not None and strategy in {"reuse", "rebuild"}:
+        try:
+            ba_handoff.worker.request_kill()
+        except Exception:
+            pass
+    return new_handoff, True
+
+
+def build_detailed_design_init_prompt(paths: dict[str, Path]) -> str:
+    return create_detailed_design_ba(
+        original_requirement_md=str(paths["original_requirement_path"].resolve()),
+        requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+        hitl_record_md=str(paths["hitl_record_path"].resolve()),
+    )
+
+
+def build_detailed_design_prompt(paths: dict[str, Path]) -> str:
+    return detailed_design(
+        original_requirement_md=str(paths["original_requirement_path"].resolve()),
+        requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+        hitl_record_md=str(paths["hitl_record_path"].resolve()),
+        detail_design_md=str(paths["detailed_design_path"].resolve()),
+    )
+
+
+def build_ba_init_result_contract(paths: dict[str, Path]) -> TaskResultContract:
+    return TaskResultContract(
+        turn_id="a05_ba_init",
+        phase="a05_ba_init",
+        task_kind="a05_ba_init",
+        mode="a05_ba_init",
+        expected_statuses=("ready",),
+        stage_name=DETAILED_DESIGN_TASK_NAME,
+        optional_artifacts={
+            "original_requirement": paths["original_requirement_path"],
+            "requirements_clear": paths["requirements_clear_path"],
+            "hitl_record": paths["hitl_record_path"],
+        },
+        terminal_status_tokens={
+            "ready": ("完成",),
+        },
+        terminal_status_summaries={
+            "ready": "需求分析师已完成详细设计初始化",
+        },
+    )
+
+
+def build_detailed_design_generate_result_contract(paths: dict[str, Path]) -> TaskResultContract:
+    return TaskResultContract(
+        turn_id="a05_detailed_design_generate",
+        phase="a05_detailed_design_generate",
+        task_kind="a05_detailed_design_generate",
+        mode="a05_detailed_design_generate",
+        expected_statuses=("completed",),
+        stage_name=DETAILED_DESIGN_TASK_NAME,
+        required_artifacts={
+            "detailed_design": paths["detailed_design_path"],
+        },
+        optional_artifacts={
+            "original_requirement": paths["original_requirement_path"],
+            "requirements_clear": paths["requirements_clear_path"],
+            "hitl_record": paths["hitl_record_path"],
+        },
+        terminal_status_tokens={
+            "completed": ("完成",),
+        },
+        terminal_status_summaries={
+            "completed": "需求分析师已生成详细设计文档",
+        },
+    )
+
+
+def build_detailed_design_feedback_result_contract(paths: dict[str, Path]) -> TaskResultContract:
+    return TaskResultContract(
+        turn_id="a05_detailed_design_feedback",
+        phase="a05_detailed_design_feedback",
+        task_kind="a05_detailed_design_feedback",
+        mode="a05_detailed_design_feedback",
+        expected_statuses=("hitl", "completed"),
+        stage_name=DETAILED_DESIGN_TASK_NAME,
+        optional_artifacts={
+            "ask_human": paths["ask_human_path"],
+            "ba_feedback": paths["ba_feedback_path"],
+            "detailed_design": paths["detailed_design_path"],
+            "hitl_record": paths["hitl_record_path"],
+            "requirements_clear": paths["requirements_clear_path"],
+        },
+    )
+
+
+def _parse_result_payload(clean_output: str) -> dict[str, object]:
+    try:
+        payload = json.loads(clean_output)
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError(f"未识别到结构化结果 JSON: {clean_output!r}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError("结构化结果必须是 JSON 对象")
+    return payload
+
+
+def _run_ba_turn(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    label: str,
+    prompt: str,
+    result_contract: TaskResultContract,
+) -> dict[str, object]:
+    result = handoff.worker.run_turn(
+        label=label,
+        prompt=prompt,
+        result_contract=result_contract,
+        timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+    )
+    if not result.ok:
+        raise RuntimeError(result.clean_output or f"{label} 执行失败")
+    return _parse_result_payload(result.clean_output)
+
+
+def recreate_design_ba_handoff(
+    *,
+    project_dir: str | Path,
+    previous_handoff: RequirementsAnalystHandoff,
+    progress: ReviewStageProgress | None = None,
+) -> RequirementsAnalystHandoff | None:
+    if not stdin_is_interactive():
+        return None
+    ba_display_name = _detailed_design_ba_display_name(project_dir=project_dir, handoff=previous_handoff)
+    selection = prompt_replacement_review_agent_selection(
+        reason_text=f"检测到{ba_display_name}不可继续使用，需要重建需求分析师后继续当前阶段。",
+        previous_selection=ReviewAgentSelection(
+            previous_handoff.vendor,
+            previous_handoff.model,
+            previous_handoff.reasoning_effort,
+            previous_handoff.proxy_url,
+        ),
+        force_model_change=True,
+        role_label=ba_display_name,
+        progress=progress,
+    )
+    if selection is None:
+        return None
+    return create_design_ba_handoff(project_dir=project_dir, selection=selection)
+
+
+def run_ba_turn_with_recovery(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    project_dir: str | Path,
+    label: str,
+    prompt: str,
+    result_contract: TaskResultContract,
+    initialize_on_replacement: bool,
+    paths: dict[str, Path],
+    progress: ReviewStageProgress | None = None,
+) -> tuple[RequirementsAnalystHandoff, dict[str, object]]:
+    current_handoff = handoff
+    needs_initialize = False
+    while True:
+        try:
+            if needs_initialize:
+                _run_ba_turn(
+                    current_handoff,
+                    label=f"{label}_reinit",
+                    prompt=build_detailed_design_init_prompt(paths),
+                    result_contract=build_ba_init_result_contract(paths),
+                )
+                needs_initialize = False
+            payload = _run_ba_turn(
+                current_handoff,
+                label=label,
+                prompt=prompt,
+                result_contract=result_contract,
+            )
+            return current_handoff, payload
+        except Exception as error:  # noqa: BLE001
+            ba_display_name = _detailed_design_ba_display_name(project_dir=project_dir, handoff=current_handoff)
+            auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_handoff.worker)
+            ready_timeout_error = is_agent_ready_timeout_error(error)
+            if auth_error or ready_timeout_error:
+                replacement = recreate_design_ba_handoff(
+                    project_dir=project_dir,
+                    previous_handoff=current_handoff,
+                    progress=progress,
+                )
+                if replacement is None:
+                    raise RuntimeError(f"{ba_display_name} 无法继续，且未能重建需求分析师") from error
+                current_handoff = replacement
+                needs_initialize = initialize_on_replacement
+                continue
+            if is_worker_death_error(error):
+                replacement = recreate_design_ba_handoff(
+                    project_dir=project_dir,
+                    previous_handoff=current_handoff,
+                    progress=progress,
+                )
+                if replacement is None:
+                    raise RuntimeError(f"{ba_display_name} 已死亡，且未能重建需求分析师") from error
+                current_handoff = replacement
+                needs_initialize = initialize_on_replacement
+                continue
+            raise
+
+
+def generate_detailed_design_document(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    project_dir: str | Path,
+    paths: dict[str, Path],
+    initialize_first: bool,
+    progress: ReviewStageProgress | None = None,
+) -> RequirementsAnalystHandoff:
+    current_handoff = handoff
+    if progress is not None:
+        progress.set_phase("详细设计 / 生成中")
+    if initialize_first:
+        current_handoff = initialize_detailed_design_ba(
+            current_handoff,
+            project_dir=project_dir,
+            paths=paths,
+            progress=progress,
+        )
+    current_handoff, _ = run_ba_turn_with_recovery(
+        current_handoff,
+        project_dir=project_dir,
+        label="generate_detailed_design",
+        prompt=build_detailed_design_prompt(paths),
+        result_contract=build_detailed_design_generate_result_contract(paths),
+        initialize_on_replacement=True,
+        paths=paths,
+        progress=progress,
+    )
+    if not get_markdown_content(paths["detailed_design_path"]).strip():
+        raise RuntimeError("详细设计文档为空，未生成有效《详细设计.md》")
+    return current_handoff
+
+
+def initialize_detailed_design_ba(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    project_dir: str | Path,
+    paths: dict[str, Path],
+    progress: ReviewStageProgress | None = None,
+) -> RequirementsAnalystHandoff:
+    current_handoff, _ = run_ba_turn_with_recovery(
+        handoff,
+        project_dir=project_dir,
+        label="detailed_design_ba_init",
+        prompt=build_detailed_design_init_prompt(paths),
+        result_contract=build_ba_init_result_contract(paths),
+        initialize_on_replacement=False,
+        paths=paths,
+        progress=progress,
+    )
+    return current_handoff
+
+
+def _discard_unused_ba_handoff(ba_handoff: RequirementsAnalystHandoff | None) -> None:
+    if ba_handoff is None:
+        return
+    try:
+        ba_handoff.worker.request_kill()
+    except Exception:
+        pass
+
+
+def build_reviewer_completion_contract(
+    *,
+    reviewer_name: str,
+    review_md_path: Path,
+    review_json_path: Path,
+) -> TurnFileContract:
+    def validator(status_path: Path) -> TurnFileResult:
+        if not status_path.exists():
+            raise FileNotFoundError(f"缺少审核 JSON 文件: {status_path}")
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise ValueError(f"审核 JSON 必须是 list: {status_path}")
+        matched_item: dict[str, object] | None = None
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("task_name", "")).strip() == DETAILED_DESIGN_TASK_NAME:
+                matched_item = item
+                break
+        if matched_item is None:
+            raise ValueError(f"{status_path.name} 缺少 {DETAILED_DESIGN_TASK_NAME} 状态项")
+        review_pass = matched_item.get("review_pass")
+        if not isinstance(review_pass, bool):
+            raise ValueError(f"{status_path.name} 中 {DETAILED_DESIGN_TASK_NAME}.review_pass 必须是 bool")
+        review_md_empty = is_file_empty(review_md_path)
+        if review_pass and not review_md_empty:
+            raise ValueError(f"{reviewer_name} 已审核通过，但 {review_md_path.name} 不为空")
+        if (not review_pass) and review_md_empty:
+            raise ValueError(f"{reviewer_name} 未通过，但 {review_md_path.name} 为空")
+        artifact_paths = {
+            "review_md": str(review_md_path.resolve()),
+            "review_json": str(review_json_path.resolve()),
+        }
+        artifact_hashes = {
+            str(review_md_path.resolve()): build_prefixed_sha256(review_md_path),
+            str(review_json_path.resolve()): build_prefixed_sha256(review_json_path),
+        }
+        return TurnFileResult(
+            status_path=str(status_path.resolve()),
+            payload={"task_name": DETAILED_DESIGN_TASK_NAME, "review_pass": review_pass},
+            artifact_paths=artifact_paths,
+            artifact_hashes=artifact_hashes,
+            validated_at=str(status_path.stat().st_mtime),
+        )
+
+    return TurnFileContract(
+        turn_id=f"detailed_design_review_{reviewer_name}",
+        phase=DETAILED_DESIGN_TASK_NAME,
+        status_path=review_json_path,
+        validator=validator,
+    )
+
+
+def _reviewer_has_materialized_outputs(reviewer: ReviewerRuntime) -> bool:
+    try:
+        payload = json.loads(reviewer.review_json_path.read_text(encoding="utf-8"))
+    except Exception:
+        payload = None
+    if isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("task_name", "")).strip() != DETAILED_DESIGN_TASK_NAME:
+                continue
+            if isinstance(item.get("review_pass"), bool):
+                return True
+    return not is_file_empty(reviewer.review_md_path)
+
+
+def _reviewer_artifact_signature(reviewer: ReviewerRuntime) -> tuple[object, ...]:
+    signatures: list[object] = []
+    for path in (reviewer.review_md_path, reviewer.review_json_path):
+        if not path.exists():
+            signatures.append(("missing", str(path.resolve())))
+            continue
+        stat = path.stat()
+        signatures.append((str(path.resolve()), stat.st_size, stat.st_mtime_ns))
+    return tuple(signatures)
+
+
+def create_reviewer_runtime(
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    reviewer_spec: DetailedDesignReviewerSpec,
+    selection: ReviewAgentSelection,
+) -> ReviewerRuntime:
+    reviewer_identity = _reviewer_spec_identity(reviewer_spec)
+    runtime_root = Path(project_dir).expanduser().resolve() / DETAILED_DESIGN_RUNTIME_ROOT_NAME
+    worker = TmuxBatchWorker(
+        worker_id=build_detailed_design_reviewer_worker_id(reviewer_spec.role_name),
+        work_dir=Path(project_dir).expanduser().resolve(),
+        config=AgentRunConfig(
+            vendor=selection.vendor,
+            model=selection.model,
+            reasoning_effort=selection.reasoning_effort,
+            proxy_url=selection.proxy_url,
+        ),
+        runtime_root=runtime_root,
+    )
+    review_md_path, review_json_path = build_reviewer_artifact_paths(
+        project_dir,
+        requirement_name,
+        str(worker.session_name).strip() or reviewer_spec.role_name,
+    )
+    ensure_empty_file(review_md_path)
+    message(render_tmux_start_summary(str(worker.session_name).strip() or reviewer_spec.role_name, worker))
+    return ReviewerRuntime(
+        reviewer_name=reviewer_identity,
+        selection=selection,
+        worker=worker,
+        review_md_path=review_md_path,
+        review_json_path=review_json_path,
+        contract=build_reviewer_completion_contract(
+            reviewer_name=reviewer_identity,
+            review_md_path=review_md_path,
+            review_json_path=review_json_path,
+        ),
+    )
+
+
+def recreate_reviewer_runtime(
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    reviewer: ReviewerRuntime,
+    reviewer_spec: DetailedDesignReviewerSpec,
+    progress: ReviewStageProgress | None = None,
+) -> ReviewerRuntime | None:
+    if not stdin_is_interactive():
+        return None
+    reviewer_display_name = _reviewer_artifact_agent_name(reviewer)
+    selection = prompt_replacement_review_agent_selection(
+        reason_text=f"检测到{reviewer_display_name}不可继续使用，需要重建审核智能体后继续当前阶段。",
+        previous_selection=reviewer.selection,
+        force_model_change=True,
+        role_label=reviewer_display_name,
+        progress=progress,
+    )
+    if selection is None:
+        return None
+    replacement = create_reviewer_runtime(
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        reviewer_spec=reviewer_spec,
+        selection=selection,
+    )
+    if replacement.review_md_path != reviewer.review_md_path and reviewer.review_md_path.exists():
+        reviewer.review_md_path.unlink()
+    if replacement.review_json_path != reviewer.review_json_path and reviewer.review_json_path.exists():
+        reviewer.review_json_path.unlink()
+    return replacement
+
+def run_reviewer_turn_with_recreation(
+    reviewer: ReviewerRuntime,
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    reviewer_spec: DetailedDesignReviewerSpec,
+    label: str,
+    prompt: str,
+    progress: ReviewStageProgress | None = None,
+) -> ReviewerRuntime | None:
+    current_reviewer = reviewer
+    while True:
+        baseline_signature = _reviewer_artifact_signature(current_reviewer)
+        try:
+            result = current_reviewer.worker.run_turn(
+                label=label,
+                prompt=prompt,
+                completion_contract=current_reviewer.contract,
+                timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+            )
+            if not result.ok:
+                raise RuntimeError(result.clean_output or f"{current_reviewer.reviewer_name} 执行失败")
+            return current_reviewer
+        except Exception as error:  # noqa: BLE001
+            reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
+            auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+            ready_timeout_error = is_agent_ready_timeout_error(error)
+            if is_turn_artifact_contract_error(error):
+                return current_reviewer
+            if (
+                _reviewer_has_materialized_outputs(current_reviewer)
+                and _reviewer_artifact_signature(current_reviewer) != baseline_signature
+            ):
+                return current_reviewer
+            if auth_error or ready_timeout_error:
+                replacement = recreate_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=current_reviewer,
+                    reviewer_spec=reviewer_spec,
+                    progress=progress,
+                )
+                if replacement is None:
+                    raise RuntimeError(f"{reviewer_display_name} 无法继续，且未能重建审核智能体") from error
+                current_reviewer = replacement
+                continue
+            if is_worker_death_error(error):
+                message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
+                return None
+            raise
+
+
+def build_reviewer_workers(
+    args: argparse.Namespace,
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    reviewer_specs: Sequence[DetailedDesignReviewerSpec],
+    progress: ReviewStageProgress | None = None,
+) -> list[ReviewerRuntime]:
+    if progress is not None:
+        progress.set_phase("详细设计 / 启动审核器")
+    reviewers: list[ReviewerRuntime] = []
+    predicted_session_names: set[str] = set()
+    interactive = stdin_is_interactive()
+    for reviewer_spec in reviewer_specs:
+        reviewer_display_name = _predict_reviewer_display_name(
+            project_dir=project_dir,
+            role_name=reviewer_spec.role_name,
+            occupied_session_names=sorted(predicted_session_names),
+        )
+        predicted_session_names.add(reviewer_display_name)
+        if interactive:
+            selection = prompt_review_agent_selection(
+                DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+                default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+                default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+                default_proxy_url="",
+                role_label=reviewer_display_name,
+                progress=progress,
+            )
+            message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
+        else:
+            selection = _reviewer_default_selection()
+        reviewers.append(
+            create_reviewer_runtime(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                reviewer_spec=reviewer_spec,
+                selection=selection,
+            )
+        )
+    return reviewers
+
+
+def _run_parallel_reviewers(
+    reviewers: Sequence[ReviewerRuntime],
+    *,
+    reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec],
+    project_dir: str | Path,
+    requirement_name: str,
+    round_index: int,
+    prompt_builder,
+    label_prefix: str,
+    progress: ReviewStageProgress | None = None,
+) -> list[ReviewerRuntime]:
+    if progress is not None:
+        progress.set_phase(f"详细设计评审第 {round_index} 轮")
+    return run_parallel_reviewer_round(
+        reviewers,
+        key_func=lambda reviewer: reviewer.reviewer_name,
+        run_turn=lambda reviewer: run_reviewer_turn_with_recreation(
+            reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            reviewer_spec=reviewer_specs_by_name[reviewer.reviewer_name],
+            label=f"{label_prefix}_{sanitize_requirement_name(reviewer.reviewer_name)}_round_{round_index}",
+            prompt=prompt_builder(reviewer, reviewer_specs_by_name[reviewer.reviewer_name]),
+            progress=progress,
+        ),
+        error_prefix="详设审核智能体执行失败:",
+    )
+
+
+def repair_reviewer_outputs(
+    reviewers: Sequence[ReviewerRuntime],
+    *,
+    reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec],
+    project_dir: str | Path,
+    requirement_name: str,
+    round_index: int,
+    progress: ReviewStageProgress | None = None,
+) -> list[ReviewerRuntime]:
+    json_pattern = f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json"
+    md_pattern = f"{sanitize_requirement_name(requirement_name)}_详设评审记录_*.md"
+    return repair_reviewer_round_outputs(
+        reviewers,
+        key_func=lambda reviewer: reviewer.reviewer_name,
+        artifact_name_func=_reviewer_artifact_agent_name,
+        check_job=lambda reviewer_names: check_reviewer_job(
+            reviewer_names,
+            directory=project_dir,
+            task_name=DETAILED_DESIGN_TASK_NAME,
+            json_pattern=json_pattern,
+            md_pattern=md_pattern,
+        ),
+        run_fix_turn=lambda reviewer, fix_prompt, repair_attempt: run_reviewer_turn_with_recreation(
+            reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            reviewer_spec=reviewer_specs_by_name[reviewer.reviewer_name],
+            label=f"detailed_design_review_fix_{sanitize_requirement_name(reviewer.reviewer_name)}_round_{round_index}_attempt_{repair_attempt}",
+            prompt=fix_prompt,
+            progress=progress,
+        ),
+        max_attempts=MAX_REVIEWER_REPAIR_ATTEMPTS,
+        error_prefix="详设审核智能体修复输出失败:",
+        final_error="详设审核智能体多次修复后仍未按协议更新文档",
+    )
+
+
+def _collect_design_hitl_response(
+    question_path: str | Path,
+    *,
+    hitl_round: int,
+    answer_path: str | Path | None = None,
+    progress: ReviewStageProgress | None = None,
+) -> str:
+    question_file = Path(question_path).expanduser().resolve()
+    question_text = get_markdown_content(question_file).strip()
+    if not isinstance(get_terminal_ui(), BridgeTerminalUI):
+        message()
+        message(f"详细设计阶段 HITL 第 {hitl_round} 轮，需要人工补充信息")
+        message(f"问题文档: {question_file}")
+        message(question_text or "(问题文档为空)")
+    with progress.suspended() if progress is not None else nullcontext():
+        return collect_multiline_input(
+            title=f"HITL 第 {hitl_round} 轮回复",
+            empty_retry_message="回复不能为空，请重新输入。",
+            question_path=question_file,
+            answer_path=answer_path,
+        )
+def _read_required_detailed_design_ba_feedback(paths: dict[str, Path]) -> str:
+    ba_feedback = get_markdown_content(paths["ba_feedback_path"]).strip()
+    if ba_feedback:
+        return ba_feedback
+    raise RuntimeError(f"详细设计评审未通过，但 {paths['ba_feedback_path'].name} 为空")
+
+
+def _active_reviewer_files(reviewers: Sequence[ReviewerRuntime]) -> tuple[list[str], list[str]]:
+    json_files = [str(reviewer.review_json_path.resolve()) for reviewer in reviewers]
+    md_files = [str(reviewer.review_md_path.resolve()) for reviewer in reviewers]
+    return json_files, md_files
+
+
+def _replace_dead_detailed_design_ba(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    project_dir: str | Path,
+    progress: ReviewStageProgress | None = None,
+) -> RequirementsAnalystHandoff:
+    replacement = recreate_design_ba_handoff(
+        project_dir=project_dir,
+        previous_handoff=handoff,
+        progress=progress,
+    )
+    if replacement is None:
+        ba_display_name = _detailed_design_ba_display_name(project_dir=project_dir, handoff=handoff)
+        raise RuntimeError(f"{ba_display_name} 已死亡，且未能重建需求分析师")
+    return replacement
+
+
+def _export_reviewer_handoff(
+    reviewers: Sequence[ReviewerRuntime],
+    *,
+    reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec],
+) -> tuple[ReviewAgentHandoff, ...]:
+    handoffs: list[ReviewAgentHandoff] = []
+    for reviewer in reviewers:
+        reviewer_spec = reviewer_specs_by_name.get(reviewer.reviewer_name)
+        if reviewer_spec is None:
+            continue
+        handoffs.append(
+            ReviewAgentHandoff(
+                reviewer_key=reviewer.reviewer_name,
+                role_name=reviewer_spec.role_name,
+                role_prompt=reviewer_spec.role_prompt,
+                selection=reviewer.selection,
+                worker=reviewer.worker,
+            )
+        )
+    return tuple(handoffs)
+
+
+def run_ba_modify_loop(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    project_dir: str | Path,
+    paths: dict[str, Path],
+    review_msg: str,
+    progress: ReviewStageProgress | None = None,
+) -> RequirementsAnalystHandoff:
+    current_handoff = handoff
+    ensure_empty_file(paths["ask_human_path"])
+    ensure_empty_file(paths["ba_feedback_path"])
+    feedback_result_contract = build_detailed_design_feedback_result_contract(paths)
+    current_handoff, _ = run_ba_turn_with_recovery(
+        current_handoff,
+        project_dir=project_dir,
+        label="modify_detailed_design",
+        prompt=modify_detailed_design(
+            review_msg,
+            original_requirement_md=str(paths["original_requirement_path"].resolve()),
+            requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+            hitl_record_md=str(paths["hitl_record_path"].resolve()),
+            detail_design_md=str(paths["detailed_design_path"].resolve()),
+            ask_human_md=str(paths["ask_human_path"].resolve()),
+            what_just_change=str(paths["ba_feedback_path"].resolve()),
+        ),
+        result_contract=feedback_result_contract,
+        initialize_on_replacement=True,
+        paths=paths,
+        progress=progress,
+    )
+    for hitl_round in range(1, MAX_DETAILED_DESIGN_HITL_ROUNDS + 1):
+        if not get_markdown_content(paths["ask_human_path"]).strip():
+            return current_handoff
+        human_msg = _collect_design_hitl_response(
+            paths["ask_human_path"],
+            hitl_round=hitl_round,
+            answer_path=paths["hitl_record_path"],
+            progress=progress,
+        )
+        ensure_empty_file(paths["ask_human_path"])
+        current_handoff, _ = run_ba_turn_with_recovery(
+            current_handoff,
+            project_dir=project_dir,
+            label=f"detailed_design_hitl_reply_round_{hitl_round}",
+            prompt=hitl_relpy(
+                human_msg,
+                review_msg,
+                hitl_record_md=str(paths["hitl_record_path"].resolve()),
+                detail_design_md=str(paths["detailed_design_path"].resolve()),
+                ask_human_md=str(paths["ask_human_path"].resolve()),
+                what_just_change=str(paths["ba_feedback_path"].resolve()),
+            ),
+            result_contract=feedback_result_contract,
+            initialize_on_replacement=True,
+            paths=paths,
+            progress=progress,
+        )
+    raise RuntimeError(f"详细设计 HITL 轮次超过上限: {MAX_DETAILED_DESIGN_HITL_ROUNDS}")
+
+
+def _shutdown_workers(
+    ba_handoff: RequirementsAnalystHandoff | None,
+    reviewers: Sequence[ReviewerRuntime],
+    *,
+    project_dir: str | Path,
+    cleanup_runtime: bool,
+    preserve_ba_worker: bool = False,
+    preserve_reviewer_keys: Sequence[str] = (),
+) -> tuple[str, ...]:
+    return shutdown_stage_workers(
+        ba_handoff,
+        reviewers,
+        cleanup_runtime=cleanup_runtime,
+        preserve_ba_worker=preserve_ba_worker,
+        preserve_reviewer_keys=preserve_reviewer_keys,
+        runtime_root_filter=Path(project_dir).expanduser().resolve() / DETAILED_DESIGN_RUNTIME_ROOT_NAME,
+    )
+
+
+def run_detailed_design_stage(
+    argv: Sequence[str] | None = None,
+    *,
+    ba_handoff: RequirementsAnalystHandoff | None = None,
+    preserve_workers: bool = False,
+) -> DetailedDesignStageResult:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.project_dir:
+        project_dir = str(Path(args.project_dir).expanduser().resolve())
+    else:
+        project_dir = prompt_project_dir("")
+    if args.requirement_name:
+        requirement_name = str(args.requirement_name).strip()
+    else:
+        requirement_name = prompt_requirement_name_selection(project_dir, "").requirement_name
+
+    progress = ReviewStageProgress()
+    paths = ensure_detailed_design_inputs(args, project_dir=project_dir, requirement_name=requirement_name)
+    active_ba_handoff: RequirementsAnalystHandoff | None = None
+    reviewer_workers: list[ReviewerRuntime] = []
+    cleanup_paths: tuple[str, ...] = ()
+    reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec] = {}
+    try:
+        existing_design_mode = decide_existing_detailed_design_mode(
+            args,
+            paths=paths,
+            progress=progress,
+        )
+        if existing_design_mode == "skip":
+            message(f"检测到已存在《{paths['detailed_design_path'].name}》")
+            message("用户选择跳过详细设计阶段")
+            update_pre_development_task_status(project_dir, requirement_name, task_key="详细设计", completed=True)
+            message("已将详细设计标记为完成，继续后续阶段")
+            return DetailedDesignStageResult(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                detailed_design_path=str(paths["detailed_design_path"].resolve()),
+                merged_review_path=str(paths["merged_review_path"].resolve()),
+                passed=True,
+                cleanup_paths=(),
+                ba_handoff=None,
+                reviewer_handoff=(),
+            )
+        if existing_design_mode == "review_existing":
+            message(f"检测到已存在《{paths['detailed_design_path'].name}》")
+            message("将直接评审现有详细设计；若评审未通过，再进入修改流程")
+        update_pre_development_task_status(project_dir, requirement_name, task_key="详细设计", completed=False)
+        cleanup_stale_detailed_design_runtime_state(project_dir)
+        cleanup_existing_detailed_design_artifacts(
+            paths,
+            requirement_name,
+            clear_detailed_design=existing_design_mode == "rerun",
+        )
+        reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"详设审核智能体 {index}"  # noqa: E731
+        if existing_design_mode == "rerun":
+            active_ba_handoff, created_new_ba = prepare_design_ba_handoff(
+                args,
+                project_dir=project_dir,
+                ba_handoff=ba_handoff,
+            )
+            _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
+                active_ba_handoff,
+                reviewers=(),
+                run_phase=lambda handoff: generate_detailed_design_document(
+                    handoff,
+                    project_dir=project_dir,
+                    paths=paths,
+                    initialize_first=created_new_ba,
+                    progress=progress,
+                ),
+                replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                    owner,
+                    project_dir=project_dir,
+                    progress=progress,
+                ),
+                main_label="详细设计需求分析师",
+                reviewer_label_getter=reviewer_label_getter,
+                notify=message,
+            )
+            reviewer_specs = resolve_reviewer_specs(args, progress=progress)
+            reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
+            reviewer_workers = build_reviewer_workers(
+                args,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                reviewer_specs=reviewer_specs,
+                progress=progress,
+            )
+        else:
+            _discard_unused_ba_handoff(ba_handoff)
+            reviewer_specs = resolve_reviewer_specs(args, progress=progress)
+            reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
+            reviewer_workers = build_reviewer_workers(
+                args,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                reviewer_specs=reviewer_specs,
+                progress=progress,
+            )
+
+        def initial_prompt_builder(reviewer: ReviewerRuntime, reviewer_spec: DetailedDesignReviewerSpec) -> str:
+            return review_detailed_design(
+                reviewer_spec.role_prompt,
+                task_name=DETAILED_DESIGN_TASK_NAME,
+                original_requirement_md=str(paths["original_requirement_path"].resolve()),
+                requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+                hitl_record_md=str(paths["hitl_record_path"].resolve()),
+                detail_design_md=str(paths["detailed_design_path"].resolve()),
+                detail_design_review_md=str(reviewer.review_md_path.resolve()),
+                detail_design_review_json=str(reviewer.review_json_path.resolve()),
+            )
+
+        for round_index in range(1, MAX_DETAILED_DESIGN_REVIEW_ROUNDS + 1):
+            if round_index == 1:
+                reviewer_workers, active_ba_handoff = run_reviewer_phase_with_death_handling(
+                    active_ba_handoff,
+                    reviewer_workers,
+                    run_phase=lambda reviewers: _run_parallel_reviewers(
+                        reviewers,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        round_index=round_index,
+                        prompt_builder=initial_prompt_builder,
+                        label_prefix="detailed_design_review_init",
+                        progress=progress,
+                    ),
+                    replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                        owner,
+                        project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    main_label="详细设计需求分析师",
+                    reviewer_label_getter=reviewer_label_getter,
+                    notify=message,
+                )
+                reviewer_workers, active_ba_handoff = run_reviewer_phase_with_death_handling(
+                    active_ba_handoff,
+                    reviewer_workers,
+                    run_phase=lambda reviewers: repair_reviewer_outputs(
+                        reviewers,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        round_index=round_index,
+                        progress=progress,
+                    ),
+                    replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                        owner,
+                        project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    main_label="详细设计需求分析师",
+                    reviewer_label_getter=reviewer_label_getter,
+                    notify=message,
+                )
+            else:
+                review_msg = get_markdown_content(paths["merged_review_path"]).strip()
+                if not review_msg:
+                    raise RuntimeError("详设评审未通过，但合并后的详设评审记录为空")
+                if active_ba_handoff is None:
+                    active_ba_handoff, _ = prepare_design_ba_handoff(
+                        args,
+                        project_dir=project_dir,
+                        ba_handoff=None,
+                    )
+                    _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
+                        active_ba_handoff,
+                        reviewers=reviewer_workers,
+                        run_phase=lambda handoff: initialize_detailed_design_ba(
+                            handoff,
+                            project_dir=project_dir,
+                            paths=paths,
+                            progress=progress,
+                        ),
+                        replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                            owner,
+                            project_dir=project_dir,
+                            progress=progress,
+                        ),
+                        main_label="详细设计需求分析师",
+                        reviewer_label_getter=reviewer_label_getter,
+                        notify=message,
+                    )
+                _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
+                    active_ba_handoff,
+                    reviewers=reviewer_workers,
+                    run_phase=lambda handoff: run_ba_modify_loop(
+                        handoff,
+                        project_dir=project_dir,
+                        paths=paths,
+                        review_msg=review_msg,
+                        progress=progress,
+                    ),
+                    replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                        owner,
+                        project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    main_label="详细设计需求分析师",
+                    reviewer_label_getter=reviewer_label_getter,
+                    notify=message,
+                )
+                ba_reply = _read_required_detailed_design_ba_feedback(paths)
+
+                def again_prompt_builder(reviewer: ReviewerRuntime, reviewer_spec: DetailedDesignReviewerSpec) -> str:
+                    return again_review_detailed_design(
+                        ba_reply,
+                        task_name=DETAILED_DESIGN_TASK_NAME,
+                        original_requirement_md=str(paths["original_requirement_path"].resolve()),
+                        requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+                        hitl_record_md=str(paths["hitl_record_path"].resolve()),
+                        detail_design_md=str(paths["detailed_design_path"].resolve()),
+                        detail_design_review_md=str(reviewer.review_md_path.resolve()),
+                        detail_design_review_json=str(reviewer.review_json_path.resolve()),
+                    )
+
+                reviewer_workers, active_ba_handoff = run_reviewer_phase_with_death_handling(
+                    active_ba_handoff,
+                    reviewer_workers,
+                    run_phase=lambda reviewers: _run_parallel_reviewers(
+                        reviewers,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        round_index=round_index,
+                        prompt_builder=again_prompt_builder,
+                        label_prefix="detailed_design_review_again",
+                        progress=progress,
+                    ),
+                    replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                        owner,
+                        project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    main_label="详细设计需求分析师",
+                    reviewer_label_getter=reviewer_label_getter,
+                    notify=message,
+                )
+                reviewer_workers, active_ba_handoff = run_reviewer_phase_with_death_handling(
+                    active_ba_handoff,
+                    reviewer_workers,
+                    run_phase=lambda reviewers: repair_reviewer_outputs(
+                        reviewers,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        round_index=round_index,
+                        progress=progress,
+                    ),
+                    replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                        owner,
+                        project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    main_label="详细设计需求分析师",
+                    reviewer_label_getter=reviewer_label_getter,
+                    notify=message,
+                )
+
+            ensure_active_reviewers(reviewer_workers, stage_label="详细设计")
+            review_json_files, review_md_files = _active_reviewer_files(reviewer_workers)
+            passed = task_done(
+                directory=project_dir,
+                file_path=paths["pre_development_path"],
+                task_name=DETAILED_DESIGN_TASK_NAME,
+                json_pattern=f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json",
+                md_pattern=f"{sanitize_requirement_name(requirement_name)}_详设评审记录_*.md",
+                md_output_name=paths["merged_review_path"].name,
+                json_files=review_json_files,
+                md_files=review_md_files,
+            )
+            if passed:
+                mark_detailed_design_completed(project_dir, requirement_name)
+                result_ba_handoff = active_ba_handoff if preserve_workers else None
+                result_reviewer_handoff = _export_reviewer_handoff(
+                    reviewer_workers,
+                    reviewer_specs_by_name=reviewer_specs_by_name,
+                ) if preserve_workers else ()
+                cleanup_paths = _shutdown_workers(
+                    active_ba_handoff,
+                    reviewer_workers,
+                    project_dir=project_dir,
+                    cleanup_runtime=True,
+                    preserve_ba_worker=preserve_workers,
+                    preserve_reviewer_keys=[item.reviewer_key for item in result_reviewer_handoff],
+                )
+                return DetailedDesignStageResult(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    detailed_design_path=str(paths["detailed_design_path"].resolve()),
+                    merged_review_path=str(paths["merged_review_path"].resolve()),
+                    passed=True,
+                    cleanup_paths=cleanup_paths,
+                    ba_handoff=result_ba_handoff,
+                    reviewer_handoff=result_reviewer_handoff,
+                )
+
+        raise RuntimeError(f"详细设计评审超过最大轮数 {MAX_DETAILED_DESIGN_REVIEW_ROUNDS}，仍未全部通过")
+    except Exception:
+        _shutdown_workers(
+            active_ba_handoff,
+            reviewer_workers,
+            project_dir=project_dir,
+            cleanup_runtime=False,
+        )
+        raise
+    finally:
+        progress.stop()
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    redirected, launch = maybe_launch_tui(argv, route="design", action="stage.a05.start")
+    if redirected:
+        return int(launch)
+    try:
+        result = run_detailed_design_stage(list(launch))
+    except Exception as error:  # noqa: BLE001
+        message(error)
+        return 1
+
+    message("详细设计完成")
+    message(result.detailed_design_path)
+    message(PLACEHOLDER_NEXT_STEP)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        cleaned_sessions = cleanup_registered_tmux_workers(reason="keyboard_interrupt")
+        if cleaned_sessions:
+            message(f"\n已清理 tmux 会话: {', '.join(cleaned_sessions)}")
+        raise SystemExit(130)

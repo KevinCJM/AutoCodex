@@ -40,7 +40,6 @@ from T02_tmux_agents import (
     is_agent_ready_timeout_error,
     is_provider_auth_error,
     is_worker_death_error,
-    try_resume_worker,
 )
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop
 from T08_pre_development import mark_requirement_clarification_completed
@@ -520,22 +519,13 @@ def run_requirements_clarification(
                         continue
                     raise RuntimeError("需求分析师启动超时，且用户未更换模型") from error
                 if is_worker_death_error(error):
-                    resumed = try_resume_worker(worker, timeout_sec=60.0)
-                    if resumed:
-                        try:
-                            worker.request_kill()
-                        except Exception:
-                            pass
-                        current_resume_existing = current_resume_existing or bool(get_markdown_content(requirements_clear_path).strip())
-                        keep_worker_alive = False
-                        continue
                     if not keep_worker_alive:
                         try:
                             worker.request_kill()
                         except Exception:
                             pass
                     selection = prompt_recreate_requirements_clarification_agent(
-                        reason_text=f"检测到需求分析师已死亡，且 resume 失败: {requirement_name}\n需要更换模型后继续当前阶段。",
+                        reason_text=f"检测到需求分析师已死亡: {requirement_name}\n需要更换模型后继续当前阶段。",
                         requirement_name=requirement_name,
                         current_vendor=current_vendor,
                         current_model=current_model,

@@ -204,22 +204,36 @@ class BridgeProgressMonitor:
         emit_event: Callable[[str, dict[str, Any]], None],
         frame_builder: Callable[[int], str],
         interval_sec: float,
+        action: str = "",
+        stage_seq: int = 0,
     ) -> None:
         self.monitor_id = monitor_id
         self.emit_event = emit_event
         self.frame_builder = frame_builder
         self.interval_sec = interval_sec
+        self.action = str(action or "").strip()
+        self.stage_seq = max(int(stage_seq or 0), 0)
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick = 0
         self._started = False
         self._last_frame = ""
 
+    def _payload(self, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "id": self.monitor_id,
+            "action": self.action,
+            "stage_seq": self.stage_seq,
+        }
+        if extra:
+            payload.update(dict(extra))
+        return payload
+
     def start(self) -> None:
         if self._started:
             return
         self._started = True
-        self.emit_event("progress.start", {"id": self.monitor_id})
+        self.emit_event("progress.start", self._payload())
         self._display_line(self.frame_builder(self._tick))
         self._tick += 1
         self._thread = threading.Thread(target=self._run_loop, name=f"bridge-progress-{self.monitor_id}", daemon=True)
@@ -231,13 +245,13 @@ class BridgeProgressMonitor:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-        self.emit_event("progress.stop", {"id": self.monitor_id})
+        self.emit_event("progress.stop", self._payload())
         self._thread = None
         self._stop_event = threading.Event()
         self._started = False
 
     def _display_line(self, line: str) -> None:
-        self.emit_event("progress.update", {"id": self.monitor_id, "line": line})
+        self.emit_event("progress.update", self._payload({"line": line}))
         self._last_frame = line
 
     def _run_loop(self) -> None:
@@ -259,12 +273,14 @@ class BridgeTerminalUI:
         external_process_runner: Callable[[Sequence[str], str | None, Mapping[str, str] | None], int] | None = None,
         state_change_notifier: Callable[[], None] | None = None,
         stage_change_notifier: Callable[[str], None] | None = None,
+        progress_context_provider: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._emit_event = emit_event
         self._request_prompt = request_prompt
         self._external_process_runner = external_process_runner
         self._state_change_notifier = state_change_notifier
         self._stage_change_notifier = stage_change_notifier
+        self._progress_context_provider = progress_context_provider
 
     def message(self, *objects: object, sep: str = " ", end: str = "\n", flush: bool = False) -> None:
         text = sep.join(str(item) for item in objects) + end
@@ -361,11 +377,14 @@ class BridgeTerminalUI:
         stream: TextIO | None = None,
         interval_sec: float = 0.2,
     ) -> ProgressMonitor:
+        context = dict(self._progress_context_provider() or {}) if self._progress_context_provider is not None else {}
         return BridgeProgressMonitor(
             monitor_id=uuid.uuid4().hex,
             emit_event=self._emit_event,
             frame_builder=frame_builder,
             interval_sec=interval_sec,
+            action=str(context.get("action", "") or "").strip(),
+            stage_seq=int(context.get("stage_seq", 0) or 0),
         )
 
     def attach_external_process(

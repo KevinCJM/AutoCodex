@@ -12,6 +12,31 @@ import sys
 from pathlib import Path
 
 
+def _normalize_required_files(
+        file_paths: list[str | Path] | None,
+        *,
+        excluded_paths: set[Path] | None = None,
+) -> tuple[list[Path], bool]:
+    if file_paths is None:
+        return [], True
+    normalized: list[Path] = []
+    seen: set[Path] = set()
+    excluded = {path.resolve() for path in (excluded_paths or set())}
+    for item in file_paths:
+        candidate = Path(item).expanduser().resolve()
+        if candidate in excluded:
+            return [], False
+        if not candidate.exists() or not candidate.is_file():
+            return [], False
+        if candidate in seen:
+            return [], False
+        seen.add(candidate)
+        normalized.append(candidate)
+    if not normalized:
+        return [], False
+    return normalized, True
+
+
 def _stderr_message(text: object) -> None:
     sys.stderr.write(f"{text}\n")
     sys.stderr.flush()
@@ -22,6 +47,7 @@ def merge_review_records(
         pattern: str = "任务单评审记录_*.md",
         output_name: str = "任务单评审记录.md",
         encoding: str = "utf-8",
+        file_paths: list[str | Path] | None = None,
 ) -> Path:
     """
     将匹配的文件内容纯合并。若无匹配文件，则生成一个空的输出文件。
@@ -33,10 +59,20 @@ def merge_review_records(
     output_path = dir_path / output_name
 
     # 获取并排序匹配的文件
-    files = sorted(
-        f for f in dir_path.glob(pattern)
-        if f.is_file() and f.resolve() != output_path
-    )
+    if file_paths is not None:
+        files, valid = _normalize_required_files(
+            file_paths,
+            excluded_paths={output_path},
+        )
+        if not valid:
+            output_path.write_text("", encoding=encoding)
+            return output_path
+        files = sorted(files)
+    else:
+        files = sorted(
+            f for f in dir_path.glob(pattern)
+            if f.is_file() and f.resolve() != output_path
+        )
 
     # 如果没有任何匹配文件，生成一个彻底的空文件
     if not files:
@@ -98,15 +134,20 @@ def check_all_reviews_passed(
         task_name: str,
         pattern: str = "代码评审记录_*.json",
         encoding: str = "utf-8",
+        json_files: list[str | Path] | None = None,
 ) -> bool:
     """
     检查所有 JSON 文件中，特定 task_name 对应的 review_pass 是否全部为 true。
     """
     dir_path = Path(directory).expanduser().resolve()
-    files = list(dir_path.glob(pattern))
-
-    if not files:
-        return True
+    if json_files is not None:
+        files, valid = _normalize_required_files(json_files)
+        if not valid:
+            return False
+    else:
+        files = list(dir_path.glob(pattern))
+        if not files:
+            return True
 
     def get_task_status(file_path: Path) -> bool:
         try:
@@ -252,13 +293,22 @@ def update_task_to_true(file_path: str | Path, target_key: str, encoding: str = 
 
 
 def task_done(directory, file_path, task_name="M1-T1", json_pattern="代码评审记录_*.json",
-              md_pattern="代码评审记录_*.md", md_output_name="代码评审记录.md"):
+              md_pattern="代码评审记录_*.md", md_output_name="代码评审记录.md",
+              *, json_files: list[str | Path] | None = None, md_files: list[str | Path] | None = None):
+    if json_files is not None:
+        _, valid = _normalize_required_files(json_files)
+        if not valid:
+            return False
+    if md_files is not None:
+        _, valid = _normalize_required_files(md_files)
+        if not valid:
+            return False
     # 合并 各个评审md文件 为 单一评审md文件
-    md_output_file = merge_review_records(directory, md_pattern, md_output_name)
+    md_output_file = merge_review_records(directory, md_pattern, md_output_name, file_paths=md_files)
     # 判断 单一评审md文件 是否为空
     md_bool = is_file_empty(md_output_file)
     # 判断是否所有评审json文件全部是通过
-    json_bool = check_all_reviews_passed(directory, task_name, json_pattern)
+    json_bool = check_all_reviews_passed(directory, task_name, json_pattern, json_files=json_files)
     if md_bool and json_bool:
         # 如果所有的 md 和 json 都为通过, 则更新该任务为通过
         update_task_to_true(file_path, target_key=task_name)

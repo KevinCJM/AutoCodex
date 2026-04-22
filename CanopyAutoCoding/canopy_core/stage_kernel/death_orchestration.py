@@ -1,0 +1,172 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Callable, Sequence, TypeVar
+
+from canopy_core.runtime.tmux_runtime import DEFAULT_COMMAND_TIMEOUT_SEC
+from canopy_core.stage_kernel.role_orchestration import ensure_main_ready, ensure_reviewers_ready
+
+TMain = TypeVar("TMain")
+TReviewer = TypeVar("TReviewer")
+TResult = TypeVar("TResult")
+
+
+def _resolve_worker(owner: object | None):
+    if owner is None:
+        return None
+    worker = getattr(owner, "worker", None)
+    return worker if worker is not None else owner
+
+
+def _state_name(worker: object | None) -> str:
+    if worker is None:
+        return ""
+    get_state = getattr(worker, "get_agent_state", None)
+    if not callable(get_state):
+        return ""
+    state = get_state()
+    return str(getattr(state, "value", state) or "").strip().upper()
+
+
+def _is_dead(owner: object | None) -> bool:
+    worker = _resolve_worker(owner)
+    return _has_ever_launched(worker) and _state_name(worker) == "DEAD"
+
+
+def _has_ever_launched(worker: object | None) -> bool:
+    if worker is None:
+        return False
+    has_ever_launched = getattr(worker, "has_ever_launched", None)
+    if callable(has_ever_launched):
+        try:
+            return bool(has_ever_launched())
+        except Exception:
+            return False
+    if bool(getattr(worker, "agent_started", False)):
+        return True
+    if str(getattr(worker, "pane_id", "") or "").strip():
+        return True
+    state_path = getattr(worker, "state_path", None)
+    if state_path is None:
+        return True
+    try:
+        return Path(state_path).expanduser().exists()
+    except Exception:
+        return False
+
+
+def drop_dead_reviewers(
+    reviewers: Sequence[TReviewer],
+    *,
+    reviewer_label_getter: Callable[[TReviewer, int], str] | None = None,
+    notify: Callable[[str], None] | None = None,
+) -> list[TReviewer]:
+    survivors: list[TReviewer] = []
+    for index, reviewer in enumerate(reviewers, start=1):
+        if not _is_dead(reviewer):
+            survivors.append(reviewer)
+            continue
+        if notify is not None:
+            label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
+            notify(f"{label} 已死亡，后续将忽略该审核智能体。")
+    return survivors
+
+
+def replace_dead_main(
+    main_owner: TMain,
+    *,
+    replace_owner: Callable[[TMain], TMain],
+) -> TMain:
+    if not _is_dead(main_owner):
+        return main_owner
+    return replace_owner(main_owner)
+
+
+def run_main_phase_with_death_handling(
+    main_owner: TMain,
+    *,
+    reviewers: Sequence[TReviewer] = (),
+    run_phase: Callable[[TMain], TResult],
+    replace_dead_main_owner: Callable[[TMain], TMain],
+    owner_getter: Callable[[TResult], TMain] | None = None,
+    main_label: str = "主工作智能体",
+    reviewer_label_getter: Callable[[TReviewer, int], str] | None = None,
+    notify: Callable[[str], None] | None = None,
+    timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
+) -> tuple[TResult, list[TReviewer], TMain]:
+    current_main = replace_dead_main(main_owner, replace_owner=replace_dead_main_owner)
+    current_reviewers = drop_dead_reviewers(
+        reviewers,
+        reviewer_label_getter=reviewer_label_getter,
+        notify=notify,
+    )
+    ensure_main_ready(
+        current_main,
+        current_reviewers,
+        main_label=main_label,
+        reviewer_label_getter=reviewer_label_getter,
+        timeout_sec=timeout_sec,
+    )
+    result = run_phase(current_main)
+    updated_main = owner_getter(result) if owner_getter is not None else result
+    updated_main = replace_dead_main(updated_main, replace_owner=replace_dead_main_owner)
+    current_reviewers = drop_dead_reviewers(
+        current_reviewers,
+        reviewer_label_getter=reviewer_label_getter,
+        notify=notify,
+    )
+    ensure_main_ready(
+        updated_main,
+        current_reviewers,
+        main_label=main_label,
+        reviewer_label_getter=reviewer_label_getter,
+        timeout_sec=timeout_sec,
+    )
+    return result, current_reviewers, updated_main
+
+
+def run_reviewer_phase_with_death_handling(
+    main_owner: TMain,
+    reviewers: Sequence[TReviewer],
+    *,
+    run_phase: Callable[[Sequence[TReviewer]], list[TReviewer]],
+    replace_dead_main_owner: Callable[[TMain], TMain],
+    main_label: str = "主工作智能体",
+    reviewer_label_getter: Callable[[TReviewer, int], str] | None = None,
+    notify: Callable[[str], None] | None = None,
+    timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
+) -> tuple[list[TReviewer], TMain]:
+    current_main = replace_dead_main(main_owner, replace_owner=replace_dead_main_owner)
+    current_reviewers = drop_dead_reviewers(
+        reviewers,
+        reviewer_label_getter=reviewer_label_getter,
+        notify=notify,
+    )
+    ensure_reviewers_ready(
+        current_main,
+        current_reviewers,
+        main_label=main_label,
+        reviewer_label_getter=reviewer_label_getter,
+        timeout_sec=timeout_sec,
+    )
+    updated_reviewers = run_phase(current_reviewers)
+    current_main = replace_dead_main(current_main, replace_owner=replace_dead_main_owner)
+    updated_reviewers = drop_dead_reviewers(
+        updated_reviewers,
+        reviewer_label_getter=reviewer_label_getter,
+        notify=notify,
+    )
+    ensure_reviewers_ready(
+        current_main,
+        updated_reviewers,
+        main_label=main_label,
+        reviewer_label_getter=reviewer_label_getter,
+        timeout_sec=timeout_sec,
+    )
+    return updated_reviewers, current_main
+
+
+def ensure_active_reviewers(reviewers: Sequence[object], *, stage_label: str) -> None:
+    if reviewers:
+        return
+    raise RuntimeError(f"{stage_label} 的审核智能体已全部死亡，无法继续当前阶段。")

@@ -24,6 +24,7 @@ from Prompt_02_RequirementIntake import (
     NOTION_STATUS_SCHEMA_VERSION,
     get_notion_requirement,
 )
+from A01_Routing_LayerPlanning import DEFAULT_MODEL_BY_VENDOR, prompt_effort, prompt_model, prompt_vendor
 from T01_tools import get_markdown_content
 from T02_tmux_agents import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -391,20 +392,53 @@ def render_agent_boot_progress_line(*, tick: int) -> str:
     return f"{spinner} 智能体启动中..."
 
 
+def prompt_recreate_notion_reader_selection(
+    *,
+    current_vendor: str,
+    current_model: str,
+    current_reasoning_effort: str,
+) -> tuple[str, str, str]:
+    if not stdin_is_interactive():
+        raise RuntimeError("Notion 需求录入智能体已死亡，且当前无法交互式重选模型。")
+    while True:
+        vendor = prompt_vendor(current_vendor, role_label="Notion 临时智能体")
+        model = prompt_model(
+            vendor,
+            current_model if vendor == current_vendor else DEFAULT_MODEL_BY_VENDOR[vendor],
+            role_label="Notion 临时智能体",
+        )
+        reasoning_effort = prompt_effort(
+            vendor,
+            model,
+            current_reasoning_effort,
+            role_label="Notion 临时智能体",
+        )
+        if vendor != current_vendor or model != current_model:
+            return vendor, model, reasoning_effort
+        message("新的智能体必须切换 vendor 或 model。")
+
+
 def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name: str) -> InputReadResult:
     project_root = resolve_existing_directory(project_dir)
     runtime_root = project_root / NOTION_RUNTIME_ROOT_NAME
     output_path, question_path, record_path = build_notion_hitl_paths(project_root, requirement_name)
-    worker = TmuxBatchWorker(
-        worker_id="requirements-notion-reader",
-        work_dir=project_root,
-        config=AgentRunConfig(
-            vendor="codex",
-            model=DEFAULT_NOTION_MODEL,
-            reasoning_effort=DEFAULT_NOTION_EFFORT,
-        ),
-        runtime_root=runtime_root,
-    )
+    current_vendor = "codex"
+    current_model = DEFAULT_NOTION_MODEL
+    current_reasoning_effort = DEFAULT_NOTION_EFFORT
+
+    def create_worker() -> TmuxBatchWorker:
+        return TmuxBatchWorker(
+            worker_id="requirements-notion-reader",
+            work_dir=project_root,
+            config=AgentRunConfig(
+                vendor=current_vendor,
+                model=current_model,
+                reasoning_effort=current_reasoning_effort,
+            ),
+            runtime_root=runtime_root,
+        )
+
+    worker = create_worker()
     runtime_dir = worker.runtime_dir
     stage_status_path = runtime_dir / "notion_status.json"
     turns_root = runtime_dir / "turns"
@@ -456,6 +490,21 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
         stop_boot_progress()
         message(render_notion_tmux_start_summary(live_worker))
 
+    def replace_dead_worker(current_worker: TmuxBatchWorker, error: BaseException) -> TmuxBatchWorker:
+        nonlocal worker, current_vendor, current_model, current_reasoning_effort
+        try:
+            current_worker.request_kill()
+        except Exception:
+            pass
+        current_vendor, current_model, current_reasoning_effort = prompt_recreate_notion_reader_selection(
+            current_vendor=current_vendor,
+            current_model=current_model,
+            current_reasoning_effort=current_reasoning_effort,
+        )
+        message(f"Notion 临时智能体已死亡，准备重建: {error}")
+        worker = create_worker()
+        return worker
+
     def initial_prompt_builder(context: HitlPromptContext) -> str:
         return get_notion_requirement(
             notion_url,
@@ -490,6 +539,7 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
                 on_worker_started=handle_worker_started,
                 on_agent_turn_started=lambda context, live_worker: start_progress(),
                 on_agent_turn_finished=lambda context, live_worker: stop_progress(),
+                replace_dead_worker=replace_dead_worker,
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
             )
         except RuntimeError as error:
