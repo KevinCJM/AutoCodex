@@ -221,7 +221,7 @@ def state_machine_output(task_title, review_md='代码评审记录_AgentName.md'
 
 
 # [主智能体] 通用输出与交互协议
-def main_agent_workflow_after_review(hitl_record_md=None,
+def main_agent_workflow_after_review(*, hitl_record_md=None,
                                      ask_human_md='name_与人类交流.md',
                                      what_just_change='name_需求分析师反馈.md'):
     # 有人类反馈信息

@@ -1297,7 +1297,7 @@ def prepare_live_workers(
             workflow_stage="pending",
             workflow_round=0,
             result_status="pending",
-            agent_state=AgentRuntimeState.DEAD.value,
+            agent_state=AgentRuntimeState.STARTING.value,
             agent_alive=False,
             agent_started=False,
             recoverable=True,

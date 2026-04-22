@@ -11,9 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from T04_common_prompt import (
-    main_agent_workflow_after_review, task_start_prompt, state_machine_output
-)
+from T04_common_prompt import main_agent_workflow_after_review, task_start_prompt, state_machine_output
 from Prompt_03_RequirementsClarification import output_protocol, fintech_ba
 
 # [审核器] 人格定位提示词 (系统设置的智能体,仅用于需求澄清)
@@ -159,8 +157,8 @@ def requirements_review_init(auditor_desc=auditor, init_prompt=task_start_prompt
 def review_feedback(review_msg, *, original_requirement_md='name_原始需求.md',
                     ask_human_md='name_与人类交流.md', hitl_record_md='name_人机交互澄清记录.md',
                     requirements_clear_md='name_需求澄清.md', what_just_change='name_需求分析师反馈.md'):
-    main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(hitl_record_md,
-                                                                               ask_human_md)
+    main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(hitl_record_md=hitl_record_md,
+                                                                               ask_human_md=ask_human_md)
     review_feedback_prompt = f"""## 任务背景
 审计员已基于《{original_requirement_md}》+《{hitl_record_md}》对比了你的《{requirements_clear_md}》。
 你需要对这些审计员提出的评审意见进行鉴定、修复，并在信息不足时向人类发起求助。

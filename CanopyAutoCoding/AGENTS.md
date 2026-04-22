@@ -1,11 +1,11 @@
 # Purpose
-Strict routing protocol for downstream agents operating inside this subtree only.
+Strict machine-first routing protocol for downstream agents inside this subtree only.
 
 # Scope Boundary
-- Treat `.` as the full visible project boundary for routing.
-- Do not route to parent paths or infer parent-level structure.
-- Mark unresolved external links as `out_of_scope`, `unknown`, or `needs_code_confirmation`.
-- Treat routing JSON as navigation hints; code, tests, and configs remain implementation truth.
+- Treat `.` as the full visible boundary.
+- Never route to parent paths or infer parent-level structure.
+- Mark unresolved edges as `out_of_scope`, `unknown`, or `needs_code_confirmation`.
+- Use code, tests, and configs as implementation truth; routing files are navigation only.
 
 # Required Read Order
 1. `AGENTS.md`
@@ -17,43 +17,38 @@ Strict routing protocol for downstream agents operating inside this subtree only
 7. visible tests/configs before edit
 
 # Hard Rules
-- Keep module facts only in `docs/repo_map.json`.
-- Keep task-routing facts only in `docs/task_routes.json`.
-- Keep pitfall facts only in `docs/pitfalls.json`.
-- Do not use terminal prose as completion truth when file contracts exist.
-- Do not infer active stage targets from legacy filenames; confirm imports/callers first.
-- 未经用户明确允许，禁止修改业务提示词文件。你是做系统实现的，不负责擅自调整提示词。
-- 默认禁止修改以下文件：
-  - `Prompt_01_RoutingLayerPlanning.py`
-  - `Prompt_02_RequirementIntake.py`
-  - `Prompt_03_RequirementsClarification.py`
-  - `Prompt_04_RequirementsReview.py`
-  - `Prompt_05_DetailedDesign.py`
-  - `Prompt_06_TaskSplit.py`
-  - `Prompt_07_Development.py`
+- `HR01_module_facts_only`: Keep module facts only in `docs/repo_map.json`.
+- `HR02_task_routes_only`: Keep task-routing facts only in `docs/task_routes.json`.
+- `HR03_pitfalls_only`: Keep pitfall facts only in `docs/pitfalls.json`.
+- `HR04_subtree_only`: Do not infer anything outside the current subtree.
+- `HR05_prompt_files_protected`: 未经用户明确允许，禁止修改业务提示词文件。
+- `HR06_vendor_tree_read_only`: 禁止修改 `packages/tui/node_modules/**`.
+- `HR07_trace_alias_before_edit`: Do not treat top-level alias files as implementation truth before tracing imports.
+- `HR08_relations_graph_only`: Interpret module links only from `docs/repo_map.json` `relations[]`; each relation points from the current module to the target module.
+- `HR09_route_merge_contract`: Expand derived route fields only by `docs/task_routes.json` `resolution_model`.
 
 # Default Operating Sequence
 1. Match the task in `docs/task_routes.json`.
-2. Read referenced module entries in `docs/repo_map.json`.
-3. Read linked pitfall entries in `docs/pitfalls.json`.
-4. Re-check active code, tests, configs, and caller/callee links.
+2. Read referenced modules in `docs/repo_map.json`.
+3. Read linked pitfalls in `docs/pitfalls.json`.
+4. Re-check active code, callers/callees, tests, and configs.
 5. Edit the smallest confirmed in-scope surface.
-6. Run the listed minimum visible regression.
-7. Report unknowns and out-of-scope edges explicitly.
+6. Run the listed `minimum_regression`.
+7. Report `unknown` and `out_of_scope` edges explicitly.
 
 # Edit Safety Rules
-- Before editing shared runtime, widen reads to all directly linked modules in `repo_map.json`.
-- Before editing stage files, check matching prompt/support files from `then_check_files`.
-- Before editing HITL or cleanup logic, confirm artifact paths, hashes, and reuse behavior.
-- Do not edit vendored files under `packages/tui/node_modules`.
+- Before editing shared workflow, bridge, or runtime code, widen reads to all directly linked modules.
+- Before editing stage code, confirm the current imported stage target and its prompt/support companions.
+- Before editing HITL, cleanup, or reuse logic, confirm artifact paths, hashes, runtime dirs, and resume behavior.
+- Do not use terminal prose as completion truth when file contracts exist.
 
 # Verification Rules
 - Prefer visible tests listed in `minimum_regression`.
-- If tests use legacy stage names, confirm the active target file before editing.
-- If no direct test is visible, state the gap and verify callers/callees manually.
-- Re-check schema/protocol writers and validators before changing completion logic.
+- If tests use legacy names or wrappers, confirm the active package target first.
+- Re-check schema writers, protocol writers, and validators before changing completion logic.
+- If no direct visible test exists, state the gap and verify imports and call chains manually.
 
 # Output Discipline
-- Keep new routing facts in the JSON files only.
-- Do not add parallel human-oriented routing documents.
-- Keep execution notes short and path-specific.
+- Keep routing facts only in the three JSON files.
+- Do not add parallel descriptive routing documents.
+- Keep notes short and path-specific.
