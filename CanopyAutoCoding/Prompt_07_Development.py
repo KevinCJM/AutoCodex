@@ -31,7 +31,7 @@ director_role = f"""你是一个【全栈工程与业务逻辑对齐审计器 (F
 
 # 初始化 [开发工程师]
 def init_developer(develop_role, init_prompt=task_start_prompt,
-                   ask_human_md='name_向人类提问.md',
+                   ask_human_md='name_与人类交流.md',
                    hitl_record_md='name_人机交互澄清记录.md',
                    requirements_clear_md='name_需求澄清.md',
                    detailed_design_md='name_详细设计.md',
@@ -89,7 +89,7 @@ def init_developer(develop_role, init_prompt=task_start_prompt,
 
 
 # 人类回馈后 [开发工程师] 继续
-def human_reply(human_msg, ask_human_md='name_向人类提问.md',
+def human_reply(human_msg, ask_human_md='name_与人类交流.md',
                 hitl_record_md='name_人机交互澄清记录.md',
                 requirements_clear_md='name_需求澄清.md',
                 detailed_design_md='name_详细设计.md',
@@ -155,9 +155,9 @@ def human_reply(human_msg, ask_human_md='name_向人类提问.md',
 
 
 # 用 [开发工程师] 智能体进行开发
-def start_develop(task_title, hitl_record_md='人机交互澄清记录.md',
-                  requirements_clear_md='需求澄清.md', detailed_design_md='详细设计.md',
-                  task_split_md='任务单.md', what_just_dev='工程师开发内容.md',
+def start_develop(task_title, hitl_record_md='name_人机交互澄清记录.md',
+                  requirements_clear_md='name_需求澄清.md', detailed_design_md='name_详细设计.md',
+                  task_split_md='name_任务单.md', what_just_dev='name_工程师开发内容.md',
                   sub_agent_num=0):
     if sub_agent_num > 0:
         sub_agent_prompt = f"用{sub_agent_num}个subagent审核刚刚开发的代码, 检查是否与需求对齐, 是否与任务描述一致, 检查是否存在逻辑错误。"
@@ -390,7 +390,7 @@ if __name__ == '__main__':
 
     # 1) 初始化开发智能体
     # print(init_developer(fintech_developer_role, init_prompt=task_start_prompt,
-    #                      ask_human_md=f'{requirement_name}_向人类提问.md',
+    #                      ask_human_md=f'{requirement_name}_与人类交流.md',
     #                      hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
     #                      requirements_clear_md=f'{requirement_name}_需求澄清.md',
     #                      detailed_design_md=f'{requirement_name}_详细设计.md',
@@ -403,11 +403,11 @@ if __name__ == '__main__':
     #                          detailed_design_md=f'{requirement_name}_详细设计.md',
     #                          task_split_md=f'{requirement_name}_任务单.md'))
 
-    #     if not is_file_empty(Path(f"{the_dir}/{requirement_name}_向人类提问.md")):
+    #     if not is_file_empty(Path(f"{the_dir}/{requirement_name}_与人类交流.md")):
     #         human_msg = """1) 本地测试的时候 pyproject.toml 里面写 priority = "supplemental"
     # 2) /Users/chenjunming/Desktop/canopy-api-v3/data/translations 只是占位, 生产环境有真实翻译数据, 不影响新指标开发
     #         """
-    #         print(human_reply(human_msg, ask_human_md=f'{requirement_name}_向人类提问.md',
+    #         print(human_reply(human_msg, ask_human_md=f'{requirement_name}_与人类交流.md',
     #                           hitl_record_md=f'{requirement_name}_人机交互澄清记录.md',
     #                           requirements_clear_md=f'{requirement_name}_需求澄清.md',
     #                           detailed_design_md=f'{requirement_name}_详细设计.md',

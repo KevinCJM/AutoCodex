@@ -65,8 +65,9 @@ def task_split(task_md='name_任务单.md', detail_design_md='name_详细设计.
 3. 针对每个里程碑，进行原子化任务拆解。
 4. 进行自检：是否每个任务单拿出来，一个初级开发都能在不看原需求的情况下直接开工？
 
-## 输出协议 (Strict)
-- 直接返回字符串 `完成`，禁止任何其他文字返回。"""
+## 约束
+- 禁止修改除了《{task_md}》以外的任何文档与源代码;
+- 直接返回字符串 `完成`，禁止返回任何其他文字。"""
     return task_split_prompt
 
 
@@ -161,9 +162,10 @@ def modify_task(review_msg, *,
 
 {main_agent_workflow_after_review_prompt}
 
-## 禁令
-- 禁止修改源代码, 禁止修改除了《{what_just_change}》/《{task_md}》/《{ask_human_md}》之外的文档。
-- 如果触发 `HITL`, 则一定要写《{ask_human_md}》。
+## 约束
+- 禁止修改源代码, 禁止修改除了《{what_just_change}》/《{task_md}》/《{ask_human_md}》之外的文档;
+- 如果返回 `HITL`, 则《{ask_human_md}》一定不为空, 必须要写;
+- 如果返回 `修改完成`, 则《{ask_human_md}》一定为空, 必须清空;
 - 只能输出 `HITL` 或 `修改完成`。"""
     return modify_task_prompt
 
