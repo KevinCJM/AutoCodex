@@ -91,6 +91,7 @@ until code verification is complete.
 
 **Output the Task Routing Assessment first, before reading implementation code.**"""
 
+
 def build_turn_status_contract_prompt(
         *,
         turn_status_path: str | Path,
@@ -181,8 +182,8 @@ def build_hitl_status_contract_prompt(
 
 
 # [审核智能体] 通用输出与交互协议
-def state_machine_output(task_title, review_md='代码评审记录_AgentName.md',
-                         review_json='评审记录_AgentName.json',
+def state_machine_output(task_title, review_md='name_代码评审记录_AgentName.md',
+                         review_json='name_评审记录_AgentName.json',
                          pass_condition="代码逻辑无瑕疵，完全对齐需求与设计。",
                          blocked_condition="发现逻辑错误、需求遗漏、架构分歧或潜在隐患。"):
     """
@@ -222,10 +223,10 @@ def state_machine_output(task_title, review_md='代码评审记录_AgentName.md'
 
 # [主智能体] 通用输出与交互协议
 def main_agent_workflow_after_review(*, hitl_record_md=None,
-                                     ask_human_md='name_与人类交流.md',
+                                     ask_human_md=None,
                                      what_just_change='name_需求分析师反馈.md'):
-    # 有人类反馈信息
-    if hitl_record_md:
+    # 有人类反馈信息, 需要人类反馈
+    if hitl_record_md and ask_human_md:
         main_agent_output_prompt = f"""## Workflow (SOP)
 
 ### Step 1: 解析与过滤 (Parse & Filter)
@@ -288,8 +289,8 @@ HITL
 ```text
 修改完成
 ```"""
-    # 无人类反馈信息
-    else:
+    # 无人类反馈信息, 但是需要人类反馈
+    elif ask_human_md:
         main_agent_output_prompt = f"""## Workflow (SOP)
 
 ### Step 1: 审计项预处理 (Deduplication & Pre-processing)
@@ -324,6 +325,35 @@ HITL
 ```
 
 #### 路径 B: [内部闭环反馈] (所有评审项均可依靠现有信息解决)
+1. 修复 [属实问题]
+2. 在《{what_just_change}》中说明修复了哪些 [属实问题], 驳回 [误判问题], 以及对 [待决疑问/歧义] 的答复.
+    - 要求：AI-to-AI 友好，高信息密度，禁止任何修饰性词汇。
+    - 写入格式 (Metadata Block)：
+```md
+- [属实问题]: 说明修复了哪些属实的问题以及改了哪里
+- [误判问题]: 明确反驳理由
+- [待决疑问/歧义]: 答复疑问和裁决歧义
+```
+3. 输出：
+```text
+修改完成
+```"""
+    # 无人类反馈信息, 无需人类反馈
+    else:
+        main_agent_output_prompt = f"""## Workflow (SOP)
+
+### Step 1: 审计项预处理 (Deduplication & Pre-processing)
+在执行修复前，你需要先完成：
+1. **语义去重**：扫描原始审核记录，将不同审核员针对同一逻辑点、同一代码的重复问题描述合并为单一审计项。
+2. **冲突消解**：若不同审核员的意见存在矛盾，必须基于已有文档记录和代码事实进行判定，并在元数据中记录你的取舍理由。
+
+### Step 2: 评审意见解析与定性 (Parse & Categorize)
+逐条分析, 并将其归类为：
+1. **[属实问题]**：确实存在的逻辑漏洞、边界遗漏、与原始约束冲突、或其他属实的问题。
+2. **[误判问题]**：审计员理解有误，实际上不是问题, 并分析驳回理由。
+3. **[待决疑问/歧义]**：如果存在多种业务解释分支或者疑问点。需要根据已有文档详细做出业务逻辑决断。
+
+### Step 3: 状态路由与输出 (State Routing & Output)
 1. 修复 [属实问题]
 2. 在《{what_just_change}》中说明修复了哪些 [属实问题], 驳回 [误判问题], 以及对 [待决疑问/歧义] 的答复.
     - 要求：AI-to-AI 友好，高信息密度，禁止任何修饰性词汇。

@@ -148,9 +148,8 @@ def review_task(agent_desc, task_name='任务拆分', *, original_requirement_md
 
 # [需求分析师] 根据评审文档优化详细设计
 def modify_task(review_msg, *,
-                task_md='name_任务单.md', ask_human_md='name_与人类交流.md', what_just_change='name_需求分析师反馈.md'):
-    main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(ask_human_md=ask_human_md,
-                                                                               what_just_change=what_just_change)
+                task_md='name_任务单.md', what_just_change='name_需求分析师反馈.md'):
+    main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(what_just_change=what_just_change)
     modify_task_prompt = f"""## 任务背景
 审计员审核了任务单《{task_md}》。你需要对这些审计员提出的评审意见进行鉴定、修复，并在信息不足时向人类发起求助。
 
@@ -163,10 +162,8 @@ def modify_task(review_msg, *,
 {main_agent_workflow_after_review_prompt}
 
 ## 约束
-- 禁止修改源代码, 禁止修改除了《{what_just_change}》/《{task_md}》/《{ask_human_md}》之外的文档;
-- 如果返回 `HITL`, 则《{ask_human_md}》一定不为空, 必须要写;
-- 如果返回 `修改完成`, 则《{ask_human_md}》一定为空, 必须清空;
-- 只能输出 `HITL` 或 `修改完成`。"""
+- 禁止修改源代码, 禁止修改除了《{what_just_change}》/《{task_md}》之外的文档;
+- 只能输出 `修改完成`。"""
     return modify_task_prompt
 
 
