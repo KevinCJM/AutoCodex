@@ -15,20 +15,23 @@ import os
 import re
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
 import weakref
+import contextlib
 from datetime import datetime
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 from contextlib import contextmanager
 from urllib.parse import urlparse
 from canopy_core.runtime.vendor_catalog import LaunchResolution, resolve_launch
 from canopy_core.runtime.contracts import (
+    TASK_RESULT_READY,
     TASK_STATUS_DONE,
     TASK_STATUS_RUNNING,
     TaskResultContract,
@@ -47,8 +50,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / ".agent_init_runtime"
 DEFAULT_COMMAND_TIMEOUT_SEC = 60 * 20
 DEFAULT_PROXY_HOST = "127.0.0.1"
+SESSION_NAME_CREATE_MAX_RETRIES = 8
 TERMINAL_ACTIVITY_IDLE_WINDOW_SEC = 1.5
 TURN_ARTIFACT_POST_DONE_GRACE_SEC = 10.0
+TASK_RESULT_POST_DONE_GRACE_SEC = 10.0
 WORKER_DEATH_ERROR_MARKERS = (
     "tmux pane died",
     "tmux pane exited",
@@ -69,6 +74,7 @@ AGENT_READY_TIMEOUT_ERROR_MARKERS = (
     "timed out waiting for agent ready",
 )
 TURN_ARTIFACT_CONTRACT_ERROR_PREFIX = "turn artifacts contract violation after task completion"
+TASK_RESULT_CONTRACT_ERROR_PREFIX = "task result contract violation after task completion"
 TIMEOUT_EXIT_CODE = -1
 GENERIC_ERROR_EXIT_CODE = 1
 PROXY_ENV_KEYS = (
@@ -157,6 +163,19 @@ OPENCODE_BOOTING_PATTERNS = (
     r"Performing one time database migration",
     r"Database migration complete",
 )
+OPENCODE_WAITING_INPUT_COMPACT_PATTERNS = (
+    r"askanything\.\.\.",
+)
+OPENCODE_IDLE_READY_COMPACT_PATTERNS = (
+    r"ctrl\+pcommands",
+)
+OPENCODE_PROCESSING_COMPACT_PATTERNS = (
+    r"escinterrupt",
+)
+OPENCODE_BOOTING_COMPACT_PATTERNS = (
+    r"performingonetimedatabasemigration",
+    r"databasemigrationcomplete",
+)
 OPENCODE_FOOTER_PATTERNS = (
     r"ctrl\+p commands$",
     r"^tab agents\b",
@@ -222,6 +241,17 @@ _LIVE_WORKERS: "weakref.WeakSet[TmuxBatchWorker]" = weakref.WeakSet()
 _LIVE_WORKERS_LOCK = threading.RLock()
 _RESERVED_SESSION_NAMES: set[str] = set()
 _RESERVED_SESSION_NAMES_LOCK = threading.RLock()
+_SESSION_NAME_LEASE_ROOT = Path(tempfile.gettempdir()) / (
+    f"canopy-tmux-session-leases-{getattr(os, 'getuid', lambda: 0)()}"
+)
+_SESSION_NAME_LEASE_LOCK_PATH = _SESSION_NAME_LEASE_ROOT / ".lock"
+_SESSION_NAME_LEASE_PROCESS_LOCK = threading.RLock()
+_SESSION_NAME_LEASE_LOCK_DEPTH = 0
+TMUX_IDENTITY_RUNTIME_DIR_OPTION = "@canopy_runtime_dir"
+TMUX_IDENTITY_WORK_DIR_OPTION = "@canopy_work_dir"
+TMUX_IDENTITY_REQUIREMENT_NAME_OPTION = "@canopy_requirement_name"
+TMUX_IDENTITY_WORKFLOW_ACTION_OPTION = "@canopy_workflow_action"
+TMUX_IDENTITY_WORKER_ID_OPTION = "@canopy_worker_id"
 SESSION_CONSTELLATION_NAMES: tuple[str, ...] = (
     "角木蛟",
     "亢金龙",
@@ -337,6 +367,12 @@ _SESSION_ROLE_REVIEWER_RE = re.compile(r"^requirements-review-r(\d+)$")
 _SESSION_ROLE_DETAILED_DESIGN_REVIEWER_RE = re.compile(r"^detailed-design-review-(.+)$")
 _SESSION_ROLE_TASK_SPLIT_REVIEWER_RE = re.compile(r"^task-split-review-(.+)$")
 _SESSION_ROLE_DEVELOPMENT_REVIEWER_RE = re.compile(r"^development-review-(.+)$")
+_DUPLICATE_SESSION_ERROR_MARKERS = (
+    "duplicate session",
+    "session already exists",
+    "session exists",
+    "already exists",
+)
 
 
 class Vendor(str, Enum):
@@ -389,6 +425,129 @@ def _register_live_worker(worker: "TmuxBatchWorker") -> None:
 def list_registered_tmux_workers() -> list["TmuxBatchWorker"]:
     with _LIVE_WORKERS_LOCK:
         return list(_LIVE_WORKERS)
+
+
+def list_tmux_session_names(*, backend: Any | None = None) -> tuple[str, ...]:
+    runtime_backend = backend or TmuxBackend()
+    return tuple(sorted(_list_backend_session_names(runtime_backend)))
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def _session_name_lease_path(session_name: str) -> Path:
+    digest = hashlib.sha1(str(session_name).encode("utf-8")).hexdigest()
+    return _SESSION_NAME_LEASE_ROOT / f"{digest}.json"
+
+
+@contextmanager
+def _session_name_lease_lock():
+    global _SESSION_NAME_LEASE_LOCK_DEPTH
+    with _SESSION_NAME_LEASE_PROCESS_LOCK:
+        if _SESSION_NAME_LEASE_LOCK_DEPTH > 0:
+            _SESSION_NAME_LEASE_LOCK_DEPTH += 1
+            try:
+                yield
+            finally:
+                _SESSION_NAME_LEASE_LOCK_DEPTH -= 1
+            return
+        _SESSION_NAME_LEASE_ROOT.mkdir(parents=True, exist_ok=True)
+        _SESSION_NAME_LEASE_LOCK_PATH.touch(exist_ok=True)
+        with _SESSION_NAME_LEASE_LOCK_PATH.open("r+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            _SESSION_NAME_LEASE_LOCK_DEPTH = 1
+            try:
+                yield
+            finally:
+                _SESSION_NAME_LEASE_LOCK_DEPTH = 0
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _read_session_name_lease(path: Path) -> dict[str, object] | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _active_session_name_leases_locked() -> set[str]:
+    active: set[str] = set()
+    if not _SESSION_NAME_LEASE_ROOT.exists():
+        return active
+    for lease_path in _SESSION_NAME_LEASE_ROOT.glob("*.json"):
+        payload = _read_session_name_lease(lease_path)
+        if payload is None:
+            with contextlib.suppress(Exception):
+                lease_path.unlink()
+            continue
+        session_name = str(payload.get("session_name", "")).strip()
+        owner_pid = int(payload.get("owner_pid", 0) or 0)
+        if not session_name:
+            with contextlib.suppress(Exception):
+                lease_path.unlink()
+            continue
+        if owner_pid and not _pid_exists(owner_pid):
+            with contextlib.suppress(Exception):
+                lease_path.unlink()
+            continue
+        active.add(session_name)
+    return active
+
+
+def _write_session_name_lease_locked(*, session_name: str, worker_id: str, work_dir: str | Path) -> None:
+    lease_path = _session_name_lease_path(session_name)
+    _atomic_write_json(
+        lease_path,
+        {
+            "session_name": session_name,
+            "worker_id": str(worker_id or "").strip(),
+            "work_dir": str(Path(work_dir).expanduser().resolve()),
+            "owner_pid": os.getpid(),
+            "created_at": _now_iso(),
+        },
+    )
+
+
+def _release_session_name_lease_locked(session_name: str) -> None:
+    session_name_text = str(session_name or "").strip()
+    if not session_name_text:
+        return
+    lease_path = _session_name_lease_path(session_name_text)
+    if not lease_path.exists():
+        return
+    payload = _read_session_name_lease(lease_path)
+    if payload is not None and str(payload.get("session_name", "")).strip() != session_name_text:
+        return
+    with contextlib.suppress(Exception):
+        lease_path.unlink()
+
+
+def list_occupied_tmux_session_names(
+        *,
+        backend: Any | None = None,
+        additional_session_names: Sequence[str] = (),
+) -> tuple[str, ...]:
+    occupied = {str(name).strip() for name in additional_session_names if str(name).strip()}
+    occupied.update(_list_backend_session_names(backend))
+    with _session_name_lease_lock():
+        occupied.update(_active_session_name_leases_locked())
+    for worker in list_registered_tmux_workers():
+        session_name = str(getattr(worker, "session_name", "") or "").strip()
+        if session_name:
+            occupied.add(session_name)
+    return tuple(sorted(occupied))
 
 
 def cleanup_registered_tmux_workers(*, reason: str = "process_exit") -> list[str]:
@@ -493,6 +652,12 @@ class TmuxBackend:
 
     def display_message(self, target: str, expression: str) -> str:
         return self.run("display-message", "-p", "-t", target, expression).stdout.strip()
+
+    def show_option(self, target: str, option_name: str) -> str:
+        result = self.run("show-options", "-qv", "-t", target, option_name, check=False)
+        if result.returncode != 0:
+            return ""
+        return result.stdout.strip()
 
     def capture_visible(self, target: str, *, tail_lines: int = 500) -> str:
         return self.run(
@@ -631,6 +796,33 @@ class TmuxRuntimeController:
     def session_exists(self, session_name: str) -> bool:
         return bool(session_name) and self.backend.has_session(session_name)
 
+    def session_matches_context(
+        self,
+        session_name: str,
+        *,
+        runtime_dir: str | Path = "",
+        work_dir: str | Path = "",
+        requirement_name: str = "",
+        workflow_action: str = "",
+    ) -> bool:
+        return _tmux_session_matches_context(
+            self.backend,
+            session_name,
+            runtime_dir=runtime_dir,
+            work_dir=work_dir,
+            requirement_name=requirement_name,
+            workflow_action=workflow_action,
+        )
+
+    def session_matches_worker_state(self, session_name: str, state: Mapping[str, Any], state_path: str | Path) -> bool:
+        return self.session_matches_context(
+            session_name,
+            runtime_dir=Path(state_path).expanduser().resolve().parent,
+            work_dir=str(state.get("work_dir") or state.get("project_dir") or "").strip(),
+            requirement_name=str(state.get("requirement_name", "") or "").strip(),
+            workflow_action=str(state.get("workflow_action", "") or "").strip(),
+        )
+
     def list_sessions(self) -> list[str]:
         return self.backend.list_sessions()
 
@@ -665,6 +857,15 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
+    target = Path(path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_suffix = f".tmp.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+    tmp_path = target.with_suffix(target.suffix + tmp_suffix)
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(target)
+
+
 def is_worker_death_error(error: BaseException | str) -> bool:
     message = str(error or "").strip().lower()
     if not message:
@@ -691,6 +892,13 @@ def is_turn_artifact_contract_error(error: BaseException | str) -> bool:
     if not message:
         return False
     return TURN_ARTIFACT_CONTRACT_ERROR_PREFIX in message
+
+
+def is_task_result_contract_error(error: BaseException | str) -> bool:
+    message = str(error or "").strip().lower()
+    if not message:
+        return False
+    return TASK_RESULT_CONTRACT_ERROR_PREFIX in message
 
 
 def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -> bool:
@@ -856,6 +1064,32 @@ def _preferred_constellation_index(work_dir: str | Path, role_key: str) -> int:
     return int(digest[:8], 16) % len(SESSION_CONSTELLATION_NAMES)
 
 
+def _resolved_path_text(path: str | Path) -> str:
+    text = str(path or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve())
+    except Exception:
+        return text
+
+
+def _same_resolved_path(left: str | Path, right: str | Path) -> bool:
+    left_text = _resolved_path_text(left)
+    right_text = _resolved_path_text(right)
+    return bool(left_text and right_text and left_text == right_text)
+
+
+def _path_is_same_or_under(candidate: str | Path, root: str | Path) -> bool:
+    candidate_text = _resolved_path_text(candidate)
+    root_text = _resolved_path_text(root)
+    if not candidate_text or not root_text:
+        return False
+    candidate_path = Path(candidate_text)
+    root_path = Path(root_text)
+    return candidate_path == root_path or root_path in candidate_path.parents
+
+
 def _list_backend_session_names(backend: Any | None) -> set[str]:
     list_sessions = getattr(backend, "list_sessions", None)
     if not callable(list_sessions):
@@ -866,13 +1100,99 @@ def _list_backend_session_names(backend: Any | None) -> set[str]:
         return set()
 
 
+def _exception_message(error: Exception) -> str:
+    parts = [str(error or "")]
+    for field_name in ("stderr", "stdout"):
+        value = getattr(error, field_name, "")
+        if value:
+            parts.append(str(value))
+    return " ".join(part for part in parts if part).strip()
+
+
+def _backend_show_option(backend: Any, target: str, option_name: str) -> str:
+    show_option = getattr(backend, "show_option", None)
+    if callable(show_option):
+        try:
+            return str(show_option(target, option_name) or "").strip()
+        except Exception:
+            return ""
+    run = getattr(backend, "run", None)
+    if not callable(run):
+        return ""
+    try:
+        result = run("show-options", "-qv", "-t", target, option_name, check=False)
+    except Exception:
+        return ""
+    if getattr(result, "returncode", 1) != 0:
+        return ""
+    return str(getattr(result, "stdout", "") or "").strip()
+
+
+def _backend_current_path(backend: Any, target: str) -> str:
+    display_message = getattr(backend, "display_message", None)
+    if not callable(display_message):
+        return ""
+    try:
+        return str(display_message(target, "#{pane_current_path}") or "").strip()
+    except Exception:
+        return ""
+
+
+def _tmux_session_matches_context(
+    backend: Any,
+    session_name: str,
+    *,
+    runtime_dir: str | Path = "",
+    work_dir: str | Path = "",
+    requirement_name: str = "",
+    workflow_action: str = "",
+) -> bool:
+    session_name_text = str(session_name or "").strip()
+    if not session_name_text:
+        return False
+    has_session = getattr(backend, "has_session", None)
+    if not callable(has_session):
+        has_session = getattr(backend, "session_exists", None)
+    if not callable(has_session):
+        return False
+    try:
+        if not bool(has_session(session_name_text)):
+            return False
+    except Exception:
+        return False
+
+    expected_runtime_dir = _resolved_path_text(runtime_dir)
+    expected_work_dir = _resolved_path_text(work_dir)
+    expected_requirement_name = str(requirement_name or "").strip()
+    expected_workflow_action = str(workflow_action or "").strip()
+
+    actual_runtime_dir = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_RUNTIME_DIR_OPTION)
+    if actual_runtime_dir:
+        return bool(expected_runtime_dir and _same_resolved_path(actual_runtime_dir, expected_runtime_dir))
+
+    actual_work_dir = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_WORK_DIR_OPTION)
+    if actual_work_dir and expected_work_dir and not _same_resolved_path(actual_work_dir, expected_work_dir):
+        return False
+
+    actual_requirement_name = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_REQUIREMENT_NAME_OPTION)
+    if actual_requirement_name and expected_requirement_name and actual_requirement_name != expected_requirement_name:
+        return False
+
+    actual_workflow_action = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_WORKFLOW_ACTION_OPTION)
+    if actual_workflow_action and expected_workflow_action and actual_workflow_action != expected_workflow_action:
+        return False
+
+    if actual_work_dir or actual_requirement_name or actual_workflow_action:
+        return True
+
+    current_path = _backend_current_path(backend, session_name_text)
+    if current_path and expected_work_dir:
+        return _path_is_same_or_under(current_path, expected_work_dir)
+    return True
+
+
 def _occupied_session_names(backend: Any | None = None) -> set[str]:
-    occupied = _list_backend_session_names(backend)
-    for worker in list_registered_tmux_workers():
-        name = str(getattr(worker, "session_name", "") or "").strip()
-        if name:
-            occupied.add(name)
-    return occupied
+    return set(list_occupied_tmux_session_names(backend=backend))
 
 
 def _reserve_session_name(
@@ -883,23 +1203,38 @@ def _reserve_session_name(
         instance_id: str = "",
         backend: Any | None = None,
 ) -> str:
-    with _RESERVED_SESSION_NAMES_LOCK:
-        occupied = _occupied_session_names(backend)
-        occupied.update(_RESERVED_SESSION_NAMES)
+    del instance_id
+    with _session_name_lease_lock():
+        occupied = _list_backend_session_names(backend)
+        occupied.update(_active_session_name_leases_locked())
+        for worker in list_registered_tmux_workers():
+            session_name = str(getattr(worker, "session_name", "") or "").strip()
+            if session_name:
+                occupied.add(session_name)
+        with _RESERVED_SESSION_NAMES_LOCK:
+            occupied.update(_RESERVED_SESSION_NAMES)
         session_name = build_session_name(
             worker_id,
             Path(work_dir),
             vendor,
-            instance_id=instance_id,
-            occupied_session_names=occupied,
+            occupied_session_names=sorted(occupied),
         )
-        _RESERVED_SESSION_NAMES.add(session_name)
+        _write_session_name_lease_locked(
+            session_name=session_name,
+            worker_id=worker_id,
+            work_dir=work_dir,
+        )
+        with _RESERVED_SESSION_NAMES_LOCK:
+            _RESERVED_SESSION_NAMES.add(session_name)
         return session_name
 
 
 def _release_reserved_session_name(session_name: str) -> None:
-    with _RESERVED_SESSION_NAMES_LOCK:
-        _RESERVED_SESSION_NAMES.discard(str(session_name or "").strip())
+    session_name_text = str(session_name or "").strip()
+    with _session_name_lease_lock():
+        _release_session_name_lease_locked(session_name_text)
+        with _RESERVED_SESSION_NAMES_LOCK:
+            _RESERVED_SESSION_NAMES.discard(session_name_text)
 
 
 def _build_prefixed_sha256(path: str | Path) -> str:
@@ -922,6 +1257,86 @@ def clean_ansi(text: str) -> str:
         "",
         str(text or ""),
     )
+
+
+def _normalize_opencode_surface(text: str) -> str:
+    return re.sub(r"\s+", " ", clean_ansi(text)).strip()
+
+
+def _compact_opencode_surface(text: str) -> str:
+    normalized = _normalize_opencode_surface(text)
+    return re.sub(r"[\s\u2500-\u28ff]+", "", normalized)
+
+
+def _matches_opencode_surface(
+        normalized_text: str,
+        compact_text: str,
+        *,
+        patterns: Sequence[str],
+        compact_patterns: Sequence[str],
+) -> bool:
+    return any(re.search(pattern, normalized_text, re.IGNORECASE | re.MULTILINE) for pattern in patterns) or any(
+        re.search(pattern, compact_text, re.IGNORECASE | re.MULTILINE) for pattern in compact_patterns
+    )
+
+
+def _classify_opencode_surface_phase(
+        *,
+        visible_text: str,
+        recent_log: str,
+        current_command: str,
+) -> ProviderPhase:
+    normalized_visible = _normalize_opencode_surface(visible_text)
+    normalized_recent = _normalize_opencode_surface(recent_log)
+    compact_visible = _compact_opencode_surface(visible_text)
+    compact_recent = _compact_opencode_surface(recent_log)
+    if _matches_opencode_surface(
+            normalized_visible,
+            compact_visible,
+            patterns=OPENCODE_PROCESSING_PATTERNS,
+            compact_patterns=OPENCODE_PROCESSING_COMPACT_PATTERNS,
+    ):
+        return ProviderPhase.PROCESSING
+    if _matches_opencode_surface(
+            normalized_visible,
+            compact_visible,
+            patterns=OPENCODE_WAITING_INPUT_PATTERNS,
+            compact_patterns=OPENCODE_WAITING_INPUT_COMPACT_PATTERNS,
+    ):
+        return ProviderPhase.WAITING_INPUT
+    if current_command and _matches_opencode_surface(
+            normalized_visible,
+            compact_visible,
+            patterns=OPENCODE_IDLE_READY_PATTERNS,
+            compact_patterns=OPENCODE_IDLE_READY_COMPACT_PATTERNS,
+    ):
+        return ProviderPhase.IDLE_READY
+    if _matches_opencode_surface(
+            normalized_visible or normalized_recent,
+            compact_visible or compact_recent,
+            patterns=OPENCODE_BOOTING_PATTERNS,
+            compact_patterns=OPENCODE_BOOTING_COMPACT_PATTERNS,
+    ):
+        return ProviderPhase.BOOTING
+    if _matches_opencode_surface(
+            normalized_recent,
+            compact_recent,
+            patterns=OPENCODE_WAITING_INPUT_PATTERNS,
+            compact_patterns=OPENCODE_WAITING_INPUT_COMPACT_PATTERNS,
+    ):
+        return ProviderPhase.WAITING_INPUT
+    if current_command and _matches_opencode_surface(
+            normalized_recent,
+            compact_recent,
+            patterns=OPENCODE_IDLE_READY_PATTERNS,
+            compact_patterns=OPENCODE_IDLE_READY_COMPACT_PATTERNS,
+    ):
+        return ProviderPhase.IDLE_READY
+    if not current_command:
+        return ProviderPhase.UNKNOWN
+    if normalized_visible or normalized_recent or compact_visible or compact_recent:
+        return ProviderPhase.PROCESSING
+    return ProviderPhase.BOOTING
 
 
 def read_text_tail(path: str | Path, max_lines: int = 40) -> str:
@@ -1231,7 +1646,7 @@ class CodexOutputDetector(BaseOutputDetector):
         if assistant_matches:
             last_match = assistant_matches[-1]
             content = clean_output[last_match.end():]
-            idle_match = re.search(r"^\s*(?:❯|›|codex>)\s*$", content, re.MULTILINE)
+            idle_match = re.search(r"^\s*(?:❯|›|codex>)(?:\s|$)", content, re.MULTILINE)
             if idle_match:
                 content = content[:idle_match.start()]
             return super().extract_last_message(content)
@@ -1357,8 +1772,6 @@ class KimiOutputDetector(BaseOutputDetector):
 
 class OpenCodeOutputDetector(BaseOutputDetector):
     def classify_phase(self, observation: WorkerObservation) -> ProviderPhase:
-        visible_text = self.current_visible_text(observation)
-        recent_log = self.recent_log_text(observation)
         base_phase = super().classify_phase(observation)
         if base_phase in {
             ProviderPhase.SHELL,
@@ -1367,17 +1780,11 @@ class OpenCodeOutputDetector(BaseOutputDetector):
             ProviderPhase.COMPLETED_RESPONSE,
         }:
             return base_phase
-        if self._contains_any(visible_text, OPENCODE_PROCESSING_PATTERNS):
-            return ProviderPhase.PROCESSING
-        if self._contains_any(visible_text, OPENCODE_WAITING_INPUT_PATTERNS):
-            return ProviderPhase.WAITING_INPUT
-        if self._contains_any(visible_text, OPENCODE_IDLE_READY_PATTERNS):
-            return ProviderPhase.IDLE_READY
-        if self._contains_any(visible_text or recent_log, OPENCODE_BOOTING_PATTERNS):
-            return ProviderPhase.BOOTING
-        if self._contains_any(recent_log, OPENCODE_WAITING_INPUT_PATTERNS):
-            return ProviderPhase.WAITING_INPUT
-        return ProviderPhase.BOOTING if observation.current_command else ProviderPhase.UNKNOWN
+        return _classify_opencode_surface_phase(
+            visible_text=self.current_visible_text(observation),
+            recent_log=self.recent_log_text(observation),
+            current_command=observation.current_command,
+        )
 
     def extract_last_message(self, output: str) -> str:
         clean_output = clean_ansi(output)
@@ -1594,6 +2001,7 @@ class TmuxBatchWorker:
             existing_pane_id: str = "",
             backend: TmuxBackend | None = None,
             launch_coordinator: LaunchCoordinator | None = None,
+            runtime_metadata: Mapping[str, object] | None = None,
     ) -> None:
         reserved_session_name = ""
         self._session_name_reserved = False
@@ -1650,6 +2058,11 @@ class TmuxBatchWorker:
         self.current_task_status_path = ""
         self.current_task_result_path = ""
         self.current_task_runtime_status = ""
+        self._runtime_metadata: dict[str, object] = {
+            key: value
+            for key, value in dict(runtime_metadata or {}).items()
+            if str(key).strip()
+        }
         self._phase_candidate = ProviderPhase.UNKNOWN
         self._phase_candidate_count = 0
         self._phase_candidate_since = 0.0
@@ -1686,15 +2099,40 @@ class TmuxBatchWorker:
             self.terminal_recently_changed = bool(existing_state.get("terminal_recently_changed", False))
             self.agent_started = bool(existing_state.get("agent_started", existing_state.get("agent_ready", False)))
             self.agent_ready = self.agent_started
+            for key in ("project_dir", "requirement_name", "workflow_action", "stage_seq", "run_id"):
+                if key in existing_state and key not in self._runtime_metadata:
+                    self._runtime_metadata[key] = existing_state.get(key)
         self._session_name_reserved = bool(reserved_session_name)
         _register_live_worker(self)
+
+    def __del__(self) -> None:
+        with contextlib.suppress(Exception):
+            self._release_session_name_reservation()
 
     def _tmux(self, *args: str, input_text: str | None = None, timeout_sec: float = 10.0) -> \
     subprocess.CompletedProcess[str]:
         return self.backend.run(*args, input_text=input_text, timeout_sec=timeout_sec, check=True)
 
     def session_exists(self) -> bool:
-        return self.backend.has_session(self.session_name)
+        return _tmux_session_matches_context(
+            self.backend,
+            self.session_name,
+            runtime_dir=self.runtime_dir,
+            work_dir=self.work_dir,
+            requirement_name=str(self._runtime_metadata.get("requirement_name", "") or "").strip(),
+            workflow_action=str(self._runtime_metadata.get("workflow_action", "") or "").strip(),
+        )
+
+    def _set_tmux_identity_options(self) -> None:
+        identity = {
+            TMUX_IDENTITY_RUNTIME_DIR_OPTION: str(self.runtime_dir),
+            TMUX_IDENTITY_WORK_DIR_OPTION: str(self.work_dir),
+            TMUX_IDENTITY_REQUIREMENT_NAME_OPTION: str(self._runtime_metadata.get("requirement_name", "") or "").strip(),
+            TMUX_IDENTITY_WORKFLOW_ACTION_OPTION: str(self._runtime_metadata.get("workflow_action", "") or "").strip(),
+            TMUX_IDENTITY_WORKER_ID_OPTION: self.worker_id,
+        }
+        for option_name, option_value in identity.items():
+            self._tmux("set-option", "-t", self.session_name, option_name, option_value)
 
     def attach_session(self) -> None:
         if not self.session_exists():
@@ -1716,10 +2154,28 @@ class TmuxBatchWorker:
         with self.state_lock:
             if not self.state_path.exists():
                 return {}
-            return json.loads(self.state_path.read_text(encoding="utf-8"))
+            raw_text = self.state_path.read_text(encoding="utf-8")
+            try:
+                payload = json.loads(raw_text)
+                return payload if isinstance(payload, dict) else {}
+            except Exception:
+                text = str(raw_text or "").lstrip()
+                if not text:
+                    return {}
+                try:
+                    payload, _ = json.JSONDecoder().raw_decode(text)
+                except Exception:
+                    return {}
+                if not isinstance(payload, dict):
+                    return {}
+                try:
+                    _atomic_write_json(self.state_path, payload)
+                except Exception:
+                    pass
+                return payload
 
     def runtime_metadata(self) -> dict[str, str]:
-        return {
+        payload = {
             "worker_id": self.worker_id,
             "runtime_worker_id": self.runtime_worker_id,
             "session_name": self.session_name,
@@ -1731,6 +2187,26 @@ class TmuxBatchWorker:
             "state_path": str(self.state_path),
             "transcript_path": str(self.transcript_path),
         }
+        for key, value in self._runtime_metadata.items():
+            payload[str(key)] = "" if value is None else str(value)
+        return payload
+
+    def set_runtime_metadata(self, **metadata: object) -> None:
+        if not metadata:
+            return
+        normalized = {
+            str(key): value
+            for key, value in metadata.items()
+            if str(key).strip()
+        }
+        self._runtime_metadata.update(normalized)
+        if not self.state_path.exists():
+            return
+        with self.state_lock:
+            payload = self.read_state()
+            payload.update(normalized)
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
 
     def target_exists(self, target: str | None = None) -> bool:
         target_name = target or self.pane_id
@@ -1810,11 +2286,68 @@ class TmuxBatchWorker:
         self.health_supervisor = None
         supervisor.stop()
 
-    def create_session(self) -> str:
-        if self.session_exists():
-            self._stop_health_supervisor()
-            self.backend.kill_session(self.session_name)
+    def _release_session_name_reservation(self) -> None:
+        if not self._session_name_reserved:
+            return
+        _release_reserved_session_name(self.session_name)
+        self._session_name_reserved = False
 
+    def mark_awaiting_reconfiguration(self, *, reason_text: str) -> None:
+        self.agent_ready = False
+        self.provider_phase = ProviderPhase.RECOVERING
+        self.wrapper_state = WrapperState.NOT_READY
+        self._write_state(
+            WorkerStatus.RUNNING,
+            note="awaiting_reconfig",
+            extra={
+                "result_status": "running",
+                "health_status": "awaiting_reconfig",
+                "health_note": str(reason_text or "").strip(),
+                "provider_phase": ProviderPhase.RECOVERING.value,
+            },
+        )
+
+    def _is_session_name_conflict_error(self, error: Exception) -> bool:
+        try:
+            if self.session_exists():
+                return True
+        except Exception:
+            pass
+        message = _exception_message(error).lower()
+        return any(marker in message for marker in _DUPLICATE_SESSION_ERROR_MARKERS)
+
+    def _reserve_conflict_retry_session_name(self, *, retry_count: int, conflict_source: str) -> None:
+        old_session_name = self.session_name
+        self._release_session_name_reservation()
+        new_session_name = _reserve_session_name(
+            worker_id=self.worker_id,
+            work_dir=self.work_dir,
+            vendor=self.config.vendor,
+            instance_id=self.instance_id,
+            backend=self.backend,
+        )
+        self.session_name = new_session_name
+        self._session_name_reserved = True
+        self._log_event(
+            "session_name_conflict_retry",
+            conflict_source=conflict_source,
+            retry_count=retry_count,
+            old_session_name=old_session_name,
+            new_session_name=new_session_name,
+        )
+
+    def _raise_session_name_conflict(self, *, retries: int, conflict_source: str, error: Exception | None = None) -> None:
+        conflict_key = f"{self.work_dir}::{self.worker_id}"
+        message = (
+            "tmux session 命名冲突，自动重试已达上限: "
+            f"conflict_key={conflict_key}, session_name={self.session_name}, "
+            f"retries={retries}, source={conflict_source}"
+        )
+        if error is None:
+            raise RuntimeError(message)
+        raise RuntimeError(message) from error
+
+    def create_session(self) -> str:
         self._reset_terminal_activity()
         self.agent_started = False
         self.agent_ready = False
@@ -1823,26 +2356,56 @@ class TmuxBatchWorker:
         self.current_task_status_path = ""
         self.current_task_result_path = ""
         self.current_task_runtime_status = ""
-        try:
-            self.pane_id = self.backend.create_session(
-                self.session_name,
-                self.work_dir,
-                self._build_shell_bootstrap_command(),
-            )
-        except Exception:
-            if self._session_name_reserved:
-                _release_reserved_session_name(self.session_name)
-                self._session_name_reserved = False
-            raise
-        if self._session_name_reserved:
-            _release_reserved_session_name(self.session_name)
-            self._session_name_reserved = False
+        self._stop_health_supervisor()
+        retry_count = 0
+        max_retries = SESSION_NAME_CREATE_MAX_RETRIES
+        while True:
+            if self.session_exists():
+                if retry_count >= max_retries:
+                    self._release_session_name_reservation()
+                    self._raise_session_name_conflict(retries=retry_count, conflict_source="pre-check")
+                retry_count += 1
+                self._reserve_conflict_retry_session_name(
+                    retry_count=retry_count,
+                    conflict_source="pre-check",
+                )
+                continue
+            try:
+                self.pane_id = self.backend.create_session(
+                    self.session_name,
+                    self.work_dir,
+                    self._build_shell_bootstrap_command(),
+                )
+                break
+            except Exception as error:
+                if not self._is_session_name_conflict_error(error):
+                    self._release_session_name_reservation()
+                    raise
+                if retry_count >= max_retries:
+                    self._release_session_name_reservation()
+                    self._raise_session_name_conflict(
+                        retries=retry_count,
+                        conflict_source="create-failure",
+                        error=error,
+                    )
+                retry_count += 1
+                self._reserve_conflict_retry_session_name(
+                    retry_count=retry_count,
+                    conflict_source="create-failure",
+                )
+        self._release_session_name_reservation()
         self._tmux("set-option", "-t", self.session_name, "allow-rename", "off")
         self._tmux("set-window-option", "-t", f"{self.session_name}:0", "automatic-rename", "off")
+        self._set_tmux_identity_options()
         self._start_pipe_logging()
         self._ensure_health_supervisor_started()
         self._refresh_health_state_nonintrusive()
-        self._log_event("session_created", pane_id=self.pane_id, session_name=self.session_name)
+        self._log_event(
+            "session_created",
+            pane_id=self.pane_id,
+            session_name=self.session_name,
+            session_name_retry_count=retry_count,
+        )
         self._write_state(WorkerStatus.READY, note="session_created")
         return self.pane_id
 
@@ -1889,6 +2452,7 @@ class TmuxBatchWorker:
         self.wrapper_state = self._infer_wrapper_state(
             current_command=observation.current_command,
             visible_text=observation.visible_text,
+            raw_log_tail=observation.raw_log_tail,
         )
         return observation
 
@@ -1964,11 +2528,13 @@ class TmuxBatchWorker:
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
             }
+            for key in ("project_dir", "requirement_name", "workflow_action", "stage_seq", "run_id"):
+                if key in previous and key not in self._runtime_metadata:
+                    self._runtime_metadata[key] = previous.get(key)
+            payload.update(self._runtime_metadata)
             if extra:
                 payload.update(extra)
-            tmp_path = self.state_path.with_suffix(".tmp")
-            tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp_path.replace(self.state_path)
+            _atomic_write_json(self.state_path, payload)
         self._log_event("state_changed", status=status.value, note=note)
         _notify_runtime_state_changed_best_effort()
 
@@ -2051,9 +2617,10 @@ class TmuxBatchWorker:
             session_name=self.session_name,
         )
 
-    def _refresh_health_state_nonintrusive(self) -> WorkerHealthSnapshot:
+    def _refresh_health_state_nonintrusive(self, *, notify_on_change: bool = True) -> WorkerHealthSnapshot:
         observation = self._capture_passive_observation()
         snapshot = self._build_passive_health_snapshot(observation)
+        health_changed = False
         with self.state_lock:
             previous = self.read_state()
             health_changed = (
@@ -2077,12 +2644,13 @@ class TmuxBatchWorker:
                         "pane_title": snapshot.pane_title,
                         "current_command": snapshot.current_command,
                         "current_path": snapshot.current_path,
+                        "updated_at": snapshot.last_heartbeat_at or _now_iso(),
                         "last_heartbeat_at": snapshot.last_heartbeat_at,
                     }
                 )
-                tmp_path = self.state_path.with_suffix(".tmp")
-                tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                tmp_path.replace(self.state_path)
+                _atomic_write_json(self.state_path, payload)
+        if health_changed and notify_on_change:
+            _notify_runtime_state_changed_best_effort()
         return snapshot
 
     def request_restart(self) -> str:
@@ -2124,11 +2692,12 @@ class TmuxBatchWorker:
             *,
             auto_relaunch: bool = False,
             relaunch_timeout_sec: float = 30.0,
+            notify_on_change: bool = True,
     ) -> WorkerHealthSnapshot:
         if auto_relaunch and self.config.vendor in {Vendor.QWEN, Vendor.KIMI}:
-            return self._refresh_health_state_nonintrusive()
+            return self._refresh_health_state_nonintrusive(notify_on_change=notify_on_change)
         if not auto_relaunch:
-            return self._refresh_health_state_nonintrusive()
+            return self._refresh_health_state_nonintrusive(notify_on_change=notify_on_change)
         session_exists = self.session_exists()
         health_status = "alive" if session_exists else "missing_session"
         health_note = self.provider_phase.value if session_exists else "missing_session"
@@ -2306,7 +2875,8 @@ class TmuxBatchWorker:
             except Exception as error:
                 stable_signature = None
                 stable_since_monotonic = 0.0
-                if status_done_seen:
+                terminal_ready_seen = self._can_finalize_turn_artifacts_without_helper(observation)
+                if status_done_seen or terminal_ready_seen:
                     invalid_state = "missing"
                     if contract.status_path.exists():
                         try:
@@ -2333,10 +2903,11 @@ class TmuxBatchWorker:
                         invalid_since_monotonic = time.monotonic()
                         invalid_elapsed = 0.0
                     if invalid_elapsed >= max(post_done_grace_sec, 0.0):
+                        completion_source = "task_status_done" if status_done_seen else "terminal_ready"
                         raise RuntimeError(
                             f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
                             f"phase={contract.phase} status_path={contract.status_path} "
-                            f"error={str(error).strip()}"
+                            f"completion_source={completion_source} error={str(error).strip()}"
                         ) from error
                 else:
                     invalid_signature = None
@@ -2410,6 +2981,69 @@ class TmuxBatchWorker:
             f"{clean_ansi(self.capture_visible(200))[-4000:]}"
         )
 
+    def _try_finalize_turn_artifacts_after_timeout(
+            self,
+            *,
+            contract: TurnFileContract,
+            task_status_path: Path | None,
+    ) -> TurnFileResult | None:
+        try:
+            file_result = contract.validator(contract.status_path)
+            status_stat = contract.status_path.stat()
+        except Exception:
+            return None
+        signature = (
+            status_stat.st_size,
+            status_stat.st_mtime,
+            tuple(sorted(file_result.artifact_hashes.items())),
+        )
+        quiet_window = max(float(contract.quiet_window_sec), 0.0)
+        if quiet_window:
+            time.sleep(quiet_window)
+        try:
+            next_result = contract.validator(contract.status_path)
+            next_stat = contract.status_path.stat()
+        except Exception:
+            return None
+        next_signature = (
+            next_stat.st_size,
+            next_stat.st_mtime,
+            tuple(sorted(next_result.artifact_hashes.items())),
+        )
+        if next_signature != signature:
+            return None
+        if task_status_path is not None:
+            write_task_status(task_status_path, status=TASK_STATUS_DONE)
+        self.current_task_runtime_status = TASK_STATUS_DONE
+        self._log_event(
+            "turn_artifacts_ready_after_prompt_timeout",
+            turn_id=contract.turn_id,
+            phase=contract.phase,
+            status_path=str(contract.status_path),
+        )
+        return next_result
+
+    def _try_finalize_task_result_after_prompt_timeout(
+            self,
+            *,
+            contract: TaskResultContract,
+            task_status_path: Path | None,
+            result_path: Path,
+            baseline_visible: str,
+            baseline_raw_log_tail: str,
+    ) -> TaskResultFile | None:
+        try:
+            return self.wait_for_task_result(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                timeout_sec=5.0,
+                baseline_visible=baseline_visible,
+                baseline_raw_log_tail=baseline_raw_log_tail,
+            )
+        except Exception:
+            return None
+
     def wait_for_task_result(
             self,
             *,
@@ -2418,11 +3052,16 @@ class TmuxBatchWorker:
             result_path: Path,
             timeout_sec: float,
             baseline_visible: str = "",
+            baseline_raw_log_tail: str = "",
     ) -> TaskResultFile:
         deadline = time.monotonic() + timeout_sec
         stable_signature: tuple[object, ...] | None = None
         stable_hits = 0
+        invalid_signature: tuple[object, ...] | None = None
+        invalid_since_monotonic = 0.0
         status_done_seen = task_status_path is None
+        post_done_since_monotonic = time.monotonic() if status_done_seen else 0.0
+        post_done_grace_sec = TASK_RESULT_POST_DONE_GRACE_SEC
 
         while time.monotonic() < deadline:
             observation = self.observe(tail_lines=220)
@@ -2431,20 +3070,59 @@ class TmuxBatchWorker:
             if observation.pane_dead:
                 raise RuntimeError(f"tmux pane died while waiting for task result:\n{self.capture_visible(160)}")
 
+            previous_done_seen = status_done_seen
             status_done_seen = self._track_task_completion_signal(
                 task_status_path=task_status_path,
                 status_done_seen=status_done_seen,
             )
+            if status_done_seen and not previous_done_seen and not post_done_since_monotonic:
+                post_done_since_monotonic = time.monotonic()
 
             try:
                 result_file = self._validate_task_result_file(
                     contract=contract,
                     result_path=result_path,
                 )
-            except Exception:
+            except Exception as error:
                 stable_signature = None
                 stable_hits = 0
-                if not result_path.exists() and self.get_agent_state(observation) == AgentRuntimeState.READY:
+                if status_done_seen:
+                    invalid_state = "missing"
+                    if result_path.exists():
+                        try:
+                            result_stat = result_path.stat()
+                            invalid_state = (result_stat.st_size, result_stat.st_mtime)
+                        except OSError:
+                            invalid_state = "stat_error"
+                    current_invalid_signature = (
+                        invalid_state,
+                        type(error).__name__,
+                        str(error).strip(),
+                    )
+                    if current_invalid_signature == invalid_signature:
+                        invalid_elapsed = (
+                            time.monotonic() - invalid_since_monotonic
+                            if invalid_since_monotonic
+                            else 0.0
+                        )
+                    else:
+                        invalid_signature = current_invalid_signature
+                        invalid_since_monotonic = time.monotonic()
+                        invalid_elapsed = 0.0
+                    if invalid_elapsed >= max(post_done_grace_sec, 0.0):
+                        raise RuntimeError(
+                            f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: "
+                            f"phase={contract.phase} result_path={result_path} "
+                            f"error={str(error).strip()}"
+                        ) from error
+                else:
+                    invalid_signature = None
+                    invalid_since_monotonic = 0.0
+                if (
+                    not result_path.exists()
+                    and self.get_agent_state(observation) == AgentRuntimeState.READY
+                    and self._can_finalize_task_result_from_contract_without_helper(contract)
+                ):
                     try:
                         result_file = finalize_task_result(
                             contract=contract,
@@ -2470,6 +3148,7 @@ class TmuxBatchWorker:
                         contract=contract,
                         observation=observation,
                         baseline_visible=baseline_visible,
+                        baseline_raw_log_tail=baseline_raw_log_tail,
                     )
                     if terminal_result is not None:
                         matched_status, matched_summary = terminal_result
@@ -2496,6 +3175,8 @@ class TmuxBatchWorker:
                 continue
 
             result_stat = result_path.stat()
+            invalid_signature = None
+            invalid_since_monotonic = 0.0
             signature = (
                 result_stat.st_size,
                 result_stat.st_mtime,
@@ -2519,6 +3200,20 @@ class TmuxBatchWorker:
                 )
                 return result_file
             if observation.current_command in SHELL_COMMANDS:
+                if status_done_seen:
+                    post_done_elapsed = (
+                        time.monotonic() - post_done_since_monotonic
+                        if post_done_since_monotonic
+                        else 0.0
+                    )
+                    if post_done_elapsed >= post_done_grace_sec:
+                        raise RuntimeError(
+                            "task_status_done 后 result 未稳定: "
+                            f"phase={contract.phase} result_path={result_path} "
+                            f"current_command={observation.current_command}"
+                        )
+                    time.sleep(0.5)
+                    continue
                 self.agent_ready = False
                 raise RuntimeError(
                     f"agent exited back to shell while waiting for task result:\n{observation.visible_text}"
@@ -2659,31 +3354,71 @@ class TmuxBatchWorker:
     ) -> TaskResultFile:
         return validate_task_result_file(contract=contract, result_path=result_path)
 
+    def _safe_extract_terminal_message(self, terminal_text: str) -> str:
+        cleaned_text = clean_ansi(str(terminal_text or "")).strip()
+        if not cleaned_text:
+            return ""
+        try:
+            extracted = clean_ansi(self._extract_last_message(terminal_text)).strip()
+        except Exception:
+            return cleaned_text
+        return extracted or cleaned_text
+
+    def _build_terminal_match_candidates(self, observation: WorkerObservation) -> list[str]:
+        candidates: list[str] = []
+        seen: set[str] = set()
+        for source in (observation.raw_log_delta, observation.raw_log_tail, observation.visible_text):
+            source_text = clean_ansi(str(source or "")).strip()
+            if not source_text:
+                continue
+            for message in (self._safe_extract_terminal_message(source), source_text):
+                normalized = clean_ansi(str(message or "")).strip()
+                if not normalized or normalized in seen:
+                    continue
+                candidates.append(normalized)
+                seen.add(normalized)
+        return candidates
+
     def _match_terminal_task_result_status(
             self,
             *,
             contract: TaskResultContract,
             observation: WorkerObservation,
             baseline_visible: str = "",
+            baseline_raw_log_tail: str = "",
     ) -> tuple[str, str] | None:
         if not contract.terminal_status_tokens:
             return None
-        visible_message = clean_ansi(self._extract_last_message(observation.visible_text)).strip()
-        if not visible_message:
+        terminal_messages = self._build_terminal_match_candidates(observation)
+        if not terminal_messages:
             return None
         baseline_message = ""
+        baseline_text = ""
+        baseline_tail_message = ""
+        baseline_tail_text = ""
         if str(baseline_visible or "").strip():
-            try:
-                baseline_message = clean_ansi(self._extract_last_message(baseline_visible)).strip()
-            except Exception:
-                baseline_message = clean_ansi(str(baseline_visible)).strip()
+            baseline_message = self._safe_extract_terminal_message(baseline_visible)
+            baseline_text = clean_ansi(str(baseline_visible)).strip()
+        if str(baseline_raw_log_tail or "").strip():
+            baseline_tail_message = self._safe_extract_terminal_message(baseline_raw_log_tail)
+            baseline_tail_text = clean_ansi(str(baseline_raw_log_tail)).strip()
         raw_log_delta = clean_ansi(observation.raw_log_delta or "")
         for status, tokens in contract.terminal_status_tokens.items():
             for token in tokens:
-                if token and token in visible_message:
-                    if token in baseline_message and token not in raw_log_delta:
+                if not token:
+                    continue
+                token_seen_in_baseline = (
+                    token in baseline_message
+                    or token in baseline_text
+                    or token in baseline_tail_message
+                    or token in baseline_tail_text
+                )
+                for terminal_message in terminal_messages:
+                    if token not in terminal_message:
                         continue
-                    summary = contract.terminal_status_summaries.get(status, visible_message)
+                    if token_seen_in_baseline and token not in raw_log_delta:
+                        continue
+                    summary = contract.terminal_status_summaries.get(status, terminal_message)
                     return status, summary
         return None
 
@@ -2840,23 +3575,57 @@ class TmuxBatchWorker:
             return True
         return self.state_path.exists()
 
+    def _is_prelaunch_shell_window(self, observation: WorkerObservation | None = None) -> bool:
+        if self.agent_started:
+            return False
+        current_observation = observation
+        if current_observation is None:
+            if not self.session_exists():
+                return False
+            current_command = self.current_command
+            pane_dead = False
+        else:
+            if not current_observation.session_exists:
+                return False
+            current_command = current_observation.current_command or self.current_command
+            pane_dead = current_observation.pane_dead
+        if pane_dead:
+            return False
+        if not self.pane_id or not self.target_exists():
+            return False
+        return str(current_command or "").strip() in SHELL_COMMANDS
+
     def get_agent_readiness(self, observation: WorkerObservation | None = None) -> str | None:
         if not self.is_agent_alive(observation):
             return None
         if not self.agent_started:
             return None
+        if observation is None:
+            if self.wrapper_state == WrapperState.READY:
+                return AgentRuntimeState.READY.value
+            if self.config.vendor == Vendor.OPENCODE and self.provider_phase in {
+                ProviderPhase.WAITING_INPUT,
+                ProviderPhase.IDLE_READY,
+            }:
+                return AgentRuntimeState.READY.value
+        if self.config.vendor == Vendor.OPENCODE and observation is not None:
+            if self._visible_indicates_agent_ready(
+                    observation.visible_text,
+                    observation.raw_log_tail,
+                    current_command=observation.current_command,
+            ):
+                return AgentRuntimeState.READY.value
+            return AgentRuntimeState.BUSY.value
         pane_title = observation.pane_title if observation is not None else self.last_pane_title
         if self._title_indicates_ready(pane_title):
             return AgentRuntimeState.READY.value
         if self._title_indicates_busy(pane_title):
             return AgentRuntimeState.BUSY.value
-        if self.config.vendor == Vendor.OPENCODE and observation is not None:
-            visible_source = observation.visible_text or observation.raw_log_tail
-            if self._visible_indicates_agent_ready(visible_source):
-                return AgentRuntimeState.READY.value
         return AgentRuntimeState.BUSY.value
 
     def get_agent_state(self, observation: WorkerObservation | None = None) -> AgentRuntimeState:
+        if self._is_prelaunch_shell_window(observation):
+            return AgentRuntimeState.STARTING
         if not self.is_agent_alive(observation):
             return AgentRuntimeState.DEAD
         if not self.agent_started:
@@ -2871,6 +3640,15 @@ class TmuxBatchWorker:
 
     def _observation_accepts_terminal_result_fallback(self, observation: WorkerObservation) -> bool:
         return self.get_agent_state(observation) == AgentRuntimeState.READY
+
+    @staticmethod
+    def _can_finalize_task_result_from_contract_without_helper(contract: TaskResultContract) -> bool:
+        expected_statuses = {
+            str(status or "").strip()
+            for status in contract.expected_statuses
+            if str(status or "").strip()
+        }
+        return bool(expected_statuses) and expected_statuses <= {TASK_RESULT_READY}
 
     def _visible_indicates_agent_starting(self, visible_text: str) -> bool:
         recent_output = "\n".join(str(visible_text or "").splitlines()[-120:])
@@ -2902,7 +3680,12 @@ class TmuxBatchWorker:
                 )
             )
         if self.config.vendor == Vendor.OPENCODE:
-            return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in OPENCODE_BOOTING_PATTERNS)
+            phase = _classify_opencode_surface_phase(
+                visible_text=recent_output,
+                recent_log="",
+                current_command=self.current_command or "node",
+            )
+            return phase == ProviderPhase.BOOTING
         if self.config.vendor == Vendor.KIMI:
             return any(
                 re.search(pattern, recent_output, re.IGNORECASE)
@@ -2913,8 +3696,14 @@ class TmuxBatchWorker:
             )
         return False
 
-    def _visible_indicates_agent_ready(self, visible_text: str) -> bool:
-        recent_output = "\n".join(str(visible_text or "").splitlines()[-120:])
+    def _visible_indicates_agent_ready(
+            self,
+            visible_text: str,
+            raw_log_tail: str = "",
+            *,
+            current_command: str = "",
+    ) -> bool:
+        recent_output = "\n".join(str(visible_text or raw_log_tail or "").splitlines()[-120:])
         if not recent_output.strip():
             return False
         if self.config.vendor == Vendor.CODEX:
@@ -2936,25 +3725,42 @@ class TmuxBatchWorker:
         if self.config.vendor == Vendor.QWEN:
             return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in QWEN_INPUT_BOX_PATTERNS + QWEN_READY_PATTERNS)
         if self.config.vendor == Vendor.OPENCODE:
-            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in OPENCODE_BOOTING_PATTERNS):
-                return False
-            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in OPENCODE_PROCESSING_PATTERNS):
-                return False
-            return any(
-                re.search(pattern, recent_output, re.IGNORECASE)
-                for pattern in OPENCODE_WAITING_INPUT_PATTERNS + OPENCODE_IDLE_READY_PATTERNS
+            phase = _classify_opencode_surface_phase(
+                visible_text=recent_output,
+                recent_log=raw_log_tail,
+                current_command=current_command or self.current_command or "node",
             )
+            return phase in {ProviderPhase.WAITING_INPUT, ProviderPhase.IDLE_READY}
         if self.config.vendor == Vendor.KIMI:
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in KIMI_NOT_READY_PATTERNS):
                 return False
             return bool(re.search(r"^\s*>\s*$", recent_output, re.MULTILINE))
         return False
 
+    def _visible_ready_signature(self, observation: WorkerObservation) -> str:
+        current_command = observation.current_command or self.current_command
+        if not self._agent_running(current_command):
+            return ""
+        surface = observation.visible_text or observation.raw_log_tail
+        if self._visible_indicates_agent_starting(surface):
+            return ""
+        if not self._visible_indicates_agent_ready(
+            observation.visible_text,
+            observation.raw_log_tail,
+            current_command=current_command,
+        ):
+            return ""
+        signature = self._build_terminal_signature("\n".join(
+            part for part in (observation.pane_title, surface) if part
+        ))
+        return f"{self.config.vendor.value}-visible-ready:{signature or 'ready'}"
+
     def _infer_wrapper_state(
             self,
             *,
             current_command: str,
             visible_text: str,
+            raw_log_tail: str = "",
     ) -> WrapperState:
         if not self._agent_running(current_command):
             return WrapperState.NOT_READY
@@ -2964,7 +3770,11 @@ class TmuxBatchWorker:
             return WrapperState.NOT_READY
         if self.agent_started and self._title_indicates_ready(self.last_pane_title):
             return WrapperState.READY
-        if self.config.vendor == Vendor.OPENCODE and self.agent_started and self._visible_indicates_agent_ready(visible_text):
+        if self.config.vendor == Vendor.OPENCODE and self.agent_started and self._visible_indicates_agent_ready(
+                visible_text,
+                raw_log_tail,
+                current_command=current_command,
+        ):
             return WrapperState.READY
         return WrapperState.NOT_READY
 
@@ -2998,12 +3808,8 @@ class TmuxBatchWorker:
 
             if self._agent_running(current_command):
                 ready_signature = observation.pane_title if self._title_indicates_ready(observation.pane_title) else ""
-                if (
-                    not ready_signature
-                    and self.config.vendor == Vendor.OPENCODE
-                    and self._visible_indicates_agent_ready(observation.visible_text or observation.raw_log_tail)
-                ):
-                    ready_signature = "opencode-visible-ready"
+                if not ready_signature:
+                    ready_signature = self._visible_ready_signature(observation)
                 if ready_signature and ready_signature == previous_ready_signature:
                     stable_count += 1
                 else:
@@ -3459,6 +4265,7 @@ class TmuxBatchWorker:
                 self.ensure_agent_ready()
                 baseline_observation = self.observe(tail_lines=500)
                 baseline_visible = baseline_observation.visible_text
+                baseline_raw_log_tail = baseline_observation.raw_log_tail
                 baseline_reply = self.last_reply
                 self._write_state(
                     WorkerStatus.RUNNING,
@@ -3500,6 +4307,7 @@ class TmuxBatchWorker:
                         result_path=result_path,
                         timeout_sec=timeout_sec,
                         baseline_visible=baseline_visible,
+                        baseline_raw_log_tail=baseline_raw_log_tail,
                     )
                     reply = json.dumps(task_result.payload, ensure_ascii=False, indent=2)
                 else:
@@ -3547,6 +4355,82 @@ class TmuxBatchWorker:
                 )
                 return result
             except TimeoutError as error:
+                if completion_contract is not None:
+                    file_result = self._try_finalize_turn_artifacts_after_timeout(
+                        contract=completion_contract,
+                        task_status_path=task_status_path,
+                    )
+                    if file_result is not None:
+                        reply = json.dumps(
+                            {
+                                "status_path": file_result.status_path,
+                                "artifact_paths": file_result.artifact_paths,
+                                "artifact_hashes": file_result.artifact_hashes,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        finished_at = _now_iso()
+                        result = CommandResult(
+                            label=label,
+                            command=submitted_prompt,
+                            exit_code=0,
+                            raw_output=reply,
+                            clean_output=reply,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                        )
+                        self._record_result(
+                            result,
+                            status=WorkerStatus.SUCCEEDED,
+                            note=f"done:{label}",
+                            extra={
+                                "label": label,
+                                "result_status": "succeeded",
+                                "retry_count": attempt - 1,
+                                "current_turn_id": completion_contract.turn_id,
+                                "current_turn_phase": completion_contract.phase,
+                                "current_turn_status_path": str(completion_contract.status_path),
+                                "current_task_status_path": str(task_status_path),
+                                "current_task_result_path": self.current_task_result_path,
+                                "current_task_runtime_status": self.current_task_runtime_status,
+                            },
+                        )
+                        return result
+                if result_contract is not None:
+                    task_result = self._try_finalize_task_result_after_prompt_timeout(
+                        contract=result_contract,
+                        task_status_path=task_status_path,
+                        result_path=result_path,
+                        baseline_visible=locals().get("baseline_visible", ""),
+                        baseline_raw_log_tail=locals().get("baseline_raw_log_tail", ""),
+                    )
+                    if task_result is not None:
+                        reply = json.dumps(task_result.payload, ensure_ascii=False, indent=2)
+                        finished_at = _now_iso()
+                        result = CommandResult(
+                            label=label,
+                            command=submitted_prompt,
+                            exit_code=0,
+                            raw_output=reply,
+                            clean_output=reply,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                        )
+                        self._record_result(
+                            result,
+                            status=WorkerStatus.SUCCEEDED,
+                            note=f"done:{label}",
+                            extra={
+                                "label": label,
+                                "result_status": "succeeded",
+                                "retry_count": attempt - 1,
+                                "current_task_status_path": str(task_status_path),
+                                "current_task_result_path": self.current_task_result_path,
+                                "current_task_runtime_status": self.current_task_runtime_status,
+                            },
+                        )
+                        return result
                 last_timeout = error
                 self.agent_ready = False
                 self.provider_phase = ProviderPhase.RECOVERING

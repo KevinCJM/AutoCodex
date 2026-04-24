@@ -78,6 +78,52 @@ type ProgressPayload = {
   stageSeq?: unknown
 }
 
+function getObject(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {}
+}
+
+function getWorkers(value: unknown): Array<Record<string, unknown>> {
+  const snapshot = getObject(value)
+  const workers = snapshot.workers
+  return Array.isArray(workers) ? workers.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object') : []
+}
+
+function workerHasLiveWork(worker: Record<string, unknown>): boolean {
+  const sessionName = String(worker.session_name ?? worker.sessionName ?? '').trim()
+  if (!sessionName) return false
+  const agentState = String(worker.agent_state ?? worker.agentState ?? '').trim().toUpperCase()
+  const status = String(worker.status ?? '').trim().toLowerCase()
+  const runtimeStatus = String(worker.current_task_runtime_status ?? worker.currentTaskRuntimeStatus ?? '').trim().toLowerCase()
+  const healthStatus = String(worker.health_status ?? worker.healthStatus ?? '').trim().toLowerCase()
+  const sessionExists = worker.session_exists ?? worker.sessionExists
+  if (agentState === 'DEAD' || healthStatus === 'dead') return false
+  if (agentState === 'BUSY' || agentState === 'STARTING') return true
+  if (status === 'running' || status === 'pending' || runtimeStatus === 'running') return true
+  return sessionExists === true && ['ready', 'alive', 'auto_relaunched'].includes(healthStatus)
+}
+
+function stageSnapshotForAction(snapshots: Record<string, unknown>, activeStage: string): unknown {
+  const stages = getObject(snapshots.stages)
+  if (activeStage === 'stage.a01.start') return stages.routing
+  if (activeStage === 'stage.a02.start' || activeStage === 'stage.a03.start') return stages.requirements
+  if (activeStage === 'stage.a04.start') return stages.review
+  if (activeStage === 'stage.a05.start') return stages.design
+  if (activeStage === 'stage.a06.start') return stages['task-split']
+  if (activeStage === 'stage.a07.start') return stages.development
+  if (activeStage === 'stage.a08.start') return stages['overall-review']
+  return undefined
+}
+
+export function inferBootstrapStatus(payload: Record<string, unknown>): string {
+  const snapshots = getObject(payload.snapshots)
+  const app = getObject(snapshots.app)
+  if (Boolean(app.pending_hitl ?? app.pendingHitl)) return 'awaiting-input'
+  const activeStage = String(app.active_stage ?? app.activeStage ?? '').trim()
+  const stageSnapshot = stageSnapshotForAction(snapshots, activeStage)
+  if (getWorkers(stageSnapshot).some(workerHasLiveWork)) return 'running'
+  return 'ready'
+}
+
 export function shouldAcceptProgressEvent(cursor: StageCursor, payload: ProgressPayload): boolean {
   const action = String(payload.action ?? '').trim()
   const stageSeq = normalizeStageSeq(payload.stage_seq ?? payload.stageSeq)

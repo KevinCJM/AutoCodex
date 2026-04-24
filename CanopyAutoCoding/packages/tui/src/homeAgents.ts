@@ -9,6 +9,7 @@ const SOURCE_RANK: Record<HomeAgentItem['source'], number> = {
   design: 3,
   'task-split': 2,
   development: 1,
+  'overall-review': 1,
 }
 
 export function isRunningWorker(worker: WorkerSnapshot): boolean {
@@ -24,15 +25,25 @@ export function resolveHomeAgentState(worker: WorkerSnapshot): string {
   const currentTaskRuntimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
   if (agentState === 'DEAD') return 'DEAD'
   if (agentState === 'STARTING') return 'STARTING'
-  if (status === 'running' || currentTaskRuntimeStatus === 'running') return 'BUSY'
+  if (agentState === 'BUSY') return 'BUSY'
+  if (agentState === 'READY') return 'READY'
+  if (!agentState && (status === 'running' || currentTaskRuntimeStatus === 'running')) return 'BUSY'
   return agentState || 'UNKNOWN'
+}
+
+function workerFreshnessTs(worker: WorkerSnapshot): number {
+  const updatedAtTs = Date.parse(String(worker.updatedAt || '').trim())
+  const heartbeatTs = Date.parse(String(worker.lastHeartbeatAt || '').trim())
+  const updatedAt = Number.isFinite(updatedAtTs) ? updatedAtTs : 0
+  const heartbeat = Number.isFinite(heartbeatTs) ? heartbeatTs : 0
+  return Math.max(updatedAt, heartbeat)
 }
 
 export function buildHomeAgents(
   sources: Array<{ source: HomeAgentItem['source']; workers: WorkerSnapshot[] }>,
 ): HomeAgentItem[] {
   const deduped = new Map<string, HomeAgentItem>()
-  const updatedAtBySession = new Map<string, string>()
+  const freshnessBySession = new Map<string, number>()
   const sourceRankBySession = new Map<string, number>()
   for (const source of sources) {
     for (const worker of source.workers) {
@@ -40,14 +51,14 @@ export function buildHomeAgents(
       const sessionName = worker.sessionName.trim()
       if (!sessionName) continue
       const nextAgentState = resolveHomeAgentState(worker)
-      const updatedAt = String(worker.updatedAt || '').trim()
-      const previousUpdatedAt = updatedAtBySession.get(sessionName) || ''
+      const freshness = workerFreshnessTs(worker)
+      const previousFreshness = freshnessBySession.get(sessionName) ?? 0
       const sourceRank = SOURCE_RANK[source.source] || 0
       const previousSourceRank = sourceRankBySession.get(sessionName) || 0
       const previousAgentState = String(deduped.get(sessionName)?.agentState || '').trim().toUpperCase()
       if (deduped.has(sessionName)) {
-        if (previousUpdatedAt > updatedAt) continue
-        if (previousUpdatedAt === updatedAt) {
+        if (previousFreshness > freshness) continue
+        if (previousFreshness === freshness) {
           if (previousAgentState === 'DEAD' && nextAgentState !== 'DEAD') continue
           if (previousAgentState !== 'DEAD' && nextAgentState === 'DEAD') {
             // Prefer the terminal DEAD snapshot when timestamps collide.
@@ -64,7 +75,7 @@ export function buildHomeAgents(
         attachCommand: `tmux attach -t ${sessionName}`,
         workDir: worker.workDir,
       })
-      updatedAtBySession.set(sessionName, updatedAt)
+      freshnessBySession.set(sessionName, freshness)
       sourceRankBySession.set(sessionName, sourceRank)
     }
   }

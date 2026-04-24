@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -40,7 +39,6 @@ from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     AgentRunConfig,
     TmuxBatchWorker,
-    TmuxRuntimeController,
     Vendor,
     build_session_name,
     cleanup_registered_tmux_workers,
@@ -49,6 +47,8 @@ from canopy_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     list_registered_tmux_workers,
+    list_tmux_session_names,
+    list_occupied_tmux_session_names,
 )
 from canopy_core.stage_kernel.reviewer_orchestration import (
     repair_reviewer_round_outputs,
@@ -60,20 +60,39 @@ from canopy_core.stage_kernel.death_orchestration import (
     run_main_phase_with_death_handling,
     run_reviewer_phase_with_death_handling,
 )
+from canopy_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from canopy_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from canopy_core.stage_kernel.shared_review import (
+    ReviewLimitHitlConfig,
+    ReviewRoundPolicy,
     MAX_REVIEWER_REPAIR_ATTEMPTS,
     ReviewAgentHandoff,
     ReviewAgentSelection,
     ReviewStageProgress,
     ReviewerRuntime,
+    collect_reviewer_agent_selections,
     ensure_empty_file,
+    mark_worker_awaiting_reconfiguration,
+    parse_review_max_rounds,
     prompt_positive_int,
+    prompt_required_replacement_review_agent_selection,
+    prompt_review_max_rounds,
     prompt_replacement_review_agent_selection,
     prompt_review_agent_selection,
     prompt_yes_no_choice,
+    render_review_limit_force_hitl_prompt,
+    render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
+)
+from canopy_core.stage_kernel.turn_output_goals import (
+    CompletionTurnGoal,
+    OutcomeGoal,
+    TaskTurnGoal,
+    run_completion_turn_with_repair,
+    run_task_result_turn_with_repair,
 )
 from T01_tools import get_markdown_content, is_file_empty, task_done
 from T08_pre_development import (
@@ -149,6 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
     parser.add_argument("--reuse-review-ba", action="store_true", help="优先复用需求评审阶段的需求分析师")
     parser.add_argument("--rebuild-review-ba", action="store_true", help="强制重建需求分析师")
+    parser.add_argument("--review-max-rounds", default="", help="详设评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖详设评审角色列表")
     parser.add_argument("--reviewer-role-prompt", action="append", default=[], help="重复传入以覆盖对应角色提示词")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
@@ -185,6 +205,77 @@ def build_reviewer_artifact_paths(project_dir: str | Path, requirement_name: str
     return review_md_path, review_json_path
 
 
+def resolve_review_max_rounds(
+    args: argparse.Namespace,
+    *,
+    progress: ReviewStageProgress | None = None,
+) -> int | None:
+    explicit = getattr(args, "review_max_rounds", "")
+    if str(explicit or "").strip():
+        return parse_review_max_rounds(
+            explicit,
+            source="--review-max-rounds",
+            default=MAX_DETAILED_DESIGN_REVIEW_ROUNDS,
+        )
+    if not stdin_is_interactive():
+        return MAX_DETAILED_DESIGN_REVIEW_ROUNDS
+    if progress is not None and hasattr(progress, "set_phase"):
+        progress.set_phase("详细设计 / 配置最大审核轮次")
+    return prompt_review_max_rounds(
+        default=MAX_DETAILED_DESIGN_REVIEW_ROUNDS,
+        progress=progress,
+    )
+
+
+def build_detailed_design_review_limit_hitl_config(paths: dict[str, Path]) -> ReviewLimitHitlConfig:
+    return ReviewLimitHitlConfig(
+        stage_label="详细设计评审超限",
+        artifact_label="详设评审",
+        primary_output_path=paths["detailed_design_path"],
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        merged_review_path=paths["merged_review_path"],
+        output_summary_path=paths["ba_feedback_path"],
+        continue_output_label="详细设计.md",
+    )
+
+
+def build_detailed_design_review_limit_force_hitl_prompt(
+    *,
+    paths: dict[str, Path],
+    review_msg: str,
+    review_limit: int,
+    review_rounds_used: int,
+) -> str:
+    return render_review_limit_force_hitl_prompt(
+        config=build_detailed_design_review_limit_hitl_config(paths),
+        review_limit=review_limit,
+        review_rounds_used=review_rounds_used,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(
+            paths["original_requirement_path"],
+            paths["requirements_clear_path"],
+        ),
+    ) + f"\n## 当前评审记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
+
+
+def build_detailed_design_review_limit_human_reply_prompt(
+    *,
+    paths: dict[str, Path],
+    review_msg: str,
+    human_msg: str,
+) -> str:
+    return render_review_limit_human_reply_prompt(
+        config=build_detailed_design_review_limit_hitl_config(paths),
+        human_msg=human_msg,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(
+            paths["original_requirement_path"],
+            paths["requirements_clear_path"],
+        ),
+    ) + f"\n## 当前评审记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
+
+
 def cleanup_existing_detailed_design_artifacts(
     paths: dict[str, Path],
     requirement_name: str,
@@ -216,33 +307,19 @@ def cleanup_existing_detailed_design_artifacts(
     return tuple(dict.fromkeys(removed))
 
 
-def cleanup_stale_detailed_design_runtime_state(project_dir: str | Path) -> tuple[str, ...]:
+def cleanup_stale_detailed_design_runtime_state(
+    project_dir: str | Path,
+    requirement_name: str,
+) -> tuple[str, ...]:
     runtime_root = Path(project_dir).expanduser().resolve() / DETAILED_DESIGN_RUNTIME_ROOT_NAME
     if not runtime_root.exists() or not runtime_root.is_dir():
         return ()
-    tmux_runtime = TmuxRuntimeController()
-    removed: list[str] = []
-    for worker_dir in sorted(path for path in runtime_root.iterdir() if path.is_dir()):
-        state_path = worker_dir / "worker.state.json"
-        session_name = ""
-        if state_path.exists():
-            try:
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-            except Exception:
-                payload = {}
-            if isinstance(payload, dict):
-                session_name = str(payload.get("session_name", "")).strip()
-        if session_name:
-            try:
-                tmux_runtime.kill_session(session_name, missing_ok=True)
-            except Exception:
-                pass
-        shutil.rmtree(worker_dir, ignore_errors=True)
-        removed.append(str(worker_dir.resolve()))
-    if runtime_root.exists() and runtime_root.is_dir() and not any(runtime_root.iterdir()):
-        runtime_root.rmdir()
-        removed.append(str(runtime_root.resolve()))
-    return tuple(removed)
+    return cleanup_runtime_dirs_by_scope(
+        runtime_root=runtime_root,
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        workflow_action="stage.a05.start",
+    )
 
 
 def build_detailed_design_reviewer_worker_id(role_name: str) -> str:
@@ -256,10 +333,19 @@ def _predict_worker_display_name(
     occupied_session_names: Sequence[str] = (),
 ) -> str:
     occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
+    for session_name in list_tmux_session_names():
+        name = str(session_name or "").strip()
+        if name:
+            occupied.add(name)
     for worker in list_registered_tmux_workers():
         session_name = str(getattr(worker, "session_name", "") or "").strip()
         if session_name:
             occupied.add(session_name)
+    occupied.update(
+        list_occupied_tmux_session_names(
+            additional_session_names=sorted(occupied),
+        )
+    )
     return build_session_name(
         worker_id,
         Path(project_dir).expanduser().resolve(),
@@ -627,6 +713,10 @@ def create_design_ba_handoff(
             proxy_url=selection.proxy_url,
         ),
         runtime_root=project_root / DETAILED_DESIGN_RUNTIME_ROOT_NAME,
+        runtime_metadata={
+            "project_dir": str(project_root),
+            "workflow_action": "stage.a05.start",
+        },
     )
     message(render_tmux_start_summary(str(worker.session_name).strip() or "需求分析师", worker))
     return RequirementsAnalystHandoff(
@@ -727,12 +817,23 @@ def build_detailed_design_generate_result_contract(paths: dict[str, Path]) -> Ta
 
 
 def build_detailed_design_feedback_result_contract(paths: dict[str, Path]) -> TaskResultContract:
+    return build_detailed_design_feedback_contract(paths)
+
+
+def build_detailed_design_feedback_contract(
+    paths: dict[str, Path],
+    *,
+    mode: str = "a05_detailed_design_feedback",
+) -> TaskResultContract:
+    expected_statuses = ("hitl", "completed")
+    if mode == "a05_detailed_design_review_limit_force_hitl":
+        expected_statuses = ("hitl",)
     return TaskResultContract(
-        turn_id="a05_detailed_design_feedback",
-        phase="a05_detailed_design_feedback",
-        task_kind="a05_detailed_design_feedback",
-        mode="a05_detailed_design_feedback",
-        expected_statuses=("hitl", "completed"),
+        turn_id=mode,
+        phase=mode,
+        task_kind=mode,
+        mode=mode,
+        expected_statuses=expected_statuses,
         stage_name=DETAILED_DESIGN_TASK_NAME,
         optional_artifacts={
             "ask_human": paths["ask_human_path"],
@@ -742,6 +843,33 @@ def build_detailed_design_feedback_result_contract(paths: dict[str, Path]) -> Ta
             "requirements_clear": paths["requirements_clear_path"],
         },
     )
+
+
+def _build_ba_turn_goal(contract: TaskResultContract) -> TaskTurnGoal | None:
+    if contract.mode == "a05_ba_init":
+        return TaskTurnGoal(goal_id=contract.mode, outcomes={"ready": OutcomeGoal(status="ready")})
+    if contract.mode == "a05_detailed_design_generate":
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={"completed": OutcomeGoal(status="completed", required_aliases=("detailed_design",))},
+        )
+    if contract.mode == "a05_detailed_design_review_limit_force_hitl":
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={"hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",))},
+        )
+    if contract.mode in {"a05_detailed_design_feedback", "a05_detailed_design_review_limit_human_reply"}:
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={
+                "hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",), forbidden_aliases=("ba_feedback",)),
+                "completed": OutcomeGoal(
+                    status="completed",
+                    required_aliases=("ba_feedback", "detailed_design"),
+                ),
+            },
+        )
+    return None
 
 
 def _parse_result_payload(clean_output: str) -> dict[str, object]:
@@ -760,16 +888,19 @@ def _run_ba_turn(
     label: str,
     prompt: str,
     result_contract: TaskResultContract,
+    turn_goal: TaskTurnGoal | None = None,
 ) -> dict[str, object]:
-    result = handoff.worker.run_turn(
+    return run_task_result_turn_with_repair(
+        worker=handoff.worker,
         label=label,
         prompt=prompt,
         result_contract=result_contract,
+        parse_result_payload=_parse_result_payload,
+        turn_goal=turn_goal or _build_ba_turn_goal(result_contract),
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+        stage_label=DETAILED_DESIGN_TASK_NAME,
+        role_label=str(getattr(handoff.worker, "session_name", "") or "需求分析师"),
     )
-    if not result.ok:
-        raise RuntimeError(result.clean_output or f"{label} 执行失败")
-    return _parse_result_payload(result.clean_output)
 
 
 def recreate_design_ba_handoff(
@@ -777,21 +908,36 @@ def recreate_design_ba_handoff(
     project_dir: str | Path,
     previous_handoff: RequirementsAnalystHandoff,
     progress: ReviewStageProgress | None = None,
+    required_reconfiguration: bool = False,
+    reason_text: str = "",
 ) -> RequirementsAnalystHandoff | None:
-    if not stdin_is_interactive():
+    if required_reconfiguration and not stdin_is_interactive():
+        raise RuntimeError("需求分析师需要重新配置智能体，但当前环境无法交互选择厂商/模型。")
+    if not required_reconfiguration and not stdin_is_interactive():
         return None
     ba_display_name = _detailed_design_ba_display_name(project_dir=project_dir, handoff=previous_handoff)
-    selection = prompt_replacement_review_agent_selection(
-        reason_text=f"检测到{ba_display_name}不可继续使用，需要重建需求分析师后继续当前阶段。",
-        previous_selection=ReviewAgentSelection(
-            previous_handoff.vendor,
-            previous_handoff.model,
-            previous_handoff.reasoning_effort,
-            previous_handoff.proxy_url,
-        ),
-        force_model_change=True,
-        role_label=ba_display_name,
-        progress=progress,
+    selection_input = ReviewAgentSelection(
+        previous_handoff.vendor,
+        previous_handoff.model,
+        previous_handoff.reasoning_effort,
+        previous_handoff.proxy_url,
+    )
+    selection = (
+        prompt_required_replacement_review_agent_selection(
+            reason_text=reason_text or f"检测到{ba_display_name}不可继续使用，需要重建需求分析师后继续当前阶段。",
+            previous_selection=selection_input,
+            force_model_change=True,
+            role_label=ba_display_name,
+            progress=progress,
+        )
+        if required_reconfiguration
+        else prompt_replacement_review_agent_selection(
+            reason_text=f"检测到{ba_display_name}不可继续使用，需要重建需求分析师后继续当前阶段。",
+            previous_selection=selection_input,
+            force_model_change=True,
+            role_label=ba_display_name,
+            progress=progress,
+        )
     )
     if selection is None:
         return None
@@ -833,10 +979,18 @@ def run_ba_turn_with_recovery(
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_handoff.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             if auth_error or ready_timeout_error:
+                reason_text = (
+                    f"检测到{ba_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                    if auth_error
+                    else f"{ba_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
+                )
+                mark_worker_awaiting_reconfiguration(current_handoff.worker, reason_text=reason_text)
                 replacement = recreate_design_ba_handoff(
                     project_dir=project_dir,
                     previous_handoff=current_handoff,
                     progress=progress,
+                    required_reconfiguration=True,
+                    reason_text=reason_text,
                 )
                 if replacement is None:
                     raise RuntimeError(f"{ba_display_name} 无法继续，且未能重建需求分析师") from error
@@ -969,6 +1123,21 @@ def build_reviewer_completion_contract(
         phase=DETAILED_DESIGN_TASK_NAME,
         status_path=review_json_path,
         validator=validator,
+        kind="review_round",
+        tracked_artifacts={
+            "review_md": review_md_path,
+            "review_json": review_json_path,
+        },
+    )
+
+
+def _build_reviewer_turn_goal() -> CompletionTurnGoal:
+    return CompletionTurnGoal(
+        goal_id="a05_reviewer_round",
+        outcomes={
+            "review_pass": OutcomeGoal(status="review_pass", required_aliases=("review_json",), forbidden_aliases=("review_md",)),
+            "review_fail": OutcomeGoal(status="review_fail", required_aliases=("review_json", "review_md")),
+        },
     )
 
 
@@ -1018,6 +1187,11 @@ def create_reviewer_runtime(
             proxy_url=selection.proxy_url,
         ),
         runtime_root=runtime_root,
+        runtime_metadata={
+            "project_dir": str(Path(project_dir).expanduser().resolve()),
+            "requirement_name": str(requirement_name).strip(),
+            "workflow_action": "stage.a05.start",
+        },
     )
     review_md_path, review_json_path = build_reviewer_artifact_paths(
         project_dir,
@@ -1047,16 +1221,30 @@ def recreate_reviewer_runtime(
     reviewer: ReviewerRuntime,
     reviewer_spec: DetailedDesignReviewerSpec,
     progress: ReviewStageProgress | None = None,
+    required_reconfiguration: bool = False,
+    reason_text: str = "",
 ) -> ReviewerRuntime | None:
-    if not stdin_is_interactive():
+    if required_reconfiguration and not stdin_is_interactive():
+        raise RuntimeError("审核智能体需要重新配置，但当前环境无法交互选择厂商/模型。")
+    if not required_reconfiguration and not stdin_is_interactive():
         return None
     reviewer_display_name = _reviewer_artifact_agent_name(reviewer)
-    selection = prompt_replacement_review_agent_selection(
-        reason_text=f"检测到{reviewer_display_name}不可继续使用，需要重建审核智能体后继续当前阶段。",
-        previous_selection=reviewer.selection,
-        force_model_change=True,
-        role_label=reviewer_display_name,
-        progress=progress,
+    selection = (
+        prompt_required_replacement_review_agent_selection(
+            reason_text=reason_text or f"检测到{reviewer_display_name}不可继续使用，需要重建审核智能体后继续当前阶段。",
+            previous_selection=reviewer.selection,
+            force_model_change=True,
+            role_label=reviewer_display_name,
+            progress=progress,
+        )
+        if required_reconfiguration
+        else prompt_replacement_review_agent_selection(
+            reason_text=f"检测到{reviewer_display_name}不可继续使用，需要重建审核智能体后继续当前阶段。",
+            previous_selection=reviewer.selection,
+            force_model_change=True,
+            role_label=reviewer_display_name,
+            progress=progress,
+        )
     )
     if selection is None:
         return None
@@ -1086,14 +1274,16 @@ def run_reviewer_turn_with_recreation(
     while True:
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
         try:
-            result = current_reviewer.worker.run_turn(
+            run_completion_turn_with_repair(
+                worker=current_reviewer.worker,
                 label=label,
                 prompt=prompt,
                 completion_contract=current_reviewer.contract,
+                turn_goal=_build_reviewer_turn_goal(),
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                stage_label=DETAILED_DESIGN_TASK_NAME,
+                role_label=_reviewer_artifact_agent_name(current_reviewer),
             )
-            if not result.ok:
-                raise RuntimeError(result.clean_output or f"{current_reviewer.reviewer_name} 执行失败")
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
@@ -1107,12 +1297,20 @@ def run_reviewer_turn_with_recreation(
             ):
                 return current_reviewer
             if auth_error or ready_timeout_error:
+                reason_text = (
+                    f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                    if auth_error
+                    else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
+                )
+                mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
                 replacement = recreate_reviewer_runtime(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     reviewer=current_reviewer,
                     reviewer_spec=reviewer_spec,
                     progress=progress,
+                    required_reconfiguration=True,
+                    reason_text=reason_text,
                 )
                 if replacement is None:
                     raise RuntimeError(f"{reviewer_display_name} 无法继续，且未能重建审核智能体") from error
@@ -1130,6 +1328,7 @@ def build_reviewer_workers(
     project_dir: str | Path,
     requirement_name: str,
     reviewer_specs: Sequence[DetailedDesignReviewerSpec],
+    reviewer_selections_by_name: dict[str, ReviewAgentSelection] | None = None,
     progress: ReviewStageProgress | None = None,
 ) -> list[ReviewerRuntime]:
     if progress is not None:
@@ -1144,7 +1343,9 @@ def build_reviewer_workers(
             occupied_session_names=sorted(predicted_session_names),
         )
         predicted_session_names.add(reviewer_display_name)
-        if interactive:
+        reviewer_key = _reviewer_spec_identity(reviewer_spec)
+        selection = (reviewer_selections_by_name or {}).get(reviewer_key)
+        if selection is None and interactive:
             selection = prompt_review_agent_selection(
                 DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
                 default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
@@ -1154,7 +1355,7 @@ def build_reviewer_workers(
                 progress=progress,
             )
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
-        else:
+        elif selection is None:
             selection = _reviewer_default_selection()
         reviewers.append(
             create_reviewer_runtime(
@@ -1253,6 +1454,7 @@ def _collect_design_hitl_response(
             empty_retry_message="回复不能为空，请重新输入。",
             question_path=question_file,
             answer_path=answer_path,
+            is_hitl=True,
         )
 def _read_required_detailed_design_ba_feedback(paths: dict[str, Path]) -> str:
     ba_feedback = get_markdown_content(paths["ba_feedback_path"]).strip()
@@ -1366,6 +1568,75 @@ def run_ba_modify_loop(
     raise RuntimeError(f"详细设计 HITL 轮次超过上限: {MAX_DETAILED_DESIGN_HITL_ROUNDS}")
 
 
+def run_detailed_design_review_limit_hitl_loop(
+    handoff: RequirementsAnalystHandoff,
+    *,
+    project_dir: str | Path,
+    paths: dict[str, Path],
+    review_msg: str,
+    review_limit: int,
+    review_rounds_used: int,
+    progress: ReviewStageProgress | None = None,
+) -> object:
+    current_handoff = handoff
+    ensure_empty_file(paths["ask_human_path"])
+    ensure_empty_file(paths["ba_feedback_path"])
+
+    def initial_turn() -> object:
+        nonlocal current_handoff
+        current_handoff, _ = run_ba_turn_with_recovery(
+            current_handoff,
+            project_dir=project_dir,
+            label="detailed_design_review_limit_hitl",
+            prompt=build_detailed_design_review_limit_force_hitl_prompt(
+                paths=paths,
+                review_msg=review_msg,
+                review_limit=review_limit,
+                review_rounds_used=review_rounds_used,
+            ),
+            result_contract=build_detailed_design_feedback_contract(
+                paths,
+                mode="a05_detailed_design_review_limit_force_hitl",
+            ),
+            initialize_on_replacement=True,
+            paths=paths,
+            progress=progress,
+        )
+        return current_handoff
+
+    def human_reply_turn(human_msg: str) -> object:
+        nonlocal current_handoff
+        current_handoff, _ = run_ba_turn_with_recovery(
+            current_handoff,
+            project_dir=project_dir,
+            label="detailed_design_review_limit_human_reply",
+            prompt=build_detailed_design_review_limit_human_reply_prompt(
+                paths=paths,
+                review_msg=review_msg,
+                human_msg=human_msg,
+            ),
+            result_contract=build_detailed_design_feedback_contract(
+                paths,
+                mode="a05_detailed_design_review_limit_human_reply",
+            ),
+            initialize_on_replacement=True,
+            paths=paths,
+            progress=progress,
+        )
+        return current_handoff
+
+    result = run_review_limit_hitl_cycle(
+        stage_label="详细设计评审超限",
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        initial_turn=initial_turn,
+        human_reply_turn=human_reply_turn,
+        progress=progress,
+        max_hitl_rounds=MAX_DETAILED_DESIGN_HITL_ROUNDS,
+    )
+    return result
+
+
 def _shutdown_workers(
     ba_handoff: RequirementsAnalystHandoff | None,
     reviewers: Sequence[ReviewerRuntime],
@@ -1409,6 +1680,12 @@ def run_detailed_design_stage(
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_paths: tuple[str, ...] = ()
     reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec] = {}
+    lock_context = requirement_concurrency_lock(
+        project_dir,
+        requirement_name,
+        action="stage.a05.start",
+    )
+    lock_context.__enter__()
     try:
         existing_design_mode = decide_existing_detailed_design_mode(
             args,
@@ -1434,18 +1711,32 @@ def run_detailed_design_stage(
             message(f"检测到已存在《{paths['detailed_design_path'].name}》")
             message("将直接评审现有详细设计；若评审未通过，再进入修改流程")
         update_pre_development_task_status(project_dir, requirement_name, task_key="详细设计", completed=False)
-        cleanup_stale_detailed_design_runtime_state(project_dir)
+        cleanup_stale_detailed_design_runtime_state(project_dir, requirement_name)
         cleanup_existing_detailed_design_artifacts(
             paths,
             requirement_name,
             clear_detailed_design=existing_design_mode == "rerun",
         )
         reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"详设审核智能体 {index}"  # noqa: E731
+        review_round_limit = resolve_review_max_rounds(args, progress=progress)
+        review_round_policy = ReviewRoundPolicy(review_round_limit)
         if existing_design_mode == "rerun":
             active_ba_handoff, created_new_ba = prepare_design_ba_handoff(
                 args,
                 project_dir=project_dir,
                 ba_handoff=ba_handoff,
+            )
+            reviewer_specs = resolve_reviewer_specs(args, progress=progress)
+            reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
+            reviewer_selections_by_name = collect_reviewer_agent_selections(
+                project_dir=project_dir,
+                reviewer_specs=reviewer_specs,
+                display_name_resolver=lambda current_project_dir, reviewer_spec, occupied_session_names: _predict_reviewer_display_name(
+                    project_dir=current_project_dir,
+                    role_name=reviewer_spec.role_name,
+                    occupied_session_names=occupied_session_names,
+                ),
+                progress=progress,
             )
             _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
                 active_ba_handoff,
@@ -1466,24 +1757,34 @@ def run_detailed_design_stage(
                 reviewer_label_getter=reviewer_label_getter,
                 notify=message,
             )
-            reviewer_specs = resolve_reviewer_specs(args, progress=progress)
-            reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
             reviewer_workers = build_reviewer_workers(
                 args,
                 project_dir=project_dir,
                 requirement_name=requirement_name,
                 reviewer_specs=reviewer_specs,
+                reviewer_selections_by_name=reviewer_selections_by_name,
                 progress=progress,
             )
         else:
             pending_discard_ba_handoff = ba_handoff
             reviewer_specs = resolve_reviewer_specs(args, progress=progress)
             reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
+            reviewer_selections_by_name = collect_reviewer_agent_selections(
+                project_dir=project_dir,
+                reviewer_specs=reviewer_specs,
+                display_name_resolver=lambda current_project_dir, reviewer_spec, occupied_session_names: _predict_reviewer_display_name(
+                    project_dir=current_project_dir,
+                    role_name=reviewer_spec.role_name,
+                    occupied_session_names=occupied_session_names,
+                ),
+                progress=progress,
+            )
             reviewer_workers = build_reviewer_workers(
                 args,
                 project_dir=project_dir,
                 requirement_name=requirement_name,
                 reviewer_specs=reviewer_specs,
+                reviewer_selections_by_name=reviewer_selections_by_name,
                 progress=progress,
             )
 
@@ -1499,8 +1800,10 @@ def run_detailed_design_stage(
                 detail_design_review_json=str(reviewer.review_json_path.resolve()),
             )
 
-        for round_index in range(1, MAX_DETAILED_DESIGN_REVIEW_ROUNDS + 1):
-            if round_index == 1:
+        round_index = 1
+        post_hitl_continue_completed = False
+        while True:
+            if not review_round_policy.initial_review_done:
                 reviewer_workers, active_ba_handoff = run_reviewer_phase_with_death_handling(
                     active_ba_handoff,
                     reviewer_workers,
@@ -1574,25 +1877,27 @@ def run_detailed_design_stage(
                         reviewer_label_getter=reviewer_label_getter,
                         notify=message,
                     )
-                _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
-                    active_ba_handoff,
-                    reviewers=reviewer_workers,
-                    run_phase=lambda handoff: run_ba_modify_loop(
-                        handoff,
-                        project_dir=project_dir,
-                        paths=paths,
-                        review_msg=review_msg,
-                        progress=progress,
-                    ),
-                    replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
-                        owner,
-                        project_dir=project_dir,
-                        progress=progress,
-                    ),
-                    main_label="详细设计需求分析师",
-                    reviewer_label_getter=reviewer_label_getter,
-                    notify=message,
-                )
+                if not post_hitl_continue_completed:
+                    _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
+                        active_ba_handoff,
+                        reviewers=reviewer_workers,
+                        run_phase=lambda handoff: run_ba_modify_loop(
+                            handoff,
+                            project_dir=project_dir,
+                            paths=paths,
+                            review_msg=review_msg,
+                            progress=progress,
+                        ),
+                        replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                            owner,
+                            project_dir=project_dir,
+                            progress=progress,
+                        ),
+                        main_label="详细设计需求分析师",
+                        reviewer_label_getter=reviewer_label_getter,
+                        notify=message,
+                    )
+                post_hitl_continue_completed = False
                 ba_reply = _read_required_detailed_design_ba_feedback(paths)
 
                 def again_prompt_builder(reviewer: ReviewerRuntime, reviewer_spec: DetailedDesignReviewerSpec) -> str:
@@ -1650,6 +1955,7 @@ def run_detailed_design_stage(
                     notify=message,
                 )
 
+            review_round_policy.record_review_attempt()
             ensure_active_reviewers(reviewer_workers, stage_label="详细设计")
             review_json_files, review_md_files = _active_reviewer_files(reviewer_workers)
             passed = task_done(
@@ -1690,8 +1996,37 @@ def run_detailed_design_stage(
                     ba_handoff=result_ba_handoff,
                     reviewer_handoff=result_reviewer_handoff,
                 )
-
-        raise RuntimeError(f"详细设计评审超过最大轮数 {MAX_DETAILED_DESIGN_REVIEW_ROUNDS}，仍未全部通过")
+            review_msg = get_markdown_content(paths["merged_review_path"]).strip()
+            if not review_msg:
+                raise RuntimeError("详设评审未通过，但合并后的详设评审记录为空")
+            if review_round_policy.should_escalate_before_next_review():
+                if review_round_policy.max_rounds is None:
+                    raise RuntimeError("review_round_policy 配置错误：无限轮次不应触发超限 HITL")
+                hitl_result, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
+                    active_ba_handoff,
+                    reviewers=reviewer_workers,
+                    run_phase=lambda handoff: run_detailed_design_review_limit_hitl_loop(
+                        handoff,
+                        project_dir=project_dir,
+                        paths=paths,
+                        review_msg=review_msg,
+                        review_limit=review_round_policy.max_rounds,
+                        review_rounds_used=review_round_policy.quota_count,
+                        progress=progress,
+                    ),
+                    owner_getter=lambda result: result.owner,
+                    replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
+                        owner,
+                        project_dir=project_dir,
+                        progress=progress,
+                    ),
+                    main_label="详细设计需求分析师",
+                    reviewer_label_getter=reviewer_label_getter,
+                    notify=message,
+                )
+                post_hitl_continue_completed = bool(getattr(hitl_result, "post_hitl_continue_completed", False))
+                review_round_policy.reset_after_hitl()
+            round_index += 1
     except Exception:
         if pending_discard_ba_handoff is not None:
             _discard_unused_ba_handoff(pending_discard_ba_handoff)
@@ -1704,6 +2039,7 @@ def run_detailed_design_stage(
         raise
     finally:
         progress.stop()
+        lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

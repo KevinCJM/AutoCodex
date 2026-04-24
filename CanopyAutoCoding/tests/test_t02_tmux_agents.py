@@ -39,15 +39,22 @@ from T02_tmux_agents import (
     build_reasoning_note,
     build_session_name,
     extract_final_protocol_token,
+    list_occupied_tmux_session_names,
     load_worker_from_state_path,
     normalize_proxy_url,
     read_text_tail,
     TERMINAL_ACTIVITY_IDLE_WINDOW_SEC,
+    _session_name_lease_lock,
 )
 from canopy_core.runtime.contracts import finalize_task_result, write_task_status
 
 
 class TmuxAgentsTests(unittest.TestCase):
+    def test_session_name_lease_lock_is_reentrant_in_process(self):
+        with _session_name_lease_lock():
+            with _session_name_lease_lock():
+                pass
+
     def test_normalize_proxy_url_accepts_port_or_url(self):
         self.assertEqual("http://127.0.0.1:7890", normalize_proxy_url("7890"))
         self.assertEqual("http://127.0.0.1:10809", normalize_proxy_url(10809))
@@ -201,15 +208,39 @@ Created hello.txt with the content hi in /private/tmp/opencode-permtest.NOSf72/.
 
 10.4K  ctrl+p commands
 """
+            wrapped_completed_visible = """
+Created hello.txt with the content hi in /private/tmp/opencode-permtest.NOSf72/.
+
+10.4K  ctrl+p
+commands
+"""
+            extreme_wrapped_completed_visible = """
+Created hello.txt with the content hi in /private/tmp/opencode-permtest.NOSf72/.
+
+85.2K (4ctrl+p
+command
+s
+"""
             busy_visible = """
 Thinking: The file has been created successfully.
 ■■■⬝⬝⬝⬝⬝  esc interrupt                         tab agents  ctrl+p commands
+"""
+            extreme_wrapped_busy_visible = """
+Thinking: The file has been created successfully.
+esc
+interrupt
+85.2K (4ctrl+p
+command
+s
 """
             self.assertTrue(worker._visible_indicates_agent_starting(booting_visible))
             self.assertFalse(worker._visible_indicates_agent_ready(booting_visible))
             self.assertTrue(worker._visible_indicates_agent_ready(waiting_visible))
             self.assertTrue(worker._visible_indicates_agent_ready(completed_visible))
+            self.assertTrue(worker._visible_indicates_agent_ready(wrapped_completed_visible))
+            self.assertTrue(worker._visible_indicates_agent_ready(extreme_wrapped_completed_visible))
             self.assertFalse(worker._visible_indicates_agent_ready(busy_visible))
+            self.assertFalse(worker._visible_indicates_agent_ready(extreme_wrapped_busy_visible))
 
     def test_codex_title_detection_accepts_work_dir_basename(self):
         class CodexStateWorker(TmuxBatchWorker):
@@ -268,6 +299,7 @@ Thinking: The file has been created successfully.
 
             worker.agent_started = False
             self.assertEqual(worker.get_agent_state(ready_observation), AgentRuntimeState.STARTING)
+            self.assertEqual(worker.get_agent_state(shell_observation), AgentRuntimeState.STARTING)
 
             worker.agent_started = True
             self.assertEqual(worker.get_agent_readiness(ready_observation), AgentRuntimeState.READY.value)
@@ -275,6 +307,32 @@ Thinking: The file has been created successfully.
             self.assertEqual(worker.get_agent_readiness(busy_observation), AgentRuntimeState.BUSY.value)
             self.assertEqual(worker.get_agent_state(busy_observation), AgentRuntimeState.BUSY)
             self.assertEqual(worker.get_agent_state(shell_observation), AgentRuntimeState.DEAD)
+
+    def test_prelaunch_shell_window_keeps_opencode_worker_starting(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            work_dir = Path(tmp_dir)
+            worker = TmuxBatchWorker(
+                worker_id="opencode-prelaunch-worker",
+                work_dir=work_dir,
+                config=AgentRunConfig(vendor="opencode", model="kimi-code/kimi-for-coding"),
+                runtime_root=work_dir / "runtime",
+            )
+            worker.pane_id = "%1"
+            observation = WorkerObservation(
+                visible_text="",
+                raw_log_delta="",
+                raw_log_tail="",
+                current_command="zsh",
+                current_path=str(work_dir),
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-22T10:00:00",
+                pane_title="OpenCode",
+            )
+
+            with mock.patch.object(worker, "target_exists", return_value=True):
+                self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.STARTING)
 
     def test_wrapper_state_maps_not_ready_and_ready(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -830,6 +888,55 @@ workspace (/directory)                                                     branc
                 worker._write_state(WorkerStatus.RUNNING, note="test")  # noqa: SLF001
         notifier.assert_called_once_with()
 
+    def test_read_state_recovers_from_trailing_json_garbage(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="reviewer-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.state_path.write_text(
+                "{\n"
+                '  "state_revision": 3,\n'
+                '  "note": "ok"\n'
+                '}\n "note": "broken"\n}',
+                encoding="utf-8",
+            )
+            recovered = worker.read_state()
+            persisted = json.loads(worker.state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(recovered.get("state_revision"), 3)
+        self.assertEqual(recovered.get("note"), "ok")
+        self.assertEqual(persisted.get("state_revision"), 3)
+        self.assertEqual(persisted.get("note"), "ok")
+
+    def test_write_state_tolerates_preexisting_corrupted_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="reviewer-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.state_path.write_text(
+                "{\n"
+                '  "state_revision": 1,\n'
+                '  "workflow_stage": "pending"\n'
+                '}\n "workflow_stage": "broken"\n}',
+                encoding="utf-8",
+            )
+            with mock.patch.object(worker, "is_agent_alive", return_value=True), mock.patch.object(
+                worker,
+                "get_agent_state",
+                return_value=type("State", (), {"value": "READY"})(),
+            ), mock.patch("T02_tmux_agents._notify_runtime_state_changed_best_effort"):
+                worker._write_state(WorkerStatus.RUNNING, note="recovered")  # noqa: SLF001
+            persisted = json.loads(worker.state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(persisted.get("status"), "running")
+        self.assertEqual(persisted.get("note"), "recovered")
+
     def test_build_session_name_maps_routing_role_for_non_ascii_work_dir(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             work_dir = Path(tmp_dir) / "测试项目"
@@ -1318,6 +1425,62 @@ workspace (/directory)                                                     branc
                         timeout_sec=2.0,
                     )
 
+    def test_wait_for_turn_artifacts_raises_contract_violation_after_ready_with_invalid_files(self):
+        class ReadyInvalidFileContractWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="› Continue working in @filename",
+                    raw_log_delta="",
+                    raw_log_tail="› Continue working in @filename",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-20T00:00:00",
+                    pane_title="AutoCodex",
+                )
+
+            def _can_finalize_turn_artifacts_without_helper(self, observation):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "› Continue working in @filename"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            expected_status_path = root / "需求A_评审记录_架构师-柳土獐.json"
+            task_status_path = root / "task_runtime.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                raise FileNotFoundError(f"缺少审核 JSON 文件: {path}")
+
+            worker = ReadyInvalidFileContractWorker(
+                worker_id="ready-invalid-file-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.agent_started = True
+            with mock.patch("canopy_core.runtime.tmux_runtime.TURN_ARTIFACT_POST_DONE_GRACE_SEC", 0.0):
+                with self.assertRaisesRegex(RuntimeError, "completion_source=terminal_ready"):
+                    worker.wait_for_turn_artifacts(
+                        contract=TurnFileContract(
+                            turn_id="development_review_M4-T1_架构师",
+                            phase="任务开发",
+                            status_path=expected_status_path,
+                            validator=validator,
+                            quiet_window_sec=0.0,
+                            kind="review_round",
+                        ),
+                        task_status_path=task_status_path,
+                        timeout_sec=2.0,
+                    )
+
     def test_wait_for_turn_artifacts_allows_late_files_after_done_before_grace_expires(self):
         class LateArtifactWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -1597,6 +1760,104 @@ workspace (/directory)                                                     branc
             self.assertEqual(Path(parsed["status_path"]).resolve(), contract_path.resolve())
             self.assertEqual(Path(parsed["artifact_paths"]["artifact.json"]).resolve(), artifact_path.resolve())
 
+    def test_run_turn_with_completion_contract_accepts_valid_files_after_prompt_submission_timeout(self):
+        class PromptTimeoutCompletionWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.provider_phase = ProviderPhase.IDLE_READY
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "You've reached your usage limit for this period. retrying in 14m"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="146.1K ctrl+p commands",
+                    raw_log_delta="",
+                    raw_log_tail="146.1K ctrl+p commands",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-24T00:00:00",
+                    pane_title="OC | review",
+                )
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+                review_md.write_text("", encoding="utf-8")
+                review_json.write_text(
+                    json.dumps([{"task_name": "M2-T3", "review_pass": True}], ensure_ascii=False),
+                    encoding="utf-8",
+                )
+
+            def _wait_for_prompt_submission(self, **kwargs):
+                raise TimeoutError("等待智能体确认收到 prompt 超时")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            review_json = root / "review.json"
+            review_md = root / "review.md"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                matched = payload[0]
+                if matched["task_name"] != "M2-T3" or matched["review_pass"] is not True:
+                    raise ValueError("review not complete")
+                if review_md.read_text(encoding="utf-8").strip():
+                    raise ValueError("review markdown should be empty when passed")
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload={"task_name": "M2-T3", "review_pass": True},
+                    artifact_paths={"review_json": str(review_json), "review_md": str(review_md)},
+                    artifact_hashes={
+                        "review_json": "sha256:json",
+                        "review_md": "sha256:md",
+                    },
+                    validated_at="2026-04-24T00:00:00",
+                )
+
+            worker = PromptTimeoutCompletionWorker(
+                worker_id="prompt-timeout-completion-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="kimi-code/kimi-for-coding"),
+                runtime_root=root / "runtime",
+            )
+            result = worker.run_turn(
+                label="development_review_init_M2-T3_审核员_round_1",
+                prompt="write review files only",
+                completion_contract=TurnFileContract(
+                    turn_id="development_review_M2-T3_审核员",
+                    phase="任务开发",
+                    status_path=review_json,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                    kind="review_round",
+                    tracked_artifacts={"review_json": review_json, "review_md": review_md},
+                ),
+                timeout_sec=2.0,
+            )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(len(worker.sent_prompts), 1)
+            self.assertEqual(json.loads(Path(worker.current_task_status_path).read_text(encoding="utf-8")), {"status": "done"})
+            parsed = json.loads(result.clean_output)
+            self.assertEqual(Path(parsed["status_path"]).resolve(), review_json.resolve())
+
 
     def test_validate_task_result_file_requires_required_artifacts_and_hashes(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1722,6 +1983,9 @@ workspace (/directory)                                                     branc
             def target_exists(self, target=None):
                 return True
 
+            def capture_visible(self, tail_lines=200):
+                return "› Continue working in @filename"
+
             def observe(self, *, tail_lines=500, tail_bytes=24000):
                 return WorkerObservation(
                     visible_text="› Continue working in @filename",
@@ -1770,6 +2034,63 @@ workspace (/directory)                                                     branc
             self.assertEqual(result.payload["status"], "ready")
             self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
             self.assertTrue(result_path.exists())
+
+    def test_wait_for_task_result_does_not_finalize_completed_from_ready_without_helper(self):
+        class ContractReadyWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=200):
+                return "› Continue working in @filename"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="› Continue working in @filename",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-16T00:00:03",
+                    pane_title="AutoCodex",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            developer_output = root / "开发记录.md"
+            developer_output.write_text("旧开发记录\n", encoding="utf-8")
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            worker = ContractReadyWorker(
+                worker_id="contract-ready-completed-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": developer_output},
+            )
+
+            with self.assertRaisesRegex(TimeoutError, "等待任务结果超时"):
+                worker.wait_for_task_result(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    timeout_sec=0.6,
+                )
+
+            self.assertFalse(result_path.exists())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "running"})
 
     def test_wait_for_task_result_materializes_ready_result_from_terminal_reply_without_helper(self):
         class ReadyReplyWorker(TmuxBatchWorker):
@@ -1840,6 +2161,87 @@ workspace (/directory)                                                     branc
                 result.payload["artifacts"]["requirements_clear"],
                 str(requirements_clear.resolve()),
             )
+
+    def test_run_turn_finalizes_task_result_after_prompt_submission_timeout(self):
+        class PromptTimeoutReadyWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.agent_started = True
+                self.agent_ready = True
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "AutoCodex"
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_text = text
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):
+                raise TimeoutError("等待智能体确认收到 prompt 超时")
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="\n".join(
+                        [
+                            "• 完成",
+                            "",
+                            "› Next task",
+                            "",
+                            "  gpt-5.4-mini low · ~/Desktop/my_test",
+                        ]
+                    ),
+                    raw_log_delta="完成",
+                    raw_log_tail="• 完成",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-24T00:00:03",
+                    pane_title="AutoCodex",
+                )
+
+            def capture_visible(self, tail_lines=500):
+                return "完成\n› Next task"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            worker = PromptTimeoutReadyWorker(
+                worker_id="prompt-timeout-ready-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            contract = TaskResultContract(
+                turn_id="a08_reviewer_init",
+                phase="a08_reviewer_init",
+                task_kind="a08_reviewer_init",
+                mode="a08_reviewer_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+                terminal_status_tokens={"ready": ("完成",)},
+                terminal_status_summaries={"ready": "复核审核器已完成初始化"},
+            )
+
+            result = worker.run_turn(
+                label="overall_review_reviewer_init_architect",
+                prompt="只返回 完成",
+                result_contract=contract,
+                timeout_sec=1.0,
+            )
+
+            self.assertTrue(result.ok)
+            result_path = Path(worker.current_task_result_path)
+            self.assertTrue(result_path.exists())
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "ready")
+            self.assertEqual(payload["summary"], "复核审核器已完成初始化")
+            self.assertEqual(json.loads(Path(worker.current_task_status_path).read_text(encoding="utf-8")), {"status": "done"})
 
     def test_wait_for_task_result_materializes_terminal_result_even_when_terminal_recently_changed(self):
         class NoisyReadyReplyWorker(TmuxBatchWorker):
@@ -1984,6 +2386,84 @@ workspace (/directory)                                                     branc
                     ),
                 )
 
+    def test_wait_for_task_result_ignores_token_seen_only_in_baseline_raw_log_tail(self):
+        class StaleTailDoneReplyWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                surface = "\n".join(
+                    [
+                        "• 完成",
+                        "",
+                        "",
+                        "› Explain this codebase",
+                        "",
+                        "  gpt-5.4-mini low · ~/Desktop/my_test",
+                    ]
+                )
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-20T00:00:03",
+                    pane_title="AutoCodex",
+                )
+
+            def _maybe_send_task_completion_nudge(self, **kwargs):
+                return False
+
+            def capture_visible(self, tail_lines=500):
+                return "• 完成"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            detailed_design = root / "详细设计.md"
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            worker = StaleTailDoneReplyWorker(
+                worker_id="stale-tail-done-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            contract = TaskResultContract(
+                turn_id="a05_detailed_design_generate",
+                phase="a05_detailed_design_generate",
+                task_kind="a05_detailed_design_generate",
+                mode="a05_detailed_design_generate",
+                expected_statuses=("completed",),
+                required_artifacts={"detailed_design": detailed_design},
+                terminal_status_tokens={"completed": ("完成",)},
+                terminal_status_summaries={"completed": "需求分析师已生成详细设计文档"},
+            )
+            with self.assertRaises(TimeoutError):
+                worker.wait_for_task_result(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    timeout_sec=0.1,
+                    baseline_visible="› Explain this codebase\n  gpt-5.4-mini low · ~/Desktop/my_test",
+                    baseline_raw_log_tail="\n".join(
+                        [
+                            "• 完成",
+                            "",
+                            "",
+                            "› Explain this codebase",
+                            "",
+                            "  gpt-5.4-mini low · ~/Desktop/my_test",
+                        ]
+                    ),
+                )
+
     def test_wait_for_task_result_accepts_repeated_terminal_token_when_delta_is_fresh(self):
         class FreshDoneReplyWorker(TmuxBatchWorker):
             def target_exists(self, target=None):
@@ -2058,6 +2538,290 @@ workspace (/directory)                                                     branc
             )
             self.assertEqual(result.payload["status"], "completed")
             self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+
+    def test_wait_for_task_result_finalizes_opencode_ready_with_extreme_narrow_footer(self):
+        class ExtremeWrappedFooterReadyWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                surface = "\n".join(
+                    [
+                        "完成",
+                        "",
+                        "74.8K (29%) · $0.08  ctrl+p",
+                        "command",
+                        "s",
+                    ]
+                )
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-23T00:00:03",
+                    pane_title="OC | demo",
+                )
+
+            def _maybe_send_task_completion_nudge(self, **kwargs):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            worker = ExtremeWrappedFooterReadyWorker(
+                worker_id="opencode-wrapped-ready-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="default"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            contract = TaskResultContract(
+                turn_id="a06_ba_init",
+                phase="a06_ba_init",
+                task_kind="a06_ba_init",
+                mode="a06_ba_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+                terminal_status_tokens={"ready": ("完成",)},
+                terminal_status_summaries={"ready": "任务拆分阶段智能体已完成初始化"},
+            )
+            result = worker.wait_for_task_result(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                timeout_sec=1.0,
+            )
+            self.assertEqual(result.payload["status"], "ready")
+            self.assertEqual(result.payload["summary"], "任务拆分阶段智能体已完成初始化")
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+
+    def test_wait_for_task_result_finalizes_claude_ready_with_footer_noise(self):
+        class ClaudeFooterReadyWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                surface = "\n".join(
+                    [
+                        "⏺ 完成",
+                        "",
+                        "────────────────────────────────────────────────────────────────────────────────",
+                        "❯",
+                        "⏵⏵ bypass permissions on     ✗ Auto-update failed · Try claude doctor or npm …",
+                        "(·oo·) Crumpet",
+                    ]
+                )
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="⏺ 完成",
+                    raw_log_tail=surface,
+                    current_command="claude",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-23T00:00:03",
+                    pane_title="✳ Understand CashCost feature requirements",
+                )
+
+            def _maybe_send_task_completion_nudge(self, **kwargs):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            worker = ClaudeFooterReadyWorker(
+                worker_id="claude-footer-ready-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="claude", model="sonnet"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            contract = TaskResultContract(
+                turn_id="a08_reviewer_init",
+                phase="a08_reviewer_init",
+                task_kind="a08_reviewer_init",
+                mode="a08_reviewer_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+                terminal_status_tokens={"ready": ("完成",)},
+                terminal_status_summaries={"ready": "复核审核器已完成初始化"},
+            )
+            result = worker.wait_for_task_result(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                timeout_sec=1.0,
+            )
+            self.assertEqual(result.payload["status"], "ready")
+            self.assertEqual(result.payload["summary"], "复核审核器已完成初始化")
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+
+    def test_wait_for_task_result_opencode_uses_raw_log_when_message_extract_fails(self):
+        class ExtractionFailingOpenCodeReadyWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def _extract_last_message(self, visible_text: str) -> str:
+                raise ValueError("No assistant response found in terminal output")
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                surface = "\n".join(
+                    [
+                        "完成",
+                        "",
+                        "74.8K (29%) · $0.08  ctrl+p",
+                        "command",
+                        "s",
+                    ]
+                )
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="完成",
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-23T00:00:03",
+                    pane_title="OC | demo",
+                )
+
+            def _maybe_send_task_completion_nudge(self, **kwargs):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            worker = ExtractionFailingOpenCodeReadyWorker(
+                worker_id="opencode-fallback-ready-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="default"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            contract = TaskResultContract(
+                turn_id="a08_reviewer_init",
+                phase="a08_reviewer_init",
+                task_kind="a08_reviewer_init",
+                mode="a08_reviewer_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+                terminal_status_tokens={"ready": ("完成",)},
+                terminal_status_summaries={"ready": "复核审核器已完成初始化"},
+            )
+            result = worker.wait_for_task_result(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                timeout_sec=1.0,
+            )
+            self.assertEqual(result.payload["status"], "ready")
+            self.assertEqual(result.payload["summary"], "复核审核器已完成初始化")
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+
+    def test_wait_for_prompt_submission_accepts_opencode_extreme_narrow_footer_ready_phase(self):
+        class ExtremeWrappedFooterPromptWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+
+            def observe(self, *, tail_lines=320, tail_bytes=24000):
+                self.observe_calls += 1
+                surface = "\n".join(
+                    [
+                        "完成",
+                        "",
+                        "74.8K (29%) · $0.08  ctrl+p",
+                        "command",
+                        "s",
+                    ]
+                )
+                observation = WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="完成",
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-23T00:00:03",
+                    pane_title="OC | demo",
+                )
+                self.provider_phase = self._debounce_provider_phase(self.detector.classify_phase(observation))
+                return observation
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch("canopy_core.runtime.tmux_runtime.time.sleep", return_value=None):
+            worker = ExtremeWrappedFooterPromptWorker(
+                worker_id="opencode-wrapped-ready-prompt-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="default"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            observation = worker._wait_for_prompt_submission(prompt="analyze", timeout_sec=1.0)
+
+        self.assertEqual(observation.current_command, "node")
+        self.assertEqual(worker.provider_phase, ProviderPhase.IDLE_READY)
+        self.assertGreaterEqual(worker.observe_calls, 2)
+
+    def test_wait_for_prompt_submission_accepts_opencode_opaque_tui_delta_as_processing(self):
+        class OpaqueTuiPromptWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+
+            def observe(self, *, tail_lines=320, tail_bytes=24000):
+                self.observe_calls += 1
+                surface = "■■⬝⬝⬝⬝⬝■■■■⬝⬝⬝"
+                observation = WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta=surface,
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-23T00:00:03",
+                    pane_title="OC | demo",
+                )
+                self.provider_phase = self._debounce_provider_phase(self.detector.classify_phase(observation))
+                return observation
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = OpaqueTuiPromptWorker(
+                worker_id="opencode-opaque-tui-prompt-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="kimi-code/kimi-for-coding"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            observation = worker._wait_for_prompt_submission(prompt="analyze", timeout_sec=1.0)
+
+        self.assertEqual(observation.current_command, "node")
+        self.assertEqual(worker.provider_phase, ProviderPhase.PROCESSING)
+        self.assertEqual(worker.observe_calls, 1)
 
     def test_ensure_agent_ready_does_not_reuse_processing_phase(self):
         class ProcessingWorker(TmuxBatchWorker):
@@ -2139,6 +2903,55 @@ workspace (/directory)                                                     branc
             self.assertEqual(worker.wrapper_state, WrapperState.READY)
             self.assertEqual(worker.last_pane_title, "canopy-api-v3")
             self.assertEqual(worker.observe_count, 3)
+
+    def test_wait_for_agent_ready_accepts_codex_stable_visible_prompt_with_busy_title(self):
+        class VisibleReadyWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_count = 0
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                self.observe_count += 1
+                return WorkerObservation(
+                    visible_text="› Write tests for @filename",
+                    raw_log_delta="",
+                    raw_log_tail="› Write tests for @filename",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at=f"2026-04-21T00:01:0{self.observe_count}",
+                    pane_title="⠋ canopy-api-v3",
+                )
+
+            def capture_visible(self, tail_lines=500):
+                return "› Write tests for @filename"
+
+        with tempfile.TemporaryDirectory(prefix="codex-visible-ready-") as tmp_dir:
+            work_dir = Path(tmp_dir) / "canopy-api-v3"
+            work_dir.mkdir()
+            worker = VisibleReadyWorker(
+                worker_id="visible-ready-worker",
+                work_dir=work_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+
+            with mock.patch("canopy_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                worker._wait_for_agent_ready(timeout_sec=1.0)
+
+            self.assertTrue(worker.agent_started)
+            self.assertTrue(worker.agent_ready)
+            self.assertEqual(worker.wrapper_state, WrapperState.READY)
+            self.assertEqual(worker.observe_count, 2)
 
 
     def test_codex_boot_prompt_handler_debounces_repeated_enter(self):
@@ -2770,6 +3583,20 @@ kimi-cli update available
         )
         self.assertEqual(detector.extract_last_message(output), "• 准备完毕")
 
+    def test_codex_extract_last_message_truncates_idle_footer_after_assistant_label(self):
+        detector = CodexOutputDetector()
+        output = "\n".join(
+            [
+                "assistant:",
+                "• 完成",
+                "",
+                "› Use /skills to list available skills",
+                "",
+                "  gpt-5.4 high fast · ~/Desktop/KevinGit/My_C_Tools",
+            ]
+        )
+        self.assertEqual(detector.extract_last_message(output), "• 完成")
+
     def test_extract_reply_from_observation_accepts_symbol_prefixed_turn_token_for_written_audit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             worker = TmuxBatchWorker(
@@ -3001,6 +3828,51 @@ kimi-cli update available
         self.assertIn(("kill", "demo"), calls)
         self.assertIn(("list", ""), calls)
 
+    def test_runtime_controller_rejects_matching_session_name_from_other_work_dir(self):
+        class FakeBackend:
+            def has_session(self, session_name):
+                return session_name == "shared-session"
+
+            def show_option(self, target, option_name):
+                return ""
+
+            def display_message(self, target, expression):
+                return "/tmp/other-project"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            controller = TmuxRuntimeController(FakeBackend())
+            self.assertFalse(
+                controller.session_matches_context(
+                    "shared-session",
+                    work_dir=Path(tmp_dir) / "current-project",
+                )
+            )
+
+    def test_runtime_controller_rejects_matching_session_name_from_other_runtime_identity(self):
+        class FakeBackend:
+            def __init__(self, runtime_dir: str):
+                self.runtime_dir = runtime_dir
+
+            def has_session(self, session_name):
+                return session_name == "shared-session"
+
+            def show_option(self, target, option_name):
+                if option_name == "@canopy_runtime_dir":
+                    return self.runtime_dir
+                return ""
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            runtime_a = Path(tmp_dir) / "project-a" / ".development_runtime" / "worker-a"
+            runtime_b = Path(tmp_dir) / "project-b" / ".development_runtime" / "worker-b"
+            controller = TmuxRuntimeController(FakeBackend(str(runtime_b)))
+            self.assertFalse(
+                controller.session_matches_context(
+                    "shared-session",
+                    runtime_dir=runtime_a,
+                    work_dir=runtime_a.parent.parent,
+                )
+            )
+
     def test_worker_restart_and_kill_are_runtime_level_ops(self):
         class FakeBackend:
             def has_session(self, session_name):
@@ -3198,10 +4070,70 @@ kimi-cli update available
                 pane_title="OpenCode",
             )
         )
+        wrapped_idle_ready_phase = detector.classify_phase(
+            WorkerObservation(
+                visible_text="OK\n\n10.9K  ctrl+p\ncommands",
+                raw_log_delta="",
+                raw_log_tail="Thinking: The user wants me to reply with exactly OK.\nOK\n\n10.9K  ctrl+p\ncommands",
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-22T00:00:04",
+                pane_title="OpenCode",
+            )
+        )
+        opaque_tui_processing_phase = detector.classify_phase(
+            WorkerObservation(
+                visible_text="■■⬝⬝⬝⬝⬝■■■■⬝⬝⬝",
+                raw_log_delta="■■⬝⬝⬝⬝⬝■■■■⬝⬝⬝",
+                raw_log_tail="■■⬝⬝⬝⬝⬝■■■■⬝⬝⬝",
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-22T00:00:04",
+                pane_title="OpenCode",
+            )
+        )
         self.assertEqual(booting_phase, ProviderPhase.BOOTING)
         self.assertEqual(waiting_phase, ProviderPhase.WAITING_INPUT)
         self.assertEqual(processing_phase, ProviderPhase.PROCESSING)
         self.assertEqual(idle_ready_phase, ProviderPhase.IDLE_READY)
+        self.assertEqual(wrapped_idle_ready_phase, ProviderPhase.IDLE_READY)
+        self.assertEqual(opaque_tui_processing_phase, ProviderPhase.PROCESSING)
+        narrow_processing_phase = detector.classify_phase(
+            WorkerObservation(
+                visible_text="Thinking: The user wants me to reply with exactly OK.\nesc\ninterrupt\n10.9K ctrl+p\ncommand\ns",
+                raw_log_delta="",
+                raw_log_tail="Thinking: The user wants me to reply with exactly OK.\nesc\ninterrupt\n10.9K ctrl+p\ncommand\ns",
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-22T00:00:05",
+                pane_title="OpenCode",
+            )
+        )
+        extreme_wrapped_idle_ready_phase = detector.classify_phase(
+            WorkerObservation(
+                visible_text="OK\n\n10.9Kctrl+p\ncommand\ns",
+                raw_log_delta="",
+                raw_log_tail="Thinking: The user wants me to reply with exactly OK.\nOK\n\n10.9Kctrl+p\ncommand\ns",
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-22T00:00:06",
+                pane_title="OpenCode",
+            )
+        )
+        self.assertEqual(narrow_processing_phase, ProviderPhase.PROCESSING)
+        self.assertEqual(extreme_wrapped_idle_ready_phase, ProviderPhase.IDLE_READY)
 
     def test_wait_for_agent_ready_supports_opencode_visible_ready_without_title_ready(self):
         class OpenCodeReadyWorker(TmuxBatchWorker):
@@ -3237,6 +4169,84 @@ kimi-cli update available
             self.assertEqual(worker.wrapper_state, WrapperState.READY)
             self.assertEqual(worker.current_command, "node")
             self.assertGreaterEqual(worker.observe_calls, 2)
+
+    def test_opencode_get_agent_state_uses_recent_log_for_extreme_narrow_ready_footer(self):
+        class OpenCodeStateWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ARG002
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = OpenCodeStateWorker(
+                worker_id="opencode-narrow-ready-state",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="default"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.pane_id = "%1"
+            observation = WorkerObservation(
+                visible_text="10.9Kctrl+p\ncommand\ns",
+                raw_log_delta="",
+                raw_log_tail="Created hello.txt with the content hi.\n\n10.9K  ctrl+p commands",
+                current_command="node",
+                current_path=str(worker.work_dir),
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-22T00:00:07",
+                pane_title="OC | demo",
+            )
+
+            self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.READY)
+
+    def test_opencode_get_agent_state_without_observation_accepts_ready_wrapper_state(self):
+        class OpenCodeCachedStateWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ARG002
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = OpenCodeCachedStateWorker(
+                worker_id="opencode-ready-cached",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="default"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.pane_id = "%1"
+            worker.current_command = "node"
+            worker.current_path = str(worker.work_dir)
+            worker.wrapper_state = WrapperState.READY
+            worker.last_pane_title = "OpenCode"
+
+            self.assertEqual(worker.get_agent_state().value, AgentRuntimeState.READY.value)
+
+    def test_opencode_get_agent_state_without_observation_accepts_waiting_input_phase(self):
+        class OpenCodeCachedPhaseWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ARG002
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = OpenCodeCachedPhaseWorker(
+                worker_id="opencode-ready-phase",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="default"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.pane_id = "%1"
+            worker.current_command = "node"
+            worker.current_path = str(worker.work_dir)
+            worker.provider_phase = ProviderPhase.WAITING_INPUT
+            worker.wrapper_state = WrapperState.NOT_READY
+            worker.last_pane_title = "OpenCode"
+
+            self.assertEqual(worker.get_agent_state().value, AgentRuntimeState.READY.value)
 
     def test_worker_does_not_restore_provider_phase_from_state_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3311,6 +4321,7 @@ kimi-cli update available
             worker.pane_id = "%1"
             worker.last_log_offset = 123
             worker._write_state(WorkerStatus.READY, note="seed")
+            previous_updated_at = str(worker.read_state().get("updated_at", ""))
 
             snapshot = worker.refresh_health()
             state = worker.read_state()
@@ -3321,7 +4332,47 @@ kimi-cli update available
             self.assertEqual(state["health_note"], ProviderPhase.WAITING_INPUT.value)
             self.assertEqual(state["current_command"], "codex")
             self.assertEqual(state["current_path"], str(worker.work_dir))
+            self.assertEqual(str(state.get("updated_at", "")), str(state.get("last_heartbeat_at", "")))
+            self.assertTrue(str(state.get("updated_at", "")))
             self.assertEqual(worker.last_log_offset, 123)
+
+    def test_passive_health_refresh_notifies_runtime_state_change_when_health_changes(self):
+        class PassiveHealthWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return """
+› Continue with the current task
+  gpt-5.4 high · ~/Desktop/KevinGit/My_C_Tools
+"""
+
+            def pane_current_command(self):
+                return "codex"
+
+            def pane_current_path(self):
+                return str(self.work_dir)
+
+            def pane_dead(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = PassiveHealthWorker(
+                worker_id="passive-health-notify-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker._write_state(WorkerStatus.READY, note="seed")
+
+            with mock.patch("T02_tmux_agents._notify_runtime_state_changed_best_effort") as notifier:
+                worker.refresh_health()
+
+            notifier.assert_called_once_with()
 
     def test_passive_health_refresh_marks_provider_auth_error_from_visible_text(self):
         class PassiveAuthErrorWorker(TmuxBatchWorker):
@@ -3545,6 +4596,162 @@ kimi-cli update available
             with self.assertRaisesRegex(RuntimeError, "tmux create failed"):
                 worker.create_session()
             self.assertFalse(worker._session_name_reserved)
+
+    def test_create_session_renames_on_precheck_conflict_without_killing_existing_session(self):
+        class FakeBackend:
+            def __init__(self):
+                self.live_sessions: set[str] = set()
+                self.kill_calls: list[str] = []
+                self.create_calls: list[str] = []
+
+            def list_sessions(self):
+                return list(self.live_sessions)
+
+            def has_session(self, session_name):
+                return session_name in self.live_sessions
+
+            def create_session(self, session_name, work_dir, command):
+                _ = work_dir
+                _ = command
+                self.create_calls.append(session_name)
+                if session_name in self.live_sessions:
+                    raise subprocess.CalledProcessError(
+                        1,
+                        ["tmux", "new-session"],
+                        stderr=f"duplicate session: {session_name}",
+                    )
+                self.live_sessions.add(session_name)
+                return "%2"
+
+            def kill_session(self, session_name):
+                self.kill_calls.append(session_name)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            backend = FakeBackend()
+            worker = TmuxBatchWorker(
+                worker_id="requirements-analyst",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=backend,
+            )
+            original_name = worker.session_name
+            backend.live_sessions.add(original_name)
+            events: list[tuple[str, dict[str, object]]] = []
+            worker._tmux = lambda *args, **kwargs: subprocess.CompletedProcess(["tmux"], 0, "", "")
+            worker._start_pipe_logging = lambda: None
+            worker._ensure_health_supervisor_started = lambda: None
+            worker._refresh_health_state_nonintrusive = lambda: None
+            worker._write_state = lambda *args, **kwargs: None
+            worker._log_event = lambda event, **payload: events.append((event, payload))
+
+            pane_id = worker.create_session()
+
+            self.assertEqual(pane_id, "%2")
+            self.assertNotEqual(worker.session_name, original_name)
+            self.assertIn(original_name, backend.live_sessions)
+            self.assertIn(worker.session_name, backend.live_sessions)
+            self.assertEqual(backend.kill_calls, [])
+            self.assertTrue(any(event == "session_name_conflict_retry" for event, _ in events))
+            self.assertFalse(worker._session_name_reserved)
+
+    def test_create_session_conflict_retry_fails_fast_after_retry_limit(self):
+        class AlwaysConflictBackend:
+            def __init__(self):
+                self.kill_calls: list[str] = []
+                self.create_calls: list[str] = []
+
+            def list_sessions(self):
+                return []
+
+            def has_session(self, session_name):
+                _ = session_name
+                return True
+
+            def create_session(self, session_name, work_dir, command):
+                _ = work_dir
+                _ = command
+                self.create_calls.append(session_name)
+                raise AssertionError("create_session should not be called when pre-check always conflicts")
+
+            def kill_session(self, session_name):
+                self.kill_calls.append(session_name)
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "canopy_core.runtime.tmux_runtime.SESSION_NAME_CREATE_MAX_RETRIES",
+            2,
+        ):
+            backend = AlwaysConflictBackend()
+            worker = TmuxBatchWorker(
+                worker_id="requirements-analyst",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=backend,
+            )
+            worker._log_event = lambda *args, **kwargs: None
+
+            with self.assertRaisesRegex(RuntimeError, "conflict_key="):
+                worker.create_session()
+            self.assertEqual(backend.kill_calls, [])
+            self.assertFalse(worker._session_name_reserved)
+
+    def test_session_name_reservation_uses_global_lease_before_create(self):
+        import canopy_core.runtime.tmux_runtime as tmux_runtime
+
+        class FakeBackend:
+            def list_sessions(self):
+                return []
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            tmux_runtime,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ):
+            backend = FakeBackend()
+            worker_a = TmuxBatchWorker(
+                worker_id="requirements-analyst",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime-a",
+                backend=backend,
+            )
+            first_name = worker_a.session_name
+            tmux_runtime._RESERVED_SESSION_NAMES.clear()  # noqa: SLF001
+
+            worker_b = TmuxBatchWorker(
+                worker_id="requirements-analyst",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime-b",
+                backend=backend,
+            )
+
+            self.assertNotEqual(worker_b.session_name, first_name)
+            occupied = set(list_occupied_tmux_session_names(backend=backend))
+            self.assertIn(first_name, occupied)
+            self.assertIn(worker_b.session_name, occupied)
+            worker_a._release_session_name_reservation()  # noqa: SLF001
+            worker_b._release_session_name_reservation()  # noqa: SLF001
+
+    def test_mark_awaiting_reconfiguration_rewrites_failed_state_to_running(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="requirements-analyst",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker._write_state(WorkerStatus.FAILED, note="error:init")  # noqa: SLF001
+
+            worker.mark_awaiting_reconfiguration(reason_text="需要重新选择模型")
+
+            state = worker.read_state()
+            self.assertEqual(state["status"], WorkerStatus.RUNNING.value)
+            self.assertEqual(state["result_status"], "running")
+            self.assertEqual(state["note"], "awaiting_reconfig")
+            self.assertEqual(state["health_status"], "awaiting_reconfig")
+            self.assertEqual(state["health_note"], "需要重新选择模型")
 
 
 

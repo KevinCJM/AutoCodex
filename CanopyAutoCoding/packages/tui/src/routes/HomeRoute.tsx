@@ -57,6 +57,15 @@ export function HomeRoute(props: Props) {
           <text fg="#888888">Ctrl+L 查看完整日志</text>
         </Show>
       </box>
+      <Show when={props.snapshot.pendingAttention}>
+        <box borderStyle="single" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
+          <text>人工提醒</text>
+          <text fg="#f7c948">macOS 提醒中: {props.snapshot.pendingAttentionReason || '待处理人工输入'}</text>
+          <Show when={props.snapshot.pendingAttentionSince}>
+            <text fg="#888888">since: {props.snapshot.pendingAttentionSince}</text>
+          </Show>
+        </box>
+      </Show>
       <box borderStyle="single" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
         <text>运行中智能体</text>
         <Show when={props.agents.length > 0} fallback={<text fg="#888888">当前没有运行中的智能体。</text>}>

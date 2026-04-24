@@ -17,7 +17,26 @@ def _resolve_worker(owner: object | None):
 
 
 def _state_name(worker: object) -> str:
+    refresh_health = getattr(worker, "refresh_health", None)
+    if callable(refresh_health):
+        try:
+            snapshot = refresh_health(notify_on_change=False)
+            state_name = str(getattr(snapshot, "agent_state", "") or "").strip().upper()
+            if state_name:
+                return state_name
+        except Exception:
+            pass
+    observe = getattr(worker, "observe", None)
     get_state = getattr(worker, "get_agent_state", None)
+    if callable(observe) and callable(get_state):
+        try:
+            observation = observe(tail_lines=120)
+            state = get_state(observation)
+            state_name = str(getattr(state, "value", state) or "").strip().upper()
+            if state_name:
+                return state_name
+        except Exception:
+            pass
     if not callable(get_state):
         return "READY"
     state = get_state()

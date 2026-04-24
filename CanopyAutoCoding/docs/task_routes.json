@@ -1,0 +1,664 @@
+{
+  "schema_version": "1.2",
+  "scope_mode": "subtree_only",
+  "resolution_model": {
+    "derive_from_modules": [
+      "first_read_files",
+      "then_check_files",
+      "related_tests",
+      "related_configs",
+      "minimum_regression",
+      "expand_search_flags"
+    ],
+    "module_order_source": "first_read_modules listed order",
+    "module_merge_direction": "left_to_right",
+    "dedupe_strategy": "stable_first_seen_exact_string",
+    "route_appends_field": "route_appends",
+    "route_expand_search_flags_field": "route_expand_search_flags",
+    "route_overrides_field": "route_overrides",
+    "merge_steps": [
+      "1_module_derived",
+      "2_route_appends_then_dedupe",
+      "3_route_expand_search_flags_then_dedupe",
+      "4_route_overrides_replace_field"
+    ],
+    "override_semantics": "if route_overrides[field] exists, ignore derived and appended values for that field and use the override exactly",
+    "missing_field_semantics": "omitted route_appends, route_expand_search_flags, and route_overrides mean inherit-with-no-route-delta",
+    "sparse_encoding": {
+      "omit_empty_route_appends": true,
+      "omit_empty_route_expand_search_flags": true,
+      "omit_empty_route_overrides": true
+    }
+  },
+  "flag_vocab": {
+    "unknown_flag_policy": "treat unknown flags as schema drift until this registry is updated",
+    "domains": [
+      {
+        "id": "expand_search_flags",
+        "used_in": [
+          "docs/repo_map.json modules[].expand_search_flags",
+          "docs/task_routes.json routes[].route_expand_search_flags"
+        ],
+        "allowed_values": [
+          "artifact_hash_rule_changed",
+          "bridge_protocol_changed",
+          "clarification_handoff_changed",
+          "clarification_prompt_contract_changed",
+          "cleanup_behavior_changed",
+          "design_artifact_contract_changed",
+          "design_prompt_contract_changed",
+          "development_prompt_contract_changed",
+          "frontend_package_boundary_changed",
+          "hitl_status_inference_changed",
+          "implementation_handoff_changed",
+          "input_mode_changed",
+          "intake_artifact_path_changed",
+          "legacy_import_surface_changed",
+          "pre_development_record_changed",
+          "prompt_contract_boundary_changed",
+          "prompt_contract_surface_changed",
+          "provider_pattern_logic_changed",
+          "requirement_name_flow_changed",
+          "requirement_name_output_changed",
+          "requirements_common_contract_changed",
+          "resume_or_retry_changed",
+          "review_handoff_changed",
+          "review_prompt_contract_changed",
+          "review_round_logic_changed",
+          "reviewer_handoff_changed",
+          "reviewer_round_logic_changed",
+          "role_orchestration_changed",
+          "routing_file_contract_changed",
+          "runtime_cleanup_changed",
+          "session_lifecycle_changed",
+          "shared_requirement_helper_changed",
+          "shared_review_flow_changed",
+          "status_schema_changed",
+          "task_contract_schema_changed",
+          "task_split_prompt_contract_changed",
+          "terminal_ui_behavior_changed",
+          "tmux_runtime_dependency_changed",
+          "tmux_session_logic_changed",
+          "tui_or_web_launch_behavior_changed",
+          "tui_redirect_changed",
+          "vendor_or_model_normalization_changed",
+          "workflow_flag_surface_changed",
+          "workflow_stage_set_changed",
+          "wrapper_target_changed"
+        ]
+      },
+      {
+        "id": "stop_and_verify_flags",
+        "used_in": [
+          "docs/task_routes.json routes[].stop_and_verify_flags"
+        ],
+        "allowed_values": [
+          "contract_check_not_read",
+          "missing_direct_stage_test",
+          "multi_stage_edit",
+          "prompt_source_change",
+          "routing_artifact_edit",
+          "session_lifecycle_edit",
+          "shared_runtime_edit",
+          "terminal_output_only_completion",
+          "vendor_tree_edit",
+          "wrapper_only_edit"
+        ]
+      },
+      {
+        "id": "fact_check_flags",
+        "used_in": [
+          "docs/task_routes.json routes[].fact_check_flags"
+        ],
+        "allowed_values": [
+          "choose_correct_review_runtime_file",
+          "confirm_architecture_boundary_tests",
+          "confirm_artifact_hash_rules",
+          "confirm_prompt_contract_boundary",
+          "confirm_python_vs_frontend_boundary",
+          "confirm_shared_review_dependency",
+          "confirm_stage_import_chain",
+          "confirm_stage_vs_prompt_change_boundary",
+          "confirm_status_schema",
+          "confirm_task_contract_schema",
+          "confirm_tmux_runtime_dependency",
+          "trace_package_target"
+        ]
+      },
+      {
+        "id": "risk_basis_flags",
+        "used_in": [
+          "docs/pitfalls.json pitfalls[].risk_basis_flags"
+        ],
+        "allowed_values": [
+          "architecture_boundary_test_anchor",
+          "artifact_hash_validator",
+          "artifact_reuse_state",
+          "bridge_boundary",
+          "cleanup_resume_coupling",
+          "file_contract_completion_gate",
+          "legacy_stage_name_drift",
+          "multi_stage_agent_behavior_surface",
+          "persistent_runtime_directories",
+          "prompt_contract_import_boundary",
+          "protected_prompt_sources",
+          "runtime_contract_writer",
+          "shared_review_runtime_boundary",
+          "workflow_entry_boundary",
+          "wrapper_alias_indirection"
+        ]
+      }
+    ]
+  },
+  "routes": [
+    {
+      "id": "R01_workflow_entry",
+      "task_type": "workflow_entry_and_stage_chaining",
+      "match_keywords": [
+        "a00",
+        "workflow",
+        "entrypoint",
+        "stage chaining",
+        "requirement_name",
+        "cli"
+      ],
+      "negative_keywords": [
+        "hitl",
+        "prompt contract",
+        "tui protocol"
+      ],
+      "route_priority": 100,
+      "first_read_modules": [
+        "M01_workflow_entry",
+        "M02_workflow_support"
+      ],
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P04"
+      ],
+      "stop_and_verify_flags": [
+        "multi_stage_edit",
+        "wrapper_only_edit"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_stage_import_chain"
+      ],
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R02_routing_init",
+      "task_type": "routing_initialization_and_session_control",
+      "match_keywords": [
+        "routing layer",
+        "routing init",
+        "a01",
+        "agent init",
+        "run-init",
+        "resume-run",
+        "target dir",
+        "vendor",
+        "model",
+        "session control"
+      ],
+      "negative_keywords": [
+        "requirements clarification",
+        "detailed design"
+      ],
+      "route_priority": 110,
+      "first_read_modules": [
+        "M03_routing_init_stage",
+        "M12_tmux_runtime"
+      ],
+      "pitfall_ids": [
+        "P02",
+        "P04",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "session_lifecycle_edit",
+        "routing_artifact_edit",
+        "wrapper_only_edit"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_tmux_runtime_dependency"
+      ],
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R03_requirement_intake",
+      "task_type": "requirement_intake_and_input_artifacts",
+      "match_keywords": [
+        "requirement intake",
+        "a02",
+        "input artifact",
+        "original requirement",
+        "notion intake",
+        "question path",
+        "record path"
+      ],
+      "negative_keywords": [
+        "requirements review",
+        "detailed design"
+      ],
+      "route_priority": 90,
+      "first_read_modules": [
+        "M04_requirement_intake_stage",
+        "M11_requirements_shared_support",
+        "M13_runtime_contracts_hitl"
+      ],
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "terminal_output_only_completion",
+        "wrapper_only_edit",
+        "contract_check_not_read"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_artifact_hash_rules"
+      ],
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R04_requirements_clarification",
+      "task_type": "requirements_clarification_and_handoff",
+      "match_keywords": [
+        "requirements clarification",
+        "a03",
+        "clarification",
+        "ba handoff",
+        "requirements common"
+      ],
+      "negative_keywords": [
+        "requirements review",
+        "detailed design"
+      ],
+      "route_priority": 85,
+      "first_read_modules": [
+        "M05_requirements_clarification_stage",
+        "M11_requirements_shared_support",
+        "M14_prompt_contracts"
+      ],
+      "route_appends": {
+        "then_check_files": [
+          "Prompt_03_RequirementsClarification.py"
+        ]
+      },
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "missing_direct_stage_test",
+        "prompt_source_change"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_prompt_contract_boundary"
+      ],
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected",
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R05_requirements_review",
+      "task_type": "requirements_review_and_shared_review_flow",
+      "match_keywords": [
+        "requirements review",
+        "review stage",
+        "reviewer orchestration",
+        "a04",
+        "shared review"
+      ],
+      "negative_keywords": [
+        "detailed design",
+        "task split"
+      ],
+      "route_priority": 88,
+      "first_read_modules": [
+        "M06_requirements_review_stage",
+        "M10_shared_review_orchestration",
+        "M14_prompt_contracts"
+      ],
+      "route_expand_search_flags": [
+        "review_prompt_contract_changed"
+      ],
+      "pitfall_ids": [
+        "P01",
+        "P03",
+        "P04",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "shared_runtime_edit",
+        "prompt_source_change"
+      ],
+      "fact_check_flags": [
+        "choose_correct_review_runtime_file",
+        "confirm_prompt_contract_boundary"
+      ],
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected"
+      ]
+    },
+    {
+      "id": "R06_detailed_design",
+      "task_type": "detailed_design_and_reviewer_handoff",
+      "match_keywords": [
+        "detailed design",
+        "a05",
+        "design stage",
+        "reviewer handoff"
+      ],
+      "negative_keywords": [
+        "task split",
+        "development"
+      ],
+      "route_priority": 84,
+      "first_read_modules": [
+        "M07_detailed_design_stage",
+        "M10_shared_review_orchestration",
+        "M14_prompt_contracts"
+      ],
+      "route_appends": {
+        "then_check_files": [
+          "Prompt_05_DetailedDesign.py"
+        ]
+      },
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P04",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "shared_runtime_edit",
+        "wrapper_only_edit",
+        "prompt_source_change"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_shared_review_dependency",
+        "confirm_prompt_contract_boundary"
+      ],
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected",
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R07_task_split",
+      "task_type": "task_split_and_task_contract_generation",
+      "match_keywords": [
+        "task split",
+        "a06",
+        "task contract",
+        "task breakdown"
+      ],
+      "negative_keywords": [
+        "development",
+        "tui"
+      ],
+      "route_priority": 82,
+      "first_read_modules": [
+        "M08_task_split_stage",
+        "M14_prompt_contracts"
+      ],
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "wrapper_only_edit",
+        "prompt_source_change"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_task_contract_schema"
+      ],
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected",
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R08_development_stage",
+      "task_type": "development_stage_or_prompt_contract",
+      "match_keywords": [
+        "development stage",
+        "a07",
+        "implementation handoff",
+        "development prompt"
+      ],
+      "negative_keywords": [
+        "task split",
+        "workflow entry"
+      ],
+      "route_priority": 80,
+      "first_read_modules": [
+        "M09_development_stage",
+        "M14_prompt_contracts"
+      ],
+      "route_appends": {
+        "then_check_files": [
+          "Prompt_07_Development.py"
+        ]
+      },
+      "pitfall_ids": [
+        "P01",
+        "P03",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "prompt_source_change"
+      ],
+      "fact_check_flags": [
+        "confirm_stage_vs_prompt_change_boundary"
+      ],
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected"
+      ]
+    },
+    {
+      "id": "R12_overall_review_stage",
+      "task_type": "overall_review_stage_and_reviewer_reuse",
+      "match_keywords": [
+        "overall review",
+        "a08",
+        "review again",
+        "复核",
+        "整体复核"
+      ],
+      "negative_keywords": [
+        "task split",
+        "tui protocol"
+      ],
+      "route_priority": 79,
+      "first_read_modules": [
+        "M16_overall_review_stage",
+        "M09_development_stage",
+        "M10_shared_review_orchestration",
+        "M14_prompt_contracts"
+      ],
+      "route_appends": {
+        "then_check_files": [
+          "Prompt_08_OverallReview.py"
+        ]
+      },
+      "route_expand_search_flags": [
+        "implementation_handoff_changed",
+        "reviewer_handoff_changed",
+        "shared_review_flow_changed"
+      ],
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P04",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "shared_runtime_edit",
+        "wrapper_only_edit",
+        "prompt_source_change"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_shared_review_dependency",
+        "confirm_prompt_contract_boundary",
+        "confirm_task_contract_schema"
+      ],
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected",
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R09_runtime_contracts_hitl",
+      "task_type": "runtime_contracts_hitl_and_status_files",
+      "match_keywords": [
+        "contract",
+        "turn_status",
+        "stage_status",
+        "task_result",
+        "hitl",
+        "artifact hash",
+        "resume",
+        "retry"
+      ],
+      "negative_keywords": [
+        "workflow entry",
+        "tui package"
+      ],
+      "route_priority": 105,
+      "first_read_modules": [
+        "M13_runtime_contracts_hitl",
+        "M12_tmux_runtime"
+      ],
+      "route_appends": {
+        "then_check_files": [
+          "T01_tools.py"
+        ]
+      },
+      "route_expand_search_flags": [
+        "tmux_runtime_dependency_changed"
+      ],
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P05"
+      ],
+      "stop_and_verify_flags": [
+        "terminal_output_only_completion",
+        "wrapper_only_edit"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_status_schema",
+        "confirm_artifact_hash_rules"
+      ],
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R10_bridge_tui",
+      "task_type": "bridge_backend_web_backend_and_tui_protocol",
+      "match_keywords": [
+        "tui",
+        "web backend",
+        "backend bridge",
+        "protocol",
+        "opentui"
+      ],
+      "negative_keywords": [
+        "task split",
+        "hitl"
+      ],
+      "route_priority": 78,
+      "first_read_modules": [
+        "M15_bridge_tui"
+      ],
+      "pitfall_ids": [
+        "P02",
+        "P04"
+      ],
+      "stop_and_verify_flags": [
+        "wrapper_only_edit",
+        "vendor_tree_edit"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_python_vs_frontend_boundary"
+      ],
+      "agent_rule_ids": [
+        "HR06_vendor_tree_read_only",
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "R11_alias_boundaries",
+      "task_type": "top_level_alias_and_boundary_confirmation",
+      "match_keywords": [
+        "alias",
+        "compat",
+        "wrapper",
+        "facade",
+        "legacy import",
+        "architecture boundary"
+      ],
+      "negative_keywords": [],
+      "route_priority": 120,
+      "first_read_modules": [
+        "M01_workflow_entry",
+        "M12_tmux_runtime",
+        "M13_runtime_contracts_hitl",
+        "M15_bridge_tui"
+      ],
+      "route_appends": {
+        "first_read_files": [
+          "A01_Routing_LayerPlanning.py",
+          "A02_RequirementIntake.py",
+          "A03_RequirementsClarification.py",
+          "A05_DetailedDesign.py",
+          "A06_TaskSplit.py"
+        ]
+      },
+      "route_expand_search_flags": [
+        "wrapper_target_changed",
+        "legacy_import_surface_changed"
+      ],
+      "pitfall_ids": [
+        "P02"
+      ],
+      "stop_and_verify_flags": [
+        "wrapper_only_edit"
+      ],
+      "fact_check_flags": [
+        "trace_package_target",
+        "confirm_architecture_boundary_tests"
+      ],
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ]
+    }
+  ]
+}

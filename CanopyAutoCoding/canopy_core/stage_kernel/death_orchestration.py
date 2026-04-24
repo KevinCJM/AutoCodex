@@ -58,6 +58,7 @@ def _has_ever_launched(worker: object | None) -> bool:
 def drop_dead_reviewers(
     reviewers: Sequence[TReviewer],
     *,
+    replace_reviewer: Callable[[TReviewer, int], TReviewer | None] | None = None,
     reviewer_label_getter: Callable[[TReviewer, int], str] | None = None,
     notify: Callable[[str], None] | None = None,
 ) -> list[TReviewer]:
@@ -66,6 +67,14 @@ def drop_dead_reviewers(
         if not _is_dead(reviewer):
             survivors.append(reviewer)
             continue
+        if replace_reviewer is not None:
+            replacement = replace_reviewer(reviewer, index)
+            if replacement is not None:
+                survivors.append(replacement)
+                if notify is not None:
+                    label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
+                    notify(f"{label} 已死亡，已重建审核智能体继续当前阶段。")
+                continue
         if notify is not None:
             label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
             notify(f"{label} 已死亡，后续将忽略该审核智能体。")
@@ -91,12 +100,14 @@ def run_main_phase_with_death_handling(
     owner_getter: Callable[[TResult], TMain] | None = None,
     main_label: str = "主工作智能体",
     reviewer_label_getter: Callable[[TReviewer, int], str] | None = None,
+    replace_dead_reviewer: Callable[[TReviewer, int], TReviewer | None] | None = None,
     notify: Callable[[str], None] | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
 ) -> tuple[TResult, list[TReviewer], TMain]:
     current_main = replace_dead_main(main_owner, replace_owner=replace_dead_main_owner)
     current_reviewers = drop_dead_reviewers(
         reviewers,
+        replace_reviewer=replace_dead_reviewer,
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
@@ -112,6 +123,7 @@ def run_main_phase_with_death_handling(
     updated_main = replace_dead_main(updated_main, replace_owner=replace_dead_main_owner)
     current_reviewers = drop_dead_reviewers(
         current_reviewers,
+        replace_reviewer=replace_dead_reviewer,
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
@@ -133,12 +145,14 @@ def run_reviewer_phase_with_death_handling(
     replace_dead_main_owner: Callable[[TMain], TMain],
     main_label: str = "主工作智能体",
     reviewer_label_getter: Callable[[TReviewer, int], str] | None = None,
+    replace_dead_reviewer: Callable[[TReviewer, int], TReviewer | None] | None = None,
     notify: Callable[[str], None] | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
 ) -> tuple[list[TReviewer], TMain]:
     current_main = replace_dead_main(main_owner, replace_owner=replace_dead_main_owner)
     current_reviewers = drop_dead_reviewers(
         reviewers,
+        replace_reviewer=replace_dead_reviewer,
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
@@ -153,6 +167,7 @@ def run_reviewer_phase_with_death_handling(
     current_main = replace_dead_main(current_main, replace_owner=replace_dead_main_owner)
     updated_reviewers = drop_dead_reviewers(
         updated_reviewers,
+        replace_reviewer=replace_dead_reviewer,
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )

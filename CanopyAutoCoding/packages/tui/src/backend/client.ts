@@ -143,4 +143,11 @@ export class BackendClient {
       value,
     })
   }
+
+  sendPresence(reason: string, shellFocus: string): void {
+    void this.request('ui.presence', {
+      reason,
+      shell_focus: shellFocus,
+    }).catch(() => undefined)
+  }
 }

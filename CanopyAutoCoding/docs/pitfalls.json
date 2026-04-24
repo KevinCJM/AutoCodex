@@ -1,0 +1,286 @@
+{
+  "schema_version": "1.2",
+  "scope_mode": "subtree_only",
+  "pitfalls": [
+    {
+      "id": "P01",
+      "title": "structured_file_contracts_are_completion_truth",
+      "severity": "high",
+      "confidence": 0.97,
+      "symptoms": [
+        "terminal_done_but_validator_fail",
+        "turn_status_artifact_mismatch",
+        "status_schema_drift"
+      ],
+      "trigger_actions": [
+        "edit_completion_checks",
+        "edit_task_result_contract",
+        "edit_artifact_hash_rules",
+        "edit_hitl_status_inference"
+      ],
+      "risk_basis_flags": [
+        "runtime_contract_writer",
+        "artifact_hash_validator",
+        "file_contract_completion_gate"
+      ],
+      "related_paths": [
+        "canopy_core/runtime/contracts.py",
+        "canopy_core/runtime/hitl.py",
+        "T05_hitl_runtime.py",
+        "tests/test_t05_hitl_runtime.py",
+        "tests/test_runtime_contract_compat.py"
+      ],
+      "affected_modules": [
+        "M01_workflow_entry",
+        "M04_requirement_intake_stage",
+        "M05_requirements_clarification_stage",
+        "M06_requirements_review_stage",
+        "M07_detailed_design_stage",
+        "M08_task_split_stage",
+        "M09_development_stage",
+        "M16_overall_review_stage",
+        "M11_requirements_shared_support",
+        "M13_runtime_contracts_hitl"
+      ],
+      "blast_radius": "stage_completion_and_resume",
+      "check_before_edit": [
+        "verify_status_schema_fields",
+        "verify_required_artifact_hash_rules",
+        "verify_file_contract_truth"
+      ],
+      "safe_observation_methods": [
+        "read_runtime_contracts_first",
+        "read_runtime_hitl_first",
+        "run_runtime_contract_tests"
+      ],
+      "agent_rule_ids": []
+    },
+    {
+      "id": "P02",
+      "title": "top_level_aliases_and_legacy_names_can_misroute_edits",
+      "severity": "high",
+      "confidence": 0.96,
+      "symptoms": [
+        "wrapper_edit_has_no_effect",
+        "legacy_stage_name_reference",
+        "package_target_not_traced"
+      ],
+      "trigger_actions": [
+        "edit_wrapper_before_target_trace",
+        "route_from_test_filename_only",
+        "treat_wrapper_as_implementation_truth"
+      ],
+      "risk_basis_flags": [
+        "wrapper_alias_indirection",
+        "legacy_stage_name_drift",
+        "architecture_boundary_test_anchor"
+      ],
+      "related_paths": [
+        "A00_main.py",
+        "A01_Routing_LayerPlanning.py",
+        "A02_RequirementIntake.py",
+        "A03_RequirementsClarification.py",
+        "A05_DetailedDesign.py",
+        "A06_TaskSplit.py",
+        "A08_OverallReview.py",
+        "T02_tmux_agents.py",
+        "T05_hitl_runtime.py",
+        "T11_tui_backend.py",
+        "T11_web_backend.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "affected_modules": [
+        "M01_workflow_entry",
+        "M03_routing_init_stage",
+        "M04_requirement_intake_stage",
+        "M05_requirements_clarification_stage",
+        "M07_detailed_design_stage",
+        "M08_task_split_stage",
+        "M16_overall_review_stage",
+        "M12_tmux_runtime",
+        "M13_runtime_contracts_hitl",
+        "M15_bridge_tui"
+      ],
+      "blast_radius": "misrouted_edit",
+      "check_before_edit": [
+        "trace_package_target",
+        "confirm_current_import_chain",
+        "confirm_wrapper_is_not_only_change_surface"
+      ],
+      "safe_observation_methods": [
+        "read_architecture_boundary_tests_first",
+        "read_wrapper_and_target_together"
+      ],
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ]
+    },
+    {
+      "id": "P03",
+      "title": "prompt_contract_boundary_and_protected_prompt_sources",
+      "severity": "high",
+      "confidence": 0.92,
+      "symptoms": [
+        "prompt_source_change_requested",
+        "runtime_logic_moved_into_prompt_contracts",
+        "prompt_contract_import_boundary_broken"
+      ],
+      "trigger_actions": [
+        "edit_business_prompt_source",
+        "edit_prompt_contract_boundary",
+        "add_runtime_or_stage_imports_to_prompt_contracts"
+      ],
+      "risk_basis_flags": [
+        "protected_prompt_sources",
+        "prompt_contract_import_boundary",
+        "multi_stage_agent_behavior_surface"
+      ],
+      "related_paths": [
+        "T04_common_prompt.py",
+        "Prompt_01_RoutingLayerPlanning.py",
+        "Prompt_03_RequirementsClarification.py",
+        "Prompt_05_DetailedDesign.py",
+        "Prompt_07_Development.py",
+        "Prompt_08_OverallReview.py",
+        "canopy_core/prompt_contracts/common.py",
+        "canopy_core/prompt_contracts/requirements_clarification.py",
+        "canopy_core/prompt_contracts/requirements_review.py",
+        "canopy_core/prompt_contracts/detailed_design.py",
+        "canopy_core/prompt_contracts/task_split.py",
+        "canopy_core/prompt_contracts/development.py",
+        "canopy_core/prompt_contracts/overall_review.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "affected_modules": [
+        "M05_requirements_clarification_stage",
+        "M06_requirements_review_stage",
+        "M07_detailed_design_stage",
+        "M08_task_split_stage",
+        "M09_development_stage",
+        "M16_overall_review_stage",
+        "M14_prompt_contracts"
+      ],
+      "blast_radius": "multi_stage_agent_behavior",
+      "check_before_edit": [
+        "confirm_agent_rule_hr05",
+        "verify_change_is_not_runtime_logic",
+        "verify_prompt_contract_import_boundary"
+      ],
+      "safe_observation_methods": [
+        "read_agents_rule_source_first",
+        "run_architecture_boundary_tests"
+      ],
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected"
+      ]
+    },
+    {
+      "id": "P04",
+      "title": "workflow_bridge_and_shared_orchestration_changes_have_high_blast_radius",
+      "severity": "high",
+      "confidence": 0.9,
+      "symptoms": [
+        "cross_stage_regression_after_small_edit",
+        "cli_or_tui_launch_regression",
+        "shared_review_flow_regression"
+      ],
+      "trigger_actions": [
+        "edit_workflow_entry",
+        "edit_bridge_backend",
+        "edit_shared_review_runtime"
+      ],
+      "risk_basis_flags": [
+        "workflow_entry_boundary",
+        "bridge_boundary",
+        "shared_review_runtime_boundary"
+      ],
+      "related_paths": [
+        "A00_main.py",
+        "canopy_core/workflow/entry.py",
+        "canopy_core/bridge/backend.py",
+        "T11_tui_backend.py",
+        "canopy_core/stage_kernel/overall_review.py",
+        "canopy_core/stage_kernel/shared_review.py",
+        "canopy_core/stage_kernel/reviewer_orchestration.py"
+      ],
+      "affected_modules": [
+        "M01_workflow_entry",
+        "M02_workflow_support",
+        "M03_routing_init_stage",
+        "M06_requirements_review_stage",
+        "M07_detailed_design_stage",
+        "M10_shared_review_orchestration",
+        "M16_overall_review_stage",
+        "M15_bridge_tui"
+      ],
+      "blast_radius": "multi_module_regression",
+      "check_before_edit": [
+        "read_direct_callers_and_callees",
+        "confirm_boundary_type",
+        "expand_regression_beyond_single_test"
+      ],
+      "safe_observation_methods": [
+        "use_repo_map_relations_first",
+        "run_cross_module_regression_sets"
+      ],
+      "agent_rule_ids": []
+    },
+    {
+      "id": "P05",
+      "title": "runtime_directories_cleanup_and_reuse_are_stateful",
+      "severity": "medium",
+      "confidence": 0.84,
+      "symptoms": [
+        "stale_runtime_state_affects_retry",
+        "resume_picks_old_artifacts",
+        "cleanup_breaks_reuse_assumptions"
+      ],
+      "trigger_actions": [
+        "edit_cleanup_logic",
+        "edit_resume_or_retry_logic",
+        "edit_runtime_directory_selection",
+        "edit_artifact_reuse_logic"
+      ],
+      "risk_basis_flags": [
+        "persistent_runtime_directories",
+        "artifact_reuse_state",
+        "cleanup_resume_coupling"
+      ],
+      "related_paths": [
+        ".agent_init_runtime",
+        ".routing_init_runtime",
+        ".requirements_clarification_runtime",
+        ".development_runtime",
+        "canopy_core/stage_kernel/overall_review.py",
+        "canopy_core/runtime/contracts.py",
+        "canopy_core/runtime/hitl.py",
+        "canopy_core/runtime/tmux_runtime.py"
+      ],
+      "affected_modules": [
+        "M03_routing_init_stage",
+        "M04_requirement_intake_stage",
+        "M05_requirements_clarification_stage",
+        "M06_requirements_review_stage",
+        "M07_detailed_design_stage",
+        "M08_task_split_stage",
+        "M09_development_stage",
+        "M10_shared_review_orchestration",
+        "M16_overall_review_stage",
+        "M12_tmux_runtime",
+        "M13_runtime_contracts_hitl"
+      ],
+      "blast_radius": "resume_cleanup_and_status",
+      "check_before_edit": [
+        "verify_runtime_directory_model",
+        "verify_cleanup_does_not_break_resume",
+        "verify_artifact_reuse_alignment"
+      ],
+      "safe_observation_methods": [
+        "inspect_runtime_directories_first",
+        "read_runtime_writers_before_cleanup_changes",
+        "run_runtime_and_stage_regressions"
+      ],
+      "agent_rule_ids": []
+    }
+  ]
+}

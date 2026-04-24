@@ -43,6 +43,7 @@ from T02_tmux_agents import (
     is_worker_death_error,
 )
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop
+from canopy_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from T08_pre_development import mark_requirement_clarification_completed
 from T09_terminal_ops import (
     SingleLineSpinnerMonitor,
@@ -575,56 +576,65 @@ def run_requirements_clarification_stage(
     parser = build_parser()
     args = parser.parse_args(argv)
     project_dir, requirement_name = collect_request(args)
-    if has_existing_requirements_clarification(project_dir, requirement_name):
-        if should_reuse_existing_requirements_clarification(
+    lock_context = requirement_concurrency_lock(
+        project_dir,
+        requirement_name,
+        action="stage.a03.start",
+    )
+    lock_context.__enter__()
+    try:
+        if has_existing_requirements_clarification(project_dir, requirement_name):
+            if should_reuse_existing_requirements_clarification(
+                    project_dir,
+                    requirement_name,
+                    overwrite=bool(args.overwrite),
+                    interactive=stdin_is_interactive(),
+            ):
+                message("复用已有的需求澄清，直接进入需求评审阶段")
+                result = reuse_existing_requirements_clarification(project_dir, requirement_name)
+                mark_requirement_clarification_completed(project_dir, requirement_name)
+                return result
+            message("不直接复用已有需求澄清，将启动需求分析师基于现有澄清继续核验")
+            selection = collect_requirements_clarification_agent_selection(args)
+            message(render_requirements_clarification_stage_start(selection))
+            result = run_requirements_clarification(
                 project_dir,
                 requirement_name,
-                overwrite=bool(args.overwrite),
-                interactive=stdin_is_interactive(),
-        ):
-            message("复用已有的需求澄清，直接进入需求评审阶段")
-            result = reuse_existing_requirements_clarification(project_dir, requirement_name)
-            mark_requirement_clarification_completed(project_dir, requirement_name)
-            return result
-        message("不直接复用已有需求澄清，将启动需求分析师基于现有澄清继续核验")
-        selection = collect_requirements_clarification_agent_selection(args)
-        message(render_requirements_clarification_stage_start(selection))
-        result = run_requirements_clarification(
-            project_dir,
-            requirement_name,
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-            resume_existing=True,
-            preserve_ba_worker=preserve_ba_worker,
+                vendor=selection.vendor,
+                model=selection.model,
+                reasoning_effort=selection.reasoning_effort,
+                proxy_url=selection.proxy_url,
+                resume_existing=True,
+                preserve_ba_worker=preserve_ba_worker,
+            )
+        else:
+            message("执行摘要: 未检测到可复用的需求澄清，需要启动需求分析师智能体执行需求澄清；请为需求分析师选择厂商、模型、推理强度、代理端口。")
+            selection = collect_requirements_clarification_agent_selection(args)
+            message(render_requirements_clarification_stage_start(selection))
+            result = run_requirements_clarification(
+                project_dir,
+                requirement_name,
+                vendor=selection.vendor,
+                model=selection.model,
+                reasoning_effort=selection.reasoning_effort,
+                proxy_url=selection.proxy_url,
+                resume_existing=False,
+                preserve_ba_worker=preserve_ba_worker,
+            )
+        mark_requirement_clarification_completed(project_dir, requirement_name)
+        cleanup_paths = result.cleanup_paths
+        if cleanup_paths:
+            cleanup_runtime_paths(cleanup_paths)
+            cleanup_paths = ()
+        return RequirementsClarificationStageResult(
+            project_dir=result.project_dir,
+            requirement_name=result.requirement_name,
+            requirements_clear_path=result.requirements_clear_path,
+            cleanup_paths=cleanup_paths,
+            ba_handoff=result.ba_handoff,
         )
-    else:
-        message("执行摘要: 未检测到可复用的需求澄清，需要启动需求分析师智能体执行需求澄清；请为需求分析师选择厂商、模型、推理强度、代理端口。")
-        selection = collect_requirements_clarification_agent_selection(args)
-        message(render_requirements_clarification_stage_start(selection))
-        result = run_requirements_clarification(
-            project_dir,
-            requirement_name,
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-            resume_existing=False,
-            preserve_ba_worker=preserve_ba_worker,
-        )
-    mark_requirement_clarification_completed(project_dir, requirement_name)
-    cleanup_paths = result.cleanup_paths
-    if cleanup_paths:
-        cleanup_runtime_paths(cleanup_paths)
-        cleanup_paths = ()
-    return RequirementsClarificationStageResult(
-        project_dir=result.project_dir,
-        requirement_name=result.requirement_name,
-        requirements_clear_path=result.requirements_clear_path,
-        cleanup_paths=cleanup_paths,
-        ba_handoff=result.ba_handoff,
-    )
+    finally:
+        lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -1,0 +1,1246 @@
+{
+  "schema_version": "1.2",
+  "scope": {
+    "root": ".",
+    "mode": "subtree_only",
+    "parent_inspection_allowed": false,
+    "path_ownership_model": "module.owned_paths[] is authoritative; each owned path uses exact or subtree matching",
+    "relation_model": {
+      "field": "relations",
+      "direction_semantics": "every relation points from the current module to the target module",
+      "allowed_directions": [
+        "outbound"
+      ],
+      "allowed_types": [
+        "depends_on",
+        "invokes_stage",
+        "dispatches_to",
+        "hands_off_to"
+      ],
+      "type_semantics": {
+        "depends_on": "current module reads, imports, or calls target module logic as a required dependency",
+        "invokes_stage": "current module starts target stage as a workflow stage transition",
+        "dispatches_to": "current module routes execution into target subsystem or bridge surface",
+        "hands_off_to": "current stage completes and hands control or artifacts to target stage"
+      },
+      "target_type": "module_id",
+      "dedupe_key": [
+        "direction",
+        "type",
+        "target"
+      ]
+    },
+    "notes": []
+  },
+  "modules": [
+    {
+      "id": "M01_workflow_entry",
+      "name": "workflow_entry",
+      "kind": "orchestrator",
+      "purpose": "top-level workflow entry and stage chaining",
+      "owned_paths": [
+        {
+          "path": "A00_main.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/workflow/entry.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "A00_main.py",
+        "canopy_core/workflow/entry.py"
+      ],
+      "key_symbols": [
+        "main",
+        "build_parser",
+        "build_stage_args",
+        "ensure_pre_development_task_record",
+        "run_stage",
+        "render_remaining_stage_placeholders"
+      ],
+      "first_read_files": [
+        "A00_main.py",
+        "canopy_core/workflow/entry.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M02_workflow_support"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M03_routing_init_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M04_requirement_intake_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M05_requirements_clarification_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M06_requirements_review_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M07_detailed_design_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M08_task_split_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M09_development_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "invokes_stage",
+          "target": "M16_overall_review_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "dispatches_to",
+          "target": "M15_bridge_tui"
+        }
+      ],
+      "out_of_scope_dependencies": [
+        "tmux binary",
+        "external agent providers"
+      ],
+      "related_tests": [
+        "tests/test_a00_main.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "stage_order",
+        "requirement_name_handoff",
+        "tui_redirect"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "whole_workflow",
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P04"
+      ],
+      "minimum_regression": [
+        "tests/test_a00_main.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "workflow_stage_set_changed",
+        "workflow_flag_surface_changed",
+        "requirement_name_flow_changed",
+        "tui_redirect_changed"
+      ]
+    },
+    {
+      "id": "M02_workflow_support",
+      "name": "workflow_support",
+      "kind": "support",
+      "purpose": "shared workflow helpers for pre-development records and terminal UI operations",
+      "owned_paths": [
+        {
+          "path": "T08_pre_development.py",
+          "match": "exact",
+          "role": "support"
+        },
+        {
+          "path": "T09_terminal_ops.py",
+          "match": "exact",
+          "role": "support"
+        }
+      ],
+      "entry_files": [
+        "T08_pre_development.py",
+        "T09_terminal_ops.py"
+      ],
+      "key_symbols": [],
+      "first_read_files": [
+        "T08_pre_development.py",
+        "T09_terminal_ops.py"
+      ],
+      "then_check_files": [],
+      "relations": [],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_a00_main.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "pre_development_record_state",
+        "terminal_ui_side_effects"
+      ],
+      "edit_risk": "medium",
+      "blast_radius": "workflow_support",
+      "pitfall_ids": [
+        "P04"
+      ],
+      "minimum_regression": [
+        "tests/test_a00_main.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "pre_development_record_changed",
+        "terminal_ui_behavior_changed"
+      ]
+    },
+    {
+      "id": "M03_routing_init_stage",
+      "name": "routing_init_stage",
+      "kind": "stage",
+      "purpose": "routing initialization, interactive terminal routing flow, and run-store orchestration",
+      "owned_paths": [
+        {
+          "path": "A01_Routing_LayerPlanning.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/stage_kernel/routing_init.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        },
+        {
+          "path": "B01_terminal_interaction.py",
+          "match": "exact",
+          "role": "interactive_support"
+        },
+        {
+          "path": "T03_agent_init_workflow.py",
+          "match": "exact",
+          "role": "run_store_support"
+        }
+      ],
+      "entry_files": [
+        "A01_Routing_LayerPlanning.py",
+        "canopy_core/stage_kernel/routing_init.py"
+      ],
+      "key_symbols": [
+        "prompt_project_dir",
+        "run_routing_stage"
+      ],
+      "first_read_files": [
+        "A01_Routing_LayerPlanning.py",
+        "canopy_core/stage_kernel/routing_init.py",
+        "B01_terminal_interaction.py"
+      ],
+      "then_check_files": [
+        "T03_agent_init_workflow.py"
+      ],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M12_tmux_runtime"
+        }
+      ],
+      "out_of_scope_dependencies": [
+        "external agent providers"
+      ],
+      "related_tests": [
+        "tests/test_a01_routing_layer_planning.py",
+        "tests/test_b01_terminal_interaction.py",
+        "tests/test_t03_agent_init_workflow.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "session_lifecycle",
+        "routing_artifact_generation",
+        "vendor_model_normalization"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "routing_stage",
+      "pitfall_ids": [
+        "P02",
+        "P04",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_a01_routing_layer_planning.py",
+        "tests/test_b01_terminal_interaction.py",
+        "tests/test_t03_agent_init_workflow.py",
+        "tests/test_t02_tmux_agents.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "routing_file_contract_changed",
+        "session_lifecycle_changed",
+        "vendor_or_model_normalization_changed",
+        "cleanup_behavior_changed"
+      ]
+    },
+    {
+      "id": "M04_requirement_intake_stage",
+      "name": "requirement_intake_stage",
+      "kind": "stage",
+      "purpose": "requirement intake stage entry and implementation",
+      "owned_paths": [
+        {
+          "path": "A02_RequirementIntake.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/stage_kernel/requirement_intake.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "A02_RequirementIntake.py",
+        "canopy_core/stage_kernel/requirement_intake.py"
+      ],
+      "key_symbols": [
+        "run_requirement_intake_stage"
+      ],
+      "first_read_files": [
+        "A02_RequirementIntake.py",
+        "canopy_core/stage_kernel/requirement_intake.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M11_requirements_shared_support"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M13_runtime_contracts_hitl"
+        },
+        {
+          "direction": "outbound",
+          "type": "hands_off_to",
+          "target": "M05_requirements_clarification_stage"
+        }
+      ],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_a02_requirements_analysis.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "input_artifact_contract",
+        "requirement_name_output"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "intake_stage",
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_a02_requirements_analysis.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "input_mode_changed",
+        "intake_artifact_path_changed",
+        "requirement_name_output_changed"
+      ]
+    },
+    {
+      "id": "M05_requirements_clarification_stage",
+      "name": "requirements_clarification_stage",
+      "kind": "stage",
+      "purpose": "requirements clarification stage entry and implementation",
+      "owned_paths": [
+        {
+          "path": "A03_RequirementsClarification.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/stage_kernel/requirements_clarification.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "A03_RequirementsClarification.py",
+        "canopy_core/stage_kernel/requirements_clarification.py"
+      ],
+      "key_symbols": [
+        "run_requirements_clarification_stage"
+      ],
+      "first_read_files": [
+        "A03_RequirementsClarification.py",
+        "canopy_core/stage_kernel/requirements_clarification.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M11_requirements_shared_support"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M13_runtime_contracts_hitl"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M14_prompt_contracts"
+        },
+        {
+          "direction": "outbound",
+          "type": "hands_off_to",
+          "target": "M06_requirements_review_stage"
+        }
+      ],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_t12_requirements_common.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "clarification_handoff",
+        "requirements_common_dependency"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "clarification_stage",
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_t12_requirements_common.py"
+      ],
+      "routing_confidence": "medium",
+      "expand_search_flags": [
+        "clarification_handoff_changed",
+        "requirements_common_contract_changed",
+        "clarification_prompt_contract_changed"
+      ]
+    },
+    {
+      "id": "M06_requirements_review_stage",
+      "name": "requirements_review_stage",
+      "kind": "stage",
+      "purpose": "requirements review stage implementation",
+      "owned_paths": [
+        {
+          "path": "canopy_core/stage_kernel/requirements_review.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "canopy_core/stage_kernel/requirements_review.py"
+      ],
+      "key_symbols": [
+        "run_requirements_review_stage"
+      ],
+      "first_read_files": [
+        "canopy_core/stage_kernel/requirements_review.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M10_shared_review_orchestration"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M14_prompt_contracts"
+        },
+        {
+          "direction": "outbound",
+          "type": "hands_off_to",
+          "target": "M07_detailed_design_stage"
+        }
+      ],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_a03_requirements_review.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "review_round_state",
+        "review_handoff"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "review_stage",
+      "pitfall_ids": [
+        "P01",
+        "P03",
+        "P04",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_a03_requirements_review.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "review_round_logic_changed",
+        "review_handoff_changed"
+      ]
+    },
+    {
+      "id": "M07_detailed_design_stage",
+      "name": "detailed_design_stage",
+      "kind": "stage",
+      "purpose": "detailed design stage entry and implementation",
+      "owned_paths": [
+        {
+          "path": "A05_DetailedDesign.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/stage_kernel/detailed_design.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "A05_DetailedDesign.py",
+        "canopy_core/stage_kernel/detailed_design.py"
+      ],
+      "key_symbols": [
+        "run_detailed_design_stage"
+      ],
+      "first_read_files": [
+        "A05_DetailedDesign.py",
+        "canopy_core/stage_kernel/detailed_design.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M10_shared_review_orchestration"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M14_prompt_contracts"
+        },
+        {
+          "direction": "outbound",
+          "type": "hands_off_to",
+          "target": "M08_task_split_stage"
+        }
+      ],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_a05_detailed_design.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "design_artifact_contract",
+        "reviewer_handoff"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "design_stage",
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P04",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_a05_detailed_design.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "design_artifact_contract_changed",
+        "reviewer_handoff_changed",
+        "design_prompt_contract_changed"
+      ]
+    },
+    {
+      "id": "M08_task_split_stage",
+      "name": "task_split_stage",
+      "kind": "stage",
+      "purpose": "task split stage entry and implementation",
+      "owned_paths": [
+        {
+          "path": "A06_TaskSplit.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/stage_kernel/task_split.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "A06_TaskSplit.py",
+        "canopy_core/stage_kernel/task_split.py"
+      ],
+      "key_symbols": [
+        "run_task_split_stage"
+      ],
+      "first_read_files": [
+        "A06_TaskSplit.py",
+        "canopy_core/stage_kernel/task_split.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M14_prompt_contracts"
+        },
+        {
+          "direction": "outbound",
+          "type": "hands_off_to",
+          "target": "M09_development_stage"
+        }
+      ],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_a06_task_split.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "task_contract_generation",
+        "task_breakdown_shape"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "task_split_stage",
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_a06_task_split.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "task_contract_schema_changed",
+        "task_split_prompt_contract_changed"
+      ]
+    },
+    {
+      "id": "M09_development_stage",
+      "name": "development_stage",
+      "kind": "stage",
+      "purpose": "development stage implementation and worker handoff export",
+      "owned_paths": [
+        {
+          "path": "canopy_core/stage_kernel/development.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "canopy_core/stage_kernel/development.py"
+      ],
+      "key_symbols": [
+        "run_development_stage"
+      ],
+      "first_read_files": [
+        "canopy_core/stage_kernel/development.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M10_shared_review_orchestration"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M13_runtime_contracts_hitl"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M14_prompt_contracts"
+        },
+        {
+          "direction": "outbound",
+          "type": "hands_off_to",
+          "target": "M16_overall_review_stage"
+        }
+      ],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_a07_development.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "implementation_handoff",
+        "development_contract_shape"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "development_stage",
+      "pitfall_ids": [
+        "P01",
+        "P03",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_a07_development.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "implementation_handoff_changed",
+        "development_prompt_contract_changed"
+      ]
+    },
+    {
+      "id": "M10_shared_review_orchestration",
+      "name": "shared_review_orchestration",
+      "kind": "shared_runtime",
+      "purpose": "shared reviewer orchestration used by review, design, development, and overall review stages",
+      "owned_paths": [
+        {
+          "path": "canopy_core/stage_kernel/shared_review.py",
+          "match": "exact",
+          "role": "shared_runtime"
+        },
+        {
+          "path": "canopy_core/stage_kernel/reviewer_orchestration.py",
+          "match": "exact",
+          "role": "shared_runtime"
+        },
+        {
+          "path": "canopy_core/stage_kernel/role_orchestration.py",
+          "match": "exact",
+          "role": "shared_runtime"
+        }
+      ],
+      "entry_files": [
+        "canopy_core/stage_kernel/shared_review.py",
+        "canopy_core/stage_kernel/reviewer_orchestration.py",
+        "canopy_core/stage_kernel/role_orchestration.py"
+      ],
+      "key_symbols": [],
+      "first_read_files": [
+        "canopy_core/stage_kernel/shared_review.py",
+        "canopy_core/stage_kernel/reviewer_orchestration.py",
+        "canopy_core/stage_kernel/role_orchestration.py"
+      ],
+      "then_check_files": [],
+      "relations": [],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_stage_kernel_review_design_shared.py",
+        "tests/test_role_orchestration.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "shared_round_logic",
+        "cross_stage_reviewer_state"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "shared_review_runtime",
+      "pitfall_ids": [
+        "P04",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_stage_kernel_review_design_shared.py",
+        "tests/test_role_orchestration.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "shared_review_flow_changed",
+        "reviewer_round_logic_changed",
+        "role_orchestration_changed"
+      ]
+    },
+    {
+      "id": "M11_requirements_shared_support",
+      "name": "requirements_shared_support",
+      "kind": "support",
+      "purpose": "shared requirement-stage helpers",
+      "owned_paths": [
+        {
+          "path": "T12_requirements_common.py",
+          "match": "exact",
+          "role": "support"
+        }
+      ],
+      "entry_files": [
+        "T12_requirements_common.py"
+      ],
+      "key_symbols": [],
+      "first_read_files": [
+        "T12_requirements_common.py"
+      ],
+      "then_check_files": [],
+      "relations": [],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_t12_requirements_common.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "shared_requirement_contracts"
+      ],
+      "edit_risk": "medium",
+      "blast_radius": "requirements_shared_support",
+      "pitfall_ids": [
+        "P01",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_t12_requirements_common.py"
+      ],
+      "routing_confidence": "high",
+      "expand_search_flags": [
+        "shared_requirement_helper_changed"
+      ]
+    },
+    {
+      "id": "M12_tmux_runtime",
+      "name": "tmux_runtime",
+      "kind": "runtime",
+      "purpose": "tmux worker runtime and wrapper entry",
+      "owned_paths": [
+        {
+          "path": "T02_tmux_agents.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/runtime/tmux_runtime.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "T02_tmux_agents.py",
+        "canopy_core/runtime/tmux_runtime.py"
+      ],
+      "key_symbols": [],
+      "first_read_files": [
+        "T02_tmux_agents.py",
+        "canopy_core/runtime/tmux_runtime.py"
+      ],
+      "then_check_files": [],
+      "relations": [],
+      "out_of_scope_dependencies": [
+        "tmux binary"
+      ],
+      "related_tests": [
+        "tests/test_t02_tmux_agents.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "provider_state_detection",
+        "session_health",
+        "wrapper_alias"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "tmux_runtime",
+      "pitfall_ids": [
+        "P02",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_t02_tmux_agents.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "routing_confidence": "high",
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ],
+      "expand_search_flags": [
+        "tmux_session_logic_changed",
+        "provider_pattern_logic_changed",
+        "runtime_cleanup_changed"
+      ]
+    },
+    {
+      "id": "M13_runtime_contracts_hitl",
+      "name": "runtime_contracts_hitl",
+      "kind": "runtime",
+      "purpose": "runtime contracts, HITL file protocol, and wrapper entry",
+      "owned_paths": [
+        {
+          "path": "T05_hitl_runtime.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/runtime/contracts.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        },
+        {
+          "path": "canopy_core/runtime/hitl.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "T05_hitl_runtime.py",
+        "canopy_core/runtime/contracts.py",
+        "canopy_core/runtime/hitl.py"
+      ],
+      "key_symbols": [
+        "TaskResultContract",
+        "TaskResultDecision",
+        "TurnFileContract",
+        "HitlPromptContext",
+        "HitlStatusDecision",
+        "HitlLoopResult"
+      ],
+      "first_read_files": [
+        "T05_hitl_runtime.py",
+        "canopy_core/runtime/hitl.py",
+        "canopy_core/runtime/contracts.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M12_tmux_runtime"
+        }
+      ],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_t05_hitl_runtime.py",
+        "tests/test_runtime_contract_compat.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "status_schema",
+        "artifact_hash_validation",
+        "file_contract_truth",
+        "wrapper_alias"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "runtime_contracts_and_hitl",
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_t05_hitl_runtime.py",
+        "tests/test_runtime_contract_compat.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "routing_confidence": "high",
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ],
+      "expand_search_flags": [
+        "status_schema_changed",
+        "artifact_hash_rule_changed",
+        "hitl_status_inference_changed",
+        "resume_or_retry_changed"
+      ]
+    },
+    {
+      "id": "M14_prompt_contracts",
+      "name": "prompt_contracts",
+      "kind": "prompt_contract_family",
+      "purpose": "prompt contract modules separated from runtime and stage implementations",
+      "owned_paths": [
+        {
+          "path": "canopy_core/prompt_contracts/common.py",
+          "match": "exact",
+          "role": "prompt_contract"
+        },
+        {
+          "path": "canopy_core/prompt_contracts/requirements_clarification.py",
+          "match": "exact",
+          "role": "prompt_contract"
+        },
+        {
+          "path": "canopy_core/prompt_contracts/requirements_review.py",
+          "match": "exact",
+          "role": "prompt_contract"
+        },
+        {
+          "path": "canopy_core/prompt_contracts/detailed_design.py",
+          "match": "exact",
+          "role": "prompt_contract"
+        },
+        {
+          "path": "canopy_core/prompt_contracts/task_split.py",
+          "match": "exact",
+          "role": "prompt_contract"
+        },
+        {
+          "path": "canopy_core/prompt_contracts/development.py",
+          "match": "exact",
+          "role": "prompt_contract"
+        },
+        {
+          "path": "canopy_core/prompt_contracts/overall_review.py",
+          "match": "exact",
+          "role": "prompt_contract"
+        }
+      ],
+      "entry_files": [
+        "canopy_core/prompt_contracts/common.py",
+        "canopy_core/prompt_contracts/requirements_clarification.py",
+        "canopy_core/prompt_contracts/requirements_review.py",
+        "canopy_core/prompt_contracts/detailed_design.py",
+        "canopy_core/prompt_contracts/task_split.py",
+        "canopy_core/prompt_contracts/development.py",
+        "canopy_core/prompt_contracts/overall_review.py"
+      ],
+      "key_symbols": [],
+      "first_read_files": [
+        "canopy_core/prompt_contracts/common.py",
+        "canopy_core/prompt_contracts/requirements_clarification.py",
+        "canopy_core/prompt_contracts/requirements_review.py",
+        "canopy_core/prompt_contracts/detailed_design.py",
+        "canopy_core/prompt_contracts/task_split.py",
+        "canopy_core/prompt_contracts/development.py",
+        "canopy_core/prompt_contracts/overall_review.py"
+      ],
+      "then_check_files": [],
+      "relations": [],
+      "out_of_scope_dependencies": [],
+      "related_tests": [
+        "tests/test_architecture_boundaries.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "prompt_contract_boundary",
+        "no_runtime_stage_imports"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "prompt_contract_family",
+      "pitfall_ids": [
+        "P03"
+      ],
+      "minimum_regression": [
+        "tests/test_architecture_boundaries.py"
+      ],
+      "routing_confidence": "high",
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected"
+      ],
+      "expand_search_flags": [
+        "prompt_contract_boundary_changed",
+        "prompt_contract_surface_changed"
+      ]
+    },
+    {
+      "id": "M15_bridge_tui",
+      "name": "bridge_tui",
+      "kind": "bridge_family",
+      "purpose": "TUI and web bridge modules plus protocol and frontend package boundary",
+      "owned_paths": [
+        {
+          "path": "T11_tui_backend.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "T11_web_backend.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/bridge/backend.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        },
+        {
+          "path": "canopy_core/bridge/web_backend.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        },
+        {
+          "path": "T10_tui_protocol.py",
+          "match": "exact",
+          "role": "protocol"
+        },
+        {
+          "path": "packages/tui/package.json",
+          "match": "exact",
+          "role": "frontend_package"
+        }
+      ],
+      "entry_files": [
+        "T11_tui_backend.py",
+        "T11_web_backend.py",
+        "canopy_core/bridge/backend.py",
+        "canopy_core/bridge/web_backend.py"
+      ],
+      "key_symbols": [],
+      "first_read_files": [
+        "T11_tui_backend.py",
+        "canopy_core/bridge/backend.py",
+        "T10_tui_protocol.py",
+        "packages/tui/package.json"
+      ],
+      "then_check_files": [
+        "T11_web_backend.py",
+        "canopy_core/bridge/web_backend.py"
+      ],
+      "relations": [],
+      "out_of_scope_dependencies": [
+        "OpenTUI runtime",
+        "bun toolchain"
+      ],
+      "related_tests": [
+        "tests/test_t11_tui_backend.py",
+        "tests/test_t11_web_backend.py",
+        "tests/test_t10_tui_protocol.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "related_configs": [
+        "packages/tui/package.json"
+      ],
+      "risk_flags": [
+        "bridge_protocol_drift",
+        "wrapper_alias",
+        "frontend_boundary"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "bridge_and_tui",
+      "pitfall_ids": [
+        "P02",
+        "P04"
+      ],
+      "minimum_regression": [
+        "tests/test_t11_tui_backend.py",
+        "tests/test_t11_web_backend.py",
+        "tests/test_t10_tui_protocol.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "routing_confidence": "high",
+      "agent_rule_ids": [
+        "HR07_trace_alias_before_edit"
+      ],
+      "expand_search_flags": [
+        "bridge_protocol_changed",
+        "frontend_package_boundary_changed",
+        "tui_or_web_launch_behavior_changed"
+      ]
+    },
+    {
+      "id": "M16_overall_review_stage",
+      "name": "overall_review_stage",
+      "kind": "stage",
+      "purpose": "overall review stage implementation, pass-state tracking, and development reviewer reuse",
+      "owned_paths": [
+        {
+          "path": "A08_OverallReview.py",
+          "match": "exact",
+          "role": "compat_entry"
+        },
+        {
+          "path": "canopy_core/stage_kernel/overall_review.py",
+          "match": "exact",
+          "role": "implementation_entry"
+        }
+      ],
+      "entry_files": [
+        "A08_OverallReview.py",
+        "canopy_core/stage_kernel/overall_review.py"
+      ],
+      "key_symbols": [
+        "run_overall_review_stage",
+        "build_overall_review_paths",
+        "overall_review_passed",
+        "discover_live_development_handoffs"
+      ],
+      "first_read_files": [
+        "A08_OverallReview.py",
+        "canopy_core/stage_kernel/overall_review.py"
+      ],
+      "then_check_files": [],
+      "relations": [
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M09_development_stage"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M10_shared_review_orchestration"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M13_runtime_contracts_hitl"
+        },
+        {
+          "direction": "outbound",
+          "type": "depends_on",
+          "target": "M14_prompt_contracts"
+        }
+      ],
+      "out_of_scope_dependencies": [
+        "external agent providers"
+      ],
+      "related_tests": [
+        "tests/test_a08_overall_review.py",
+        "tests/test_t11_tui_backend.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "related_configs": [],
+      "risk_flags": [
+        "overall_review_state_gate",
+        "reviewer_reuse",
+        "developer_reentry_loop"
+      ],
+      "edit_risk": "high",
+      "blast_radius": "overall_review_stage",
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P03",
+        "P04",
+        "P05"
+      ],
+      "minimum_regression": [
+        "tests/test_a08_overall_review.py",
+        "tests/test_t11_tui_backend.py",
+        "tests/test_architecture_boundaries.py"
+      ],
+      "routing_confidence": "high",
+      "agent_rule_ids": [
+        "HR05_prompt_files_protected",
+        "HR07_trace_alias_before_edit"
+      ],
+      "expand_search_flags": [
+        "implementation_handoff_changed",
+        "reviewer_handoff_changed",
+        "reviewer_round_logic_changed",
+        "runtime_cleanup_changed",
+        "prompt_contract_surface_changed"
+      ]
+    }
+  ]
+}

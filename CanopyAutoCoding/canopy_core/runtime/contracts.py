@@ -72,9 +72,20 @@ class TurnFileContract:
     status_path: Path
     validator: Any
     quiet_window_sec: float = 1.0
+    kind: str = ""
+    tracked_artifacts: dict[str, Path] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "status_path", Path(self.status_path).expanduser().resolve())
+        object.__setattr__(
+            self,
+            "tracked_artifacts",
+            {
+                str(alias).strip(): Path(path).expanduser().resolve()
+                for alias, path in self.tracked_artifacts.items()
+                if str(alias).strip()
+            },
+        )
 
 
 @dataclass(frozen=True)
@@ -148,6 +159,26 @@ class TaskResultDecision:
     summary: str
     artifacts: dict[str, str]
     artifact_hashes: dict[str, str]
+
+
+@dataclass(frozen=True)
+class TaskResultObservation:
+    observed_status: str
+    present_aliases: tuple[str, ...]
+    missing_required_aliases: tuple[str, ...]
+    empty_required_aliases: tuple[str, ...]
+    artifact_paths: dict[str, str]
+    last_validation_error: str
+
+
+@dataclass(frozen=True)
+class CompletionObservation:
+    observed_status: str
+    present_aliases: tuple[str, ...]
+    missing_required_aliases: tuple[str, ...]
+    empty_required_aliases: tuple[str, ...]
+    artifact_paths: dict[str, str]
+    last_validation_error: str
 
 
 def write_task_status(path: str | Path, *, status: str) -> Path:
@@ -259,7 +290,7 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
             )
         raise ValueError("详细设计文档未生成有效内容")
 
-    if mode == "a05_detailed_design_feedback":
+    if mode in {"a05_detailed_design_feedback", "a05_detailed_design_review_limit_human_reply"}:
         ask_human_text = _read_text(all_artifacts.get("ask_human"))
         ba_feedback_text = _read_text(all_artifacts.get("ba_feedback"))
         detailed_design_text = _read_text(all_artifacts.get("detailed_design"))
@@ -279,6 +310,16 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
             )
         raise ValueError("详细设计反馈未生成有效 HITL 问题或修订结果")
 
+    if mode == "a05_detailed_design_review_limit_force_hitl":
+        if _read_text(all_artifacts.get("ask_human")):
+            return TaskResultDecision(
+                status=TASK_RESULT_HITL,
+                summary="需求分析师需要继续向人类澄清详细设计问题",
+                artifacts=artifacts,
+                artifact_hashes=artifact_hashes,
+            )
+        raise ValueError("详细设计评审超限后未写入《与人类交流.md》")
+
     if mode == "a06_task_split_generate":
         if _read_text(all_artifacts.get("task_md")):
             return TaskResultDecision(
@@ -289,7 +330,7 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
             )
         raise ValueError("任务单文档未生成有效内容")
 
-    if mode == "a06_task_split_feedback":
+    if mode in {"a06_task_split_feedback", "a06_task_split_review_limit_human_reply"}:
         ask_human_text = _read_text(all_artifacts.get("ask_human"))
         ba_feedback_text = _read_text(all_artifacts.get("ba_feedback"))
         task_md_text = _read_text(all_artifacts.get("task_md"))
@@ -308,6 +349,16 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
                 artifact_hashes=artifact_hashes,
             )
         raise ValueError("任务拆分反馈未生成有效修订结果")
+
+    if mode == "a06_task_split_review_limit_force_hitl":
+        if _read_text(all_artifacts.get("ask_human")):
+            return TaskResultDecision(
+                status=TASK_RESULT_HITL,
+                summary="需求分析师需要继续向人类澄清任务拆分问题",
+                artifacts=artifacts,
+                artifact_hashes=artifact_hashes,
+            )
+        raise ValueError("任务拆分评审超限后未写入《与人类交流.md》")
 
     if mode == "a06_task_split_json_generate":
         task_json_path = _resolve_optional_path(all_artifacts.get("task_json"))
@@ -355,6 +406,35 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
             )
         raise ValueError("开发工程师未生成有效开发元数据")
 
+    if mode in {"a07_developer_review_feedback", "a07_developer_review_limit_human_reply"}:
+        ask_human_text = _read_text(all_artifacts.get("ask_human"))
+        developer_output_text = _read_text(all_artifacts.get("developer_output"))
+        if ask_human_text:
+            return TaskResultDecision(
+                status=TASK_RESULT_HITL,
+                summary="开发工程师在评审超限后需要继续等待人类决策",
+                artifacts=artifacts,
+                artifact_hashes=artifact_hashes,
+            )
+        if developer_output_text:
+            return TaskResultDecision(
+                status=TASK_RESULT_COMPLETED,
+                summary="开发工程师已根据人类反馈继续完成任务开发",
+                artifacts=artifacts,
+                artifact_hashes=artifact_hashes,
+            )
+        raise ValueError("开发工程师评审反馈未生成有效 HITL 问题或开发结果")
+
+    if mode == "a07_developer_review_limit_force_hitl":
+        if _read_text(all_artifacts.get("ask_human")):
+            return TaskResultDecision(
+                status=TASK_RESULT_HITL,
+                summary="开发工程师在评审超限后需要继续等待人类决策",
+                artifacts=artifacts,
+                artifact_hashes=artifact_hashes,
+            )
+        raise ValueError("开发阶段评审超限后未写入《与人类交流.md》")
+
     if mode == "a03_reviewer_round":
         review_json = _resolve_optional_path(all_artifacts.get("review_json"))
         review_md = _resolve_optional_path(all_artifacts.get("review_md"))
@@ -387,7 +467,7 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
             artifact_hashes=artifact_hashes,
         )
 
-    if mode == "a03_ba_feedback":
+    if mode in {"a03_ba_feedback", "a03_ba_review_limit_human_reply"}:
         if _read_text(all_artifacts.get("ask_human")):
             return TaskResultDecision(
                 status=TASK_RESULT_HITL,
@@ -403,6 +483,16 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
                 artifact_hashes=artifact_hashes,
             )
         raise ValueError("需求分析师反馈未生成 HITL 问题或修改反馈")
+
+    if mode == "a03_ba_review_limit_force_hitl":
+        if _read_text(all_artifacts.get("ask_human")):
+            return TaskResultDecision(
+                status=TASK_RESULT_HITL,
+                summary="需求分析师需要继续向人类澄清",
+                artifacts=artifacts,
+                artifact_hashes=artifact_hashes,
+            )
+        raise ValueError("需求评审超限后未写入《与人类交流.md》")
 
     if mode == "a03_human_feedback":
         if _read_text(all_artifacts.get("ask_human")):
@@ -462,6 +552,134 @@ def resolve_task_result_decision(contract: TaskResultContract) -> TaskResultDeci
         raise ValueError("Notion 需求录入未生成有效结果文件")
 
     raise ValueError(f"不支持的 contract mode: {mode}")
+
+
+def _collect_observed_artifact_texts(artifact_map: dict[str, Path]) -> tuple[dict[str, str], set[str], set[str]]:
+    resolved_paths: dict[str, str] = {}
+    present_aliases: set[str] = set()
+    empty_aliases: set[str] = set()
+    for alias, path in artifact_map.items():
+        resolved = Path(path).expanduser().resolve()
+        resolved_paths[alias] = str(resolved)
+        if not resolved.exists() or not resolved.is_file():
+            continue
+        text = resolved.read_text(encoding="utf-8").strip()
+        if text:
+            present_aliases.add(alias)
+        else:
+            empty_aliases.add(alias)
+    return resolved_paths, present_aliases, empty_aliases
+
+
+def _infer_observed_task_status(contract: TaskResultContract, present_aliases: set[str]) -> str:
+    mode = contract.mode
+    if mode in {"a03_ba_review_limit_force_hitl", "a05_detailed_design_review_limit_force_hitl", "a06_task_split_review_limit_force_hitl", "a07_developer_review_limit_force_hitl"}:
+        return TASK_RESULT_HITL if "ask_human" in present_aliases else ""
+    if mode in {"a03_ba_feedback", "a03_ba_review_limit_human_reply", "a05_detailed_design_feedback", "a05_detailed_design_review_limit_human_reply", "a06_task_split_feedback", "a06_task_split_review_limit_human_reply", "a07_developer_review_feedback", "a07_developer_review_limit_human_reply"}:
+        if "ask_human" in present_aliases:
+            return TASK_RESULT_HITL
+        if {"ba_feedback", "requirements_clear"} <= present_aliases:
+            return TASK_RESULT_COMPLETED
+        if {"ba_feedback", "detailed_design"} <= present_aliases:
+            return TASK_RESULT_COMPLETED
+        if {"ba_feedback", "task_md"} <= present_aliases:
+            return TASK_RESULT_COMPLETED
+        if "developer_output" in present_aliases:
+            return TASK_RESULT_COMPLETED
+        return ""
+    if mode in {"a05_detailed_design_generate"}:
+        return TASK_RESULT_COMPLETED if "detailed_design" in present_aliases else ""
+    if mode in {"a06_task_split_generate"}:
+        return TASK_RESULT_COMPLETED if "task_md" in present_aliases else ""
+    if mode in {"a06_task_split_json_generate"}:
+        return TASK_RESULT_COMPLETED if "task_json" in present_aliases else ""
+    if mode in {"a07_developer_task_complete", "a07_developer_refine"}:
+        return TASK_RESULT_COMPLETED if "developer_output" in present_aliases else ""
+    if mode in {"a03_ba_resume", "a05_ba_init", "a06_ba_init", "a07_reviewer_init"}:
+        return TASK_RESULT_READY
+    if mode in {"a07_developer_init", "a07_developer_human_reply"}:
+        if "ask_human" in present_aliases:
+            return TASK_RESULT_HITL
+        return TASK_RESULT_READY
+    if mode == "a03_human_feedback":
+        return TASK_RESULT_COMPLETED if "ask_human" in present_aliases else ""
+    return ""
+
+
+def observe_task_result_state(
+    contract: TaskResultContract,
+    result_path: str | Path,
+) -> TaskResultObservation:
+    target = Path(result_path).expanduser().resolve()
+    all_artifacts = {**contract.required_artifacts, **contract.optional_artifacts}
+    artifact_paths, present_aliases, empty_aliases = _collect_observed_artifact_texts(all_artifacts)
+    observed_status = ""
+    validation_error = ""
+    try:
+        validated = validate_task_result_file(contract=contract, result_path=target)
+        observed_status = str(validated.payload.get("status", "")).strip()
+    except Exception as error:  # noqa: BLE001
+        validation_error = str(error).strip()
+        observed_status = _infer_observed_task_status(contract, present_aliases)
+    missing_required = tuple(
+        alias
+        for alias in contract.required_artifacts
+        if alias not in present_aliases and alias not in empty_aliases
+    )
+    empty_required = tuple(alias for alias in contract.required_artifacts if alias in empty_aliases)
+    return TaskResultObservation(
+        observed_status=observed_status,
+        present_aliases=tuple(sorted(present_aliases)),
+        missing_required_aliases=missing_required,
+        empty_required_aliases=empty_required,
+        artifact_paths=artifact_paths,
+        last_validation_error=validation_error,
+    )
+
+
+def observe_completion_state(contract: TurnFileContract) -> CompletionObservation:
+    tracked = dict(contract.tracked_artifacts)
+    if "status_path" not in tracked:
+        tracked["status_path"] = contract.status_path
+    artifact_paths, present_aliases, empty_aliases = _collect_observed_artifact_texts(tracked)
+    observed_status = ""
+    validation_error = ""
+    try:
+        result = contract.validator(contract.status_path)
+        review_pass = result.payload.get("review_pass")
+        if isinstance(review_pass, bool):
+            observed_status = TASK_RESULT_REVIEW_PASS if review_pass else TASK_RESULT_REVIEW_FAIL
+    except Exception as error:  # noqa: BLE001
+        validation_error = str(error).strip()
+        review_json_path = tracked.get("review_json")
+        if review_json_path is not None and review_json_path.exists():
+            try:
+                payload = json.loads(review_json_path.read_text(encoding="utf-8"))
+            except Exception:
+                payload = None
+            if isinstance(payload, list):
+                for item in payload:
+                    if not isinstance(item, dict):
+                        continue
+                    review_pass = item.get("review_pass")
+                    if isinstance(review_pass, bool):
+                        observed_status = TASK_RESULT_REVIEW_PASS if review_pass else TASK_RESULT_REVIEW_FAIL
+                        break
+    required_aliases: tuple[str, ...]
+    if contract.kind == "review_round":
+        required_aliases = ("review_json",)
+    else:
+        required_aliases = tuple(sorted(alias for alias in tracked if alias != "status_path"))
+    missing_required = tuple(alias for alias in required_aliases if alias not in present_aliases and alias not in empty_aliases)
+    empty_required = tuple(alias for alias in required_aliases if alias in empty_aliases)
+    return CompletionObservation(
+        observed_status=observed_status,
+        present_aliases=tuple(sorted(present_aliases)),
+        missing_required_aliases=missing_required,
+        empty_required_aliases=empty_required,
+        artifact_paths=artifact_paths,
+        last_validation_error=validation_error,
+    )
 
 
 def validate_task_result_file(
@@ -567,14 +785,18 @@ __all__ = [
     "TASK_RESULT_REVIEW_PASS",
     "TASK_STATUS_DONE",
     "TASK_STATUS_RUNNING",
+    "CompletionObservation",
     "TaskResultContract",
     "TaskResultDecision",
     "TaskResultFile",
+    "TaskResultObservation",
     "TurnFileContract",
     "TurnFileResult",
     "collect_contract_artifacts",
     "finalize_task_result",
     "materialize_task_result",
+    "observe_completion_state",
+    "observe_task_result_state",
     "read_task_result_payload",
     "read_task_status",
     "resolve_task_result_decision",

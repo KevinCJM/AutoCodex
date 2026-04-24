@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,7 +37,6 @@ from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     AgentRunConfig,
     TmuxBatchWorker,
-    TmuxRuntimeController,
     Vendor,
     build_session_name,
     cleanup_registered_tmux_workers,
@@ -47,12 +45,16 @@ from canopy_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     list_registered_tmux_workers,
+    list_tmux_session_names,
+    list_occupied_tmux_session_names,
 )
 from canopy_core.stage_kernel.reviewer_orchestration import (
     repair_reviewer_round_outputs,
     run_parallel_reviewer_round,
     shutdown_stage_workers,
 )
+from canopy_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from canopy_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from canopy_core.stage_kernel.death_orchestration import (
     ensure_active_reviewers,
     run_main_phase_with_death_handling,
@@ -62,12 +64,28 @@ from canopy_core.stage_kernel import shared_review
 from canopy_core.stage_kernel.shared_review import (
     DEFAULT_REVIEWER_COUNT,
     MAX_REVIEWER_REPAIR_ATTEMPTS,
+    ReviewLimitHitlConfig,
+    ReviewRoundPolicy,
     ReviewAgentSelection,
     ReviewerRuntime,
     ensure_empty_file,
+    is_recoverable_startup_failure,
+    mark_worker_awaiting_reconfiguration,
+    parse_review_max_rounds,
+    prompt_required_replacement_review_agent_selection as shared_prompt_required_replacement_review_agent_selection,
+    render_review_limit_force_hitl_prompt,
+    render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
+)
+from canopy_core.stage_kernel.turn_output_goals import (
+    CompletionTurnGoal,
+    OutcomeGoal,
+    TaskTurnGoal,
+    run_completion_turn_with_repair,
+    run_task_result_turn_with_repair,
 )
 from T01_tools import (
     check_task_exists,
@@ -102,6 +120,7 @@ from T12_requirements_common import (
     prompt_project_dir,
     prompt_requirement_name_selection,
     sanitize_requirement_name,
+    stdin_is_interactive,
 )
 
 
@@ -203,6 +222,18 @@ def prompt_yes_no_choice(
     )
 
 
+def prompt_review_max_rounds(
+        *,
+        default: int = MAX_REVIEW_ROUNDS,
+        progress: ReviewStageProgress | None = None,
+) -> int | None:
+    _sync_shared_review_bindings()
+    return shared_review.prompt_review_max_rounds(
+        default=default,
+        progress=progress,
+    )
+
+
 def prompt_replacement_review_agent_selection(
         *,
         reason_text: str,
@@ -234,10 +265,43 @@ def prompt_replacement_review_agent_selection(
         message("需要更换模型，请选择与当前不同的厂商或模型。")
 
 
+def prompt_required_replacement_review_agent_selection(
+        *,
+        reason_text: str,
+        previous_selection: ReviewAgentSelection,
+        force_model_change: bool,
+        role_label: str,
+        progress: ReviewStageProgress | None = None,
+) -> ReviewAgentSelection:
+    progress = _resolve_review_progress(progress)
+    prompt_is_patched = getattr(prompt_review_agent_selection, "__module__", __name__) != __name__
+    if not stdin_is_interactive() and not prompt_is_patched:
+        raise RuntimeError(f"{role_label} 需要重新配置智能体，但当前环境无法交互选择厂商/模型。")
+    message(reason_text)
+    while True:
+        selection = prompt_review_agent_selection(
+            default_vendor=previous_selection.vendor,
+            default_model=previous_selection.model,
+            default_reasoning_effort=previous_selection.reasoning_effort,
+            default_proxy_url=previous_selection.proxy_url,
+            role_label=role_label,
+            progress=progress,
+        )
+        if (
+                not force_model_change
+                or selection.vendor != previous_selection.vendor
+                or selection.model != previous_selection.model
+        ):
+            message(render_review_agent_selection(f"重新创建{role_label}", selection))
+            return selection
+        message("需要更换模型，请选择与当前不同的厂商或模型。")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="需求评审阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--review-max-rounds", default="", help="需求评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
@@ -271,6 +335,68 @@ def build_requirements_review_paths(
     }
 
 
+def resolve_review_max_rounds(
+        args: argparse.Namespace,
+        *,
+        progress: ReviewStageProgress | None = None,
+) -> int | None:
+    explicit = getattr(args, "review_max_rounds", "")
+    if str(explicit or "").strip():
+        return parse_review_max_rounds(
+            explicit,
+            source="--review-max-rounds",
+            default=MAX_REVIEW_ROUNDS,
+        )
+    if not stdin_is_interactive():
+        return MAX_REVIEW_ROUNDS
+    if progress is not None and hasattr(progress, "set_phase"):
+        progress.set_phase("需求评审 / 配置最大审核轮次")
+    return prompt_review_max_rounds(default=MAX_REVIEW_ROUNDS, progress=progress)
+
+
+def build_requirements_review_limit_hitl_config(paths: dict[str, Path]) -> ReviewLimitHitlConfig:
+    return ReviewLimitHitlConfig(
+        stage_label="需求评审超限",
+        artifact_label="需求评审",
+        primary_output_path=paths["requirements_clear_path"],
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        merged_review_path=paths["merged_review_path"],
+        output_summary_path=paths["ba_feedback_path"],
+        continue_output_label="需求澄清.md",
+    )
+
+
+def build_requirements_review_limit_force_hitl_prompt(
+    *,
+    paths: dict[str, Path],
+    review_msg: str,
+    review_limit: int,
+    review_rounds_used: int,
+) -> str:
+    return render_review_limit_force_hitl_prompt(
+        config=build_requirements_review_limit_hitl_config(paths),
+        review_limit=review_limit,
+        review_rounds_used=review_rounds_used,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(paths["original_requirement_path"],),
+    ) + f"\n## 当前评审记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
+
+
+def build_requirements_review_limit_human_reply_prompt(
+    *,
+    paths: dict[str, Path],
+    review_msg: str,
+    human_msg: str,
+) -> str:
+    return render_review_limit_human_reply_prompt(
+        config=build_requirements_review_limit_hitl_config(paths),
+        human_msg=human_msg,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(paths["original_requirement_path"],),
+    ) + f"\n## 当前评审记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
+
+
 def build_reviewer_artifact_paths(project_dir: str | Path, requirement_name: str, reviewer_name: str) -> tuple[Path, Path]:
     project_root = Path(project_dir).expanduser().resolve()
     safe_name = sanitize_requirement_name(requirement_name)
@@ -287,10 +413,19 @@ def _predict_review_worker_display_name(
         occupied_session_names: Sequence[str] = (),
 ) -> str:
     occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
+    for session_name in list_tmux_session_names():
+        name = str(session_name or "").strip()
+        if name:
+            occupied.add(name)
     for worker in list_registered_tmux_workers():
         session_name = str(getattr(worker, "session_name", "") or "").strip()
         if session_name:
             occupied.add(session_name)
+    occupied.update(
+        list_occupied_tmux_session_names(
+            additional_session_names=sorted(occupied),
+        )
+    )
     return build_session_name(
         worker_id,
         Path(project_dir).expanduser().resolve(),
@@ -351,6 +486,11 @@ def create_reviewer_runtime(
             proxy_url=selection.proxy_url,
         ),
         runtime_root=runtime_root,
+        runtime_metadata={
+            "project_dir": str(Path(project_dir).expanduser().resolve()),
+            "requirement_name": str(requirement_name).strip(),
+            "workflow_action": "stage.a04.start",
+        },
     )
     review_md_path, review_json_path = build_reviewer_artifact_paths(
         project_dir,
@@ -398,6 +538,7 @@ def cleanup_existing_review_artifacts(paths: dict[str, Path], requirement_name: 
 
 def cleanup_stale_review_runtime_state(
         project_dir: str | Path,
+        requirement_name: str,
         *,
         preserve_workers: Sequence[TmuxBatchWorker] = (),
 ) -> tuple[str, ...]:
@@ -415,34 +556,14 @@ def cleanup_stale_review_runtime_state(
         for worker in preserve_workers
         if str(getattr(worker, "session_name", "")).strip()
     }
-    tmux_runtime = TmuxRuntimeController()
-    removed: list[str] = []
-
-    for worker_dir in sorted(path for path in runtime_root.iterdir() if path.is_dir()):
-        resolved_worker_dir = worker_dir.expanduser().resolve()
-        if resolved_worker_dir in preserve_runtime_dirs:
-            continue
-        state_path = resolved_worker_dir / "worker.state.json"
-        session_name = ""
-        if state_path.exists() and state_path.is_file():
-            try:
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-            except Exception:
-                payload = {}
-            if isinstance(payload, dict):
-                session_name = str(payload.get("session_name", "")).strip()
-        if session_name and session_name not in preserve_session_names:
-            try:
-                tmux_runtime.kill_session(session_name, missing_ok=True)
-            except Exception:
-                pass
-        shutil.rmtree(resolved_worker_dir, ignore_errors=True)
-        removed.append(str(resolved_worker_dir))
-
-    if runtime_root.exists() and runtime_root.is_dir() and not any(runtime_root.iterdir()):
-        runtime_root.rmdir()
-        removed.append(str(runtime_root))
-    return tuple(removed)
+    return cleanup_runtime_dirs_by_scope(
+        runtime_root=runtime_root,
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        workflow_action="stage.a04.start",
+        preserve_runtime_dirs=tuple(preserve_runtime_dirs),
+        preserve_session_names=tuple(preserve_session_names),
+    )
 
 
 def build_reviewer_completion_contract(
@@ -496,6 +617,11 @@ def build_reviewer_completion_contract(
         phase=REQUIREMENTS_REVIEW_TASK_NAME,
         status_path=review_json_path,
         validator=validator,
+        kind="review_round",
+        tracked_artifacts={
+            "review_md": review_md_path,
+            "review_json": review_json_path,
+        },
     )
 
 
@@ -540,18 +666,69 @@ def build_ba_human_feedback_result_contract(paths: dict[str, Path]) -> TaskResul
 
 
 def build_ba_review_feedback_result_contract(paths: dict[str, Path]) -> TaskResultContract:
+    return build_requirements_feedback_result_contract(paths)
+
+
+def build_requirements_feedback_result_contract(
+    paths: dict[str, Path],
+    *,
+    mode: str = "a03_ba_feedback",
+) -> TaskResultContract:
+    expected_statuses = ("hitl", "completed")
+    if mode == "a03_ba_review_limit_force_hitl":
+        expected_statuses = ("hitl",)
     return TaskResultContract(
-        turn_id="requirements_review_feedback",
-        phase="requirements_review_feedback",
-        task_kind="a03_ba_feedback",
-        mode="a03_ba_feedback",
-        expected_statuses=("hitl", "completed"),
+        turn_id=mode,
+        phase=mode,
+        task_kind=mode,
+        mode=mode,
+        expected_statuses=expected_statuses,
         stage_name=REQUIREMENTS_REVIEW_TASK_NAME,
         optional_artifacts={
             "ask_human": paths["ask_human_path"],
             "ba_feedback": paths["ba_feedback_path"],
             "requirements_clear": paths["requirements_clear_path"],
             "hitl_record": paths["hitl_record_path"],
+        },
+    )
+
+
+def _build_ba_turn_goal(contract: TaskResultContract) -> TaskTurnGoal | None:
+    if contract.mode == "a03_ba_resume":
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={"ready": OutcomeGoal(status="ready")},
+        )
+    if contract.mode == "a03_human_feedback":
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={"completed": OutcomeGoal(status="completed", required_aliases=("ask_human",))},
+        )
+    if contract.mode == "a03_ba_review_limit_force_hitl":
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={"hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",))},
+        )
+    if contract.mode in {"a03_ba_feedback", "a03_ba_review_limit_human_reply"}:
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={
+                "hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",), forbidden_aliases=("ba_feedback",)),
+                "completed": OutcomeGoal(
+                    status="completed",
+                    required_aliases=("ba_feedback", "requirements_clear"),
+                ),
+            },
+        )
+    return None
+
+
+def _build_reviewer_turn_goal() -> CompletionTurnGoal:
+    return CompletionTurnGoal(
+        goal_id="requirements_review_reviewer_round",
+        outcomes={
+            "review_pass": OutcomeGoal(status="review_pass", required_aliases=("review_json",), forbidden_aliases=("review_md",)),
+            "review_fail": OutcomeGoal(status="review_fail", required_aliases=("review_json", "review_md")),
         },
     )
 
@@ -572,16 +749,19 @@ def _run_ba_turn(
         label: str,
         prompt: str,
         result_contract: TaskResultContract,
+        turn_goal: TaskTurnGoal | None = None,
 ) -> dict[str, object]:
-    result = handoff.worker.run_turn(
+    return run_task_result_turn_with_repair(
+        worker=handoff.worker,
         label=label,
         prompt=prompt,
         result_contract=result_contract,
+        parse_result_payload=_parse_result_payload,
+        turn_goal=turn_goal or _build_ba_turn_goal(result_contract),
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+        stage_label=REQUIREMENTS_REVIEW_TASK_NAME,
+        role_label=str(getattr(handoff.worker, "session_name", "") or "需求分析师"),
     )
-    if not result.ok:
-        raise RuntimeError(result.clean_output or f"{label} 执行失败")
-    return _parse_result_payload(result.clean_output)
 
 
 def _run_reviewer_turn(
@@ -590,14 +770,16 @@ def _run_reviewer_turn(
         label: str,
         prompt: str,
 ) -> None:
-    result = reviewer.worker.run_turn(
+    run_completion_turn_with_repair(
+        worker=reviewer.worker,
         label=label,
         prompt=prompt,
         completion_contract=reviewer.contract,
+        turn_goal=_build_reviewer_turn_goal(),
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+        stage_label=REQUIREMENTS_REVIEW_TASK_NAME,
+        role_label=_reviewer_artifact_agent_name(reviewer),
     )
-    if not result.ok:
-        raise RuntimeError(result.clean_output or f"{reviewer.reviewer_name} 执行失败")
 
 
 def run_ba_turn_with_recreation(
@@ -625,8 +807,12 @@ def run_ba_turn_with_recreation(
             ready_timeout_error = is_agent_ready_timeout_error(error)
             ba_display_name = _review_ba_display_name(project_dir=project_dir, handoff=current_handoff)
             if auth_error:
-                selection = prompt_replacement_review_agent_selection(
-                    reason_text=f"检测到{ba_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。",
+                reason_text = (
+                    f"检测到{ba_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                )
+                mark_worker_awaiting_reconfiguration(current_handoff.worker, reason_text=reason_text)
+                selection = prompt_required_replacement_review_agent_selection(
+                    reason_text=reason_text,
                     previous_selection=ReviewAgentSelection(
                         current_handoff.vendor,
                         current_handoff.model,
@@ -637,8 +823,6 @@ def run_ba_turn_with_recreation(
                     role_label=ba_display_name,
                     progress=progress,
                 )
-                if selection is None:
-                    raise RuntimeError(f"{ba_display_name}认证已失效，且用户未更换模型") from error
                 current_handoff = RequirementsAnalystHandoff(
                     worker=TmuxBatchWorker(
                         worker_id="requirements-review-analyst",
@@ -659,8 +843,10 @@ def run_ba_turn_with_recreation(
                 message(render_tmux_start_summary(str(current_handoff.worker.session_name).strip() or ba_display_name, current_handoff.worker))
                 continue
             if ready_timeout_error:
-                selection = prompt_replacement_review_agent_selection(
-                    reason_text=f"{ba_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。",
+                reason_text = f"{ba_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
+                mark_worker_awaiting_reconfiguration(current_handoff.worker, reason_text=reason_text)
+                selection = prompt_required_replacement_review_agent_selection(
+                    reason_text=reason_text,
                     previous_selection=ReviewAgentSelection(
                         current_handoff.vendor,
                         current_handoff.model,
@@ -671,8 +857,6 @@ def run_ba_turn_with_recreation(
                     role_label=ba_display_name,
                     progress=progress,
                 )
-                if selection is None:
-                    raise RuntimeError(f"{ba_display_name}启动超时，且用户未更换模型") from error
                 current_handoff = RequirementsAnalystHandoff(
                     worker=TmuxBatchWorker(
                         worker_id="requirements-review-analyst",
@@ -731,15 +915,17 @@ def run_reviewer_turn_with_recreation(
             if is_turn_artifact_contract_error(error):
                 return current_reviewer
             if auth_error:
-                selection = prompt_replacement_review_agent_selection(
-                    reason_text=f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。",
+                reason_text = (
+                    f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                )
+                mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
+                selection = prompt_required_replacement_review_agent_selection(
+                    reason_text=reason_text,
                     previous_selection=current_reviewer.selection,
                     force_model_change=True,
                     role_label=reviewer_display_name,
                     progress=progress,
                 )
-                if selection is None:
-                    raise RuntimeError(f"{reviewer_display_name}认证已失效，且用户未更换模型") from error
                 current_reviewer = create_reviewer_runtime(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
@@ -748,15 +934,15 @@ def run_reviewer_turn_with_recreation(
                 )
                 continue
             if ready_timeout_error:
-                selection = prompt_replacement_review_agent_selection(
-                    reason_text=f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。",
+                reason_text = f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
+                mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
+                selection = prompt_required_replacement_review_agent_selection(
+                    reason_text=reason_text,
                     previous_selection=current_reviewer.selection,
                     force_model_change=True,
                     role_label=reviewer_display_name,
                     progress=progress,
                 )
-                if selection is None:
-                    raise RuntimeError(f"{reviewer_display_name}启动超时，且用户未更换模型") from error
                 current_reviewer = create_reviewer_runtime(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
@@ -840,6 +1026,10 @@ def _create_review_ba_handoff(
             proxy_url=selection.proxy_url,
         ),
         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+        runtime_metadata={
+            "project_dir": str(Path(project_dir).expanduser().resolve()),
+            "workflow_action": "stage.a04.start",
+        },
     )
     message(render_tmux_start_summary(str(worker.session_name).strip() or ba_display_name, worker))
     return RequirementsAnalystHandoff(
@@ -883,6 +1073,10 @@ def recreate_ba_handoff(
             proxy_url=selection.proxy_url,
         ),
         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+        runtime_metadata={
+            "project_dir": str(Path(project_dir).expanduser().resolve()),
+            "workflow_action": "stage.a04.start",
+        },
     )
     message(render_tmux_start_summary(str(worker.session_name).strip() or ba_display_name, worker))
     return RequirementsAnalystHandoff(
@@ -1052,6 +1246,7 @@ def _collect_review_hitl_response(
             empty_retry_message="回复不能为空，请重新输入。",
             question_path=question_file,
             answer_path=answer_path,
+            is_hitl=True,
         )
 
 
@@ -1249,6 +1444,7 @@ def _run_review_feedback_loop(
         requirement_name: str,
         round_index: int,
         progress: ReviewStageProgress | None = None,
+        skip_ba_feedback: bool = False,
 ) -> tuple[RequirementsAnalystHandoff, list[ReviewerRuntime]]:
     progress = _resolve_review_progress(progress)
     reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"审核智能体 {index}"  # noqa: E731
@@ -1264,34 +1460,35 @@ def _run_review_feedback_loop(
             paths=paths,
             progress=progress,
         )
-    ensure_empty_file(paths["ask_human_path"])
-    ensure_empty_file(paths["ba_feedback_path"])
-    _, reviewers, current_handoff = run_main_phase_with_death_handling(
-        current_handoff,
-        reviewers=reviewers,
-        run_phase=lambda active_handoff: _run_review_clarification_continuation(
-            handoff=active_handoff,
-            paths=paths,
-            initial_prompt=review_feedback(
-                review_msg,
-                original_requirement_md=str(paths["original_requirement_path"].resolve()),
-                ask_human_md=str(paths["ask_human_path"].resolve()),
-                hitl_record_md=str(paths["hitl_record_path"].resolve()),
-                requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
-                what_just_change=str(paths["ba_feedback_path"].resolve()),
+    if not skip_ba_feedback:
+        ensure_empty_file(paths["ask_human_path"])
+        ensure_empty_file(paths["ba_feedback_path"])
+        _, reviewers, current_handoff = run_main_phase_with_death_handling(
+            current_handoff,
+            reviewers=reviewers,
+            run_phase=lambda active_handoff: _run_review_clarification_continuation(
+                handoff=active_handoff,
+                paths=paths,
+                initial_prompt=review_feedback(
+                    review_msg,
+                    original_requirement_md=str(paths["original_requirement_path"].resolve()),
+                    ask_human_md=str(paths["ask_human_path"].resolve()),
+                    hitl_record_md=str(paths["hitl_record_path"].resolve()),
+                    requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+                    what_just_change=str(paths["ba_feedback_path"].resolve()),
+                ),
+                label_prefix=f"requirements_review_feedback_round_{round_index}",
+                progress=progress,
             ),
-            label_prefix=f"requirements_review_feedback_round_{round_index}",
-            progress=progress,
-        ),
-        replace_dead_main_owner=lambda owner: _replace_dead_review_ba(
-            owner,
-            project_dir=paths["project_root"],
-            progress=progress,
-        ),
-        main_label="需求评审需求分析师",
-        reviewer_label_getter=reviewer_label_getter,
-        notify=message,
-    )
+            replace_dead_main_owner=lambda owner: _replace_dead_review_ba(
+                owner,
+                project_dir=paths["project_root"],
+                progress=progress,
+            ),
+            main_label="需求评审需求分析师",
+            reviewer_label_getter=reviewer_label_getter,
+            notify=message,
+        )
     ba_reply = get_markdown_content(paths["ba_feedback_path"]).strip() or _default_review_reply(paths)
 
     def prompt_builder(reviewer: ReviewerRuntime) -> str:
@@ -1344,6 +1541,106 @@ def _run_review_feedback_loop(
     return current_handoff, reviewer_list
 
 
+def run_requirements_review_limit_hitl_loop(
+        handoff: RequirementsAnalystHandoff | None,
+        *,
+        reviewers: Sequence[ReviewerRuntime],
+        paths: dict[str, Path],
+        requirement_name: str,
+        review_msg: str,
+        review_limit: int,
+        review_rounds_used: int,
+        progress: ReviewStageProgress | None = None,
+) -> tuple[RequirementsAnalystHandoff, list[ReviewerRuntime], bool]:
+    progress = _resolve_review_progress(progress)
+    reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"审核智能体 {index}"  # noqa: E731
+    current_handoff = handoff
+    if current_handoff is None:
+        current_handoff, _ = prepare_ba_handoff(
+            project_dir=paths["project_root"],
+            requirement_name=requirement_name,
+            ba_handoff=None,
+            paths=paths,
+            progress=progress,
+        )
+    ensure_empty_file(paths["ask_human_path"])
+    ensure_empty_file(paths["ba_feedback_path"])
+
+    def initial_turn() -> object:
+        nonlocal current_handoff, reviewers
+        _, reviewers, current_handoff = run_main_phase_with_death_handling(
+            current_handoff,
+            reviewers=reviewers,
+            run_phase=lambda active_handoff: run_ba_turn_with_recreation(
+                active_handoff,
+                project_dir=paths["project_root"],
+                label="requirements_review_limit_hitl",
+                prompt=build_requirements_review_limit_force_hitl_prompt(
+                    paths=paths,
+                    review_msg=review_msg,
+                    review_limit=review_limit,
+                    review_rounds_used=review_rounds_used,
+                ),
+                result_contract=build_requirements_feedback_result_contract(
+                    paths,
+                    mode="a03_ba_review_limit_force_hitl",
+                ),
+                progress=progress,
+            )[0],
+            replace_dead_main_owner=lambda owner: _replace_dead_review_ba(
+                owner,
+                project_dir=paths["project_root"],
+                progress=progress,
+            ),
+            main_label="需求评审需求分析师",
+            reviewer_label_getter=reviewer_label_getter,
+            notify=message,
+        )
+        return current_handoff
+
+    def human_reply_turn(human_msg: str) -> object:
+        nonlocal current_handoff, reviewers
+        _, reviewers, current_handoff = run_main_phase_with_death_handling(
+            current_handoff,
+            reviewers=reviewers,
+            run_phase=lambda active_handoff: run_ba_turn_with_recreation(
+                active_handoff,
+                project_dir=paths["project_root"],
+                label="requirements_review_limit_human_reply",
+                prompt=build_requirements_review_limit_human_reply_prompt(
+                    paths=paths,
+                    review_msg=review_msg,
+                    human_msg=human_msg,
+                ),
+                result_contract=build_requirements_feedback_result_contract(
+                    paths,
+                    mode="a03_ba_review_limit_human_reply",
+                ),
+                progress=progress,
+            )[0],
+            replace_dead_main_owner=lambda owner: _replace_dead_review_ba(
+                owner,
+                project_dir=paths["project_root"],
+                progress=progress,
+            ),
+            main_label="需求评审需求分析师",
+            reviewer_label_getter=reviewer_label_getter,
+            notify=message,
+        )
+        return current_handoff
+
+    result = run_review_limit_hitl_cycle(
+        stage_label="需求评审超限",
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        initial_turn=initial_turn,
+        human_reply_turn=human_reply_turn,
+        progress=progress,
+        max_hitl_rounds=8,
+    )
+    return current_handoff, list(reviewers), result.post_hitl_continue_completed
+
+
 def _shutdown_workers(
         ba_handoff: RequirementsAnalystHandoff | None,
         reviewers: Sequence[ReviewerRuntime],
@@ -1378,6 +1675,12 @@ def run_requirements_review_stage(
     ensure_pre_development_task_record(project_dir, requirement_name)
     update_pre_development_task_status(project_dir, requirement_name, task_key="需求评审", completed=False)
 
+    lock_context = requirement_concurrency_lock(
+        project_dir,
+        requirement_name,
+        action="stage.a04.start",
+    )
+    lock_context.__enter__()
     progress = ReviewStageProgress()
     shared_review._ACTIVE_REVIEW_PROGRESS = progress
     active_ba_handoff: RequirementsAnalystHandoff | None = None
@@ -1390,7 +1693,6 @@ def run_requirements_review_stage(
             runtime_root = Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME
             if Path(ba_handoff.worker.runtime_root).expanduser().resolve() == runtime_root:
                 preserved_workers = (ba_handoff.worker,)
-        cleanup_stale_review_runtime_state(project_dir, preserve_workers=preserved_workers)
         try:
             active_ba_handoff = run_human_check_loop(
                 handoff=ba_handoff,
@@ -1413,6 +1715,13 @@ def run_requirements_review_stage(
                 cleanup_paths=cleanup_paths,
                 ba_handoff=None,
             )
+        review_round_limit = resolve_review_max_rounds(args, progress=progress)
+        review_round_policy = ReviewRoundPolicy(review_round_limit)
+        cleanup_stale_review_runtime_state(
+            project_dir,
+            requirement_name,
+            preserve_workers=preserved_workers,
+        )
         cleanup_existing_review_artifacts(paths, requirement_name)
         reviewer_workers = build_reviewer_workers(project_dir=project_dir, requirement_name=requirement_name)
 
@@ -1425,8 +1734,10 @@ def run_requirements_review_stage(
                 requirement_review_json=str(reviewer.review_json_path.resolve()),
             )
 
-        for round_index in range(1, MAX_REVIEW_ROUNDS + 1):
-            if round_index == 1:
+        round_index = 1
+        post_hitl_continue_completed = False
+        while True:
+            if not review_round_policy.initial_review_done:
                 reviewer_workers, active_ba_handoff = run_reviewer_phase_with_death_handling(
                     active_ba_handoff,
                     reviewer_workers,
@@ -1472,8 +1783,11 @@ def run_requirements_review_stage(
                     paths=paths,
                     requirement_name=requirement_name,
                     round_index=round_index,
+                    skip_ba_feedback=post_hitl_continue_completed,
                 )
+                post_hitl_continue_completed = False
 
+            review_round_policy.record_review_attempt()
             ensure_active_reviewers(reviewer_workers, stage_label="需求评审")
             review_json_files, review_md_files = _active_reviewer_files(reviewer_workers)
             passed = task_done(
@@ -1503,8 +1817,24 @@ def run_requirements_review_stage(
                     cleanup_paths=cleanup_paths,
                     ba_handoff=result_ba_handoff,
                 )
-
-        raise RuntimeError(f"需求评审超过最大轮数 {MAX_REVIEW_ROUNDS}，仍未全部通过")
+            review_msg = get_markdown_content(paths["merged_review_path"]).strip()
+            if not review_msg:
+                raise RuntimeError("评审未通过，但合并后的需求评审记录为空")
+            if review_round_policy.should_escalate_before_next_review():
+                if review_round_policy.max_rounds is None:
+                    raise RuntimeError("review_round_policy 配置错误：无限轮次不应触发超限 HITL")
+                active_ba_handoff, reviewer_workers, post_hitl_continue_completed = run_requirements_review_limit_hitl_loop(
+                    active_ba_handoff,
+                    reviewers=reviewer_workers,
+                    paths=paths,
+                    requirement_name=requirement_name,
+                    review_msg=review_msg,
+                    review_limit=review_round_policy.max_rounds,
+                    review_rounds_used=review_round_policy.quota_count,
+                    progress=progress,
+                )
+                review_round_policy.reset_after_hitl()
+            round_index += 1
     except Exception:
         _shutdown_workers(
             active_ba_handoff,
@@ -1516,6 +1846,7 @@ def run_requirements_review_stage(
     finally:
         progress.stop()
         shared_review._ACTIVE_REVIEW_PROGRESS = None
+        lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

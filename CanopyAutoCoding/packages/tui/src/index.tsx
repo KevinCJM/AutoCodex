@@ -3,7 +3,7 @@ import { render } from '@opentui/solid'
 import { App } from './app'
 import { copyToClipboard } from './clipboard'
 
-type StartupRoute = 'home' | 'routing' | 'requirements' | 'review' | 'control'
+type StartupRoute = 'home' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'overall-review' | 'control'
 
 function parseStartupArgs(argv: string[]) {
   let route: StartupRoute | undefined
@@ -13,7 +13,17 @@ function parseStartupArgs(argv: string[]) {
     const item = argv[index]
     if (item === '--route') {
       const value = argv[index + 1]
-      if (value === 'home' || value === 'routing' || value === 'requirements' || value === 'review' || value === 'control') {
+      if (
+        value === 'home'
+        || value === 'routing'
+        || value === 'requirements'
+        || value === 'review'
+        || value === 'design'
+        || value === 'task-split'
+        || value === 'development'
+        || value === 'overall-review'
+        || value === 'control'
+      ) {
         route = value
       }
       index += 1

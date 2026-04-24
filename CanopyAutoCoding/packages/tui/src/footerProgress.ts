@@ -7,11 +7,13 @@ type FooterProgressContext = {
   route: string
   activeStage: string
   activeStageLabel: string
+  routingWorkers: WorkerSnapshot[]
   requirementsWorkers: WorkerSnapshot[]
   reviewWorkers: WorkerSnapshot[]
   designWorkers: WorkerSnapshot[]
   taskSplitWorkers: WorkerSnapshot[]
   developmentWorkers: WorkerSnapshot[]
+  overallReviewWorkers: WorkerSnapshot[]
 }
 
 const STARTUP_PROGRESS_PATTERNS = [
@@ -26,22 +28,28 @@ function isBusyWorker(worker: WorkerSnapshot): boolean {
   const agentState = String(worker.agentState || '').trim().toUpperCase()
   const status = String(worker.status || '').trim().toLowerCase()
   const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
-  return agentState === 'BUSY' || status === 'running' || runtimeStatus === 'running'
+  if (agentState === 'BUSY') return true
+  if (agentState === 'READY' || agentState === 'STARTING' || agentState === 'DEAD') return false
+  return status === 'running' || runtimeStatus === 'running'
 }
 
 function inferStageKey(route: string, activeStage: string): string {
   const normalizedStage = String(activeStage || '').trim()
+  if (normalizedStage === 'stage.a01.start') return 'routing'
   if (normalizedStage === 'stage.a02.start') return 'requirements-intake'
   if (normalizedStage === 'stage.a03.start') return 'requirements-clarification'
   if (normalizedStage === 'stage.a04.start') return 'review'
   if (normalizedStage === 'stage.a05.start') return 'design'
   if (normalizedStage === 'stage.a06.start') return 'task-split'
   if (normalizedStage === 'stage.a07.start') return 'development'
+  if (normalizedStage === 'stage.a08.start') return 'overall-review'
   return String(route || '').trim()
 }
 
 function stageWorkers(context: FooterProgressContext): WorkerSnapshot[] {
   switch (inferStageKey(context.route, context.activeStage)) {
+    case 'routing':
+      return context.routingWorkers
     case 'requirements-intake':
     case 'requirements-clarification':
     case 'requirements':
@@ -54,6 +62,8 @@ function stageWorkers(context: FooterProgressContext): WorkerSnapshot[] {
       return context.taskSplitWorkers
     case 'development':
       return context.developmentWorkers
+    case 'overall-review':
+      return context.overallReviewWorkers
     default:
       return []
   }
@@ -61,6 +71,8 @@ function stageWorkers(context: FooterProgressContext): WorkerSnapshot[] {
 
 function stageBusyLabel(context: FooterProgressContext): string {
   switch (inferStageKey(context.route, context.activeStage)) {
+    case 'routing':
+      return '路由初始化 / 执行中'
     case 'requirements-intake':
       return '需求录入 / 执行中'
     case 'requirements-clarification':
@@ -73,6 +85,8 @@ function stageBusyLabel(context: FooterProgressContext): string {
       return '任务拆分 / 审核中'
     case 'development':
       return '任务开发 / 执行中'
+    case 'overall-review':
+      return '复核 / 审核中'
     default:
       return `${context.activeStageLabel || '当前阶段'} / 执行中`
   }

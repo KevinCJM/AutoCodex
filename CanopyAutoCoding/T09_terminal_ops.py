@@ -47,6 +47,8 @@ class TerminalUI(Protocol):
         prompt_text: str = "请选择",
         preview_path: str | Path | None = None,
         preview_title: str = "",
+        is_hitl: bool = False,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str: ...
 
     def prompt_multiline(
@@ -56,6 +58,7 @@ class TerminalUI(Protocol):
         empty_retry_message: str = "输入不能为空，请重试。",
         question_path: str | Path | None = None,
         answer_path: str | Path | None = None,
+        is_hitl: bool = False,
     ) -> str: ...
 
     def clear_pending_tty_input(self) -> None: ...
@@ -106,9 +109,13 @@ class StdioTerminalUI:
         prompt_text: str = "请选择",
         preview_path: str | Path | None = None,
         preview_title: str = "",
+        is_hitl: bool = False,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str:
         _ = preview_path
         _ = preview_title
+        _ = is_hitl
+        _ = extra_payload
         normalized = [(str(value), str(label)) for value, label in options]
         if not normalized:
             raise ValueError("选项不能为空")
@@ -134,9 +141,11 @@ class StdioTerminalUI:
         empty_retry_message: str = "输入不能为空，请重试。",
         question_path: str | Path | None = None,
         answer_path: str | Path | None = None,
+        is_hitl: bool = False,
     ) -> str:
         _ = question_path
         _ = answer_path
+        _ = is_hitl
         while True:
             self.message(title)
             self.message("输入完成后单独输入 END 或 EOF 提交。")
@@ -312,18 +321,29 @@ class BridgeTerminalUI:
         prompt_text: str = "请选择",
         preview_path: str | Path | None = None,
         preview_title: str = "",
+        is_hitl: bool = False,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str:
+        request_payload: dict[str, Any] = {
+            "title": title,
+            "options": [{"value": value, "label": label} for value, label in options],
+            "default_value": default_value,
+            "prompt_text": prompt_text,
+            "preview_path": str(Path(preview_path).expanduser().resolve()) if preview_path else "",
+            "preview_title": str(preview_title or "").strip(),
+        }
+        if extra_payload:
+            protected_keys = set(request_payload)
+            for key, value in extra_payload.items():
+                key_text = str(key)
+                if key_text not in protected_keys:
+                    request_payload[key_text] = value
+        if is_hitl:
+            request_payload["is_hitl"] = True
         payload = self._request_prompt(
             BridgePromptRequest(
                 prompt_type="select",
-                payload={
-                    "title": title,
-                    "options": [{"value": value, "label": label} for value, label in options],
-                    "default_value": default_value,
-                    "prompt_text": prompt_text,
-                    "preview_path": str(Path(preview_path).expanduser().resolve()) if preview_path else "",
-                    "preview_title": str(preview_title or "").strip(),
-                },
+                payload=request_payload,
             )
         )
         value = str(payload.get("value", default_value))
@@ -339,6 +359,7 @@ class BridgeTerminalUI:
         empty_retry_message: str = "输入不能为空，请重试。",
         question_path: str | Path | None = None,
         answer_path: str | Path | None = None,
+        is_hitl: bool = False,
     ) -> str:
         while True:
             payload = self._request_prompt(
@@ -349,6 +370,7 @@ class BridgeTerminalUI:
                         "empty_retry_message": empty_retry_message,
                         "question_path": str(Path(question_path).expanduser().resolve()) if question_path else "",
                         "answer_path": str(Path(answer_path).expanduser().resolve()) if answer_path else "",
+                        "is_hitl": bool(is_hitl),
                     },
                 )
             )
@@ -484,15 +506,32 @@ def prompt_select_option(
     prompt_text: str = "请选择",
     preview_path: str | Path | None = None,
     preview_title: str = "",
+    is_hitl: bool = False,
+    extra_payload: Mapping[str, Any] | None = None,
 ) -> str:
-    return get_terminal_ui().prompt_select(
-        title=title,
-        options=options,
-        default_value=default_value,
-        prompt_text=prompt_text,
-        preview_path=preview_path,
-        preview_title=preview_title,
-    )
+    terminal_ui = get_terminal_ui()
+    try:
+        return terminal_ui.prompt_select(
+            title=title,
+            options=options,
+            default_value=default_value,
+            prompt_text=prompt_text,
+            preview_path=preview_path,
+            preview_title=preview_title,
+            is_hitl=is_hitl,
+            extra_payload=extra_payload,
+        )
+    except TypeError:
+        if is_hitl or extra_payload:
+            raise
+        return terminal_ui.prompt_select(
+            title=title,
+            options=options,
+            default_value=default_value,
+            prompt_text=prompt_text,
+            preview_path=preview_path,
+            preview_title=preview_title,
+        )
 
 
 def prompt_yes_no(
@@ -531,12 +570,14 @@ def collect_multiline_input(
     empty_retry_message: str = "输入不能为空，请重试。",
     question_path: str | Path | None = None,
     answer_path: str | Path | None = None,
+    is_hitl: bool = False,
 ) -> str:
     return get_terminal_ui().prompt_multiline(
         title=title,
         empty_retry_message=empty_retry_message,
         question_path=question_path,
         answer_path=answer_path,
+        is_hitl=is_hitl,
     )
 
 

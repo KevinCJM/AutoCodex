@@ -10,10 +10,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -42,13 +42,17 @@ from canopy_core.runtime.tmux_runtime import (
     AgentRunConfig,
     LaunchCoordinator,
     TmuxBatchWorker,
-    TmuxRuntimeController,
     Vendor,
     build_session_name,
     cleanup_registered_tmux_workers,
+    is_agent_ready_timeout_error,
+    is_task_result_contract_error,
     is_worker_death_error,
     is_turn_artifact_contract_error,
+    is_provider_auth_error,
     list_registered_tmux_workers,
+    list_tmux_session_names,
+    list_occupied_tmux_session_names,
     try_resume_worker,
 )
 from canopy_core.stage_kernel.detailed_design import collect_ba_agent_selection
@@ -62,17 +66,42 @@ from canopy_core.stage_kernel.death_orchestration import (
     run_main_phase_with_death_handling,
     run_reviewer_phase_with_death_handling,
 )
+from canopy_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from canopy_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from canopy_core.stage_kernel.shared_review import (
+    AGENT_READY_TIMEOUT_RETRY,
+    AGENT_READY_TIMEOUT_SKIP,
     MAX_REVIEWER_REPAIR_ATTEMPTS,
+    ReviewLimitHitlConfig,
+    ReviewRoundPolicy,
+    ReviewAgentHandoff,
     ReviewAgentSelection,
     ReviewStageProgress,
     ReviewerRuntime,
     ensure_empty_file,
+    is_recoverable_startup_failure,
+    mark_worker_awaiting_reconfiguration,
+    parse_review_max_rounds,
+    prompt_agent_ready_timeout_recovery,
     prompt_positive_int,
+    prompt_required_replacement_review_agent_selection,
+    prompt_review_max_rounds,
     prompt_replacement_review_agent_selection,
     prompt_review_agent_selection,
+    render_review_limit_force_hitl_prompt,
+    render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    run_review_limit_hitl_cycle,
+    worker_has_provider_auth_error,
+)
+from canopy_core.stage_kernel.turn_output_goals import (
+    CompletionTurnGoal,
+    OutcomeGoal,
+    RepairPromptContext,
+    TaskTurnGoal,
+    run_completion_turn_with_repair,
+    run_task_result_turn_with_repair,
 )
 from canopy_core.stage_kernel.task_split import run_task_split_stage
 from T01_tools import (
@@ -153,6 +182,30 @@ class DeveloperRuntime:
 
 
 @dataclass(frozen=True)
+class DevelopmentAgentHandoff:
+    selection: ReviewAgentSelection
+    role_prompt: str
+    worker: TmuxBatchWorker
+
+
+class _ReadyTimeoutSkipBudget:
+    def __init__(self, reviewer_count: int) -> None:
+        self._remaining = max(int(reviewer_count) - 1, 0)
+        self._lock = threading.Lock()
+
+    def reserve(self) -> bool:
+        with self._lock:
+            if self._remaining <= 0:
+                return False
+            self._remaining -= 1
+            return True
+
+    def release(self) -> None:
+        with self._lock:
+            self._remaining += 1
+
+
+@dataclass(frozen=True)
 class DevelopmentStageResult:
     project_dir: str
     requirement_name: str
@@ -161,6 +214,8 @@ class DevelopmentStageResult:
     merged_review_path: str
     completed: bool
     cleanup_paths: tuple[str, ...] = ()
+    developer_handoff: DevelopmentAgentHandoff | None = None
+    reviewer_handoff: tuple[ReviewAgentHandoff, ...] = ()
 
 
 @dataclass
@@ -182,12 +237,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="任务开发阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
-    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|qwen|kimi")
+    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|qwen|kimi|opencode")
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")
     parser.add_argument("--developer-role-prompt", default="", help="开发工程师自定义角色定义提示词")
     parser.add_argument("--developer-max-turns", default=None, help="开发工程师最大对话轮数；传 infinite 表示不重建，默认 15")
+    parser.add_argument("--review-max-rounds", default="", help="代码评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--subagent-num", type=int, default=None, help="开发工程师自检使用的 subagent 数量")
     parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖代码评审角色列表")
     parser.add_argument("--reviewer-role-prompt", action="append", default=[], help="重复传入以覆盖对应角色提示词")
@@ -200,22 +256,37 @@ def build_parser() -> argparse.ArgumentParser:
 def build_development_paths(project_dir: str | Path, requirement_name: str) -> dict[str, Path]:
     project_root = Path(project_dir).expanduser().resolve()
     safe_name = sanitize_requirement_name(requirement_name)
-    original_requirement_path, requirements_clear_path, _, hitl_record_path = build_requirements_clarification_paths(
+    original_requirement_path, requirements_clear_path, ask_human_path, hitl_record_path = build_requirements_clarification_paths(
         project_root,
         requirement_name,
     )
+    legacy_question_path = project_root / f"{safe_name}_向人类提问.md"
+    if legacy_question_path.exists() and legacy_question_path.is_file():
+        ask_human_path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_text = legacy_question_path.read_text(encoding="utf-8")
+        current_text = ask_human_path.read_text(encoding="utf-8") if ask_human_path.exists() else ""
+        if legacy_text.strip() and not current_text.strip():
+            ask_human_path.write_text(legacy_text, encoding="utf-8")
+        legacy_question_path.unlink()
     return {
         "project_root": project_root,
         "original_requirement_path": original_requirement_path,
         "requirements_clear_path": requirements_clear_path,
+        "ask_human_path": ask_human_path,
         "hitl_record_path": hitl_record_path,
         "detailed_design_path": project_root / f"{safe_name}_详细设计.md",
         "task_md_path": project_root / f"{safe_name}_任务单.md",
         "task_json_path": project_root / f"{safe_name}_任务单.json",
-        "developer_question_path": project_root / f"{safe_name}_向人类提问.md",
         "developer_output_path": project_root / f"{safe_name}_工程师开发内容.md",
         "merged_review_path": project_root / f"{safe_name}_代码评审记录.md",
     }
+
+
+def build_development_runtime_root(project_dir: str | Path, requirement_name: str = "") -> Path:
+    project_root = Path(project_dir).expanduser().resolve()
+    runtime_root = project_root / DEVELOPMENT_RUNTIME_ROOT_NAME
+    safe_requirement = sanitize_requirement_name(requirement_name) if str(requirement_name).strip() else ""
+    return runtime_root / safe_requirement if safe_requirement else runtime_root
 
 
 def build_reviewer_artifact_paths(project_dir: str | Path, requirement_name: str, reviewer_name: str) -> tuple[Path, Path]:
@@ -240,7 +311,7 @@ def cleanup_existing_development_artifacts(paths: dict[str, Path], requirement_n
                 candidate.unlink()
                 removed.append(str(candidate.resolve()))
     for candidate in (
-        paths["developer_question_path"],
+        paths["ask_human_path"],
         paths["developer_output_path"],
         paths["merged_review_path"],
     ):
@@ -250,33 +321,19 @@ def cleanup_existing_development_artifacts(paths: dict[str, Path], requirement_n
     return tuple(dict.fromkeys(removed))
 
 
-def cleanup_stale_development_runtime_state(project_dir: str | Path) -> tuple[str, ...]:
+def cleanup_stale_development_runtime_state(
+    project_dir: str | Path,
+    requirement_name: str,
+) -> tuple[str, ...]:
     runtime_root = Path(project_dir).expanduser().resolve() / DEVELOPMENT_RUNTIME_ROOT_NAME
     if not runtime_root.exists() or not runtime_root.is_dir():
         return ()
-    tmux_runtime = TmuxRuntimeController()
-    removed: list[str] = []
-    for worker_dir in sorted(path for path in runtime_root.iterdir() if path.is_dir()):
-        state_path = worker_dir / "worker.state.json"
-        session_name = ""
-        if state_path.exists():
-            try:
-                payload = json.loads(state_path.read_text(encoding="utf-8"))
-            except Exception:
-                payload = {}
-            if isinstance(payload, dict):
-                session_name = str(payload.get("session_name", "")).strip()
-        if session_name:
-            try:
-                tmux_runtime.kill_session(session_name, missing_ok=True)
-            except Exception:
-                pass
-        shutil.rmtree(worker_dir, ignore_errors=True)
-        removed.append(str(worker_dir.resolve()))
-    if runtime_root.exists() and runtime_root.is_dir() and not any(runtime_root.iterdir()):
-        runtime_root.rmdir()
-        removed.append(str(runtime_root.resolve()))
-    return tuple(removed)
+    return cleanup_runtime_dirs_by_scope(
+        runtime_root=runtime_root,
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        workflow_action="stage.a07.start",
+    )
 
 
 def build_developer_worker_id() -> str:
@@ -294,10 +351,19 @@ def _predict_worker_display_name(
     occupied_session_names: Sequence[str] = (),
 ) -> str:
     occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
+    for session_name in list_tmux_session_names():
+        name = str(session_name or "").strip()
+        if name:
+            occupied.add(name)
     for worker in list_registered_tmux_workers():
         session_name = str(getattr(worker, "session_name", "") or "").strip()
         if session_name:
             occupied.add(session_name)
+    occupied.update(
+        list_occupied_tmux_session_names(
+            additional_session_names=sorted(occupied),
+        )
+    )
     return build_session_name(
         worker_id,
         Path(project_dir).expanduser().resolve(),
@@ -528,9 +594,11 @@ def _developer_display_name(*, project_dir: str | Path) -> str:
 def create_developer_runtime(
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     selection: ReviewAgentSelection,
     role_prompt: str,
     launch_coordinator: LaunchCoordinator | None = None,
+    run_id: str = "",
 ) -> DeveloperRuntime:
     project_root = Path(project_dir).expanduser().resolve()
     worker = TmuxBatchWorker(
@@ -542,8 +610,16 @@ def create_developer_runtime(
             reasoning_effort=selection.reasoning_effort,
             proxy_url=selection.proxy_url,
         ),
-        runtime_root=project_root / DEVELOPMENT_RUNTIME_ROOT_NAME,
+        runtime_root=build_development_runtime_root(project_root, requirement_name),
         launch_coordinator=launch_coordinator,
+        runtime_metadata={
+            "project_dir": str(project_root),
+            "requirement_name": str(requirement_name).strip(),
+            "workflow_action": "stage.a07.start",
+            "run_id": str(run_id or "").strip(),
+            "agent_role": "developer",
+            "role_prompt": str(role_prompt or "").strip(),
+        },
     )
     message(render_tmux_start_summary(str(worker.session_name).strip() or "开发工程师", worker))
     return DeveloperRuntime(selection=selection, worker=worker, role_prompt=role_prompt)
@@ -552,24 +628,50 @@ def create_developer_runtime(
 def recreate_developer_runtime(
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     developer: DeveloperRuntime,
     progress: ReviewStageProgress | None = None,
     launch_coordinator: LaunchCoordinator | None = None,
+    required_reconfiguration: bool = False,
+    reason_text: str = "",
 ) -> DeveloperRuntime | None:
-    if not stdin_is_interactive():
-        return None
+    scope_requirement_name = (
+        str(requirement_name).strip()
+        or str(getattr(developer.worker, "_runtime_metadata", {}).get("requirement_name", "") or "").strip()
+    )
+    if required_reconfiguration and not stdin_is_interactive():
+        raise RuntimeError("开发工程师需要重新配置智能体，但当前环境无法交互选择厂商/模型。")
+    if not required_reconfiguration and not stdin_is_interactive():
+        return create_developer_runtime(
+            project_dir=project_dir,
+            requirement_name=scope_requirement_name,
+            selection=developer.selection,
+            role_prompt=developer.role_prompt,
+            launch_coordinator=launch_coordinator,
+        )
     developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
-    selection = prompt_replacement_review_agent_selection(
-        reason_text=f"检测到{developer_name}已死亡，需要重建开发工程师后继续当前阶段。",
-        previous_selection=developer.selection,
-        force_model_change=True,
-        role_label=developer_name,
-        progress=progress,
+    selection = (
+        prompt_required_replacement_review_agent_selection(
+            reason_text=reason_text or f"检测到{developer_name}不可继续使用，需要更换模型后继续当前阶段。",
+            previous_selection=developer.selection,
+            force_model_change=True,
+            role_label=developer_name,
+            progress=progress,
+        )
+        if required_reconfiguration
+        else prompt_replacement_review_agent_selection(
+            reason_text=f"检测到{developer_name}已死亡，需要重建开发工程师后继续当前阶段。",
+            previous_selection=developer.selection,
+            force_model_change=True,
+            role_label=developer_name,
+            progress=progress,
+        )
     )
     if selection is None:
         return None
     return create_developer_runtime(
         project_dir=project_dir,
+        requirement_name=scope_requirement_name,
         selection=selection,
         role_prompt=developer.role_prompt,
         launch_coordinator=launch_coordinator,
@@ -592,16 +694,22 @@ def prepare_developer_runtime(
     args: argparse.Namespace,
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     progress: ReviewStageProgress | None = None,
 ) -> DeveloperRuntime:
     plan = resolve_developer_plan(args, project_dir=project_dir, progress=progress)
-    return create_developer_runtime(project_dir=project_dir, selection=plan.selection, role_prompt=plan.role_prompt)
+    return create_developer_runtime(
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        selection=plan.selection,
+        role_prompt=plan.role_prompt,
+    )
 
 
 def build_developer_init_prompt(paths: dict[str, Path], *, role_prompt: str) -> str:
     return init_developer(
         role_prompt,
-        ask_human_md=str(paths["developer_question_path"].resolve()),
+        ask_human_md=str(paths["ask_human_path"].resolve()),
         hitl_record_md=str(paths["hitl_record_path"].resolve()),
         requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
         detailed_design_md=str(paths["detailed_design_path"].resolve()),
@@ -612,7 +720,7 @@ def build_developer_init_prompt(paths: dict[str, Path], *, role_prompt: str) -> 
 def build_developer_human_reply_prompt(paths: dict[str, Path], *, human_msg: str) -> str:
     return human_reply(
         human_msg,
-        ask_human_md=str(paths["developer_question_path"].resolve()),
+        ask_human_md=str(paths["ask_human_path"].resolve()),
         hitl_record_md=str(paths["hitl_record_path"].resolve()),
         requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
         detailed_design_md=str(paths["detailed_design_path"].resolve()),
@@ -657,6 +765,85 @@ def resolve_developer_max_turns(
                 message(str(error))
 
 
+def resolve_review_max_rounds(
+    args: argparse.Namespace,
+    *,
+    progress: ReviewStageProgress | None = None,
+) -> int | None:
+    explicit = getattr(args, "review_max_rounds", "")
+    if str(explicit or "").strip():
+        return parse_review_max_rounds(
+            explicit,
+            source="--review-max-rounds",
+            default=MAX_DEVELOPMENT_REVIEW_ROUNDS,
+        )
+    if not stdin_is_interactive():
+        return MAX_DEVELOPMENT_REVIEW_ROUNDS
+    if progress is not None and hasattr(progress, "set_phase"):
+        progress.set_phase("任务开发 / 配置最大审核轮次")
+    return prompt_review_max_rounds(
+        default=MAX_DEVELOPMENT_REVIEW_ROUNDS,
+        progress=progress,
+    )
+
+
+def build_development_review_limit_hitl_config(paths: dict[str, Path]) -> ReviewLimitHitlConfig:
+    return ReviewLimitHitlConfig(
+        stage_label="任务开发评审超限",
+        artifact_label="代码评审",
+        primary_output_path=paths["developer_output_path"],
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        merged_review_path=paths["merged_review_path"],
+        output_summary_path=paths["developer_output_path"],
+        continue_output_label="工程师开发内容.md",
+    )
+
+
+def build_development_review_limit_force_hitl_prompt(
+    *,
+    paths: dict[str, Path],
+    task_name: str,
+    review_msg: str,
+    review_limit: int,
+    review_rounds_used: int,
+) -> str:
+    _ = task_name
+    return render_review_limit_force_hitl_prompt(
+        config=build_development_review_limit_hitl_config(paths),
+        review_limit=review_limit,
+        review_rounds_used=review_rounds_used,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(
+            paths["requirements_clear_path"],
+            paths["detailed_design_path"],
+            paths["task_md_path"],
+            paths["task_json_path"],
+        ),
+    ) + f"\n## 当前评审记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
+
+
+def build_development_review_limit_human_reply_prompt(
+    *,
+    paths: dict[str, Path],
+    task_name: str,
+    review_msg: str,
+    human_msg: str,
+) -> str:
+    _ = task_name
+    return render_review_limit_human_reply_prompt(
+        config=build_development_review_limit_hitl_config(paths),
+        human_msg=human_msg,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(
+            paths["requirements_clear_path"],
+            paths["detailed_design_path"],
+            paths["task_md_path"],
+            paths["task_json_path"],
+        ),
+    ) + f"\n## 当前评审记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
+
+
 def build_reviewer_init_prompt(paths: dict[str, Path], *, reviewer_spec: DevelopmentReviewerSpec) -> str:
     return init_code_reviewer(
         reviewer_spec.role_prompt,
@@ -676,7 +863,7 @@ def build_developer_init_result_contract(paths: dict[str, Path], *, mode: str) -
         expected_statuses=("ready", "hitl"),
         stage_name="任务开发",
         optional_artifacts={
-            "ask_human": paths["developer_question_path"],
+            "ask_human": paths["ask_human_path"],
             "hitl_record": paths["hitl_record_path"],
             "requirements_clear": paths["requirements_clear_path"],
             "detailed_design": paths["detailed_design_path"],
@@ -692,6 +879,83 @@ def build_developer_init_result_contract(paths: dict[str, Path], *, mode: str) -
             "hitl": "开发工程师需要人类补充阻断信息",
         },
     )
+
+
+def build_developer_review_feedback_result_contract(paths: dict[str, Path]) -> TaskResultContract:
+    return build_developer_review_feedback_contract(paths)
+
+
+def build_developer_review_feedback_contract(
+    paths: dict[str, Path],
+    *,
+    mode: str = "a07_developer_review_feedback",
+) -> TaskResultContract:
+    expected_statuses = ("hitl", "completed")
+    if mode == "a07_developer_review_limit_force_hitl":
+        expected_statuses = ("hitl",)
+    return TaskResultContract(
+        turn_id=mode,
+        phase=mode,
+        task_kind=mode,
+        mode=mode,
+        expected_statuses=expected_statuses,
+        stage_name="任务开发",
+        optional_artifacts={
+            "ask_human": paths["ask_human_path"],
+            "hitl_record": paths["hitl_record_path"],
+            "developer_output": paths["developer_output_path"],
+            "requirements_clear": paths["requirements_clear_path"],
+            "detailed_design": paths["detailed_design_path"],
+            "task_md": paths["task_md_path"],
+            "task_json": paths["task_json_path"],
+        },
+        terminal_status_tokens={
+            "hitl": ("HITL",),
+            "completed": ("修改完成",),
+        },
+        terminal_status_summaries={
+            "hitl": "开发工程师在评审超限后需要继续等待人类决策",
+            "completed": "开发工程师已根据人类反馈继续完成任务开发",
+        },
+    )
+
+
+def _build_developer_turn_goal(paths: dict[str, Path], contract: TaskResultContract, *, task_name: str = "") -> TaskTurnGoal | None:
+    if contract.mode in {"a07_developer_init", "a07_developer_human_reply"}:
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={
+                "ready": OutcomeGoal(status="ready"),
+                "hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",)),
+            },
+        )
+    if contract.mode in {"a07_developer_task_complete", "a07_developer_refine"}:
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={"completed": OutcomeGoal(status="completed", required_aliases=("developer_output",))},
+            repair_prompt_builder=lambda context: check_develop_job(
+                paths["developer_output_path"],
+                task_name or "当前任务",
+                task_split_md=str(paths["task_md_path"].resolve()),
+                what_just_dev=str(paths["developer_output_path"].resolve()),
+            ),
+        )
+    if contract.mode == "a07_developer_review_limit_force_hitl":
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={"hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",))},
+        )
+    if contract.mode in {"a07_developer_review_feedback", "a07_developer_review_limit_human_reply"}:
+        return TaskTurnGoal(
+            goal_id=contract.mode,
+            outcomes={
+                "hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",)),
+                "completed": OutcomeGoal(status="completed", required_aliases=("developer_output",)),
+            },
+        )
+    if contract.mode == "a07_reviewer_init":
+        return TaskTurnGoal(goal_id=contract.mode, outcomes={"ready": OutcomeGoal(status="ready")})
+    return None
 
 
 def build_reviewer_init_result_contract(paths: dict[str, Path]) -> TaskResultContract:
@@ -763,27 +1027,56 @@ def _run_developer_result_turn(
     label: str,
     prompt: str,
     result_contract: TaskResultContract,
+    paths: dict[str, Path] | None = None,
+    task_name: str = "",
+    turn_goal: TaskTurnGoal | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
+    progress: ReviewStageProgress | None = None,
 ) -> tuple[DeveloperRuntime, dict[str, object]]:
     current_developer = developer
     while True:
         try:
-            result = current_developer.worker.run_turn(
+            payload = run_task_result_turn_with_repair(
+                worker=current_developer.worker,
                 label=label,
                 prompt=prompt,
                 result_contract=result_contract,
+                parse_result_payload=_parse_result_payload,
+                turn_goal=turn_goal or (
+                    _build_developer_turn_goal(paths, result_contract, task_name=task_name)
+                    if paths is not None else None
+                ),
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                stage_label="任务开发",
+                role_label=str(current_developer.worker.session_name or "开发工程师").strip() or "开发工程师",
+                task_name=task_name,
             )
             if turn_policy is not None:
                 turn_policy.record_turn()
-            if not result.ok:
-                raise RuntimeError(result.clean_output or f"{label} 执行失败")
-            return current_developer, _parse_result_payload(result.clean_output)
+            return current_developer, payload
         except Exception as error:  # noqa: BLE001
+            if is_agent_ready_timeout_error(error):
+                developer_display_name = str(current_developer.worker.session_name or "开发工程师").strip() or "开发工程师"
+                prompt_agent_ready_timeout_recovery(
+                    current_developer.worker,
+                    role_label=developer_display_name,
+                    can_skip=False,
+                    progress=progress,
+                    reason_text=(
+                        f"{developer_display_name}启动超时，未能进入可输入状态。\n"
+                        "请先手动更换模型，再继续尝试当前 turn。"
+                    ),
+                )
+                continue
             if is_worker_death_error(error) and replace_dead_developer is not None:
                 current_developer = replace_dead_developer(current_developer, error)
                 continue
+            if is_recoverable_startup_failure(error, current_developer.worker) and replace_dead_developer is not None:
+                current_developer = replace_dead_developer(current_developer, error)
+                continue
+            if is_task_result_contract_error(error):
+                raise
             if try_resume_worker(current_developer.worker, timeout_sec=60.0):
                 continue
             raise RuntimeError(f"{current_developer.worker.session_name or '开发工程师'} 执行失败") from error
@@ -858,7 +1151,88 @@ def build_reviewer_completion_contract(
         phase="任务开发",
         status_path=review_json_path,
         validator=validator,
+        kind="review_round",
+        tracked_artifacts={
+            "review_md": review_md_path,
+            "review_json": review_json_path,
+        },
     )
+
+
+def _build_reviewer_turn_goal() -> CompletionTurnGoal:
+    return CompletionTurnGoal(
+        goal_id="a07_reviewer_round",
+        outcomes={
+            "review_pass": OutcomeGoal(status="review_pass", required_aliases=("review_json",), forbidden_aliases=("review_md",)),
+            "review_fail": OutcomeGoal(status="review_fail", required_aliases=("review_json", "review_md")),
+        },
+        repair_prompt_builder=_build_reviewer_protocol_repair_prompt,
+    )
+
+
+def _infer_reviewer_artifact_name_from_context(context: RepairPromptContext) -> str:
+    role_label = str(context.role_label or "").strip()
+    if role_label:
+        return role_label
+    review_json = str(context.artifact_paths.get("review_json", "") or "").strip()
+    if not review_json:
+        return ""
+    path = Path(review_json)
+    safe_requirement = sanitize_requirement_name(context.requirement_name) if context.requirement_name else ""
+    prefix = f"{safe_requirement}_评审记录_" if safe_requirement else ""
+    suffix = ".json"
+    name = path.name
+    if prefix and name.startswith(prefix) and name.endswith(suffix):
+        return name[len(prefix):-len(suffix)]
+    if name.endswith(suffix):
+        return name[:-len(suffix)]
+    return name
+
+
+def _build_reviewer_protocol_repair_prompt(context: RepairPromptContext) -> str:
+    reviewer_artifact_name = _infer_reviewer_artifact_name_from_context(context)
+    review_json = str(context.artifact_paths.get("review_json", "") or "").strip()
+    review_md = str(context.artifact_paths.get("review_md", "") or "").strip()
+    task_name = str(context.task_name or "").strip()
+    if not reviewer_artifact_name or not review_json or not task_name:
+        from canopy_core.stage_kernel.turn_output_goals import build_default_completion_repair_prompt
+
+        return build_default_completion_repair_prompt(context)
+
+    review_json_path = Path(review_json).expanduser().resolve()
+    safe_requirement = sanitize_requirement_name(context.requirement_name) if context.requirement_name else ""
+    if safe_requirement:
+        json_pattern = f"{safe_requirement}_评审记录_*.json"
+        md_pattern = f"{safe_requirement}_代码评审记录_*.md"
+    else:
+        json_pattern = review_json_path.name.replace(reviewer_artifact_name, "*")
+        md_pattern = Path(review_md).name.replace(reviewer_artifact_name, "*") if review_md else "代码评审记录_*.md"
+    prompts = check_reviewer_job(
+        [reviewer_artifact_name],
+        directory=review_json_path.parent,
+        task_name=task_name,
+        json_pattern=json_pattern,
+        md_pattern=md_pattern,
+    )
+    prompt = str(prompts.get(reviewer_artifact_name, "") or "").strip()
+    if not prompt:
+        from canopy_core.stage_kernel.turn_output_goals import build_default_completion_repair_prompt
+
+        prompt = build_default_completion_repair_prompt(context)
+    exact_paths = [
+        "",
+        "## 精确文件路径约束",
+        f"- 必须写入 JSON: `{review_json_path}`",
+    ]
+    if review_md:
+        exact_paths.append(f"- 必须写入/清空 Markdown: `{Path(review_md).expanduser().resolve()}`")
+    exact_paths.extend(
+        [
+            "- 不要创建同名变体文件。",
+            "- 不要在角色名与星宿名之间插入额外空格。",
+        ]
+    )
+    return prompt + "\n" + "\n".join(exact_paths)
 
 
 def _reviewer_has_materialized_outputs(reviewer: ReviewerRuntime, task_name: str) -> bool:
@@ -895,9 +1269,10 @@ def create_reviewer_runtime(
     reviewer_spec: DevelopmentReviewerSpec,
     selection: ReviewAgentSelection,
     launch_coordinator: LaunchCoordinator | None = None,
+    run_id: str = "",
 ) -> ReviewerRuntime:
     reviewer_identity = str(reviewer_spec.reviewer_key or reviewer_spec.role_name).strip()
-    runtime_root = Path(project_dir).expanduser().resolve() / DEVELOPMENT_RUNTIME_ROOT_NAME
+    runtime_root = build_development_runtime_root(project_dir, requirement_name)
     worker = TmuxBatchWorker(
         worker_id=build_development_reviewer_worker_id(reviewer_spec.role_name),
         work_dir=Path(project_dir).expanduser().resolve(),
@@ -909,6 +1284,16 @@ def create_reviewer_runtime(
         ),
         runtime_root=runtime_root,
         launch_coordinator=launch_coordinator,
+        runtime_metadata={
+            "project_dir": str(Path(project_dir).expanduser().resolve()),
+            "requirement_name": str(requirement_name).strip(),
+            "workflow_action": "stage.a07.start",
+            "run_id": str(run_id or "").strip(),
+            "agent_role": "reviewer",
+            "role_name": str(reviewer_spec.role_name).strip(),
+            "reviewer_key": reviewer_identity,
+            "role_prompt": str(reviewer_spec.role_prompt or "").strip(),
+        },
     )
     review_md_path, review_json_path = build_reviewer_artifact_paths(
         project_dir,
@@ -1014,6 +1399,8 @@ def collect_reviewer_agent_selections(
 def _run_parallel_reviewer_initialization(
     reviewers: Sequence[ReviewerRuntime],
     *,
+    project_dir: str | Path,
+    requirement_name: str,
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     progress: ReviewStageProgress | None = None,
@@ -1023,14 +1410,24 @@ def _run_parallel_reviewer_initialization(
         return reviewer_list
     if progress is not None:
         progress.set_phase("任务开发 / 初始化审核器")
+    skip_budget = _ReadyTimeoutSkipBudget(len(reviewer_list))
+
+    def run_initialization(reviewer: ReviewerRuntime) -> ReviewerRuntime | None:
+        return _run_single_reviewer_initialization(
+            reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            paths=paths,
+            reviewer_specs_by_name=reviewer_specs_by_name,
+            progress=progress,
+            can_skip_ready_timeout=True,
+            ready_timeout_skip_budget=skip_budget,
+        )
+
     return run_parallel_reviewer_round(
         reviewer_list,
         key_func=lambda reviewer: reviewer.reviewer_name,
-        run_turn=lambda reviewer: _run_single_reviewer_initialization(
-            reviewer,
-            paths=paths,
-            reviewer_specs_by_name=reviewer_specs_by_name,
-        ),
+        run_turn=run_initialization,
         error_prefix="任务开发审核智能体初始化失败:",
     )
 
@@ -1038,25 +1435,89 @@ def _run_parallel_reviewer_initialization(
 def _run_single_reviewer_initialization(
     reviewer: ReviewerRuntime,
     *,
+    project_dir: str | Path,
+    requirement_name: str,
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
+    progress: ReviewStageProgress | None = None,
+    can_skip_ready_timeout: bool = True,
+    ready_timeout_skip_budget: _ReadyTimeoutSkipBudget | None = None,
 ) -> ReviewerRuntime | None:
-    reviewer_spec = reviewer_specs_by_name[reviewer.reviewer_name]
-    try:
-        result = reviewer.worker.run_turn(
-            label=f"development_reviewer_init_{sanitize_requirement_name(reviewer.reviewer_name)}",
-            prompt=build_reviewer_init_prompt(paths, reviewer_spec=reviewer_spec),
-            result_contract=build_reviewer_init_result_contract(paths),
-            timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
-        )
-    except Exception as error:  # noqa: BLE001
-        if is_worker_death_error(error):
-            message(f"{reviewer.worker.session_name or reviewer.reviewer_name} 已死亡，当前阶段将忽略该审核智能体。")
-            return None
-        raise
-    if not result.ok:
-        raise RuntimeError(f"{reviewer.reviewer_name}: {result.clean_output or 'reviewer init failed'}")
-    return reviewer
+    init_contract = build_reviewer_init_result_contract(paths)
+    current_reviewer = reviewer
+    while True:
+        reviewer_spec = reviewer_specs_by_name[current_reviewer.reviewer_name]
+        try:
+            run_task_result_turn_with_repair(
+                worker=current_reviewer.worker,
+                label=f"development_reviewer_init_{sanitize_requirement_name(current_reviewer.reviewer_name)}",
+                prompt=build_reviewer_init_prompt(paths, reviewer_spec=reviewer_spec),
+                result_contract=init_contract,
+                parse_result_payload=lambda text: _parse_result_payload(text) if str(text).strip() else {},
+                turn_goal=_build_developer_turn_goal(paths, init_contract),
+                timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                stage_label="任务开发",
+                role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
+            )
+            return current_reviewer
+        except Exception as error:  # noqa: BLE001
+            reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
+            if is_worker_death_error(error):
+                message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
+                return None
+            if is_agent_ready_timeout_error(error):
+                effective_can_skip = bool(can_skip_ready_timeout)
+                reserved_skip = False
+                if ready_timeout_skip_budget is not None:
+                    effective_can_skip = ready_timeout_skip_budget.reserve()
+                    reserved_skip = effective_can_skip
+                try:
+                    choice = prompt_agent_ready_timeout_recovery(
+                        current_reviewer.worker,
+                        role_label=reviewer_display_name,
+                        can_skip=effective_can_skip,
+                        progress=progress,
+                        reason_text=(
+                            f"{reviewer_display_name}启动超时，未能进入可输入状态。\n"
+                            + ("请先手动更换模型，或关闭并跳过该审核智能体。" if effective_can_skip else "请先手动更换模型，再继续尝试当前 turn。")
+                        ),
+                    )
+                except Exception:
+                    if reserved_skip:
+                        ready_timeout_skip_budget.release()
+                    raise
+                if choice == AGENT_READY_TIMEOUT_SKIP and effective_can_skip:
+                    with suppress(Exception):
+                        current_reviewer.worker.request_kill()
+                    message(f"{reviewer_display_name} 已关闭，当前阶段将跳过该审核智能体。")
+                    return None
+                if reserved_skip:
+                    ready_timeout_skip_budget.release()
+                if choice == AGENT_READY_TIMEOUT_RETRY:
+                    continue
+                continue
+            if is_recoverable_startup_failure(error, current_reviewer.worker):
+                reason_text = (
+                    f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                    if is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+                    else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
+                )
+                mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
+                replacement = recreate_development_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=current_reviewer,
+                    reviewer_spec=reviewer_spec,
+                    progress=progress,
+                    force_model_change=True,
+                    required_reconfiguration=True,
+                    reason_text=reason_text,
+                )
+                if replacement is None:
+                    raise RuntimeError(f"{reviewer_display_name} 初始化失败，且未能重建审核智能体") from error
+                current_reviewer = replacement
+                continue
+            raise
 
 
 def initialize_development_workers(
@@ -1065,6 +1526,8 @@ def initialize_development_workers(
     paths: dict[str, Path],
     reviewers: Sequence[ReviewerRuntime],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
+    project_dir: str | Path = ".",
+    requirement_name: str = "",
     initialize_developer: bool = True,
     initialize_reviewers: bool = True,
     progress: ReviewStageProgress | None = None,
@@ -1085,8 +1548,10 @@ def initialize_development_workers(
             label="development_developer_init",
             prompt=build_developer_init_prompt(paths, role_prompt=current_developer.role_prompt),
             result_contract=build_developer_init_result_contract(paths, mode="a07_developer_init"),
+            paths=paths,
             turn_policy=turn_policy,
             replace_dead_developer=replace_dead_developer_for_init or replace_dead_developer,
+            progress=progress,
         )
         if developer_payload is None:
             raise RuntimeError("开发工程师初始化未返回有效结果")
@@ -1101,6 +1566,8 @@ def initialize_development_workers(
     if initialize_reviewers:
         reviewer_list = _run_parallel_reviewer_initialization(
             reviewer_list,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
             paths=paths,
             reviewer_specs_by_name=reviewer_specs_by_name,
             progress=progress,
@@ -1130,6 +1597,7 @@ def _collect_development_hitl_response(
             empty_retry_message="回复不能为空，请重新输入。",
             question_path=question_file,
             answer_path=answer_path,
+            is_hitl=True,
         )
 
 
@@ -1145,26 +1613,101 @@ def run_developer_hitl_loop(
     current_developer = developer
     payload = initial_payload
     for hitl_round in range(1, MAX_DEVELOPMENT_HITL_ROUNDS + 1):
-        if str(payload.get("status", "")).strip() == "ready" and not get_markdown_content(paths["developer_question_path"]).strip():
+        if str(payload.get("status", "")).strip() == "ready" and not get_markdown_content(paths["ask_human_path"]).strip():
             return current_developer
-        if not get_markdown_content(paths["developer_question_path"]).strip():
+        if not get_markdown_content(paths["ask_human_path"]).strip():
             return current_developer
         human_msg = _collect_development_hitl_response(
-            paths["developer_question_path"],
+            paths["ask_human_path"],
             hitl_round=hitl_round,
             answer_path=paths["hitl_record_path"],
             progress=progress,
         )
-        ensure_empty_file(paths["developer_question_path"])
+        ensure_empty_file(paths["ask_human_path"])
         current_developer, payload = _run_developer_result_turn(
             current_developer,
             label=f"development_developer_hitl_reply_round_{hitl_round}",
             prompt=build_developer_human_reply_prompt(paths, human_msg=human_msg),
             result_contract=build_developer_init_result_contract(paths, mode="a07_developer_human_reply"),
+            paths=paths,
             turn_policy=turn_policy,
             replace_dead_developer=replace_dead_developer,
+            progress=progress,
         )
     raise RuntimeError(f"任务开发 HITL 轮次超过上限: {MAX_DEVELOPMENT_HITL_ROUNDS}")
+
+
+def run_development_review_limit_hitl_loop(
+    developer: DeveloperRuntime,
+    *,
+    paths: dict[str, Path],
+    task_name: str,
+    review_msg: str,
+    review_limit: int,
+    review_rounds_used: int,
+    progress: ReviewStageProgress | None = None,
+    turn_policy: DeveloperTurnPolicy | None = None,
+    replace_dead_developer=None,
+) -> object:
+    ensure_empty_file(paths["ask_human_path"])
+
+    def initial_turn() -> object:
+        nonlocal developer
+        developer, _ = _run_developer_result_turn(
+            developer,
+            label=f"development_review_limit_hitl_{sanitize_requirement_name(task_name)}",
+            prompt=build_development_review_limit_force_hitl_prompt(
+                paths=paths,
+                task_name=task_name,
+                review_msg=review_msg,
+                review_limit=review_limit,
+                review_rounds_used=review_rounds_used,
+            ),
+            result_contract=build_developer_review_feedback_contract(
+                paths,
+                mode="a07_developer_review_limit_force_hitl",
+            ),
+            paths=paths,
+            task_name=task_name,
+            turn_policy=turn_policy,
+            replace_dead_developer=replace_dead_developer,
+            progress=progress,
+        )
+        return developer
+
+    def human_reply_turn(human_msg: str) -> object:
+        nonlocal developer
+        developer, _ = _run_developer_result_turn(
+            developer,
+            label=f"development_review_limit_human_reply_{sanitize_requirement_name(task_name)}",
+            prompt=build_development_review_limit_human_reply_prompt(
+                paths=paths,
+                task_name=task_name,
+                review_msg=review_msg,
+                human_msg=human_msg,
+            ),
+            result_contract=build_developer_review_feedback_contract(
+                paths,
+                mode="a07_developer_review_limit_human_reply",
+            ),
+            paths=paths,
+            task_name=task_name,
+            turn_policy=turn_policy,
+            replace_dead_developer=replace_dead_developer,
+            progress=progress,
+        )
+        return developer
+
+    result = run_review_limit_hitl_cycle(
+        stage_label="任务开发评审超限",
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        initial_turn=initial_turn,
+        human_reply_turn=human_reply_turn,
+        progress=progress,
+        max_hitl_rounds=MAX_DEVELOPMENT_HITL_ROUNDS,
+    )
+    return result
 
 
 def _run_reviewer_turn_with_resume(
@@ -1177,7 +1720,8 @@ def _run_reviewer_turn_with_resume(
     while True:
         baseline_signature = _reviewer_artifact_signature(reviewer)
         try:
-            result = reviewer.worker.run_turn(
+            run_completion_turn_with_repair(
+                worker=reviewer.worker,
                 label=label,
                 prompt=prompt,
                 completion_contract=build_reviewer_completion_contract(
@@ -1186,10 +1730,12 @@ def _run_reviewer_turn_with_resume(
                     review_md_path=reviewer.review_md_path,
                     review_json_path=reviewer.review_json_path,
                 ),
+                turn_goal=_build_reviewer_turn_goal(),
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                stage_label="任务开发",
+                role_label=str(reviewer.worker.session_name or reviewer.reviewer_name).strip() or reviewer.reviewer_name,
+                task_name=task_name,
             )
-            if not result.ok:
-                raise RuntimeError(result.clean_output or f"{reviewer.reviewer_name} 执行失败")
             return reviewer
         except Exception as error:  # noqa: BLE001
             if is_turn_artifact_contract_error(error):
@@ -1204,9 +1750,224 @@ def _run_reviewer_turn_with_resume(
             raise RuntimeError(f"{reviewer.worker.session_name or reviewer.reviewer_name} 无法继续，自动恢复失败") from error
 
 
+def recreate_development_reviewer_runtime(
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    reviewer: ReviewerRuntime,
+    reviewer_spec: DevelopmentReviewerSpec,
+    progress: ReviewStageProgress | None = None,
+    force_model_change: bool,
+    required_reconfiguration: bool = False,
+    reason_text: str = "",
+) -> ReviewerRuntime | None:
+    reviewer_display_name = str(reviewer.worker.session_name or reviewer.reviewer_name).strip() or reviewer.reviewer_name
+    if force_model_change:
+        if required_reconfiguration and not stdin_is_interactive():
+            raise RuntimeError("审核智能体需要重新配置，但当前环境无法交互选择厂商/模型。")
+        if not required_reconfiguration and not stdin_is_interactive():
+            return None
+        selection = (
+            prompt_required_replacement_review_agent_selection(
+                reason_text=reason_text or f"检测到{reviewer_display_name}不可继续使用，需要更换模型后重建审核智能体。",
+                previous_selection=reviewer.selection,
+                force_model_change=True,
+                role_label=reviewer_display_name,
+                progress=progress,
+            )
+            if required_reconfiguration
+            else prompt_replacement_review_agent_selection(
+                reason_text=f"检测到{reviewer_display_name}不可继续使用，需要更换模型后重建审核智能体。",
+                previous_selection=reviewer.selection,
+                force_model_change=True,
+                role_label=reviewer_display_name,
+                progress=progress,
+            )
+        )
+        if selection is None:
+            return None
+    else:
+        selection = reviewer.selection
+    replacement = create_reviewer_runtime(
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+        reviewer_spec=reviewer_spec,
+        selection=selection,
+        launch_coordinator=getattr(reviewer.worker, "launch_coordinator", None),
+    )
+    if replacement.review_md_path != reviewer.review_md_path and reviewer.review_md_path.exists():
+        reviewer.review_md_path.unlink()
+    if replacement.review_json_path != reviewer.review_json_path and reviewer.review_json_path.exists():
+        reviewer.review_json_path.unlink()
+    return replacement
+
+
+def run_reviewer_turn_with_recreation(
+    reviewer: ReviewerRuntime,
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    task_name: str,
+    reviewer_spec: DevelopmentReviewerSpec,
+    paths: dict[str, Path],
+    reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
+    label: str,
+    prompt: str,
+    progress: ReviewStageProgress | None = None,
+    can_skip_ready_timeout: bool = True,
+    ready_timeout_skip_budget: _ReadyTimeoutSkipBudget | None = None,
+) -> ReviewerRuntime | None:
+    current_reviewer = reviewer
+    while True:
+        baseline_signature = _reviewer_artifact_signature(current_reviewer)
+        try:
+            run_completion_turn_with_repair(
+                worker=current_reviewer.worker,
+                label=label,
+                prompt=prompt,
+                completion_contract=build_reviewer_completion_contract(
+                    reviewer_name=current_reviewer.reviewer_name,
+                    task_name=task_name,
+                    review_md_path=current_reviewer.review_md_path,
+                    review_json_path=current_reviewer.review_json_path,
+                ),
+                turn_goal=_build_reviewer_turn_goal(),
+                timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                stage_label="任务开发",
+                role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
+                task_name=task_name,
+                requirement_name=requirement_name,
+            )
+            return current_reviewer
+        except Exception as error:  # noqa: BLE001
+            if is_turn_artifact_contract_error(error):
+                return current_reviewer
+            if _reviewer_has_materialized_outputs(current_reviewer, task_name) and _reviewer_artifact_signature(current_reviewer) != baseline_signature:
+                return current_reviewer
+            reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
+            auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+            ready_timeout_error = is_agent_ready_timeout_error(error)
+            if ready_timeout_error:
+                effective_can_skip = bool(can_skip_ready_timeout)
+                reserved_skip = False
+                if ready_timeout_skip_budget is not None:
+                    effective_can_skip = ready_timeout_skip_budget.reserve()
+                    reserved_skip = effective_can_skip
+                try:
+                    choice = prompt_agent_ready_timeout_recovery(
+                        current_reviewer.worker,
+                        role_label=reviewer_display_name,
+                        can_skip=effective_can_skip,
+                        progress=progress,
+                        reason_text=(
+                            f"{reviewer_display_name}启动超时，未能进入可输入状态。\n"
+                            + ("请先手动更换模型，或关闭并跳过该审核智能体。" if effective_can_skip else "请先手动更换模型，再继续尝试当前 turn。")
+                        ),
+                    )
+                except Exception:
+                    if reserved_skip:
+                        ready_timeout_skip_budget.release()
+                    raise
+                if choice == AGENT_READY_TIMEOUT_SKIP and effective_can_skip:
+                    with suppress(Exception):
+                        current_reviewer.worker.request_kill()
+                    message(f"{reviewer_display_name} 已关闭，当前阶段将跳过该审核智能体。")
+                    return None
+                if reserved_skip:
+                    ready_timeout_skip_budget.release()
+                if choice == AGENT_READY_TIMEOUT_RETRY:
+                    continue
+                continue
+            if auth_error:
+                reason_text = f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
+                replacement = recreate_development_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=current_reviewer,
+                    reviewer_spec=reviewer_spec,
+                    progress=progress,
+                    force_model_change=True,
+                    required_reconfiguration=True,
+                    reason_text=reason_text,
+                )
+                if replacement is None:
+                    raise RuntimeError(f"{reviewer_display_name} 无法继续，且未能重建审核智能体") from error
+                initialized = _run_single_reviewer_initialization(
+                    replacement,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    paths=paths,
+                    reviewer_specs_by_name=reviewer_specs_by_name,
+                    progress=progress,
+                    can_skip_ready_timeout=can_skip_ready_timeout,
+                    ready_timeout_skip_budget=ready_timeout_skip_budget,
+                )
+                if initialized is None:
+                    raise RuntimeError(f"{reviewer_display_name} 重建后初始化失败") from error
+                current_reviewer = initialized
+                continue
+            if is_worker_death_error(error):
+                replacement = recreate_development_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=current_reviewer,
+                    reviewer_spec=reviewer_spec,
+                    progress=progress,
+                    force_model_change=False,
+                )
+                if replacement is None:
+                    message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
+                    return None
+                initialized = _run_single_reviewer_initialization(
+                    replacement,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    paths=paths,
+                    reviewer_specs_by_name=reviewer_specs_by_name,
+                    progress=progress,
+                    can_skip_ready_timeout=can_skip_ready_timeout,
+                    ready_timeout_skip_budget=ready_timeout_skip_budget,
+                )
+                if initialized is None:
+                    message(f"{reviewer_display_name} 已死亡，重建后初始化失败，当前阶段将忽略该审核智能体。")
+                    return None
+                current_reviewer = initialized
+                continue
+            if try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
+                continue
+            replacement = recreate_development_reviewer_runtime(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                reviewer=current_reviewer,
+                reviewer_spec=reviewer_spec,
+                progress=progress,
+                force_model_change=False,
+            )
+            if replacement is None:
+                raise RuntimeError(f"{reviewer_display_name} 无法继续，自动恢复失败") from error
+            initialized = _run_single_reviewer_initialization(
+                replacement,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                paths=paths,
+                reviewer_specs_by_name=reviewer_specs_by_name,
+                progress=progress,
+                can_skip_ready_timeout=can_skip_ready_timeout,
+                ready_timeout_skip_budget=ready_timeout_skip_budget,
+            )
+            if initialized is None:
+                raise RuntimeError(f"{reviewer_display_name} 重建后初始化失败") from error
+            current_reviewer = initialized
+
+
 def _run_parallel_reviewers(
     reviewers: Sequence[ReviewerRuntime],
     *,
+    project_dir: str | Path,
+    requirement_name: str,
+    paths: dict[str, Path],
+    reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     task_name: str,
     round_index: int,
     prompt_builder,
@@ -1215,15 +1976,29 @@ def _run_parallel_reviewers(
 ) -> list[ReviewerRuntime]:
     if progress is not None:
         progress.set_phase(f"任务开发 / {task_name} 评审第 {round_index} 轮")
-    return run_parallel_reviewer_round(
-        reviewers,
-        key_func=lambda reviewer: reviewer.reviewer_name,
-        run_turn=lambda reviewer: _run_reviewer_turn_with_resume(
+    reviewer_list = list(reviewers)
+    skip_budget = _ReadyTimeoutSkipBudget(len(reviewer_list))
+
+    def run_review_turn(reviewer: ReviewerRuntime) -> ReviewerRuntime | None:
+        return run_reviewer_turn_with_recreation(
             reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
             task_name=task_name,
+            reviewer_spec=reviewer_specs_by_name[reviewer.reviewer_name],
+            paths=paths,
+            reviewer_specs_by_name=reviewer_specs_by_name,
             label=f"{label_prefix}_{sanitize_requirement_name(reviewer.reviewer_name)}_round_{round_index}",
             prompt=prompt_builder(reviewer),
-        ),
+            progress=progress,
+            can_skip_ready_timeout=True,
+            ready_timeout_skip_budget=skip_budget,
+        )
+
+    return run_parallel_reviewer_round(
+        reviewer_list,
+        key_func=lambda reviewer: reviewer.reviewer_name,
+        run_turn=run_review_turn,
         error_prefix=f"{task_name} 代码评审智能体执行失败:",
     )
 
@@ -1231,6 +2006,8 @@ def _run_parallel_reviewers(
 def repair_reviewer_outputs(
     reviewers: Sequence[ReviewerRuntime],
     *,
+    paths: dict[str, Path],
+    reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     project_dir: str | Path,
     requirement_name: str,
     task_name: str,
@@ -1238,8 +2015,27 @@ def repair_reviewer_outputs(
 ) -> list[ReviewerRuntime]:
     json_pattern = f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json"
     md_pattern = f"{sanitize_requirement_name(requirement_name)}_代码评审记录_*.md"
+    reviewer_list = list(reviewers)
+    skip_budget = _ReadyTimeoutSkipBudget(len(reviewer_list))
+
+    def run_fix_turn(reviewer: ReviewerRuntime, fix_prompt: str, repair_attempt: int) -> ReviewerRuntime | None:
+        return run_reviewer_turn_with_recreation(
+            reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            task_name=task_name,
+            reviewer_spec=reviewer_specs_by_name[reviewer.reviewer_name],
+            paths=paths,
+            reviewer_specs_by_name=reviewer_specs_by_name,
+            label=f"development_review_fix_{sanitize_requirement_name(task_name)}_{sanitize_requirement_name(reviewer.reviewer_name)}_round_{round_index}_attempt_{repair_attempt}",
+            prompt=fix_prompt,
+            progress=None,
+            can_skip_ready_timeout=True,
+            ready_timeout_skip_budget=skip_budget,
+        )
+
     return repair_reviewer_round_outputs(
-        reviewers,
+        reviewer_list,
         key_func=lambda reviewer: reviewer.reviewer_name,
         artifact_name_func=lambda reviewer: str(reviewer.worker.session_name).strip() or reviewer.reviewer_name,
         check_job=lambda reviewer_names: check_reviewer_job(
@@ -1249,12 +2045,7 @@ def repair_reviewer_outputs(
             json_pattern=json_pattern,
             md_pattern=md_pattern,
         ),
-        run_fix_turn=lambda reviewer, fix_prompt, repair_attempt: _run_reviewer_turn_with_resume(
-            reviewer,
-            task_name=task_name,
-            label=f"development_review_fix_{sanitize_requirement_name(task_name)}_{sanitize_requirement_name(reviewer.reviewer_name)}_round_{round_index}_attempt_{repair_attempt}",
-            prompt=fix_prompt,
-        ),
+        run_fix_turn=run_fix_turn,
         max_attempts=MAX_REVIEWER_REPAIR_ATTEMPTS,
         error_prefix=f"{task_name} 代码评审智能体修复输出失败:",
         final_error="代码评审智能体多次修复后仍未按协议更新文档",
@@ -1277,17 +2068,43 @@ def _replace_dead_developer(
     developer: DeveloperRuntime,
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     progress: ReviewStageProgress | None = None,
     launch_coordinator: LaunchCoordinator | None = None,
+    error: Exception | None = None,
 ) -> DeveloperRuntime:
+    developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
+    if error is not None and is_agent_ready_timeout_error(error):
+        reason_text = (
+            f"{developer_name}启动超时，未能进入可输入状态。\n"
+            "请先手动更换模型，再继续尝试当前 turn。"
+        )
+        prompt_agent_ready_timeout_recovery(
+            developer.worker,
+            role_label=developer_name,
+            can_skip=False,
+            progress=progress,
+            reason_text=reason_text,
+        )
+        return developer
+    startup_reconfigure = bool(error is not None and is_recoverable_startup_failure(error, developer.worker))
+    if startup_reconfigure:
+        reason_text = (
+            f"检测到{developer_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+            if is_provider_auth_error(error) or worker_has_provider_auth_error(developer.worker)
+            else f"{developer_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
+        )
+        mark_worker_awaiting_reconfiguration(developer.worker, reason_text=reason_text)
     replacement = recreate_developer_runtime(
         project_dir=project_dir,
+        requirement_name=requirement_name,
         developer=developer,
         progress=progress,
         launch_coordinator=launch_coordinator,
+        required_reconfiguration=startup_reconfigure,
+        reason_text=reason_text if startup_reconfigure else "",
     )
     if replacement is None:
-        developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
         raise RuntimeError(f"{developer_name} 已死亡，且未能重建开发工程师")
     return replacement
 
@@ -1298,12 +2115,15 @@ def _bootstrap_developer_runtime(
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     project_dir: str | Path,
+    requirement_name: str = "",
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     launch_coordinator: LaunchCoordinator | None = None,
 ) -> DeveloperRuntime:
     bootstrapped_developer, _ = initialize_development_workers(
         developer,
+        project_dir=project_dir,
+        requirement_name=requirement_name,
         paths=paths,
         reviewers=(),
         reviewer_specs_by_name=reviewer_specs_by_name,
@@ -1311,20 +2131,24 @@ def _bootstrap_developer_runtime(
         initialize_reviewers=False,
         progress=progress,
         turn_policy=turn_policy,
-        replace_dead_developer=lambda active_developer, _error: _replace_dead_developer_with_bootstrap(
+        replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
             active_developer,
             paths=paths,
             reviewer_specs_by_name=reviewer_specs_by_name,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             progress=progress,
             turn_policy=turn_policy,
             launch_coordinator=launch_coordinator,
+            error=error,
         ),
-        replace_dead_developer_for_init=lambda active_developer, _error: _replace_dead_developer(
+        replace_dead_developer_for_init=lambda active_developer, error: _replace_dead_developer(
             active_developer,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             progress=progress,
             launch_coordinator=launch_coordinator,
+            error=error,
         ),
     )
     return bootstrapped_developer
@@ -1336,21 +2160,26 @@ def _replace_dead_developer_with_bootstrap(
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     project_dir: str | Path,
+    requirement_name: str = "",
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     launch_coordinator: LaunchCoordinator | None = None,
+    error: Exception | None = None,
 ) -> DeveloperRuntime:
     replacement = _replace_dead_developer(
         developer,
         project_dir=project_dir,
+        requirement_name=requirement_name,
         progress=progress,
         launch_coordinator=launch_coordinator,
+        error=error,
     )
     return _bootstrap_developer_runtime(
         replacement,
         paths=paths,
         reviewer_specs_by_name=reviewer_specs_by_name,
         project_dir=project_dir,
+        requirement_name=requirement_name,
         progress=progress,
         turn_policy=turn_policy,
         launch_coordinator=launch_coordinator,
@@ -1407,8 +2236,11 @@ def ensure_developer_metadata(
             label=f"{label_prefix}_metadata_repair_attempt_{attempt + 1}",
             prompt=reminder_prompt,
             result_contract=build_developer_task_complete_result_contract(paths),
+            paths=paths,
+            task_name=task_name,
             turn_policy=turn_policy,
             replace_dead_developer=replace_dead_developer,
+            progress=progress,
         )
     raise RuntimeError(f"{task_name} 开发完成后，开发工程师仍未按协议更新《{paths['developer_output_path'].name}》")
 
@@ -1439,8 +2271,11 @@ def develop_current_task(
             sub_agent_num=subagent_num,
         ),
         result_contract=build_developer_task_complete_result_contract(paths),
+        paths=paths,
+        task_name=task_name,
         turn_policy=turn_policy,
         replace_dead_developer=replace_dead_developer,
+        progress=progress,
     )
     return ensure_developer_metadata(
         current_developer,
@@ -1476,8 +2311,11 @@ def refine_current_task(
             what_just_dev=str(paths["developer_output_path"].resolve()),
         ),
         result_contract=build_developer_refine_result_contract(paths),
+        paths=paths,
+        task_name=task_name,
         turn_policy=turn_policy,
         replace_dead_developer=replace_dead_developer,
+        progress=progress,
     )
     return ensure_developer_metadata(
         current_developer,
@@ -1498,6 +2336,8 @@ def run_first_task_with_parallel_reviewer_init(
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     task_name: str,
     subagent_num: int,
+    project_dir: str | Path = ".",
+    requirement_name: str = "",
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
@@ -1532,6 +2372,8 @@ def run_first_task_with_parallel_reviewer_init(
             executor.submit(
                 initialize_development_workers,
                 developer,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
                 paths=paths,
                 reviewers=reviewer_list,
                 reviewer_specs_by_name=reviewer_specs_by_name,
@@ -1581,12 +2423,14 @@ def recreate_development_workers(
             developer,
             reviewers,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             cleanup_runtime=True,
         )
     )
     cleanup_paths.extend(cleanup_existing_development_artifacts(paths, requirement_name))
     recreated_developer = create_developer_runtime(
         project_dir=project_dir,
+        requirement_name=requirement_name,
         selection=developer.selection,
         role_prompt=developer.role_prompt,
         launch_coordinator=launch_coordinator,
@@ -1610,6 +2454,7 @@ def recreate_development_workers(
         paths=paths,
         reviewer_specs_by_name=reviewer_specs_by_name,
         project_dir=project_dir,
+        requirement_name=requirement_name,
         progress=progress,
         turn_policy=turn_policy,
         launch_coordinator=launch_coordinator,
@@ -1617,36 +2462,83 @@ def recreate_development_workers(
     return recreated_developer, recreated_reviewers, tuple(dict.fromkeys(cleanup_paths))
 
 
+def _export_developer_handoff(developer: DeveloperRuntime | None) -> DevelopmentAgentHandoff | None:
+    if developer is None:
+        return None
+    return DevelopmentAgentHandoff(
+        selection=developer.selection,
+        role_prompt=developer.role_prompt,
+        worker=developer.worker,
+    )
+
+
+def _export_reviewer_handoff(
+    reviewers: Sequence[ReviewerRuntime],
+    *,
+    reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
+) -> tuple[ReviewAgentHandoff, ...]:
+    handoffs: list[ReviewAgentHandoff] = []
+    for reviewer in reviewers:
+        reviewer_spec = reviewer_specs_by_name.get(reviewer.reviewer_name)
+        if reviewer_spec is None:
+            continue
+        handoffs.append(
+            ReviewAgentHandoff(
+                reviewer_key=reviewer.reviewer_name,
+                role_name=reviewer_spec.role_name,
+                role_prompt=reviewer_spec.role_prompt,
+                selection=reviewer.selection,
+                worker=reviewer.worker,
+            )
+        )
+    return tuple(handoffs)
+
+
 def _shutdown_workers(
     developer: DeveloperRuntime | None,
     reviewers: Sequence[ReviewerRuntime],
     *,
     project_dir: str | Path,
+    requirement_name: str,
     cleanup_runtime: bool,
+    preserve_developer: bool = False,
+    preserve_reviewer_keys: Sequence[str] = (),
 ) -> tuple[str, ...]:
     return shutdown_stage_workers(
         developer,
         reviewers,
         cleanup_runtime=cleanup_runtime,
-        runtime_root_filter=Path(project_dir).expanduser().resolve() / DEVELOPMENT_RUNTIME_ROOT_NAME,
+        preserve_ba_worker=preserve_developer,
+        preserve_reviewer_keys=preserve_reviewer_keys,
+        runtime_root_filter=build_development_runtime_root(project_dir, requirement_name),
     )
 
 
-def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStageResult:
+def run_development_stage(
+    argv: Sequence[str] | None = None,
+    *,
+    preserve_workers: bool = False,
+) -> DevelopmentStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     requirement_name = str(args.requirement_name).strip() if args.requirement_name else prompt_requirement_name_selection(project_dir, "").requirement_name
 
+    lock_context = requirement_concurrency_lock(
+        project_dir,
+        requirement_name,
+        action="stage.a07.start",
+    )
+    lock_context.__enter__()
     progress = ReviewStageProgress(initial_phase="任务开发准备中")
     developer: DeveloperRuntime | None = None
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_records: list[str] = []
     try:
         paths = ensure_development_inputs(args, project_dir=project_dir, requirement_name=requirement_name)
-        cleanup_records.extend(cleanup_stale_development_runtime_state(project_dir))
+        cleanup_records.extend(cleanup_stale_development_runtime_state(project_dir, requirement_name))
         cleanup_records.extend(cleanup_existing_development_artifacts(paths, requirement_name))
-        launch_coordinator = DevelopmentStageLaunchCoordinator(Path(project_dir).expanduser().resolve() / DEVELOPMENT_RUNTIME_ROOT_NAME)
+        launch_coordinator = DevelopmentStageLaunchCoordinator(build_development_runtime_root(project_dir, requirement_name))
 
         next_task = get_first_false_task(paths["task_json_path"])
         if next_task is None:
@@ -1658,10 +2550,10 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                 merged_review_path=str(paths["merged_review_path"].resolve()),
                 completed=True,
                 cleanup_paths=(),
+                developer_handoff=None,
+                reviewer_handoff=(),
             )
 
-        developer_turn_policy = DeveloperTurnPolicy(resolve_developer_max_turns(args, progress=progress))
-        subagent_num = resolve_subagent_num(args, progress=progress)
         developer_plan = resolve_developer_plan(args, project_dir=project_dir, progress=progress)
         reviewer_specs = resolve_reviewer_specs(args, progress=progress)
         reviewer_selections_by_name = collect_reviewer_agent_selections(
@@ -1670,17 +2562,25 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
             reserved_session_names=(_developer_display_name(project_dir=project_dir),),
             progress=progress,
         )
+        developer_turn_policy = DeveloperTurnPolicy(resolve_developer_max_turns(args, progress=progress))
+        review_round_limit = resolve_review_max_rounds(args, progress=progress)
+        subagent_num = resolve_subagent_num(args, progress=progress)
         developer = create_developer_runtime(
             project_dir=project_dir,
+            requirement_name=requirement_name,
             selection=developer_plan.selection,
             role_prompt=developer_plan.role_prompt,
             launch_coordinator=launch_coordinator,
         )
+        set_runtime_metadata = getattr(developer.worker, "set_runtime_metadata", None)
+        if callable(set_runtime_metadata):
+            set_runtime_metadata(project_dir=project_dir, requirement_name=requirement_name, workflow_action="stage.a07.start")
         reviewer_specs_by_name = {str(item.reviewer_key or item.role_name).strip(): item for item in reviewer_specs}
         reviewer_label_getter = lambda reviewer, index: str(getattr(getattr(reviewer, "worker", None), "session_name", "") or getattr(reviewer, "reviewer_name", "") or f"代码审核智能体 {index}")  # noqa: E731
         replace_dead_developer_raw = lambda owner: _replace_dead_developer(  # noqa: E731
             owner,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             progress=progress,
             launch_coordinator=launch_coordinator,
         )
@@ -1689,10 +2589,34 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
             paths=paths,
             reviewer_specs_by_name=reviewer_specs_by_name,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             progress=progress,
             turn_policy=developer_turn_policy,
             launch_coordinator=launch_coordinator,
         )
+        def replace_dead_reviewer(reviewer, _index):  # noqa: ANN001
+            reviewer_spec = reviewer_specs_by_name.get(reviewer.reviewer_name)
+            if reviewer_spec is None:
+                return reviewer
+            replacement = recreate_development_reviewer_runtime(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                reviewer=reviewer,
+                reviewer_spec=reviewer_spec,
+                progress=progress,
+                force_model_change=False,
+            )
+            if replacement is None:
+                return None
+            return _run_single_reviewer_initialization(
+                replacement,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                paths=paths,
+                reviewer_specs_by_name=reviewer_specs_by_name,
+                progress=progress,
+                can_skip_ready_timeout=len(reviewer_workers) > 1,
+            )
         reviewers_built = False
         reviewers_initialized = False
         _, reviewer_workers, developer = run_main_phase_with_death_handling(
@@ -1700,6 +2624,8 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
             reviewers=(),
             run_phase=lambda current_developer: initialize_development_workers(
                 current_developer,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
                 paths=paths,
                 reviewers=(),
                 reviewer_specs_by_name=reviewer_specs_by_name,
@@ -1707,17 +2633,24 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                 initialize_reviewers=False,
                 progress=progress,
                 turn_policy=developer_turn_policy,
-                replace_dead_developer=lambda active_developer, _error: _replace_dead_developer_with_bootstrap(
+                replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
                     active_developer,
                     paths=paths,
                     reviewer_specs_by_name=reviewer_specs_by_name,
                     project_dir=project_dir,
+                    requirement_name=requirement_name,
                     progress=progress,
                     turn_policy=developer_turn_policy,
                     launch_coordinator=launch_coordinator,
+                    error=error,
                 ),
-                replace_dead_developer_for_init=lambda active_developer, _error: replace_dead_developer_raw(
+                replace_dead_developer_for_init=lambda active_developer, error: _replace_dead_developer(
                     active_developer,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    progress=progress,
+                    launch_coordinator=launch_coordinator,
+                    error=error,
                 ),
             )[0],
             replace_dead_main_owner=replace_dead_developer_owner,
@@ -1725,6 +2658,7 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
             reviewer_label_getter=reviewer_label_getter,
             notify=message,
         )
+        review_round_policy = ReviewRoundPolicy(review_round_limit)
 
         while next_task is not None:
             if not reviewers_built:
@@ -1742,20 +2676,24 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                 developer, code_change, reviewer_workers = run_first_task_with_parallel_reviewer_init(
                     developer,
                     reviewer_workers,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
                     paths=paths,
                     reviewer_specs_by_name=reviewer_specs_by_name,
                     task_name=next_task,
                     subagent_num=subagent_num,
                     progress=progress,
                     turn_policy=developer_turn_policy,
-                    replace_dead_developer=lambda active_developer, _error: _replace_dead_developer_with_bootstrap(
+                    replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
                         active_developer,
                         paths=paths,
                         reviewer_specs_by_name=reviewer_specs_by_name,
                         project_dir=project_dir,
+                        requirement_name=requirement_name,
                         progress=progress,
                         turn_policy=developer_turn_policy,
                         launch_coordinator=launch_coordinator,
+                        error=error,
                     ),
                 )
                 reviewers_initialized = True
@@ -1770,14 +2708,16 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                             subagent_num=subagent_num,
                             progress=progress,
                             turn_policy=developer_turn_policy,
-                            replace_dead_developer=lambda active_developer, _error: _replace_dead_developer_with_bootstrap(
+                            replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
                                 active_developer,
                                 paths=paths,
                                 reviewer_specs_by_name=reviewer_specs_by_name,
                                 project_dir=project_dir,
+                                requirement_name=requirement_name,
                                 progress=progress,
                                 turn_policy=developer_turn_policy,
                                 launch_coordinator=launch_coordinator,
+                                error=error,
                             ),
                         ),
                         owner_getter=lambda result: result[0],
@@ -1787,14 +2727,20 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                     notify=message,
                 )
 
-            for round_index in range(1, MAX_DEVELOPMENT_REVIEW_ROUNDS + 1):
-                if round_index == 1:
+            round_index = 1
+            post_hitl_continue_completed = False
+            while True:
+                if not review_round_policy.initial_review_done:
                     prepare_review_round_artifacts(paths, reviewer_workers)
                     reviewer_workers, developer = run_reviewer_phase_with_death_handling(
                         developer,
                         reviewer_workers,
                         run_phase=lambda active_reviewers: _run_parallel_reviewers(
                             active_reviewers,
+                            project_dir=project_dir,
+                            requirement_name=requirement_name,
+                            paths=paths,
+                            reviewer_specs_by_name=reviewer_specs_by_name,
                             task_name=next_task,
                             round_index=round_index,
                             prompt_builder=lambda reviewer: reviewer_review_code(
@@ -1809,6 +2755,7 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                             progress=progress,
                         ),
                         replace_dead_main_owner=replace_dead_developer_owner,
+                        replace_dead_reviewer=replace_dead_reviewer,
                         main_label="开发工程师",
                         reviewer_label_getter=reviewer_label_getter,
                         notify=message,
@@ -1817,38 +2764,47 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                     review_msg = get_markdown_content(paths["merged_review_path"]).strip()
                     if not review_msg:
                         raise RuntimeError(f"{next_task} 代码评审未通过，但《{paths['merged_review_path'].name}》为空")
-                    (developer, code_change), reviewer_workers, developer = run_main_phase_with_death_handling(
-                        developer,
-                        reviewers=reviewer_workers,
-                        run_phase=lambda current_developer: refine_current_task(
-                            current_developer,
-                            paths=paths,
-                            task_name=next_task,
-                            review_msg=review_msg,
-                            progress=progress,
-                            turn_policy=developer_turn_policy,
-                            replace_dead_developer=lambda active_developer, _error: _replace_dead_developer_with_bootstrap(
-                                active_developer,
+                    if not post_hitl_continue_completed:
+                        (developer, code_change), reviewer_workers, developer = run_main_phase_with_death_handling(
+                            developer,
+                            reviewers=reviewer_workers,
+                            run_phase=lambda current_developer: refine_current_task(
+                                current_developer,
                                 paths=paths,
-                                reviewer_specs_by_name=reviewer_specs_by_name,
-                                project_dir=project_dir,
+                                task_name=next_task,
+                                review_msg=review_msg,
                                 progress=progress,
                                 turn_policy=developer_turn_policy,
-                                launch_coordinator=launch_coordinator,
+                                replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
+                                    active_developer,
+                                    paths=paths,
+                                    reviewer_specs_by_name=reviewer_specs_by_name,
+                                    project_dir=project_dir,
+                                    requirement_name=requirement_name,
+                                    progress=progress,
+                                    turn_policy=developer_turn_policy,
+                                    launch_coordinator=launch_coordinator,
+                                    error=error,
+                                ),
                             ),
-                        ),
-                        owner_getter=lambda result: result[0],
-                        replace_dead_main_owner=replace_dead_developer_owner,
-                        main_label="开发工程师",
-                        reviewer_label_getter=reviewer_label_getter,
-                        notify=message,
-                    )
+                            owner_getter=lambda result: result[0],
+                            replace_dead_main_owner=replace_dead_developer_owner,
+                            replace_dead_reviewer=replace_dead_reviewer,
+                            main_label="开发工程师",
+                            reviewer_label_getter=reviewer_label_getter,
+                            notify=message,
+                        )
+                    post_hitl_continue_completed = False
                     prepare_review_round_artifacts(paths, reviewer_workers)
                     reviewer_workers, developer = run_reviewer_phase_with_death_handling(
                         developer,
                         reviewer_workers,
                         run_phase=lambda active_reviewers: _run_parallel_reviewers(
                             active_reviewers,
+                            project_dir=project_dir,
+                            requirement_name=requirement_name,
+                            paths=paths,
+                            reviewer_specs_by_name=reviewer_specs_by_name,
                             task_name=next_task,
                             round_index=round_index,
                             prompt_builder=lambda reviewer: re_review_code(
@@ -1869,17 +2825,21 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                         notify=message,
                     )
 
+                review_round_policy.record_review_attempt()
                 reviewer_workers, developer = run_reviewer_phase_with_death_handling(
                     developer,
                     reviewer_workers,
                     run_phase=lambda active_reviewers: repair_reviewer_outputs(
                         active_reviewers,
+                        paths=paths,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
                         project_dir=project_dir,
                         requirement_name=requirement_name,
                         task_name=next_task,
                         round_index=round_index,
                     ),
                     replace_dead_main_owner=replace_dead_developer_owner,
+                    replace_dead_reviewer=replace_dead_reviewer,
                     main_label="开发工程师",
                     reviewer_label_getter=reviewer_label_getter,
                     notify=message,
@@ -1898,8 +2858,45 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                 )
                 if passed:
                     break
-            else:
-                raise RuntimeError(f"{next_task} 代码评审超过最大轮数 {MAX_DEVELOPMENT_REVIEW_ROUNDS}，仍未通过")
+                review_msg = get_markdown_content(paths["merged_review_path"]).strip()
+                if not review_msg:
+                    raise RuntimeError(f"{next_task} 代码评审未通过，但《{paths['merged_review_path'].name}》为空")
+                if review_round_policy.should_escalate_before_next_review():
+                    if review_round_policy.max_rounds is None:
+                        raise RuntimeError("review_round_policy 配置错误：无限轮次不应触发超限 HITL")
+                    hitl_result, reviewer_workers, developer = run_main_phase_with_death_handling(
+                        developer,
+                        reviewers=reviewer_workers,
+                        run_phase=lambda current_developer: run_development_review_limit_hitl_loop(
+                            current_developer,
+                            paths=paths,
+                            task_name=next_task,
+                            review_msg=review_msg,
+                            review_limit=review_round_policy.max_rounds,
+                            review_rounds_used=review_round_policy.quota_count,
+                            progress=progress,
+                            turn_policy=developer_turn_policy,
+                            replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
+                                active_developer,
+                                paths=paths,
+                                reviewer_specs_by_name=reviewer_specs_by_name,
+                                project_dir=project_dir,
+                                requirement_name=requirement_name,
+                                progress=progress,
+                                turn_policy=developer_turn_policy,
+                                launch_coordinator=launch_coordinator,
+                                error=error,
+                            ),
+                        ),
+                        owner_getter=lambda result: result.owner,
+                        replace_dead_main_owner=replace_dead_developer_owner,
+                        main_label="开发工程师",
+                        reviewer_label_getter=reviewer_label_getter,
+                        notify=message,
+                    )
+                    post_hitl_continue_completed = bool(getattr(hitl_result, "post_hitl_continue_completed", False))
+                    review_round_policy.reset_after_hitl()
+                round_index += 1
 
             next_task = get_first_false_task(paths["task_json_path"])
             if (
@@ -1926,12 +2923,21 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
                 cleanup_records.extend(recreated_cleanup_paths)
                 reviewers_built = True
                 reviewers_initialized = False
+            review_round_policy = ReviewRoundPolicy(review_round_limit)
 
+        result_developer_handoff = _export_developer_handoff(developer) if preserve_workers else None
+        result_reviewer_handoff = _export_reviewer_handoff(
+            reviewer_workers,
+            reviewer_specs_by_name=reviewer_specs_by_name,
+        ) if preserve_workers else ()
         cleanup_records.extend(_shutdown_workers(
             developer,
             reviewer_workers,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             cleanup_runtime=True,
+            preserve_developer=preserve_workers,
+            preserve_reviewer_keys=[item.reviewer_key for item in result_reviewer_handoff],
         ))
         return DevelopmentStageResult(
             project_dir=project_dir,
@@ -1941,17 +2947,21 @@ def run_development_stage(argv: Sequence[str] | None = None) -> DevelopmentStage
             merged_review_path=str(paths["merged_review_path"].resolve()),
             completed=True,
             cleanup_paths=tuple(dict.fromkeys(cleanup_records)),
+            developer_handoff=result_developer_handoff,
+            reviewer_handoff=result_reviewer_handoff,
         )
     except Exception:
         _shutdown_workers(
             developer,
             reviewer_workers,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             cleanup_runtime=False,
         )
         raise
     finally:
         progress.stop()
+        lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

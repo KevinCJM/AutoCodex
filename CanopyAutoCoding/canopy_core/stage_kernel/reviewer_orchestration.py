@@ -121,20 +121,22 @@ def shutdown_stage_workers(
         reviewer_runtime_dir = Path(reviewer.worker.runtime_dir).expanduser().resolve()
         reviewer_runtime_root = Path(reviewer.worker.runtime_root).expanduser().resolve()
         if runtime_root_constraint is None or reviewer_runtime_root == runtime_root_constraint:
-            try:
-                reviewer.worker.request_kill()
-            except Exception:
-                pass
+            if cleanup_runtime:
+                try:
+                    reviewer.worker.request_kill()
+                except Exception:
+                    pass
             seen_runtime_dirs.add(reviewer_runtime_dir)
             runtime_roots.add(reviewer_runtime_root)
     if ba_handoff is not None and not preserve_ba_worker:
         ba_runtime_dir = Path(ba_handoff.worker.runtime_dir).expanduser().resolve()
         ba_runtime_root = Path(ba_handoff.worker.runtime_root).expanduser().resolve()
         if runtime_root_constraint is None or ba_runtime_root == runtime_root_constraint:
-            try:
-                ba_handoff.worker.request_kill()
-            except Exception:
-                pass
+            if cleanup_runtime:
+                try:
+                    ba_handoff.worker.request_kill()
+                except Exception:
+                    pass
             seen_runtime_dirs.add(ba_runtime_dir)
             runtime_roots.add(ba_runtime_root)
     if not cleanup_runtime:

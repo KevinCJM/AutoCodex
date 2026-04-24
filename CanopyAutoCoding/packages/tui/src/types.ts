@@ -23,6 +23,7 @@ export type WorkerSnapshot = {
   answerPath: string
   artifactPaths: string[]
   sessionExists?: boolean
+  lastHeartbeatAt?: string
   updatedAt?: string
 }
 
@@ -101,6 +102,14 @@ export type DevelopmentSnapshot = {
   allTasksCompleted: boolean
 }
 
+export type OverallReviewSnapshot = {
+  projectDir: string
+  requirementName: string
+  files: FileSnapshot[]
+  workers: WorkerSnapshot[]
+  blockers: string[]
+}
+
 export type HitlSnapshot = {
   pending: boolean
   questionPath: string
@@ -115,7 +124,7 @@ export type ArtifactItem = {
 }
 
 export type HomeAgentItem = {
-  source: 'control' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development'
+  source: 'control' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'overall-review'
   sessionName: string
   healthStatus: string
   agentState: string
@@ -145,6 +154,9 @@ export type AppSnapshot = {
   activeStage: string
   activeStageLabel: string
   pendingHitl: boolean
+  pendingAttention: boolean
+  pendingAttentionReason: string
+  pendingAttentionSince: string
   recentArtifacts: ArtifactItem[]
   availableRuns: RunOption[]
   capabilities: Record<string, unknown>

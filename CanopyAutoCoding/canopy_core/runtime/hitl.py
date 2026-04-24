@@ -620,6 +620,7 @@ def collect_terminal_hitl_response(question_path: str | Path, *, hitl_round: int
         title=f"HITL 第 {hitl_round} 轮回复",
         empty_retry_message="回复不能为空，请重新输入。",
         question_path=question_file,
+        is_hitl=True,
     )
 
 

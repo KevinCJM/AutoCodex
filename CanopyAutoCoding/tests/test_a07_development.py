@@ -1,0 +1,2237 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from A07_Development import (
+    DevelopmentReviewerSpec,
+    DevelopmentStageResult,
+    DeveloperPlan,
+    DeveloperRuntime,
+    _build_reviewer_protocol_repair_prompt,
+    _build_reviewer_turn_goal,
+    _shutdown_workers as shutdown_development_workers,
+    _run_developer_result_turn,
+    _run_single_reviewer_initialization,
+    _replace_dead_developer_with_bootstrap,
+    build_reviewer_completion_contract,
+    build_developer_review_feedback_result_contract,
+    build_development_paths,
+    build_development_runtime_root,
+    build_parser,
+    cleanup_stale_development_runtime_state,
+    create_developer_runtime,
+    create_reviewer_runtime,
+    ensure_developer_metadata,
+    ensure_development_inputs,
+    initialize_development_workers,
+    recreate_developer_runtime,
+    recreate_development_workers,
+    resolve_developer_max_turns,
+    resolve_review_max_rounds,
+    run_development_stage,
+    run_developer_hitl_loop,
+)
+from canopy_core.runtime.contracts import TaskResultContract, TurnFileContract, TurnFileResult
+from canopy_core.runtime.tmux_runtime import CommandResult, TURN_ARTIFACT_CONTRACT_ERROR_PREFIX
+from canopy_core.stage_kernel.turn_output_goals import RepairPromptContext, run_completion_turn_with_repair
+from canopy_core.stage_kernel.shared_review import (
+    AGENT_READY_TIMEOUT_RETRY,
+    AGENT_READY_TIMEOUT_SKIP,
+    ReviewAgentSelection,
+    ReviewerRuntime,
+)
+
+
+class _FakeWorker:
+    def __init__(
+        self,
+        *,
+        session_name: str,
+        runtime_root: str | Path = "/tmp/runtime",
+        runtime_dir: str | Path = "/tmp/runtime/worker",
+        session_exists_value: bool = True,
+    ) -> None:
+        self.session_name = session_name
+        self.runtime_root = Path(runtime_root)
+        self.runtime_dir = Path(runtime_dir)
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        self.runtime_dir.mkdir(parents=True, exist_ok=True)
+        self._session_exists_value = session_exists_value
+        self.killed = False
+
+    def request_kill(self):
+        self.killed = True
+        return self.session_name
+
+    def session_exists(self) -> bool:
+        return self._session_exists_value
+
+
+class _ReconfigurableWorker(_FakeWorker):
+    def __init__(self, *, session_name: str):
+        super().__init__(session_name=session_name)
+        self.reconfig_reason = ""
+
+    def mark_awaiting_reconfiguration(self, *, reason_text: str) -> None:
+        self.reconfig_reason = reason_text
+
+
+class _FreshReviewerWorker:
+    def __init__(self, *, session_name: str) -> None:
+        self.session_name = session_name
+        self.ensure_calls = 0
+        self._launched = False
+
+    def get_agent_state(self):
+        state = "READY" if self._launched else "DEAD"
+        return type("State", (), {"value": state})()
+
+    def has_ever_launched(self) -> bool:
+        return self._launched
+
+    def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
+        _ = timeout_sec
+        self.ensure_calls += 1
+        self._launched = True
+
+
+def _dummy_contract() -> TurnFileContract:
+    def validator(path: Path) -> TurnFileResult:
+        return TurnFileResult(
+            status_path=str(path.resolve()),
+            payload={"ok": True},
+            artifact_paths={},
+            artifact_hashes={},
+            validated_at="0",
+        )
+
+    return TurnFileContract(
+        turn_id="dummy",
+        phase="dummy",
+        status_path=Path("/tmp/dummy.json"),
+        validator=validator,
+    )
+
+
+def _dummy_task_result_contract() -> TaskResultContract:
+    return TaskResultContract(
+        turn_id="dummy_task",
+        phase="dummy",
+        task_kind="dummy",
+        mode="dummy",
+        expected_statuses=("completed",),
+    )
+
+
+def _write_required_inputs(paths: dict[str, Path]) -> None:
+    paths["original_requirement_path"].write_text("原始需求\n", encoding="utf-8")
+    paths["requirements_clear_path"].write_text("需求澄清\n", encoding="utf-8")
+    paths["detailed_design_path"].write_text("详细设计\n", encoding="utf-8")
+
+
+class A07DevelopmentTests(unittest.TestCase):
+    def test_reviewer_protocol_repair_prompt_uses_check_reviewer_job_for_exact_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            expected_json = root / "需求A_评审记录_架构师-柳土獐.json"
+            expected_md = root / "需求A_代码评审记录_架构师-柳土獐.md"
+            expected_md.write_text("", encoding="utf-8")
+            (root / "需求A_评审记录_架构师 - 柳土獐.json").write_text(
+                json.dumps([{"task_name": "M4-T1", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            context = RepairPromptContext(
+                turn_label="development_review_init_M4-T1_架构师_round_1",
+                stage_label="任务开发",
+                role_label="架构师-柳土獐",
+                observed_status="",
+                expected_status="",
+                missing_aliases=("review_json",),
+                forbidden_aliases=(),
+                present_aliases=(),
+                last_validation_error=f"缺少审核 JSON 文件: {expected_json}",
+                artifact_paths={
+                    "review_json": str(expected_json),
+                    "review_md": str(expected_md),
+                },
+                task_name="M4-T1",
+                requirement_name="需求A",
+            )
+
+            prompt = _build_reviewer_protocol_repair_prompt(context)
+
+        self.assertIn("协议违态提醒", prompt)
+        self.assertIn("需求A_评审记录_架构师-柳土獐.json", prompt)
+        self.assertIn(str(expected_json), prompt)
+        self.assertIn("不要在角色名与星宿名之间插入额外空格", prompt)
+
+    def test_reviewer_completion_repair_turn_uses_check_reviewer_job_prompt(self):
+        class RepairPromptWorker:
+            def __init__(self):
+                self.prompts: list[str] = []
+
+            def run_turn(self, *, label, prompt, completion_contract, timeout_sec):  # noqa: ANN001
+                _ = completion_contract
+                _ = timeout_sec
+                self.prompts.append(prompt)
+                if len(self.prompts) == 1:
+                    error = (
+                        f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
+                        "phase=任务开发 completion_source=terminal_ready error=缺少审核 JSON 文件"
+                    )
+                    return CommandResult(label, prompt, 1, error, error, "start", "finish")
+                expected_md.write_text("", encoding="utf-8")
+                expected_json.write_text(
+                    json.dumps([{"task_name": "M4-T1", "review_pass": True}], ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                return CommandResult(label, prompt, 0, "{}", "{}", "start", "finish")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            expected_json = root / "需求A_评审记录_架构师-柳土獐.json"
+            expected_md = root / "需求A_代码评审记录_架构师-柳土獐.md"
+            expected_md.write_text("", encoding="utf-8")
+            (root / "需求A_评审记录_架构师 - 柳土獐.json").write_text(
+                json.dumps([{"task_name": "M4-T1", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            worker = RepairPromptWorker()
+
+            run_completion_turn_with_repair(
+                worker=worker,  # type: ignore[arg-type]
+                label="development_review_init_M4-T1_架构师_round_1",
+                prompt="原始审核提示",
+                completion_contract=build_reviewer_completion_contract(
+                    reviewer_name="架构师",
+                    task_name="M4-T1",
+                    review_md_path=expected_md,
+                    review_json_path=expected_json,
+                ),
+                turn_goal=_build_reviewer_turn_goal(),
+                stage_label="任务开发",
+                role_label="架构师-柳土獐",
+                task_name="M4-T1",
+                requirement_name="需求A",
+            )
+
+        self.assertEqual(len(worker.prompts), 2)
+        self.assertIn("协议违态提醒", worker.prompts[1])
+        self.assertIn("需求A_评审记录_架构师-柳土獐.json", worker.prompts[1])
+        self.assertIn("不要在角色名与星宿名之间插入额外空格", worker.prompts[1])
+
+    def test_resolve_review_max_rounds_supports_default_and_infinite(self):
+        args = build_parser().parse_args([])
+        self.assertEqual(resolve_review_max_rounds(args), 5)
+
+        args = build_parser().parse_args(["--review-max-rounds", "infinite"])
+        self.assertIsNone(resolve_review_max_rounds(args))
+
+    def test_resolve_review_max_rounds_rejects_invalid_cli_value(self):
+        args = build_parser().parse_args(["--review-max-rounds", "abc"])
+
+        with self.assertRaisesRegex(RuntimeError, "必须是正整数或 infinite"):
+            resolve_review_max_rounds(args)
+
+    def test_resolve_review_max_rounds_prompts_in_interactive_mode(self):
+        args = build_parser().parse_args([])
+
+        with patch("A07_Development.stdin_is_interactive", return_value=True), patch(
+            "A07_Development.prompt_review_max_rounds",
+            return_value=8,
+        ) as prompt_mock:
+            value = resolve_review_max_rounds(args, progress=object())
+
+        self.assertEqual(value, 8)
+        prompt_mock.assert_called_once()
+
+    def test_build_developer_review_feedback_result_contract_supports_terminal_tokens(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = build_development_paths(tmp_dir, "需求A")
+
+            contract = build_developer_review_feedback_result_contract(paths)
+
+        self.assertEqual(contract.terminal_status_tokens["hitl"], ("HITL",))
+        self.assertEqual(contract.terminal_status_tokens["completed"], ("修改完成",))
+
+    def test_predict_worker_display_name_includes_tmux_sessions_in_occupied_pool(self):
+        import A07_Development as development_module
+
+        observed: dict[str, set[str]] = {}
+
+        def fake_build_session_name(worker_id, work_dir, vendor, instance_id="", occupied_session_names=None):  # noqa: ANN001
+            _ = worker_id
+            _ = work_dir
+            _ = vendor
+            _ = instance_id
+            observed["occupied"] = {str(item).strip() for item in occupied_session_names or () if str(item).strip()}
+            return "开发工程师-天魁星"
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "A07_Development.build_session_name",
+            side_effect=fake_build_session_name,
+        ), patch(
+            "A07_Development.list_tmux_session_names",
+            return_value=["开发工程师-天暴星"],
+        ), patch(
+            "A07_Development.list_registered_tmux_workers",
+            return_value=[],
+        ):
+            session_name = development_module._predict_worker_display_name(
+                project_dir=tmpdir,
+                worker_id="development-developer",
+                occupied_session_names=("预占用-会话",),
+            )
+
+        self.assertEqual(session_name, "开发工程师-天魁星")
+        self.assertIn("开发工程师-天暴星", observed["occupied"])
+        self.assertIn("预占用-会话", observed["occupied"])
+
+    def test_run_development_stage_prompts_models_before_review_limits(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            calls: list[str] = []
+
+            def record(name: str, value):  # noqa: ANN001
+                calls.append(name)
+                return value
+
+            with patch("A07_Development.ensure_development_inputs", return_value=paths), patch(
+                "A07_Development.cleanup_stale_development_runtime_state",
+                return_value=(),
+            ), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                side_effect=lambda *args, **kwargs: record(
+                    "developer_plan",
+                    DeveloperPlan(
+                        selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                        role_prompt="实现视角",
+                    ),
+                ),
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                side_effect=lambda *args, **kwargs: record("reviewer_specs", []),
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                side_effect=lambda *args, **kwargs: record("reviewer_models", {}),
+            ), patch(
+                "A07_Development.resolve_developer_max_turns",
+                side_effect=lambda *args, **kwargs: record("developer_max_turns", 15),
+            ), patch(
+                "A07_Development.resolve_review_max_rounds",
+                side_effect=lambda *args, **kwargs: record("review_max_rounds", 5),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                side_effect=lambda *args, **kwargs: record("subagent_num", 0),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                side_effect=RuntimeError("stop-after-order-check"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop-after-order-check"):
+                    run_development_stage(["--project-dir", str(project_dir), "--requirement-name", "需求A"])
+
+        self.assertEqual(
+            calls,
+            [
+                "developer_plan",
+                "reviewer_specs",
+                "reviewer_models",
+                "developer_max_turns",
+                "review_max_rounds",
+                "subagent_num",
+            ],
+        )
+
+    def test_resolve_developer_max_turns_defaults_to_15_in_noninteractive_mode(self):
+        args = build_parser().parse_args([])
+
+        with patch("A07_Development.stdin_is_interactive", return_value=False):
+            value = resolve_developer_max_turns(args)
+
+        self.assertEqual(value, 15)
+
+    def test_resolve_developer_max_turns_accepts_infinite_cli_value(self):
+        args = build_parser().parse_args(["--developer-max-turns", "infinite"])
+
+        value = resolve_developer_max_turns(args)
+
+        self.assertIsNone(value)
+
+    def test_recreate_developer_runtime_noninteractive_reuses_existing_selection(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            original = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            replacement = DeveloperRuntime(
+                selection=original.selection,
+                worker=_FakeWorker(session_name="开发工程师-天罡星"),
+                role_prompt=original.role_prompt,
+            )
+            with patch("A07_Development.stdin_is_interactive", return_value=False), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=replacement,
+            ) as create_runtime, patch(
+                "A07_Development.prompt_replacement_review_agent_selection",
+            ) as prompt_replace:
+                recreated = recreate_developer_runtime(
+                    project_dir=tmp_dir,
+                    developer=original,
+                    progress=None,
+                )
+
+        self.assertIs(recreated, replacement)
+        prompt_replace.assert_not_called()
+        create_runtime.assert_called_once()
+        kwargs = create_runtime.call_args.kwargs
+        self.assertEqual(kwargs["selection"], original.selection)
+        self.assertEqual(kwargs["role_prompt"], original.role_prompt)
+
+    def test_run_development_stage_resolves_review_max_rounds_before_runtime_creation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            calls: list[str] = []
+
+            with patch("A07_Development.ensure_development_inputs", return_value=paths), patch(
+                "A07_Development.cleanup_stale_development_runtime_state",
+                return_value=(),
+            ), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    role_prompt="实现视角",
+                ),
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={},
+            ), patch(
+                "A07_Development.resolve_developer_max_turns",
+                return_value=15,
+            ), patch(
+                "A07_Development.resolve_review_max_rounds",
+                side_effect=lambda *args, **kwargs: calls.append("review_max_rounds") or 5,
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                side_effect=lambda *args, **kwargs: calls.append("create_developer_runtime") or (_ for _ in ()).throw(RuntimeError("stop-after-order-check")),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop-after-order-check"):
+                    run_development_stage(["--project-dir", str(project_dir), "--requirement-name", "需求A"])
+
+        self.assertEqual(calls, ["review_max_rounds", "create_developer_runtime"])
+
+    def test_build_development_paths_migrates_legacy_question_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            legacy_path = project_dir / "需求A_向人类提问.md"
+            legacy_path.write_text("旧的人类问题\n", encoding="utf-8")
+
+            paths = build_development_paths(project_dir, "需求A")
+            migrated_text = paths["ask_human_path"].read_text(encoding="utf-8")
+            legacy_exists = legacy_path.exists()
+
+        self.assertFalse(legacy_exists)
+        self.assertEqual(migrated_text, "旧的人类问题\n")
+
+    def test_create_development_runtimes_accept_stage_local_launch_coordinator(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            sentinel = object()
+            developer = create_developer_runtime(
+                project_dir=project_dir,
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                role_prompt="实现视角",
+                launch_coordinator=sentinel,  # type: ignore[arg-type]
+            )
+            reviewer = create_reviewer_runtime(
+                project_dir=project_dir,
+                requirement_name="需求A",
+                reviewer_spec=DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师"),
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                launch_coordinator=sentinel,  # type: ignore[arg-type]
+            )
+
+        self.assertIs(developer.worker.launch_coordinator, sentinel)
+        self.assertIs(reviewer.worker.launch_coordinator, sentinel)
+
+    def test_initialize_development_workers_runs_reviewer_init_in_parallel(self):
+        class ReviewerInitWorker(_FakeWorker):
+            def __init__(self, *, session_name: str, barrier: threading.Barrier, active_lock: threading.Lock, active_state: dict[str, int]):
+                super().__init__(session_name=session_name)
+                self._barrier = barrier
+                self._active_lock = active_lock
+                self._active_state = active_state
+
+            def run_turn(self, **kwargs):  # noqa: ANN003, ANN001
+                with self._active_lock:
+                    self._active_state["active"] += 1
+                    self._active_state["max_active"] = max(
+                        self._active_state["max_active"],
+                        self._active_state["active"],
+                    )
+                try:
+                    self._barrier.wait(timeout=1.0)
+                finally:
+                    with self._active_lock:
+                        self._active_state["active"] -= 1
+                return type("Result", (), {"ok": True, "clean_output": ""})()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            barrier = threading.Barrier(2)
+            active_lock = threading.Lock()
+            active_state = {"active": 0, "max_active": 0}
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=ReviewerInitWorker(
+                        session_name="测试工程师-天英星",
+                        barrier=barrier,
+                        active_lock=active_lock,
+                        active_state=active_state,
+                    ),
+                    review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                    review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                    contract=_dummy_contract(),
+                ),
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=ReviewerInitWorker(
+                        session_name="审核员-天机星",
+                        barrier=barrier,
+                        active_lock=active_lock,
+                        active_state=active_state,
+                    ),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                    contract=_dummy_contract(),
+                ),
+            ]
+
+            _, initialized_reviewers = initialize_development_workers(
+                developer,
+                paths=paths,
+                reviewers=reviewers,
+                reviewer_specs_by_name={
+                    "测试工程师": DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师"),
+                    "审核员": DevelopmentReviewerSpec(role_name="审核员", role_prompt="审计视角", reviewer_key="审核员"),
+                },
+                initialize_developer=False,
+                initialize_reviewers=True,
+            )
+
+        self.assertEqual(len(initialized_reviewers), 2)
+        self.assertEqual(active_state["max_active"], 2)
+
+    def test_recreate_development_workers_only_reinitializes_developer(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星", runtime_root=project_dir / "runtime", runtime_dir=project_dir / "runtime" / "developer"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="审核员-天机星", runtime_root=project_dir / "runtime", runtime_dir=project_dir / "runtime" / "reviewer"),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            recreated_developer = DeveloperRuntime(
+                selection=developer.selection,
+                worker=_FakeWorker(session_name="开发工程师-天罡星"),
+                role_prompt="实现视角",
+            )
+            recreated_reviewer = ReviewerRuntime(
+                reviewer_name="审核员",
+                selection=reviewers[0].selection,
+                worker=_FakeWorker(session_name="审核员-天平星"),
+                review_md_path=project_dir / "需求A_代码评审记录_审核员_v2.md",
+                review_json_path=project_dir / "需求A_评审记录_审核员_v2.json",
+                contract=_dummy_contract(),
+            )
+
+            init_calls: list[tuple[bool, bool]] = []
+
+            def fake_initialize(current_developer, **kwargs):  # noqa: ANN001
+                init_calls.append((kwargs["initialize_developer"], kwargs["initialize_reviewers"]))
+                return current_developer, list(kwargs["reviewers"])
+
+            with patch("A07_Development.create_developer_runtime", return_value=recreated_developer), patch(
+                "A07_Development.create_reviewer_runtime",
+                return_value=recreated_reviewer,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                side_effect=fake_initialize,
+            ):
+                updated_developer, updated_reviewers, _ = recreate_development_workers(
+                    developer,
+                    reviewers,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={"审核员": DevelopmentReviewerSpec(role_name="审核员", role_prompt="审计视角", reviewer_key="审核员")},
+                )
+
+        self.assertIs(updated_developer, recreated_developer)
+        self.assertEqual(updated_reviewers, [recreated_reviewer])
+        self.assertEqual(init_calls, [(True, False)])
+
+    def test_replace_dead_developer_with_bootstrap_reinitializes_replacement_before_retry(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            original = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            recreated = DeveloperRuntime(
+                selection=original.selection,
+                worker=_FakeWorker(session_name="开发工程师-天罡星"),
+                role_prompt="实现视角",
+            )
+            bootstrapped = DeveloperRuntime(
+                selection=original.selection,
+                worker=_FakeWorker(session_name="开发工程师-天机星"),
+                role_prompt="实现视角",
+            )
+
+            with patch("A07_Development._replace_dead_developer", return_value=recreated) as replace_raw, patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(bootstrapped, []),
+            ) as initialize_workers:
+                result = _replace_dead_developer_with_bootstrap(
+                    original,
+                    paths=paths,
+                    reviewer_specs_by_name={},
+                    project_dir=project_dir,
+                )
+
+        self.assertIs(result, bootstrapped)
+        replace_raw.assert_called_once()
+        initialize_workers.assert_called_once()
+
+    def test_run_single_reviewer_initialization_skips_reviewer_after_ready_timeout_close_choice(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            attempts = {"count": 0}
+            def always_timeout(**kwargs):  # noqa: ANN001
+                attempts["count"] += 1
+                raise RuntimeError("Timed out waiting for agent ready.\nmock screen")
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=always_timeout,
+            ), patch(
+                "A07_Development.prompt_agent_ready_timeout_recovery",
+                return_value=AGENT_READY_TIMEOUT_SKIP,
+            ) as prompt_recovery, patch("A07_Development.recreate_development_reviewer_runtime") as recreate_runtime:
+                result = _run_single_reviewer_initialization(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={
+                        "测试工程师": DevelopmentReviewerSpec(
+                            role_name="测试工程师",
+                            role_prompt="测试视角",
+                            reviewer_key="测试工程师",
+                        ),
+                    },
+                    can_skip_ready_timeout=True,
+                )
+
+        self.assertIsNone(result)
+        self.assertEqual(attempts["count"], 1)
+        self.assertTrue(reviewer.worker.killed)
+        prompt_recovery.assert_called_once()
+        self.assertTrue(prompt_recovery.call_args.kwargs["can_skip"])
+        recreate_runtime.assert_not_called()
+
+    def test_run_single_reviewer_initialization_last_reviewer_ready_timeout_only_retries(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+            attempts = {"count": 0}
+
+            def timeout_then_success(**kwargs):  # noqa: ANN001
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise RuntimeError("Timed out waiting for agent ready.\nmock screen")
+                return {}
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=timeout_then_success,
+            ), patch(
+                "A07_Development.prompt_agent_ready_timeout_recovery",
+                return_value=AGENT_READY_TIMEOUT_RETRY,
+            ) as prompt_recovery, patch("A07_Development.recreate_development_reviewer_runtime") as recreate_runtime:
+                result = _run_single_reviewer_initialization(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={
+                        "测试工程师": DevelopmentReviewerSpec(
+                            role_name="测试工程师",
+                            role_prompt="测试视角",
+                            reviewer_key="测试工程师",
+                        ),
+                    },
+                    can_skip_ready_timeout=False,
+                )
+
+        self.assertIs(result, reviewer)
+        self.assertEqual(attempts["count"], 2)
+        self.assertFalse(reviewer.worker.killed)
+        prompt_recovery.assert_called_once()
+        self.assertFalse(prompt_recovery.call_args.kwargs["can_skip"])
+        recreate_runtime.assert_not_called()
+
+    def test_developer_ready_timeout_requires_manual_retry_and_continues_after_success(self):
+        developer = DeveloperRuntime(
+            selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+            worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+            role_prompt="实现视角",
+        )
+        attempts = {"count": 0}
+
+        def timeout_then_success(**kwargs):  # noqa: ANN001
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("Timed out waiting for agent ready.\nmock screen")
+            return {"status": "completed"}
+
+        with patch(
+            "A07_Development.run_task_result_turn_with_repair",
+            side_effect=timeout_then_success,
+        ), patch(
+            "A07_Development.prompt_agent_ready_timeout_recovery",
+            return_value=AGENT_READY_TIMEOUT_RETRY,
+        ) as prompt_recovery, patch("A07_Development.recreate_developer_runtime") as recreate_runtime:
+            returned, payload = _run_developer_result_turn(
+                developer,
+                label="developer_ready_timeout_retry",
+                prompt="请开发",
+                result_contract=_dummy_task_result_contract(),
+            )
+
+        self.assertIs(returned, developer)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(attempts["count"], 2)
+        prompt_recovery.assert_called_once()
+        self.assertFalse(prompt_recovery.call_args.kwargs["can_skip"])
+        recreate_runtime.assert_not_called()
+
+    def test_developer_ready_timeout_reopens_hitl_when_manual_retry_times_out_again(self):
+        developer = DeveloperRuntime(
+            selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+            worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+            role_prompt="实现视角",
+        )
+        attempts = {"count": 0}
+
+        def timeout_timeout_success(**kwargs):  # noqa: ANN001
+            attempts["count"] += 1
+            if attempts["count"] <= 2:
+                raise RuntimeError("Timed out waiting for agent ready.\nmock screen")
+            return {"status": "completed"}
+
+        with patch(
+            "A07_Development.run_task_result_turn_with_repair",
+            side_effect=timeout_timeout_success,
+        ), patch(
+            "A07_Development.prompt_agent_ready_timeout_recovery",
+            return_value=AGENT_READY_TIMEOUT_RETRY,
+        ) as prompt_recovery:
+            returned, payload = _run_developer_result_turn(
+                developer,
+                label="developer_ready_timeout_retry",
+                prompt="请开发",
+                result_contract=_dummy_task_result_contract(),
+            )
+
+        self.assertIs(returned, developer)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(prompt_recovery.call_count, 2)
+
+    def test_recreate_development_workers_uses_bootstrap_helper(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="审核员-天机星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            recreated_developer = DeveloperRuntime(
+                selection=developer.selection,
+                worker=_FakeWorker(session_name="开发工程师-天罡星"),
+                role_prompt="实现视角",
+            )
+
+            with patch("A07_Development.create_developer_runtime", return_value=recreated_developer), patch(
+                "A07_Development.create_reviewer_runtime",
+                return_value=reviewers[0],
+            ), patch(
+                "A07_Development._bootstrap_developer_runtime",
+                return_value=recreated_developer,
+            ) as bootstrap_helper:
+                updated_developer, _, _ = recreate_development_workers(
+                    developer,
+                    reviewers,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={"审核员": DevelopmentReviewerSpec(role_name="审核员", role_prompt="审计视角", reviewer_key="审核员")},
+                )
+
+        self.assertIs(updated_developer, recreated_developer)
+        bootstrap_helper.assert_called_once()
+
+    def test_ensure_development_inputs_runs_a06_when_task_outputs_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            args = build_parser().parse_args(["--project-dir", str(project_dir), "--requirement-name", "需求A"])
+
+            def fake_run_task_split_stage(argv):  # noqa: ANN001
+                self.assertEqual(argv[:4], ["--project-dir", str(project_dir), "--requirement-name", "需求A"])
+                paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+                paths["task_json_path"].write_text(
+                    json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return object()
+
+            with patch("A07_Development.run_task_split_stage", side_effect=fake_run_task_split_stage) as mocked_a06:
+                resolved = ensure_development_inputs(
+                    args,
+                    project_dir=str(project_dir),
+                    requirement_name="需求A",
+                )
+
+        mocked_a06.assert_called_once()
+        self.assertEqual(resolved["task_md_path"].name, "需求A_任务单.md")
+        self.assertEqual(resolved["task_json_path"].name, "需求A_任务单.json")
+
+    def test_ensure_development_inputs_runs_a06_when_task_json_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": "invalid"}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            args = build_parser().parse_args(["--project-dir", str(project_dir), "--requirement-name", "需求A"])
+
+            def fake_run_task_split_stage(argv):  # noqa: ANN001
+                self.assertIn("--requirement-name", argv)
+                paths["task_json_path"].write_text(
+                    json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return object()
+
+            with patch("A07_Development.run_task_split_stage", side_effect=fake_run_task_split_stage) as mocked_a06:
+                resolved = ensure_development_inputs(
+                    args,
+                    project_dir=str(project_dir),
+                    requirement_name="需求A",
+                )
+
+        mocked_a06.assert_called_once()
+        self.assertEqual(resolved["task_json_path"].name, "需求A_任务单.json")
+
+    def test_run_developer_hitl_loop_replies_until_ready(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = build_development_paths(tmp_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            paths["ask_human_path"].write_text("请确认字段映射\n", encoding="utf-8")
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+
+            def fake_reply(current_developer, **kwargs):  # noqa: ANN001
+                paths["ask_human_path"].write_text("", encoding="utf-8")
+                return current_developer, {"status": "ready"}
+
+            with patch("A07_Development._collect_development_hitl_response", return_value="已确认字段映射") as ask_human, patch(
+                "A07_Development._run_developer_result_turn",
+                side_effect=fake_reply,
+            ) as reply_turn:
+                returned = run_developer_hitl_loop(
+                    developer,
+                    paths=paths,
+                    initial_payload={"status": "hitl"},
+                )
+
+        self.assertIs(returned, developer)
+        ask_human.assert_called_once()
+        reply_turn.assert_called_once()
+
+    def test_ensure_developer_metadata_requests_repair_until_output_valid(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = build_development_paths(tmp_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+
+            prompts: list[str] = []
+
+            def fake_run_turn(current_developer, **kwargs):  # noqa: ANN001
+                prompts.append(kwargs["prompt"])
+                paths["developer_output_path"].write_text("- **完成任务**: `M1-T1`\n", encoding="utf-8")
+                return current_developer, {"status": "completed"}
+
+            with patch("A07_Development.check_develop_job", side_effect=["请补开发元数据", ""]), patch(
+                "A07_Development._run_developer_result_turn",
+                side_effect=fake_run_turn,
+            ):
+                returned_developer, code_change = ensure_developer_metadata(
+                    developer,
+                    paths=paths,
+                    task_name="M1-T1",
+                    label_prefix="development_start_M1_T1",
+                )
+
+        self.assertIs(returned_developer, developer)
+        self.assertEqual(code_change.strip(), "- **完成任务**: `M1-T1`")
+        self.assertEqual(prompts, ["请补开发元数据"])
+
+    def test_run_development_stage_marks_current_task_true_after_review_pass(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                    review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["task_json_path"].write_text(
+                    json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"测试工程师": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, reviewers),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                return_value=(developer, "代码变更摘要"),
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ) as parallel_reviewers, patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ) as task_done_mock, patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                )
+
+        self.assertIsInstance(result, DevelopmentStageResult)
+        self.assertTrue(result.completed)
+        parallel_reviewers.assert_called_once()
+        task_done_mock.assert_called_once()
+
+    def test_run_development_stage_exports_live_handoffs_when_preserve_workers_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                    review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["task_json_path"].write_text(
+                    json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"测试工程师": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, reviewers),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                return_value=(developer, "代码变更摘要"),
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ) as shutdown_mock:
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                    preserve_workers=True,
+                )
+
+        self.assertTrue(result.completed)
+        self.assertIsNotNone(result.developer_handoff)
+        self.assertEqual(result.developer_handoff.worker, developer.worker)
+        self.assertEqual(len(result.reviewer_handoff), 1)
+        self.assertEqual(result.reviewer_handoff[0].reviewer_key, "测试工程师")
+        self.assertTrue(shutdown_mock.call_args.kwargs["preserve_developer"])
+        self.assertEqual(shutdown_mock.call_args.kwargs["preserve_reviewer_keys"], ["测试工程师"])
+
+    def test_run_development_stage_keeps_fresh_reviewers_until_first_review(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            fresh_worker = _FreshReviewerWorker(session_name="测试工程师-天英星")
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=fresh_worker,
+                    review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                    review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["task_json_path"].write_text(
+                    json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"测试工程师": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, reviewers),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                return_value=(developer, "代码变更摘要"),
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ) as parallel_reviewers, patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                )
+
+        self.assertTrue(result.completed)
+        parallel_reviewers.assert_called_once()
+        self.assertEqual(fresh_worker.ensure_calls, 1)
+
+    def test_run_development_stage_builds_reviewers_before_first_task_and_overlaps_reviewer_init(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                    review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            call_order: list[str] = []
+            developer_plan = DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt)
+            develop_started = threading.Event()
+            reviewer_init_started = threading.Event()
+            develop_finished = threading.Event()
+            reviewer_init_finished = threading.Event()
+
+            def fake_initialize_workers(current_developer, **kwargs):  # noqa: ANN001
+                call_order.append(
+                    f"initialize_development_workers:{kwargs['initialize_developer']}:{kwargs['initialize_reviewers']}"
+                )
+                if kwargs["initialize_reviewers"]:
+                    reviewer_init_started.set()
+                    self.assertTrue(develop_started.wait(timeout=1.0))
+                    reviewer_init_finished.set()
+                return current_developer, list(kwargs["reviewers"])
+
+            def fake_develop(current_developer, **kwargs):  # noqa: ANN001
+                call_order.append("develop_current_task")
+                develop_started.set()
+                self.assertTrue(reviewer_init_started.wait(timeout=1.0))
+                develop_finished.set()
+                return current_developer, "代码变更摘要"
+
+            def fake_collect_developer_plan(*args, **kwargs):  # noqa: ANN001
+                _ = args
+                _ = kwargs
+                call_order.append("resolve_developer_plan")
+                return developer_plan
+
+            def fake_collect_reviewer_selections(*args, **kwargs):  # noqa: ANN001
+                _ = args
+                _ = kwargs
+                call_order.append("collect_reviewer_agent_selections")
+                return {"测试工程师": reviewers[0].selection}
+
+            def fake_create_developer_runtime(*args, **kwargs):  # noqa: ANN001
+                _ = args
+                _ = kwargs
+                call_order.append("create_developer_runtime")
+                return developer
+
+            def fake_build_reviewers(*args, **kwargs):  # noqa: ANN001
+                _ = args
+                _ = kwargs
+                call_order.append("build_reviewer_workers")
+                return reviewers
+
+            def fake_parallel_reviewers(reviewer_list, **kwargs):  # noqa: ANN001
+                _ = kwargs
+                self.assertTrue(develop_finished.is_set())
+                self.assertTrue(reviewer_init_finished.is_set())
+                call_order.append("_run_parallel_reviewers")
+                return list(reviewer_list)
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["task_json_path"].write_text(
+                    json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                side_effect=fake_collect_developer_plan,
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                side_effect=fake_create_developer_runtime,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                side_effect=fake_collect_reviewer_selections,
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                side_effect=fake_build_reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                side_effect=fake_initialize_workers,
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                side_effect=fake_develop,
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=fake_parallel_reviewers,
+            ), patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(call_order[0:4], [
+            "resolve_developer_plan",
+            "collect_reviewer_agent_selections",
+            "create_developer_runtime",
+            "initialize_development_workers:True:False",
+        ])
+        self.assertLess(call_order.index("build_reviewer_workers"), call_order.index("develop_current_task"))
+        self.assertLess(call_order.index("build_reviewer_workers"), call_order.index("initialize_development_workers:False:True"))
+        self.assertLess(call_order.index("develop_current_task"), call_order.index("_run_parallel_reviewers"))
+        self.assertLess(call_order.index("initialize_development_workers:False:True"), call_order.index("_run_parallel_reviewers"))
+
+    def test_run_development_stage_resumes_from_first_false_task(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True, "M1-T2": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                    review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            seen_tasks: list[str] = []
+
+            def fake_develop(current_developer, **kwargs):  # noqa: ANN001
+                seen_tasks.append(kwargs["task_name"])
+                kwargs["turn_policy"].record_turn()
+                return current_developer, "代码变更摘要"
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["task_json_path"].write_text(
+                    json.dumps({"M1": {"M1-T1": True, "M1-T2": True}}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"测试工程师": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, reviewers),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                side_effect=fake_develop,
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(seen_tasks, ["M1-T2"])
+
+    def test_run_development_stage_shuts_down_when_parallel_reviewer_init_fails(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                    review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+
+            def fake_initialize_workers(current_developer, **kwargs):  # noqa: ANN001
+                if kwargs["initialize_reviewers"]:
+                    raise RuntimeError("reviewer init failed")
+                return current_developer, list(kwargs["reviewers"])
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"测试工程师": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                side_effect=fake_initialize_workers,
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                return_value=(developer, "代码变更摘要"),
+            ), patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ) as shutdown_workers:
+                with self.assertRaisesRegex(RuntimeError, "reviewer init failed"):
+                    run_development_stage(
+                        ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                    )
+
+        shutdown_workers.assert_called_once()
+
+    def test_run_development_stage_retries_failed_review_round_until_pass(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="审核员-天平星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+
+            def fake_parallel(reviewers_arg, **kwargs):  # noqa: ANN001
+                if kwargs["round_index"] == 1:
+                    paths["merged_review_path"].write_text("请补充异常处理\n", encoding="utf-8")
+                return list(reviewers_arg)
+
+            task_done_calls = {"count": 0}
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                task_done_calls["count"] += 1
+                if task_done_calls["count"] >= 2:
+                    paths["task_json_path"].write_text(
+                        json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    return True
+                paths["merged_review_path"].write_text("请补充异常处理\n", encoding="utf-8")
+                return False
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="审核员", role_prompt="审计视角", reviewer_key="审核员")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"审核员": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, reviewers),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                return_value=(developer, "首轮代码变更"),
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=fake_parallel,
+            ) as parallel_reviewers, patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development.refine_current_task",
+                return_value=(developer, "修订后代码变更"),
+            ) as refine_task, patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(parallel_reviewers.call_count, 2)
+        refine_task.assert_called_once()
+
+    def test_run_development_stage_recreates_workers_before_next_task_when_turn_limit_reached(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False, "M1-T2": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer1 = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            developer2 = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天罡星"),
+                role_prompt="实现视角",
+            )
+            reviewers1 = [
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="审核员-天平星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            reviewers2 = [
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="审核员-天机星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员_v2.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员_v2.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            used_developers: list[str] = []
+            task_done_count = {"count": 0}
+
+            def fake_develop(current_developer, **kwargs):  # noqa: ANN001
+                used_developers.append(current_developer.worker.session_name)
+                kwargs["turn_policy"].record_turn()
+                return current_developer, f"代码变更-{kwargs['task_name']}"
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                task_done_count["count"] += 1
+                if task_done_count["count"] == 1:
+                    paths["task_json_path"].write_text(
+                        json.dumps({"M1": {"M1-T1": True, "M1-T2": False}}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                else:
+                    paths["task_json_path"].write_text(
+                        json.dumps({"M1": {"M1-T1": True, "M1-T2": True}}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer1.selection, role_prompt=developer1.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer1,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="审核员", role_prompt="审计视角", reviewer_key="审核员")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"审核员": reviewers1[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers1,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer1, reviewers1),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                side_effect=fake_develop,
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development.recreate_development_workers",
+                return_value=(developer2, reviewers2, ("cleanup/runtime1",)),
+            ) as recreate_workers, patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A", "--developer-max-turns", "1"],
+                )
+
+        self.assertTrue(result.completed)
+        recreate_workers.assert_called_once()
+        self.assertEqual(used_developers, ["开发工程师-天魁星", "开发工程师-天罡星"])
+
+    def test_run_development_stage_does_not_recreate_workers_when_turn_limit_is_infinite(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False, "M1-T2": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="审核员-天平星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            used_developers: list[str] = []
+            task_done_count = {"count": 0}
+
+            def fake_develop(current_developer, **kwargs):  # noqa: ANN001
+                used_developers.append(current_developer.worker.session_name)
+                kwargs["turn_policy"].record_turn()
+                return current_developer, f"代码变更-{kwargs['task_name']}"
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                task_done_count["count"] += 1
+                if task_done_count["count"] == 1:
+                    paths["task_json_path"].write_text(
+                        json.dumps({"M1": {"M1-T1": True, "M1-T2": False}}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                else:
+                    paths["task_json_path"].write_text(
+                        json.dumps({"M1": {"M1-T1": True, "M1-T2": True}}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="审核员", role_prompt="审计视角", reviewer_key="审核员")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"审核员": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, reviewers),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.develop_current_task",
+                side_effect=fake_develop,
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development.recreate_development_workers",
+            ) as recreate_workers, patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A", "--developer-max-turns", "infinite"],
+                )
+
+        self.assertTrue(result.completed)
+        recreate_workers.assert_not_called()
+        self.assertEqual(used_developers, ["开发工程师-天魁星", "开发工程师-天魁星"])
+
+    def test_run_development_stage_resolves_subagent_num_once_per_stage(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False, "M1-T2": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewers = [
+                ReviewerRuntime(
+                    reviewer_name="审核员",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="审核员-天平星"),
+                    review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                    review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                    contract=_dummy_contract(),
+                )
+            ]
+            task_done_count = {"count": 0}
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                task_done_count["count"] += 1
+                if task_done_count["count"] == 1:
+                    paths["task_json_path"].write_text(
+                        json.dumps({"M1": {"M1-T1": True, "M1-T2": False}}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                else:
+                    paths["task_json_path"].write_text(
+                        json.dumps({"M1": {"M1-T1": True, "M1-T2": True}}, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                return True
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(selection=developer.selection, role_prompt=developer.role_prompt),
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                return_value=developer,
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="审核员", role_prompt="审计视角", reviewer_key="审核员")],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={"审核员": reviewers[0].selection},
+            ), patch(
+                "A07_Development.build_reviewer_workers",
+                return_value=reviewers,
+            ), patch(
+                "A07_Development.initialize_development_workers",
+                return_value=(developer, reviewers),
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ) as resolve_subagent_num, patch(
+                "A07_Development.develop_current_task",
+                side_effect=lambda current_developer, **kwargs: (current_developer, f"代码变更-{kwargs['task_name']}"),
+            ), patch(
+                "A07_Development._run_parallel_reviewers",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.repair_reviewer_outputs",
+                side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
+            ), patch(
+                "A07_Development.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A07_Development._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_development_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                )
+
+        self.assertTrue(result.completed)
+        resolve_subagent_num.assert_called_once()
+
+    def test_run_development_stage_returns_immediately_when_all_tasks_complete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            result = run_development_stage(
+                ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+            )
+
+        self.assertTrue(result.completed)
+
+    def test_run_development_stage_does_not_short_circuit_completed_when_tasks_remain(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            with patch("A07_Development.cleanup_stale_development_runtime_state", return_value=()), patch(
+                "A07_Development.cleanup_existing_development_artifacts",
+                return_value=(),
+            ), patch(
+                "A07_Development.resolve_developer_plan",
+                return_value=DeveloperPlan(
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    role_prompt="实现视角",
+                ),
+            ), patch(
+                "A07_Development.resolve_reviewer_specs",
+                return_value=[],
+            ), patch(
+                "A07_Development.collect_reviewer_agent_selections",
+                return_value={},
+            ), patch(
+                "A07_Development.resolve_developer_max_turns",
+                return_value=999,
+            ), patch(
+                "A07_Development.resolve_review_max_rounds",
+                return_value=3,
+            ), patch(
+                "A07_Development.resolve_subagent_num",
+                return_value=0,
+            ), patch(
+                "A07_Development.create_developer_runtime",
+                side_effect=RuntimeError("developer runtime should start for unfinished task"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "developer runtime should start for unfinished task"):
+                    run_development_stage(
+                        ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                    )
+
+    def test_development_runtime_root_is_scoped_by_requirement_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            scoped_root = build_development_runtime_root(root, "需求A")
+            developer = create_developer_runtime(
+                project_dir=root,
+                requirement_name="需求A",
+                selection=ReviewAgentSelection(vendor="codex", model="gpt-5.4", reasoning_effort="high", proxy_url=""),
+                role_prompt="role",
+            )
+
+        self.assertEqual(scoped_root, root.resolve() / ".development_runtime" / "需求A")
+        self.assertEqual(Path(developer.worker.runtime_root), scoped_root)
+        self.assertTrue(str(developer.worker.runtime_dir).startswith(str(scoped_root)))
+
+    def test_shutdown_development_workers_removes_requirement_scoped_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            scoped_root = build_development_runtime_root(root, "需求A")
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(
+                    session_name="开发工程师-天魁星",
+                    runtime_root=scoped_root,
+                    runtime_dir=scoped_root / "development-developer-aaaa",
+                ),
+                role_prompt="实现视角",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(
+                    session_name="测试工程师-天英星",
+                    runtime_root=scoped_root,
+                    runtime_dir=scoped_root / "development-review-bbbb",
+                ),
+                review_md_path=root / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=root / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            removed = shutdown_development_workers(
+                developer,
+                [reviewer],
+                project_dir=root,
+                requirement_name="需求A",
+                cleanup_runtime=True,
+            )
+
+            self.assertTrue(developer.worker.killed)
+            self.assertTrue(reviewer.worker.killed)
+            self.assertFalse(developer.worker.runtime_dir.exists())
+            self.assertFalse(reviewer.worker.runtime_dir.exists())
+            self.assertFalse(scoped_root.exists())
+            self.assertIn(str(developer.worker.runtime_dir.resolve()), removed)
+            self.assertIn(str(reviewer.worker.runtime_dir.resolve()), removed)
+
+    def test_cleanup_stale_development_runtime_state_scopes_by_requirement_and_keeps_live_legacy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runtime_root = root / ".development_runtime"
+            target_dir = runtime_root / "target-reviewer"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "开发-当前需求",
+                        "project_dir": str(root.resolve()),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a07.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            other_requirement_dir = runtime_root / "other-requirement"
+            other_requirement_dir.mkdir(parents=True, exist_ok=True)
+            (other_requirement_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "开发-其他需求",
+                        "project_dir": str(root.resolve()),
+                        "requirement_name": "需求B",
+                        "workflow_action": "stage.a07.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            legacy_live_dir = runtime_root / "legacy-live"
+            legacy_live_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_live_dir / "worker.state.json").write_text(
+                json.dumps({"session_name": "开发-遗留存活"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            legacy_dead_dir = runtime_root / "legacy-dead"
+            legacy_dead_dir.mkdir(parents=True, exist_ok=True)
+            (legacy_dead_dir / "worker.state.json").write_text(
+                json.dumps({"session_name": "开发-遗留死亡", "agent_state": "DEAD"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            killed_sessions: list[str] = []
+
+            class FakeTmuxRuntimeController:
+                def session_exists(self, session_name: str) -> bool:
+                    return session_name in {"开发-遗留存活", "开发-其他需求"}
+
+                def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
+                    killed_sessions.append(session_name)
+                    return session_name
+
+            with patch("canopy_core.stage_kernel.runtime_scope_cleanup.TmuxRuntimeController", FakeTmuxRuntimeController):
+                removed = cleanup_stale_development_runtime_state(root, "需求A")
+
+            self.assertFalse(target_dir.exists())
+            self.assertFalse(legacy_dead_dir.exists())
+            self.assertTrue(other_requirement_dir.exists())
+            self.assertTrue(legacy_live_dir.exists())
+            self.assertIn("开发-当前需求", killed_sessions)
+            self.assertIn("开发-遗留死亡", killed_sessions)
+            self.assertIn(str(target_dir.resolve()), removed)
+            self.assertIn(str(legacy_dead_dir.resolve()), removed)
+
+    def test_cleanup_stale_development_runtime_state_scans_requirement_subdirectories(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runtime_root = root / ".development_runtime"
+            target_dir = runtime_root / "需求A" / "development-developer-aaaa"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "开发-当前需求",
+                        "project_dir": str(root.resolve()),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a07.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            other_dir = runtime_root / "需求B" / "development-developer-bbbb"
+            other_dir.mkdir(parents=True, exist_ok=True)
+            (other_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "开发-其他需求",
+                        "project_dir": str(root.resolve()),
+                        "requirement_name": "需求B",
+                        "workflow_action": "stage.a07.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeTmuxRuntimeController:
+                def session_exists(self, session_name: str) -> bool:
+                    return True
+
+                def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
+                    return session_name
+
+            with patch("canopy_core.stage_kernel.runtime_scope_cleanup.TmuxRuntimeController", FakeTmuxRuntimeController):
+                removed = cleanup_stale_development_runtime_state(root, "需求A")
+
+            self.assertFalse(target_dir.exists())
+            self.assertTrue(other_dir.exists())
+            self.assertIn(str(target_dir.resolve()), removed)
+
+    def test_cleanup_stale_development_runtime_state_preserves_lock_subdirectories(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            runtime_root = root / ".development_runtime"
+            target_dir = runtime_root / "需求A" / "development-developer-aaaa"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            (target_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "开发-当前需求",
+                        "project_dir": str(root.resolve()),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a07.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            lock_child = runtime_root / "_locks" / "stage.a07.start"
+            lock_child.mkdir(parents=True, exist_ok=True)
+
+            class FakeTmuxRuntimeController:
+                def session_exists(self, session_name: str) -> bool:
+                    return True
+
+                def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
+                    return session_name
+
+            with patch("canopy_core.stage_kernel.runtime_scope_cleanup.TmuxRuntimeController", FakeTmuxRuntimeController):
+                removed = cleanup_stale_development_runtime_state(root, "需求A")
+
+            self.assertFalse(target_dir.exists())
+            self.assertTrue(lock_child.exists())
+            self.assertNotIn(str(lock_child.resolve()), removed)
+
+
+if __name__ == "__main__":
+    unittest.main()

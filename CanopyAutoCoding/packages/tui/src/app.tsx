@@ -21,6 +21,7 @@ import { ReviewRoute } from './routes/ReviewRoute'
 import { DesignRoute } from './routes/DesignRoute'
 import { TaskSplitRoute } from './routes/TaskSplitRoute'
 import { DevelopmentRoute } from './routes/DevelopmentRoute'
+import { OverallReviewRoute } from './routes/OverallReviewRoute'
 import { ControlRoute } from './routes/ControlRoute'
 import { resolveFooterProgressLine } from './footerProgress'
 import { buildHomeAgents } from './homeAgents'
@@ -28,6 +29,7 @@ import { resolvePromptResponseTransition } from './promptTransition'
 import {
   applyStageChanged,
   EMPTY_STAGE_CURSOR,
+  inferBootstrapStatus,
   markTerminalStage,
   shouldAcceptProgressEvent,
 } from './stageStatus'
@@ -43,6 +45,7 @@ import type {
   FileSnapshot,
   HitlSnapshot,
   HomeAgentItem,
+  OverallReviewSnapshot,
   RequirementsSnapshot,
   ReviewSnapshot,
   RoutingSnapshot,
@@ -52,7 +55,7 @@ import type {
   WorkerSnapshot,
 } from './types'
 
-type RouteName = 'home' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'control'
+type RouteName = 'home' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'overall-review' | 'control'
 type ShellFocus = 'content' | 'prompt' | 'log' | 'dialog'
 
 type PromptState = {
@@ -107,6 +110,8 @@ type DialogOverlayProps = {
   children: any
 }
 
+const PRESENCE_REPORT_DEBOUNCE_MS = 1500
+
 const EMPTY_APP_SNAPSHOT: AppSnapshot = {
   projectDir: '',
   requirementName: '',
@@ -115,6 +120,9 @@ const EMPTY_APP_SNAPSHOT: AppSnapshot = {
   activeStage: 'idle',
   activeStageLabel: '等待中',
   pendingHitl: false,
+  pendingAttention: false,
+  pendingAttentionReason: '',
+  pendingAttentionSince: '',
   recentArtifacts: [],
   availableRuns: [],
   capabilities: {},
@@ -168,6 +176,14 @@ const EMPTY_DEVELOPMENT_SNAPSHOT: DevelopmentSnapshot = {
   milestones: [],
   currentMilestoneKey: '',
   allTasksCompleted: false,
+}
+
+const EMPTY_OVERALL_REVIEW_SNAPSHOT: OverallReviewSnapshot = {
+  projectDir: '',
+  requirementName: '',
+  files: [],
+  workers: [],
+  blockers: [],
 }
 
 const EMPTY_HITL_SNAPSHOT: HitlSnapshot = {
@@ -239,6 +255,26 @@ function resolveHitlAnswerPath(payload: Record<string, unknown> | null | undefin
   return String(payload?.answer_path ?? payload?.answerPath ?? '').trim()
 }
 
+function resolvePromptIsHitl(payload: Record<string, unknown> | null | undefined) {
+  const explicit = payload?.is_hitl ?? payload?.isHitl
+  if (explicit !== undefined && explicit !== null) return Boolean(explicit)
+  return false
+}
+
+function resolvePromptRequiresAttention(promptType: string, payload: Record<string, unknown> | null | undefined) {
+  const explicit = payload?.requires_attention ?? payload?.requiresAttention
+  if (explicit !== undefined && explicit !== null) return Boolean(explicit)
+  if (resolvePromptIsHitl(payload)) return true
+  return new Set(['select', 'confirm', 'text', 'multiline']).has(String(promptType || '').trim())
+}
+
+function resolvePromptAttentionReason(promptType: string, payload: Record<string, unknown> | null | undefined) {
+  if (resolvePromptIsHitl(payload)) return 'hitl'
+  const explicit = payload?.attention_reason ?? payload?.attentionReason
+  if (explicit !== undefined && explicit !== null && String(explicit).trim()) return String(explicit).trim()
+  return String(promptType || 'prompt').trim() || 'prompt'
+}
+
 function resolvePreviewPath(payload: Record<string, unknown> | null | undefined) {
   return String(payload?.preview_path ?? payload?.previewPath ?? '').trim()
 }
@@ -249,9 +285,25 @@ function resolvePreviewTitle(payload: Record<string, unknown> | null | undefined
 
 function isHitlPrompt(active: PromptState | null): boolean {
   if (!active) return false
+  if (resolvePromptIsHitl(active.payload)) return true
   const title = String(active.payload.title ?? '')
   const promptText = String(active.payload.prompt_text ?? '')
   return `${active.promptType} ${title} ${promptText}`.toLowerCase().includes('hitl')
+}
+
+function buildPromptBackedAttentionSnapshot(active: PromptState | null, fallback: AppSnapshot): Pick<AppSnapshot, 'pendingAttention' | 'pendingAttentionReason' | 'pendingAttentionSince'> {
+  if (!active || !resolvePromptRequiresAttention(active.promptType, active.payload)) {
+    return {
+      pendingAttention: fallback.pendingAttention,
+      pendingAttentionReason: fallback.pendingAttentionReason,
+      pendingAttentionSince: fallback.pendingAttentionSince,
+    }
+  }
+  return {
+    pendingAttention: true,
+    pendingAttentionReason: resolvePromptAttentionReason(active.promptType, active.payload),
+    pendingAttentionSince: fallback.pendingAttentionSince,
+  }
 }
 
 function buildPromptBackedHitlSnapshot(active: PromptState | null, fallback: HitlSnapshot): HitlSnapshot {
@@ -523,6 +575,7 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
       ? rawArtifactPaths.map((item) => String(item))
       : [],
     sessionExists: value.session_exists === undefined ? undefined : Boolean(value.session_exists),
+    lastHeartbeatAt: String(value.last_heartbeat_at ?? value.lastHeartbeatAt ?? ''),
     updatedAt: String(value.updated_at ?? value.updatedAt ?? ''),
   }
 }
@@ -620,6 +673,16 @@ function normalizeDevelopmentSnapshot(payload: Record<string, unknown>): Develop
   }
 }
 
+function normalizeOverallReviewSnapshot(payload: Record<string, unknown>): OverallReviewSnapshot {
+  return {
+    projectDir: String(payload.project_dir ?? payload.projectDir ?? ''),
+    requirementName: String(payload.requirement_name ?? payload.requirementName ?? ''),
+    files: Array.isArray(payload.files) ? (payload.files as Record<string, unknown>[]).map(normalizeFileSnapshot) : [],
+    workers: Array.isArray(payload.workers) ? (payload.workers as Record<string, unknown>[]).map(normalizeWorkerSnapshot) : [],
+    blockers: Array.isArray(payload.blockers) ? payload.blockers.map((item) => String(item)) : [],
+  }
+}
+
 function buildDevelopmentStatusLines(snapshot: DevelopmentSnapshot): string[] {
   if (snapshot.milestones.length === 0) return []
   const lines: string[] = [`current_milestone: ${snapshot.currentMilestoneKey || '(none)'}`]
@@ -663,6 +726,9 @@ function normalizeAppSnapshot(payload: Record<string, unknown>): AppSnapshot {
     activeStage: String(payload.active_stage ?? payload.activeStage ?? 'idle'),
     activeStageLabel: String(payload.active_stage_label ?? payload.activeStageLabel ?? '等待中'),
     pendingHitl: Boolean(payload.pending_hitl ?? payload.pendingHitl),
+    pendingAttention: Boolean(payload.pending_attention ?? payload.pendingAttention),
+    pendingAttentionReason: String(payload.pending_attention_reason ?? payload.pendingAttentionReason ?? ''),
+    pendingAttentionSince: String(payload.pending_attention_since ?? payload.pendingAttentionSince ?? ''),
     recentArtifacts: Array.isArray(payload.recent_artifacts)
       ? payload.recent_artifacts.map((item) => ({
         path: String((item as Record<string, unknown>).path ?? ''),
@@ -737,15 +803,19 @@ export function App(props: StartupOptions) {
   const [designSnapshot, setDesignSnapshot] = createSignal<DesignSnapshot>(EMPTY_DESIGN_SNAPSHOT)
   const [taskSplitSnapshot, setTaskSplitSnapshot] = createSignal<TaskSplitSnapshot>(EMPTY_TASK_SPLIT_SNAPSHOT)
   const [developmentSnapshot, setDevelopmentSnapshot] = createSignal<DevelopmentSnapshot>(EMPTY_DEVELOPMENT_SNAPSHOT)
+  const [overallReviewSnapshot, setOverallReviewSnapshot] = createSignal<OverallReviewSnapshot>(EMPTY_OVERALL_REVIEW_SNAPSHOT)
   const [controlSnapshot, setControlSnapshot] = createSignal<ControlSnapshot | null>(null)
   const [controlSelectedIndex, setControlSelectedIndex] = createSignal(0)
   const [hitlSnapshot, setHitlSnapshot] = createSignal<HitlSnapshot>(EMPTY_HITL_SNAPSHOT)
   const [artifactsSnapshot, setArtifactsSnapshot] = createSignal<ArtifactsSnapshot>(EMPTY_ARTIFACTS_SNAPSHOT)
   const displayHitlSnapshot = createMemo(() => buildPromptBackedHitlSnapshot(prompt(), hitlSnapshot()))
-  const displayAppSnapshot = createMemo<AppSnapshot>(() => ({
-    ...appSnapshot(),
-    pendingHitl: appSnapshot().pendingHitl || displayHitlSnapshot().pending,
-  }))
+  const displayAppSnapshot = createMemo<AppSnapshot>(() => {
+    const base = appSnapshot()
+    return {
+      ...base,
+      pendingHitl: base.pendingHitl || displayHitlSnapshot().pending,
+    }
+  })
   const homeAgents = createMemo<HomeAgentItem[]>(() =>
     buildHomeAgents([
       { source: 'control', workers: controlSnapshot()?.workers ?? [] },
@@ -755,6 +825,7 @@ export function App(props: StartupOptions) {
       { source: 'design', workers: designSnapshot().workers },
       { source: 'task-split', workers: taskSplitSnapshot().workers },
       { source: 'development', workers: developmentSnapshot().workers },
+      { source: 'overall-review', workers: overallReviewSnapshot().workers },
     ]),
   )
   const footerPrompt = createMemo<PromptState | null>(() => {
@@ -773,6 +844,7 @@ export function App(props: StartupOptions) {
   const [shellFocus, setShellFocus] = createSignal<ShellFocus>('content')
   const [focusBeforeLog, setFocusBeforeLog] = createSignal<ShellFocus>('content')
   const [documentPreviewOpen, setDocumentPreviewOpen] = createSignal(false)
+  const lastPresenceAtByReason = new Map<string, number>()
   const footerPromptFocusToken = createMemo(() => `${footerPrompt()?.id ?? 'no-prompt'}:${shellFocus()}`)
   const shellHeights = createMemo(() => allocateShellHeights(dimensions().height, Boolean(footerPrompt()), showLogs()))
   let logScrollbox: ScrollBoxRenderable | undefined
@@ -798,11 +870,13 @@ export function App(props: StartupOptions) {
         route: route(),
         activeStage: displayAppSnapshot().activeStage,
         activeStageLabel: displayAppSnapshot().activeStageLabel,
+        routingWorkers: routingSnapshot().workers,
         requirementsWorkers: requirementsSnapshot().workers,
         reviewWorkers: reviewSnapshot().workers,
         designWorkers: designSnapshot().workers,
         taskSplitWorkers: taskSplitSnapshot().workers,
         developmentWorkers: developmentSnapshot().workers,
+        overallReviewWorkers: overallReviewSnapshot().workers,
       },
       currentProgress(),
       footerSpinnerTick(),
@@ -820,6 +894,7 @@ export function App(props: StartupOptions) {
     if (Object.keys(bootstrap()).length > 0) lines.push(`python: ${String(bootstrap().python_path ?? '')}`)
     lines.push(`active_run: ${displayAppSnapshot().activeRunId || '(none)'}`)
     lines.push(`pending_hitl: ${displayAppSnapshot().pendingHitl ? 'yes' : 'no'}`)
+    lines.push(`pending_attention: ${displayAppSnapshot().pendingAttention ? 'yes' : 'no'}`)
     lines.push(...developmentStatusLines())
     if (showLogs()) lines.push('log_open: yes')
     return lines
@@ -970,6 +1045,9 @@ export function App(props: StartupOptions) {
       if (stageSnapshots.development && typeof stageSnapshots.development === 'object') {
         setDevelopmentSnapshot(normalizeDevelopmentSnapshot(stageSnapshots.development as Record<string, unknown>))
       }
+      if (stageSnapshots['overall-review'] && typeof stageSnapshots['overall-review'] === 'object') {
+        setOverallReviewSnapshot(normalizeOverallReviewSnapshot(stageSnapshots['overall-review'] as Record<string, unknown>))
+      }
     }
     if (snapshots.control && typeof snapshots.control === 'object') {
       const nextControl = normalizeControlSnapshot(snapshots.control as Record<string, unknown>)
@@ -980,6 +1058,16 @@ export function App(props: StartupOptions) {
     if (snapshots.artifacts && typeof snapshots.artifacts === 'object') {
       setArtifactsSnapshot(normalizeArtifactsSnapshot(snapshots.artifacts as Record<string, unknown>))
     }
+  }
+
+  const reportPresence = (reason: string, focus: ShellFocus = shellFocus()) => {
+    const normalizedReason = String(reason || '').trim()
+    if (!normalizedReason) return
+    const now = Date.now()
+    const lastAt = lastPresenceAtByReason.get(normalizedReason) ?? 0
+    if (now - lastAt < PRESENCE_REPORT_DEBOUNCE_MS) return
+    lastPresenceAtByReason.set(normalizedReason, now)
+    client.sendPresence(normalizedReason, focus)
   }
 
   const handleEvent = (event: BackendEvent) => {
@@ -1010,6 +1098,7 @@ export function App(props: StartupOptions) {
     }
     if (event.type === 'prompt.request') {
       const promptType = String(event.payload.prompt_type ?? 'text')
+      const nextFocus = isOverlayPromptType(promptType) ? 'dialog' : 'prompt'
       setPrompt({
         id: String(event.payload.id ?? ''),
         promptType,
@@ -1017,7 +1106,8 @@ export function App(props: StartupOptions) {
         draftKey: buildPromptDraftKey(promptType, event.payload),
       })
       setStatus('awaiting-input')
-      setShellFocus(isOverlayPromptType(promptType) ? 'dialog' : 'prompt')
+      setShellFocus(nextFocus)
+      reportPresence('prompt-open', nextFocus)
       return
     }
     if (event.type === 'stage.changed') {
@@ -1049,6 +1139,7 @@ export function App(props: StartupOptions) {
       if (stageRoute === 'design') setDesignSnapshot(normalizeDesignSnapshot(stageSnapshot))
       if (stageRoute === 'task-split') setTaskSplitSnapshot(normalizeTaskSplitSnapshot(stageSnapshot))
       if (stageRoute === 'development') setDevelopmentSnapshot(normalizeDevelopmentSnapshot(stageSnapshot))
+      if (stageRoute === 'overall-review') setOverallReviewSnapshot(normalizeOverallReviewSnapshot(stageSnapshot))
       return
     }
     if (event.type === 'snapshot.control') {
@@ -1123,7 +1214,7 @@ export function App(props: StartupOptions) {
       const result = (await client.bootstrap()) as Record<string, unknown>
       setBootstrap(result)
       applyBootstrapSnapshots(result)
-      setStatus('ready')
+      setStatus(inferBootstrapStatus(result))
       if (props.initialRoute) {
         setRoute(props.initialRoute)
       }
@@ -1249,6 +1340,7 @@ export function App(props: StartupOptions) {
   }
 
   useKeyboard(async (event) => {
+    if (event.name) reportPresence('keyboard')
     if (activeDocumentPreview()) {
       if (event.name === 'k' && event.ctrl) {
         event.preventDefault()
@@ -1366,6 +1458,7 @@ export function App(props: StartupOptions) {
       width="100%"
       height="100%"
       onMouseUp={(event) => {
+        reportPresence('mouse')
         const selectedText = renderer.getSelection?.()?.getSelectedText?.()
         if (!selectedText) return
         event.preventDefault()
@@ -1428,6 +1521,9 @@ export function App(props: StartupOptions) {
                 </Match>
                 <Match when={route() === 'development'}>
                   <DevelopmentRoute snapshot={developmentSnapshot()} />
+                </Match>
+                <Match when={route() === 'overall-review'}>
+                  <OverallReviewRoute snapshot={overallReviewSnapshot()} />
                 </Match>
                 <Match when={route() === 'control'}>
                   <ControlRoute snapshot={controlSnapshot()} selectedWorkerIndex={controlSelectedIndex()} />

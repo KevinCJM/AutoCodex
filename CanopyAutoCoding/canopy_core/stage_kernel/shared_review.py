@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable, Sequence
 
 from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
@@ -12,11 +13,18 @@ from A01_Routing_LayerPlanning import (
     prompt_vendor,
 )
 from canopy_core.runtime.contracts import TurnFileContract
-from canopy_core.runtime.tmux_runtime import TmuxBatchWorker, Vendor, is_provider_auth_error
+from canopy_core.runtime.tmux_runtime import (
+    TmuxBatchWorker,
+    Vendor,
+    is_agent_ready_timeout_error,
+    is_provider_auth_error,
+)
 from T09_terminal_ops import (
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
+    collect_multiline_input,
     message,
+    prompt_select_option,
     prompt_positive_int as terminal_prompt_positive_int,
     prompt_with_default,
     prompt_yes_no as terminal_prompt_yes_no,
@@ -24,10 +32,15 @@ from T09_terminal_ops import (
 from T12_requirements_common import (
     DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
     DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+    DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+    stdin_is_interactive,
 )
 
 DEFAULT_REVIEWER_COUNT = 1
 MAX_REVIEWER_REPAIR_ATTEMPTS = 2
+DEFAULT_STAGE_REVIEW_MAX_ROUNDS = 5
+AGENT_READY_TIMEOUT_RETRY = "retry_after_manual_model_change"
+AGENT_READY_TIMEOUT_SKIP = "kill_and_skip"
 
 
 @dataclass(frozen=True)
@@ -55,6 +68,42 @@ class ReviewAgentHandoff:
     role_prompt: str
     selection: ReviewAgentSelection
     worker: TmuxBatchWorker
+
+
+@dataclass
+class ReviewRoundPolicy:
+    max_rounds: int | None
+    quota_count: int = 0
+    initial_review_done: bool = False
+
+    def record_review_attempt(self) -> None:
+        self.quota_count += 1
+        self.initial_review_done = True
+
+    def should_escalate_before_next_review(self) -> bool:
+        return self.max_rounds is not None and self.quota_count >= self.max_rounds
+
+    def reset_after_hitl(self) -> None:
+        self.quota_count = 0
+
+
+@dataclass(frozen=True)
+class ReviewLimitHitlConfig:
+    stage_label: str
+    artifact_label: str
+    primary_output_path: str | Path
+    ask_human_path: str | Path
+    hitl_record_path: str | Path
+    merged_review_path: str | Path
+    output_summary_path: str | Path
+    continue_output_label: str
+
+
+@dataclass(frozen=True)
+class ReviewLimitHitlResult:
+    owner: object
+    rounds_used: int
+    post_hitl_continue_completed: bool = False
 
 
 class ReviewStageProgress:
@@ -163,6 +212,48 @@ def render_review_agent_selection(title: str, selection: ReviewAgentSelection) -
     )
 
 
+def collect_reviewer_agent_selections(
+    *,
+    project_dir: str | Path,
+    reviewer_specs: Sequence[object],
+    display_name_resolver: Callable[[str | Path, object, Sequence[str]], str],
+    progress: ReviewStageProgress | None = None,
+    skip_reviewer_keys: Sequence[str] = (),
+    reserved_session_names: Sequence[str] = (),
+) -> dict[str, ReviewAgentSelection]:
+    selections: dict[str, ReviewAgentSelection] = {}
+    predicted_session_names: set[str] = {str(name).strip() for name in reserved_session_names if str(name).strip()}
+    skip_keys = {str(item).strip() for item in skip_reviewer_keys if str(item).strip()}
+    interactive = stdin_is_interactive()
+    for reviewer_spec in reviewer_specs:
+        reviewer_key = str(
+            getattr(reviewer_spec, "reviewer_key", "") or getattr(reviewer_spec, "role_name", "")
+        ).strip()
+        if not reviewer_key or reviewer_key in skip_keys:
+            continue
+        reviewer_display_name = display_name_resolver(project_dir, reviewer_spec, sorted(predicted_session_names))
+        predicted_session_names.add(reviewer_display_name)
+        if interactive:
+            selection = prompt_review_agent_selection(
+                DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+                default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+                default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+                default_proxy_url="",
+                role_label=reviewer_display_name,
+                progress=progress,
+            )
+            message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
+        else:
+            selection = ReviewAgentSelection(
+                vendor=DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+                model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+                reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+                proxy_url="",
+            )
+        selections[reviewer_key] = selection
+    return selections
+
+
 def prompt_yes_no_choice(
     prompt_text: str,
     default: bool = False,
@@ -210,6 +301,37 @@ def prompt_replacement_review_agent_selection(
         message("新的智能体必须切换 vendor 或 model，当前选择与旧智能体完全相同，请重新选择。")
 
 
+def prompt_required_replacement_review_agent_selection(
+    *,
+    reason_text: str,
+    previous_selection: ReviewAgentSelection,
+    force_model_change: bool,
+    role_label: str,
+    progress: ReviewStageProgress | None = None,
+) -> ReviewAgentSelection:
+    progress = resolve_review_progress(progress)
+    prompt_is_patched = getattr(prompt_review_agent_selection, "__module__", __name__) != __name__
+    if not stdin_is_interactive() and not prompt_is_patched:
+        raise RuntimeError(f"{role_label} 需要重新配置智能体，但当前环境无法交互选择厂商/模型。")
+    message(reason_text)
+    while True:
+        selection = prompt_review_agent_selection(
+            default_vendor=previous_selection.vendor,
+            default_model=previous_selection.model,
+            default_reasoning_effort=previous_selection.reasoning_effort,
+            default_proxy_url=previous_selection.proxy_url,
+            role_label=role_label,
+            progress=progress,
+        )
+        if not force_model_change or (
+            selection.vendor != previous_selection.vendor
+            or selection.model != previous_selection.model
+        ):
+            message(render_review_agent_selection(f"重新创建{role_label}", selection))
+            return selection
+        message("新的智能体必须切换 vendor 或 model，当前选择与旧智能体完全相同，请重新选择。")
+
+
 def render_tmux_start_summary(role_name: str, worker: TmuxBatchWorker) -> str:
     return "\n".join(
         [
@@ -234,8 +356,250 @@ def worker_has_provider_auth_error(worker: TmuxBatchWorker | None) -> bool:
     return health_status == "provider_auth_error" or is_provider_auth_error(health_note)
 
 
+def is_recoverable_startup_failure(error: Exception, worker: TmuxBatchWorker | None = None) -> bool:
+    message_text = str(error or "").strip().lower()
+    if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):
+        return True
+    if is_agent_ready_timeout_error(error):
+        return True
+    if "shell initialization timed out" in message_text:
+        return True
+    if "agent exited back to shell while starting" in message_text:
+        return True
+    return False
+
+
+def mark_worker_awaiting_reconfiguration(
+    worker: TmuxBatchWorker | None,
+    *,
+    reason_text: str,
+) -> None:
+    if worker is None:
+        return
+    marker = getattr(worker, "mark_awaiting_reconfiguration", None)
+    if not callable(marker):
+        return
+    try:
+        marker(reason_text=reason_text)
+    except Exception:
+        return
+
+
+def prompt_agent_ready_timeout_recovery(
+    worker: TmuxBatchWorker | None,
+    *,
+    role_label: str,
+    can_skip: bool,
+    progress: ReviewStageProgress | None = None,
+    reason_text: str = "",
+) -> str:
+    role_text = str(role_label or "").strip() or "智能体"
+    session_name = str(getattr(worker, "session_name", "") or "").strip()
+    reason = str(reason_text or "").strip() or (
+        f"{session_name or role_text}启动超时，未能进入可输入状态。\n"
+        "请先手动更换模型或处理该 AGENT，再选择恢复动作。"
+    )
+    mark_worker_awaiting_reconfiguration(worker, reason_text=reason)
+    message(reason)
+    if progress is not None:
+        progress.set_phase(f"等待人工处理智能体启动超时 | {session_name or role_text}")
+    options: list[tuple[str, str]] = [
+        (AGENT_READY_TIMEOUT_RETRY, "我已手动更换模型，继续尝试"),
+    ]
+    if can_skip:
+        options.append((AGENT_READY_TIMEOUT_SKIP, "关闭这个 AGENT"))
+    with progress.suspended() if progress is not None else nullcontext():
+        return prompt_select_option(
+            title=f"HITL: 智能体启动超时 - {session_name or role_text}",
+            options=tuple(options),
+            default_value=AGENT_READY_TIMEOUT_RETRY,
+            prompt_text="请选择恢复方式",
+            is_hitl=True,
+            extra_payload={
+                "recovery_kind": "agent_ready_timeout",
+                "session_name": session_name,
+                "role_label": role_text,
+                "can_skip": bool(can_skip),
+            },
+        )
+
+
 def ensure_empty_file(file_path: str | Path) -> Path:
     target = Path(file_path).expanduser().resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("", encoding="utf-8")
     return target
+
+
+def collect_review_limit_hitl_response(
+    question_path: str | Path,
+    *,
+    stage_label: str,
+    hitl_round: int,
+    answer_path: str | Path | None = None,
+    progress: ReviewStageProgress | None = None,
+) -> str:
+    question_file = Path(question_path).expanduser().resolve()
+    question_text = question_file.read_text(encoding="utf-8").strip() if question_file.exists() else ""
+    message()
+    message(f"{stage_label} 第 {hitl_round} 轮，需要人工补充信息")
+    message(f"问题文档: {question_file}")
+    message(question_text or "(问题文档为空)")
+    if progress is not None:
+        progress.set_phase(f"{stage_label} / 等待 HITL")
+    with progress.suspended() if progress is not None else nullcontext():
+        return collect_multiline_input(
+            title=f"{stage_label} HITL 第 {hitl_round} 轮回复",
+            empty_retry_message="回复不能为空，请重新输入。",
+            question_path=question_file,
+            answer_path=answer_path,
+            is_hitl=True,
+        )
+
+
+def parse_review_max_rounds(value: object, *, source: str, default: int = DEFAULT_STAGE_REVIEW_MAX_ROUNDS) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return int(default)
+    if text.lower() == "infinite":
+        return None
+    try:
+        parsed = int(text)
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError(f"{source} 必须是正整数或 infinite") from error
+    if parsed <= 0:
+        raise RuntimeError(f"{source} 必须是正整数或 infinite")
+    return parsed
+
+
+def prompt_review_max_rounds(
+    *,
+    default: int = DEFAULT_STAGE_REVIEW_MAX_ROUNDS,
+    progress: ReviewStageProgress | None = None,
+    prompt_text: str = "输入最大审核轮次（输入 infinite 表示不设上限）",
+    source: str = "最大审核轮次",
+) -> int | None:
+    progress = resolve_review_progress(progress)
+    with progress.suspended() if progress is not None else nullcontext():
+        while True:
+            value = prompt_with_default(prompt_text, str(default)).strip()
+            try:
+                return parse_review_max_rounds(value, source=source, default=default)
+            except RuntimeError as error:
+                message(str(error))
+
+
+def render_review_limit_force_hitl_prompt(
+    *,
+    config: ReviewLimitHitlConfig,
+    review_limit: int,
+    review_rounds_used: int,
+    hitl_record_md: str | Path,
+    extra_inputs: Sequence[str | Path] = (),
+) -> str:
+    merged_review_md = str(Path(config.merged_review_path).expanduser().resolve())
+    ask_human_md = str(Path(config.ask_human_path).expanduser().resolve())
+    output_md = str(Path(config.primary_output_path).expanduser().resolve())
+    hitl_record_md = str(Path(hitl_record_md).expanduser().resolve())
+    feedback_md = str(Path(config.output_summary_path).expanduser().resolve())
+    extra_input_list = [str(Path(item).expanduser().resolve()) for item in extra_inputs]
+    input_lines = "\n".join(f"- 《{item}》" for item in [merged_review_md, output_md, hitl_record_md, *extra_input_list])
+    return f"""## 任务目标
+当前《{merged_review_md}》对应的评审已累计 {review_rounds_used} 轮，达到上限 {review_limit}。
+你现在必须停止继续自修，改为发起一次强制 HITL，请人类给出新的决策信息。
+
+## 必读输入
+{input_lines}
+
+## 强制执行步骤
+1. 阅读并去重《{merged_review_md}》中的多轮评审意见。
+2. 结合《{output_md}》与《{hitl_record_md}》，总结“为什么多轮仍未通过”。
+3. 只保留必须由人类拍板的缺口，覆盖写入《{ask_human_md}》。
+4. 不要继续尝试闭环该问题，不要声称已完成继续工作。
+
+## 《{ask_human_md}》固定结构
+- [多轮未通过原因]
+- [仍未闭环的问题]
+- [需要人类决策]
+- [可选方案与影响]
+- [继续工作后将修改的产物]
+
+## 输出约束
+- 允许修改：《{ask_human_md}》、可选更新《{hitl_record_md}》。
+- 禁止修改：《{output_md}》与其他业务产物。
+- 若《{ask_human_md}》为空，视为失败。
+- 只允许返回 `HITL`。
+"""
+
+
+def render_review_limit_human_reply_prompt(
+    *,
+    config: ReviewLimitHitlConfig,
+    human_msg: str,
+    hitl_record_md: str | Path,
+    extra_inputs: Sequence[str | Path] = (),
+) -> str:
+    ask_human_md = str(Path(config.ask_human_path).expanduser().resolve())
+    output_md = str(Path(config.primary_output_path).expanduser().resolve())
+    hitl_record_md = str(Path(hitl_record_md).expanduser().resolve())
+    feedback_md = str(Path(config.output_summary_path).expanduser().resolve())
+    extra_input_list = [str(Path(item).expanduser().resolve()) for item in extra_inputs]
+    input_lines = "\n".join(f"- 《{item}》" for item in [output_md, hitl_record_md, *extra_input_list])
+    return f"""## 任务目标
+你上一轮因评审超过上限触发了 HITL。现在人类已经回复，请先同步人类信息，再继续当前阶段工作。
+
+## 人类回复
+[HUMAN MSG START]
+{human_msg}
+[HUMAN MSG END]
+
+## 必读输入
+{input_lines}
+
+## 执行步骤
+1. 解析人类回复，区分有效信息、噪音、冲突修订。
+2. 以追加 / 拦截 / 覆写规则同步《{hitl_record_md}》。
+3. 若信息仍不足，继续覆盖写入《{ask_human_md}》并返回 `HITL`。
+4. 若信息足够，继续当前阶段工作，必须更新《{output_md}》。
+5. 如有必要，同时更新《{feedback_md}》说明本轮处理结果。
+
+## 输出约束
+- 如果仍需人类介入：必须写《{ask_human_md}》，只返回 `HITL`。
+- 如果信息已足够：必须清空《{ask_human_md}》，并完成《{config.continue_output_label}》对应产物更新，只返回 `修改完成`。
+- 禁止输出其他文本。
+"""
+
+
+def run_review_limit_hitl_cycle(
+    *,
+    stage_label: str,
+    ask_human_path: str | Path,
+    hitl_record_path: str | Path,
+    initial_turn: Callable[[], object],
+    human_reply_turn: Callable[[str], object],
+    progress: ReviewStageProgress | None = None,
+    max_hitl_rounds: int = 8,
+) -> ReviewLimitHitlResult:
+    ask_human_file = Path(ask_human_path).expanduser().resolve()
+    hitl_record_file = Path(hitl_record_path).expanduser().resolve()
+    owner = initial_turn()
+    if not ask_human_file.exists() or not ask_human_file.read_text(encoding="utf-8").strip():
+        raise RuntimeError(f"{stage_label} 超限后未生成有效《{ask_human_file.name}》")
+    post_hitl_continue_completed = False
+    for hitl_round in range(1, max_hitl_rounds + 1):
+        if not ask_human_file.read_text(encoding="utf-8").strip():
+            return ReviewLimitHitlResult(
+                owner=owner,
+                rounds_used=hitl_round - 1,
+                post_hitl_continue_completed=post_hitl_continue_completed,
+            )
+        human_msg = collect_review_limit_hitl_response(
+            ask_human_file,
+            stage_label=stage_label,
+            hitl_round=hitl_round,
+            answer_path=hitl_record_file,
+            progress=progress,
+        )
+        owner = human_reply_turn(human_msg)
+        post_hitl_continue_completed = True
+    raise RuntimeError(f"{stage_label} HITL 轮次超过上限: {max_hitl_rounds}")
