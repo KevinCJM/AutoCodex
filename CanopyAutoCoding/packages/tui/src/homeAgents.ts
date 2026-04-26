@@ -1,3 +1,4 @@
+import { stageRouteForAction } from './stageRegistry'
 import type { HomeAgentItem, WorkerSnapshot } from './types'
 
 const LIVE_WORKER_HEALTH_STATUSES = new Set(['alive', 'auto_relaunched', 'observe_error', 'provider_auth_error'])
@@ -21,14 +22,11 @@ export function isRunningWorker(worker: WorkerSnapshot): boolean {
 
 export function resolveHomeAgentState(worker: WorkerSnapshot): string {
   const agentState = String(worker.agentState || '').trim().toUpperCase()
-  const status = String(worker.status || '').trim().toLowerCase()
-  const currentTaskRuntimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
   if (agentState === 'DEAD') return 'DEAD'
   if (agentState === 'STARTING') return 'STARTING'
   if (agentState === 'BUSY') return 'BUSY'
   if (agentState === 'READY') return 'READY'
-  if (!agentState && (status === 'running' || currentTaskRuntimeStatus === 'running')) return 'BUSY'
-  return agentState || 'UNKNOWN'
+  return 'UNKNOWN'
 }
 
 function workerFreshnessTs(worker: WorkerSnapshot): number {
@@ -39,13 +37,22 @@ function workerFreshnessTs(worker: WorkerSnapshot): number {
   return Math.max(updatedAt, heartbeat)
 }
 
+function allowedHomeSources(activeStage: string): ReadonlySet<HomeAgentItem['source']> | null {
+  const stageRoute = stageRouteForAction(activeStage)
+  if (!stageRoute) return null
+  return new Set<HomeAgentItem['source']>(['control', stageRoute as HomeAgentItem['source']])
+}
+
 export function buildHomeAgents(
   sources: Array<{ source: HomeAgentItem['source']; workers: WorkerSnapshot[] }>,
+  activeStage = '',
 ): HomeAgentItem[] {
+  const scopedSources = allowedHomeSources(activeStage)
   const deduped = new Map<string, HomeAgentItem>()
   const freshnessBySession = new Map<string, number>()
   const sourceRankBySession = new Map<string, number>()
   for (const source of sources) {
+    if (scopedSources && !scopedSources.has(source.source)) continue
     for (const worker of source.workers) {
       if (!isRunningWorker(worker)) continue
       const sessionName = worker.sessionName.trim()
@@ -59,9 +66,10 @@ export function buildHomeAgents(
       if (deduped.has(sessionName)) {
         if (previousFreshness > freshness) continue
         if (previousFreshness === freshness) {
-          if (previousAgentState === 'DEAD' && nextAgentState !== 'DEAD') continue
-          if (previousAgentState !== 'DEAD' && nextAgentState === 'DEAD') {
-            // Prefer the terminal DEAD snapshot when timestamps collide.
+          if (previousAgentState === 'DEAD' && nextAgentState !== 'DEAD') {
+            // Prefer a live backend state over a same-timestamp stale DEAD projection.
+          } else if (previousAgentState !== 'DEAD' && nextAgentState === 'DEAD') {
+            continue
           } else if (previousSourceRank >= sourceRank) {
             continue
           }

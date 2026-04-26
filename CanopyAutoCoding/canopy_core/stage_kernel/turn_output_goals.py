@@ -11,6 +11,7 @@ from canopy_core.runtime.contracts import (
     TurnFileContract,
     observe_completion_state,
     observe_task_result_state,
+    read_task_result_payload,
 )
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -73,6 +74,30 @@ class GoalValidation:
     missing_aliases: tuple[str, ...]
     forbidden_aliases: tuple[str, ...]
     message: str
+
+
+_INTERNAL_TASK_RESULT_MARKERS = (
+    ".development_runtime",
+    ".agent_init_runtime",
+    ".routing_init_runtime",
+    "task_runtime",
+    "_result.json",
+)
+
+
+def _is_internal_task_result_error(message: str) -> bool:
+    text = str(message or "")
+    if not text:
+        return False
+    if "result.json" not in text and "_result.json" not in text:
+        return False
+    return "缺少 result.json" in text or "result_path=" in text or any(marker in text for marker in _INTERNAL_TASK_RESULT_MARKERS)
+
+
+def _sanitize_task_validation_error(message: str) -> str:
+    if _is_internal_task_result_error(message):
+        return "内部任务结果尚未由 runtime 生成；请只检查上方允许修改的业务文件。"
+    return str(message or "").strip()
 
 
 def _choose_expected_status(
@@ -165,11 +190,12 @@ def build_default_task_repair_prompt(context: RepairPromptContext) -> str:
     lines.append("允许修改的文件:")
     for alias, path in sorted(context.artifact_paths.items()):
         lines.append(f"- {alias}: {path}")
-    if context.last_validation_error:
-        lines.append(f"上次校验错误: {context.last_validation_error}")
+    validation_error = _sanitize_task_validation_error(context.last_validation_error)
+    if validation_error:
+        lines.append(f"上次校验错误: {validation_error}")
     lines.extend(
         [
-            "只补齐本轮缺失或错误的结果文件，不要做无关修改。",
+            "只补齐上方允许修改文件中的缺失或错误内容，不要做无关修改。",
             "补齐后仍按本轮原协议返回，不要改终止 token 家族。",
         ]
     )
@@ -323,8 +349,22 @@ def run_task_result_turn_with_repair(
             if turn_goal is not None
             else GoalValidation(valid=True, expected_status="", missing_aliases=(), forbidden_aliases=(), message="")
         )
+        internal_result_error = _is_internal_task_result_error(
+            observation.last_validation_error or (str(current_error).strip() if current_error else "")
+        )
+        if validation.valid and internal_result_error and (
+            current_error is None or is_task_result_contract_error(current_error)
+        ):
+            observed = observation.observed_status or validation.expected_status or "unknown"
+            raise RuntimeError(
+                f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: "
+                f"turn={current_label} observed_status={observed} "
+                "internal task result materialization missing"
+            )
         if result.ok and validation.valid:
             return payload or {}
+        if validation.valid and not observation.last_validation_error:
+            return read_task_result_payload(result_path)
         if turn_goal is None:
             raise current_error or _build_task_goal_error(turn_label=current_label, observation=observation, validation=validation)
         if current_error is not None and not (
@@ -389,7 +429,17 @@ def run_completion_turn_with_repair(
             if turn_goal is not None
             else GoalValidation(valid=True, expected_status="", missing_aliases=(), forbidden_aliases=(), message="")
         )
+        if validation.valid and observation.last_validation_error:
+            validation = GoalValidation(
+                valid=False,
+                expected_status=validation.expected_status,
+                missing_aliases=validation.missing_aliases,
+                forbidden_aliases=validation.forbidden_aliases,
+                message=observation.last_validation_error,
+            )
         if result.ok and validation.valid:
+            return
+        if validation.valid and not observation.last_validation_error:
             return
         if turn_goal is None:
             raise current_error or _build_completion_goal_error(

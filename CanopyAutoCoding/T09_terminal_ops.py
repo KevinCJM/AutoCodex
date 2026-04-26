@@ -667,7 +667,7 @@ def maybe_launch_tui(
     no_tui, filtered = split_legacy_cli_flag(argv)
     if any(item in {"-h", "--help"} for item in filtered):
         return False, filtered
-    if argv is None and not no_tui and sys.stdin.isatty() and sys.stdout.isatty():
+    if argv is None and not filtered and not no_tui and sys.stdin.isatty() and sys.stdout.isatty():
         ensure_tui_dependencies_installed()
         command = [
             str(repo_root() / "scripts" / "canopy-tui"),

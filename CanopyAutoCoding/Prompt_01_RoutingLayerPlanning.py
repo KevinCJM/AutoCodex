@@ -10,9 +10,44 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from canopy_core.prompt_contracts.spec import (
+    ACCESS_READ,
+    ACCESS_WRITE,
+    CHANGE_MUST_CHANGE,
+    CHANGE_NONE,
+    CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+    SPECIAL_REVIEW_FAIL,
+    SPECIAL_REVIEW_PASS,
+    SPECIAL_STAGE_ARTIFACT,
+    FileSpec,
+    OutcomeSpec,
+    agent_prompt,
+    prompt_helper,
+    wraps_prompt,
+)
+
 
 # 创建路由层文件, 由 [路由创建器] 执行
-def create_routing_layer_file():
+@agent_prompt(
+    prompt_id="a01.routing.create",
+    stage="a01",
+    role="routing_agent",
+    intent="create_routing_layer",
+    mode="a01_routing_create",
+    files={
+        "agents_md": FileSpec(path_arg="agents_md", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "repo_map_json": FileSpec(path_arg="repo_map_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "task_routes_json": FileSpec(path_arg="task_routes_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "pitfalls_json": FileSpec(path_arg="pitfalls_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+    },
+    outcomes={"completed": OutcomeSpec(status="completed", requires=("agents_md", "repo_map_json", "task_routes_json", "pitfalls_json"))},
+)
+def create_routing_layer_file(
+        agents_md="AGENTS.md",
+        repo_map_json="docs/repo_map.json",
+        task_routes_json="docs/task_routes.json",
+        pitfalls_json="docs/pitfalls.json",
+):
     create_routing_layer_file_prompt = """Your task is **not** to modify business code. Your task is to generate a **strictly machine-first AI-to-AI routing layer** for the **current agent working directory subtree only**.
 
 The routing layer is for:
@@ -41,6 +76,15 @@ Before drafting the 4 required outputs, use a **small bounded scan budget**:
 * CI/workflow/editor metadata is **low priority** unless the visible subtree is mostly tooling and contains little or no source code
 
 If the first bounded scan already reveals likely module families, entry points, tests, and risks, start writing the 4 required files immediately.
+
+## Required output paths (authoritative)
+
+If any earlier instruction mentions default routing filenames, the following exact paths override it for this run:
+
+* AGENTS instructions: `{agents_md}`
+* module facts: `{repo_map_json}`
+* task routes: `{task_routes_json}`
+* pitfalls: `{pitfalls_json}`
 
 ## First-write rule (hard rule)
 
@@ -521,6 +565,7 @@ Once the 4 required files are written and the self-check passes, stop further ex
 
 
 # 路由层文件审核, 由 [路由创建器] 执行
+@prompt_helper(no_turn=True)
 def routing_layer_file_audit():
     routing_layer_file_audit_prompt = """# Optimized Prompt — Audit of the Machine-First Routing Layer (WORKDIR Only)
 
@@ -971,7 +1016,28 @@ Do **not** climb outside the assigned working directory for context.
 
 
 # 路由层文件优化,  由 [路由创建器] 执行
-def routing_layer_refine(audit_record_path='路由层审核记录.md'):
+@agent_prompt(
+    prompt_id="a01.routing.refine",
+    stage="a01",
+    role="routing_agent",
+    intent="refine_routing_layer",
+    mode="a01_routing_refine",
+    files={
+        "audit_record": FileSpec(path_arg="audit_record_path", access=ACCESS_READ, change=CHANGE_NONE),
+        "agents_md": FileSpec(path_arg="agents_md", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "repo_map_json": FileSpec(path_arg="repo_map_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "task_routes_json": FileSpec(path_arg="task_routes_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "pitfalls_json": FileSpec(path_arg="pitfalls_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+    },
+    outcomes={"completed": OutcomeSpec(status="completed", requires=("agents_md", "repo_map_json", "task_routes_json", "pitfalls_json"))},
+)
+def routing_layer_refine(
+        audit_record_path='路由层审核记录.md',
+        agents_md="AGENTS.md",
+        repo_map_json="docs/repo_map.json",
+        task_routes_json="docs/task_routes.json",
+        pitfalls_json="docs/pitfalls.json",
+):
     routing_layer_refine_prompt = f"""读取审核记录文件《{audit_record_path}》, 基于其中的最终审核意见优化路由层。
 
 要求:
@@ -983,13 +1049,48 @@ def routing_layer_refine(audit_record_path='路由层审核记录.md'):
 6. 不要进入循环
 
 系统会在你完成后重新执行 audit, 并重写审核记录文件。"""
+    routing_layer_refine_prompt += f"""
+
+## 本轮必须修改的路由层文件
+如果上文出现默认文件名，本段路径优先级最高：
+- AGENTS instructions: `{agents_md}`
+- module facts: `{repo_map_json}`
+- task routes: `{task_routes_json}`
+- pitfalls: `{pitfalls_json}`
+"""
     return routing_layer_refine_prompt
 
 
-def build_create_prompt() -> str:
-    return create_routing_layer_file().strip()
+@wraps_prompt(create_routing_layer_file)
+def build_create_prompt(
+        agents_md="AGENTS.md",
+        repo_map_json="docs/repo_map.json",
+        task_routes_json="docs/task_routes.json",
+        pitfalls_json="docs/pitfalls.json",
+) -> str:
+    return create_routing_layer_file(
+        agents_md=agents_md,
+        repo_map_json=repo_map_json,
+        task_routes_json=task_routes_json,
+        pitfalls_json=pitfalls_json,
+    ).strip()
 
 
+@agent_prompt(
+    prompt_id="a01.routing.audit",
+    stage="a01",
+    role="routing_agent",
+    intent="audit_routing_layer",
+    mode="a01_routing_audit",
+    files={
+        "routing_audit_status": FileSpec(path_arg="routing_audit_status_file", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY),
+        "routing_audit_record": FileSpec(path_arg="routing_audit_record_file", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY),
+    },
+    outcomes={
+        "review_pass": OutcomeSpec(status="review_pass", requires=("routing_audit_status", "routing_audit_record"), special=SPECIAL_REVIEW_PASS),
+        "review_fail": OutcomeSpec(status="review_fail", requires=("routing_audit_status", "routing_audit_record"), special=SPECIAL_REVIEW_FAIL),
+    },
+)
 def build_audit_prompt(
         *,
         audit_round: int,
@@ -1013,19 +1114,47 @@ Audit file output requirements:
   "status": "{routing_audit_status_pass}" | "{routing_audit_status_fail}",
   "review_record_path": "{routing_audit_record_file}"
 }}
+- Machine outcome mapping:
+  - `review_pass` means JSON `status` must be `{routing_audit_status_pass}`.
+  - `review_fail` means JSON `status` must be `{routing_audit_status_fail}`.
 - If the audit passes, `{routing_audit_record_file}` must still be overwritten with a minimal record that states the pass result.
 - If the audit fails, write the final AI-to-AI bullet audit into `{routing_audit_record_file}`.
 - `{routing_audit_status_file}` is the single source of truth for pass/fail.
 """
 
 
+@agent_prompt(
+    prompt_id="a01.routing.refine_wrapped",
+    stage="a01",
+    role="routing_agent",
+    intent="refine_routing_layer",
+    mode="a01_routing_refine",
+    files={
+        "audit_record": FileSpec(path_arg="audit_record_path", access=ACCESS_READ, change=CHANGE_NONE),
+        "routing_audit_status": FileSpec(path_arg="routing_audit_status_file", access=ACCESS_READ, change=CHANGE_NONE),
+        "agents_md": FileSpec(path_arg="agents_md", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "repo_map_json": FileSpec(path_arg="repo_map_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "task_routes_json": FileSpec(path_arg="task_routes_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+        "pitfalls_json": FileSpec(path_arg="pitfalls_json", access=ACCESS_WRITE, change=CHANGE_MUST_CHANGE, cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY, special=SPECIAL_STAGE_ARTIFACT),
+    },
+    outcomes={"completed": OutcomeSpec(status="completed", requires=("agents_md", "repo_map_json", "task_routes_json", "pitfalls_json"))},
+)
 def build_refine_prompt(
         audit_record_path: str | Path,
         *,
         routing_audit_status_file: str,
+        agents_md="AGENTS.md",
+        repo_map_json="docs/repo_map.json",
+        task_routes_json="docs/task_routes.json",
+        pitfalls_json="docs/pitfalls.json",
 ) -> str:
-    base_prompt = routing_layer_refine(str(audit_record_path)) if callable(routing_layer_refine) else str(
-        routing_layer_refine)
+    base_prompt = routing_layer_refine(
+        str(audit_record_path),
+        agents_md=agents_md,
+        repo_map_json=repo_map_json,
+        task_routes_json=task_routes_json,
+        pitfalls_json=pitfalls_json,
+    ) if callable(routing_layer_refine) else str(routing_layer_refine)
     return f"""{str(base_prompt).strip()}
 
 执行约束:

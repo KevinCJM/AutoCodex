@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
+    normalize_effort_choice,
+    normalize_model_choice,
+    normalize_vendor_choice,
     prompt_effort,
     prompt_model,
     prompt_vendor,
@@ -18,6 +22,8 @@ from canopy_core.runtime.tmux_runtime import (
     Vendor,
     is_agent_ready_timeout_error,
     is_provider_auth_error,
+    is_provider_runtime_error,
+    is_worker_death_error,
 )
 from T09_terminal_ops import (
     SingleLineSpinnerMonitor,
@@ -39,6 +45,7 @@ from T12_requirements_common import (
 DEFAULT_REVIEWER_COUNT = 1
 MAX_REVIEWER_REPAIR_ATTEMPTS = 2
 DEFAULT_STAGE_REVIEW_MAX_ROUNDS = 5
+REVIEWER_CONSECUTIVE_FAILURE_RECONFIG_THRESHOLD = 2
 AGENT_READY_TIMEOUT_RETRY = "retry_after_manual_model_change"
 AGENT_READY_TIMEOUT_SKIP = "kill_and_skip"
 
@@ -59,6 +66,8 @@ class ReviewerRuntime:
     review_md_path: Path
     review_json_path: Path
     contract: TurnFileContract
+    failure_streak: int = 0
+    last_failure_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -68,6 +77,17 @@ class ReviewAgentHandoff:
     role_prompt: str
     selection: ReviewAgentSelection
     worker: TmuxBatchWorker
+
+
+@dataclass(frozen=True)
+class StageAgentConfig:
+    main: ReviewAgentSelection | None = None
+    reviewers: dict[str, ReviewAgentSelection] | None = None
+    reviewer_order: tuple[str, ...] = ()
+
+    def reviewer_selection(self, reviewer_key: str) -> ReviewAgentSelection | None:
+        selections = self.reviewers or {}
+        return selections.get(str(reviewer_key or "").strip())
 
 
 @dataclass
@@ -104,6 +124,90 @@ class ReviewLimitHitlResult:
     owner: object
     rounds_used: int
     post_hitl_continue_completed: bool = False
+
+
+def _review_worker_state(worker: TmuxBatchWorker | None) -> dict[str, object]:
+    if worker is None:
+        return {}
+    reader = getattr(worker, "read_state", None)
+    if not callable(reader):
+        return {}
+    try:
+        state = reader()
+    except Exception:
+        return {}
+    return dict(state) if isinstance(state, Mapping) else {}
+
+
+def describe_reviewer_failure_reason(
+    error: Exception | BaseException | str,
+    worker: TmuxBatchWorker | None = None,
+) -> str:
+    message_text = str(error or "").strip()
+    lowered = message_text.lower()
+    state = _review_worker_state(worker)
+    health_status = str(state.get("health_status", "")).strip().lower()
+    if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):
+        return "模型认证已失效"
+    if is_provider_runtime_error(error) or worker_has_provider_runtime_error(worker):
+        return "模型服务出现临时运行错误"
+    if is_agent_ready_timeout_error(error) or "shell initialization timed out" in lowered:
+        return "启动超时，未能进入可输入状态"
+    if "agent exited back to shell" in lowered:
+        return "agent 进程已退出并返回 shell"
+    if is_worker_death_error(error):
+        if health_status == "missing_session":
+            return "tmux 会话已丢失"
+        if health_status == "pane_dead":
+            return "tmux pane 已退出"
+        if not getattr(worker, "session_exists", lambda: True)():
+            return "tmux 会话已丢失"
+        return "智能体进程已死亡或退出"
+    first_line = message_text.splitlines()[0].strip() if message_text else ""
+    return first_line[:160] if first_line else "未知原因"
+
+
+def note_reviewer_failure(
+    reviewer: ReviewerRuntime,
+    *,
+    reason_text: str,
+) -> ReviewerRuntime:
+    next_streak = max(int(getattr(reviewer, "failure_streak", 0) or 0), 0) + 1
+    return replace(
+        reviewer,
+        failure_streak=next_streak,
+        last_failure_reason=str(reason_text or "").strip(),
+    )
+
+
+def carry_reviewer_failure_state(
+    reviewer: ReviewerRuntime,
+    *,
+    previous: ReviewerRuntime,
+) -> ReviewerRuntime:
+    return replace(
+        reviewer,
+        failure_streak=max(int(getattr(previous, "failure_streak", 0) or 0), 0),
+        last_failure_reason=str(getattr(previous, "last_failure_reason", "") or "").strip(),
+    )
+
+
+def reviewer_requires_manual_model_reconfiguration(reviewer: ReviewerRuntime) -> bool:
+    return int(getattr(reviewer, "failure_streak", 0) or 0) >= REVIEWER_CONSECUTIVE_FAILURE_RECONFIG_THRESHOLD
+
+
+def build_reviewer_failure_reconfiguration_reason(
+    reviewer: ReviewerRuntime,
+    *,
+    role_label: str,
+    failure_reason: str,
+) -> str:
+    streak = max(int(getattr(reviewer, "failure_streak", 0) or 0), 0)
+    return (
+        f"检测到{role_label}连续 {streak} 次死亡/失败。\n"
+        f"最近一次原因：{str(failure_reason or '').strip() or '未知原因'}\n"
+        "需要重新选择模型后继续当前阶段。"
+    )
 
 
 class ReviewStageProgress:
@@ -174,6 +278,155 @@ def prompt_positive_int(prompt_text: str, default: int = 1, *, progress: ReviewS
     progress = resolve_review_progress(progress)
     with progress.suspended() if progress is not None else nullcontext():
         return terminal_prompt_positive_int(prompt_text, default)
+
+
+def _parse_spec_text(value: str, *, source: str) -> dict[str, str]:
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    fields: dict[str, str] = {}
+    if "=" not in text and ":" in text:
+        parts = [part.strip() for part in text.split(":")]
+        names = ("vendor", "model", "effort", "proxy")
+        for index, part in enumerate(parts[: len(names)]):
+            if part:
+                fields[names[index]] = part
+        return fields
+    for chunk in text.split(","):
+        item = chunk.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise RuntimeError(f"{source} 配置项必须是 key=value: {item}")
+        key, raw = item.split("=", 1)
+        key_text = key.strip().replace("-", "_").lower()
+        if not key_text:
+            raise RuntimeError(f"{source} 存在空 key: {item}")
+        fields[key_text] = raw.strip()
+    return fields
+
+
+def _coerce_agent_spec_fields(spec: object, *, source: str) -> dict[str, str]:
+    if spec is None:
+        return {}
+    if isinstance(spec, str):
+        return _parse_spec_text(spec, source=source)
+    if isinstance(spec, Mapping):
+        return {
+            str(key).strip().replace("-", "_").lower(): str(value).strip()
+            for key, value in spec.items()
+            if str(key).strip() and value is not None and str(value).strip()
+        }
+    raise RuntimeError(f"{source} 必须是字符串或对象")
+
+
+def parse_agent_selection_spec(
+    spec: object,
+    *,
+    default_name: str = "",
+    default_vendor: str = DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+    default_model: str = "",
+    default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+    source: str = "agent",
+) -> tuple[str, ReviewAgentSelection]:
+    fields = _coerce_agent_spec_fields(spec, source=source)
+    raw_vendor = fields.get("vendor") or default_vendor
+    vendor = normalize_vendor_choice(raw_vendor)
+    model_default = default_model if default_model and vendor == default_vendor else get_default_model_for_vendor(vendor)
+    model = normalize_model_choice(vendor, fields.get("model") or model_default)
+    effort = normalize_effort_choice(
+        vendor,
+        model,
+        fields.get("effort") or fields.get("reasoning_effort") or default_reasoning_effort,
+    )
+    proxy_url = (
+        fields.get("proxy_url")
+        or fields.get("proxy")
+        or fields.get("proxy_port")
+        or fields.get("port")
+        or ""
+    )
+    name = (
+        fields.get("name")
+        or fields.get("key")
+        or fields.get("role")
+        or fields.get("reviewer")
+        or default_name
+    )
+    return (
+        str(name or "").strip(),
+        ReviewAgentSelection(
+            vendor=vendor,
+            model=model,
+            reasoning_effort=effort,
+            proxy_url=str(proxy_url or "").strip(),
+        ),
+    )
+
+
+def _load_agent_config_payload(path_value: object) -> dict[str, Any]:
+    text = str(path_value or "").strip()
+    if not text:
+        return {}
+    path = Path(text).expanduser().resolve()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError(f"--agent-config 读取失败: {path}: {error}") from error
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"--agent-config 根节点必须是 JSON 对象: {path}")
+    return payload
+
+
+def _config_reviewer_specs(payload: Mapping[str, Any]) -> list[object]:
+    for key in ("reviewers", "reviewer_agents", "reviewer_agent"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if isinstance(value, list):
+            return list(value)
+        return [value]
+    return []
+
+
+def resolve_stage_agent_config(
+    args: object,
+    *,
+    default_reviewer_names: Sequence[str] = (),
+) -> StageAgentConfig:
+    config_payload = _load_agent_config_payload(getattr(args, "agent_config", ""))
+    main_spec = config_payload.get("main") or config_payload.get("main_agent")
+    cli_main = getattr(args, "main_agent", "")
+    if str(cli_main or "").strip():
+        main_spec = cli_main
+    main_selection: ReviewAgentSelection | None = None
+    if main_spec:
+        _, main_selection = parse_agent_selection_spec(main_spec, source="main-agent")
+
+    reviewer_specs: list[object] = _config_reviewer_specs(config_payload)
+    cli_reviewers = list(getattr(args, "reviewer_agent", []) or [])
+    if cli_reviewers:
+        reviewer_specs = cli_reviewers
+
+    reviewers: dict[str, ReviewAgentSelection] = {}
+    reviewer_order: list[str] = []
+    default_names = [str(item).strip() for item in default_reviewer_names if str(item).strip()]
+    for index, reviewer_spec in enumerate(reviewer_specs):
+        default_name = default_names[index] if index < len(default_names) else f"R{index + 1}"
+        reviewer_name, selection = parse_agent_selection_spec(
+            reviewer_spec,
+            default_name=default_name,
+            source=f"reviewer-agent[{index + 1}]",
+        )
+        if not reviewer_name:
+            reviewer_name = default_name
+        reviewers[reviewer_name] = selection
+        reviewer_order.append(reviewer_name)
+    return StageAgentConfig(
+        main=main_selection,
+        reviewers=reviewers,
+        reviewer_order=tuple(reviewer_order),
+    )
 
 
 def prompt_review_agent_selection(
@@ -338,6 +591,7 @@ def render_tmux_start_summary(role_name: str, worker: TmuxBatchWorker) -> str:
             f"{role_name} 已创建",
             f"runtime_dir: {worker.runtime_dir}",
             f"session_name: {worker.session_name}",
+            "首次执行任务时会等待 READY；启动失败将进入阶段恢复逻辑。",
             "可使用以下命令进入会话:",
             f"  tmux attach -t {worker.session_name}",
         ]
@@ -356,9 +610,28 @@ def worker_has_provider_auth_error(worker: TmuxBatchWorker | None) -> bool:
     return health_status == "provider_auth_error" or is_provider_auth_error(health_note)
 
 
+def worker_has_provider_runtime_error(worker: TmuxBatchWorker | None) -> bool:
+    if worker is None:
+        return False
+    try:
+        state = worker.read_state()
+    except Exception:
+        state = {}
+    health_status = str(state.get("health_status", "")).strip().lower()
+    health_note = str(state.get("health_note", "")).strip().lower()
+    last_provider_error = str(state.get("last_provider_error", "")).strip().lower()
+    return (
+        health_status == "provider_runtime_error"
+        or is_provider_runtime_error(health_note)
+        or is_provider_runtime_error(last_provider_error)
+    )
+
+
 def is_recoverable_startup_failure(error: Exception, worker: TmuxBatchWorker | None = None) -> bool:
     message_text = str(error or "").strip().lower()
     if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):
+        return True
+    if is_provider_runtime_error(error) or worker_has_provider_runtime_error(worker):
         return True
     if is_agent_ready_timeout_error(error):
         return True
@@ -429,6 +702,14 @@ def ensure_empty_file(file_path: str | Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("", encoding="utf-8")
     return target
+
+
+def ensure_review_artifacts(md_path: str | Path, json_path: str | Path) -> tuple[Path, Path]:
+    review_md = ensure_empty_file(md_path)
+    review_json = Path(json_path).expanduser().resolve()
+    review_json.parent.mkdir(parents=True, exist_ok=True)
+    review_json.write_text("[]", encoding="utf-8")
+    return review_md, review_json
 
 
 def collect_review_limit_hitl_response(

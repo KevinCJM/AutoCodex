@@ -8,6 +8,22 @@
 
 from __future__ import annotations
 
+from canopy_core.prompt_contracts.spec import (
+    ACCESS_READ,
+    ACCESS_READ_WRITE,
+    CHANGE_MAY_CHANGE,
+    CHANGE_MUST_CHANGE,
+    CHANGE_MUST_EXIST_NONEMPTY,
+    CHANGE_NONE,
+    CLEANUP_AGENT_INSIDE_FILE,
+    CLEANUP_NONE,
+    CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+    SPECIAL_OPEN_HITL,
+    FileSpec,
+    OutcomeSpec,
+    agent_prompt,
+    prompt_helper,
+)
 from T04_common_prompt import task_start_prompt
 
 REQUIREMENTS_STATUS_SCHEMA_VERSION = "1.0"
@@ -28,6 +44,7 @@ fintech_ba = f"""**角色属性：**
 2. **逻辑唯一性**：设计的输出必须能导出唯一的代码实现，杜绝“见仁见智”的描述。"""
 
 
+@prompt_helper(no_turn=True)
 def output_protocol(requirements_clear_md='name_需求澄清.md', ask_human_md='name_与人类交流.md'):
     output_protocol_prompt = f"""## Output Protocol (Strict)
 > 你 **只能** 选择以下两种输出协议响应格式之一，严禁输出其他内容, 禁止修改其他文档：
@@ -61,6 +78,42 @@ HITL
     return output_protocol_prompt
 
 
+@agent_prompt(
+    prompt_id="a03.requirements_clarification.understand",
+    stage="a03",
+    role="requirements_analyst",
+    intent="clarify_requirements",
+    mode="a03_requirements_clarification",
+    files={
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(
+            path_arg="requirements_clear_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求澄清完成态事实源",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "ask_human": FileSpec(
+            path_arg="ask_human_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求缺口 HITL 问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_OPEN_HITL,
+        ),
+        "hitl_record": FileSpec(
+            path_arg="hitl_record_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="已确认的人类反馈事实缓存",
+            cleanup=CLEANUP_AGENT_INSIDE_FILE,
+        ),
+    },
+    outcomes={
+        "completed": OutcomeSpec(status="completed", requires=("requirements_clear",), forbids=("ask_human",)),
+        "hitl": OutcomeSpec(status="hitl", requires=("ask_human", "hitl_record"), special=SPECIAL_OPEN_HITL),
+    },
+)
 def requirements_understand(
         ba_desc, *,
         init_prompt=task_start_prompt,
@@ -104,7 +157,7 @@ def requirements_understand(
 ## HITL 文档同步要求
 - 只要进入 HITL，必须新建或覆盖写入《{ask_human_md}》, 保证《{ask_human_md}》不为空。
 - 只要进入 HITL，必须新建或更新《{hitl_record_md}》，记录当前已确认事实、冲突点、待确认边界。
-- 无论是否进入 HITL 或者有没有已经确认的事实《{ask_human_md}》和《{hitl_record_md}》必须存在, 可以为空
+- 未进入 HITL 时《{ask_human_md}》必须为空或不存在；《{hitl_record_md}》仅在新增或更新已确认事实时修改。
 
 ## 约束
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。
@@ -120,6 +173,42 @@ def requirements_understand(
     return requirements_understand_prompt
 
 
+@agent_prompt(
+    prompt_id="a03.requirements_clarification.hitl_reply",
+    stage="a03",
+    role="requirements_analyst",
+    intent="hitl_reply",
+    mode="a03_requirements_clarification",
+    files={
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "hitl_record": FileSpec(
+            path_arg="hitl_record_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="人类反馈解析后的事实缓存",
+            cleanup=CLEANUP_AGENT_INSIDE_FILE,
+        ),
+        "requirements_clear": FileSpec(
+            path_arg="requirements_clear_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求澄清完成态事实源",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "ask_human": FileSpec(
+            path_arg="ask_human_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="仍需人类补充的 HITL 问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_OPEN_HITL,
+        ),
+    },
+    outcomes={
+        "completed": OutcomeSpec(status="completed", requires=("requirements_clear",), optional=("hitl_record",), forbids=("ask_human",)),
+        "hitl": OutcomeSpec(status="hitl", requires=("ask_human", "hitl_record"), special=SPECIAL_OPEN_HITL),
+    },
+)
 def hitl_bck(
         human_msg, *,
         original_requirement_md='name_原始需求.md',
@@ -185,6 +274,42 @@ def hitl_bck(
     return hitl_bck_prompt
 
 
+@agent_prompt(
+    prompt_id="a03.requirements_clarification.resume",
+    stage="a03",
+    role="requirements_analyst",
+    intent="resume_clarification",
+    mode="a03_requirements_clarification",
+    files={
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(
+            path_arg="requirements_clear_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_EXIST_NONEMPTY,
+            meaning="恢复分析后可能修正的需求澄清",
+            cleanup=CLEANUP_NONE,
+        ),
+        "ask_human": FileSpec(
+            path_arg="ask_human_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="恢复分析时发现的新 HITL 问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_OPEN_HITL,
+        ),
+        "hitl_record": FileSpec(
+            path_arg="hitl_record_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="已确认的人类反馈事实缓存",
+            cleanup=CLEANUP_AGENT_INSIDE_FILE,
+        ),
+    },
+    outcomes={
+        "completed": OutcomeSpec(status="completed", requires=("requirements_clear",), forbids=("ask_human",)),
+        "hitl": OutcomeSpec(status="hitl", requires=("ask_human", "hitl_record"), special=SPECIAL_OPEN_HITL),
+    },
+)
 def resume_requirements_understand(
         ba_desc, *,
         init_prompt=task_start_prompt,
@@ -229,7 +354,7 @@ def resume_requirements_understand(
 ## HITL 文档同步要求
 - 只要进入 HITL，必须覆盖写入《{ask_human_md}》, 保证《{ask_human_md}》不为空。
 - 只要进入 HITL，必须新建或更新《{hitl_record_md}》，记录当前与人类已确认的事实、冲突点、待确认边界。
-- 无论是否进入 HITL 或者有没有已经确认的事实《{ask_human_md}》和《{hitl_record_md}》必须存在, 可以为空
+- 未进入 HITL 时《{ask_human_md}》必须为空或不存在；《{hitl_record_md}》仅在新增或更新已确认事实时修改。
 
 ## 约束
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须走路径 A 继续追问。

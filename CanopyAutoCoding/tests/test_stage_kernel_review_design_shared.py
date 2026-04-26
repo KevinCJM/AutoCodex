@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -67,3 +69,36 @@ class StageKernelSharedTests(unittest.TestCase):
     def test_shell_initialization_timeout_is_recoverable_startup_failure(self):
         error = RuntimeError("Shell initialization timed out.\nzsh prompt")
         self.assertTrue(shared_review.is_recoverable_startup_failure(error))
+
+    def test_ensure_review_artifacts_creates_empty_markdown_and_empty_json_list(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            md_path = Path(tmpdir) / "review.md"
+            json_path = Path(tmpdir) / "review.json"
+
+            shared_review.ensure_review_artifacts(md_path, json_path)
+
+            self.assertEqual(md_path.read_text(encoding="utf-8"), "")
+            self.assertEqual(json.loads(json_path.read_text(encoding="utf-8")), [])
+
+    def test_resolve_stage_agent_config_accepts_fixed_two_reviewers(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "agent_config": "",
+                "main_agent": "vendor=codex,model=gpt-5.4,effort=high,proxy=10900",
+                "reviewer_agent": [
+                    "name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium,proxy=10900",
+                    "name=R2,vendor=codex,model=gpt-5.4,effort=high",
+                ],
+            },
+        )()
+
+        config = shared_review.resolve_stage_agent_config(args)
+
+        self.assertIsNotNone(config.main)
+        self.assertEqual(config.main.vendor, "codex")
+        self.assertEqual(config.main.proxy_url, "10900")
+        self.assertEqual(config.reviewer_order, ("R1", "R2"))
+        self.assertEqual(config.reviewer_selection("R1").model, "gpt-5.4-mini")
+        self.assertEqual(config.reviewer_selection("R2").model, "gpt-5.4")

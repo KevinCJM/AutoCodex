@@ -64,7 +64,7 @@ class _FakeCenter:
                 "work_dir": "/tmp/project",
                 "status": "running",
                 "workflow_stage": "create_running",
-                "provider_phase": "waiting_input",
+                "agent_state": "READY",
                 "health_status": "healthy",
                 "retry_count": 0,
                 "note": "running",
@@ -595,7 +595,7 @@ class T11TuiBackendTests(unittest.TestCase):
                             "work_dir": str(project_dir),
                             "result_status": "running",
                             "workflow_stage": "turn_running",
-                            "provider_phase": "processing",
+                            "agent_state": "BUSY",
                             "health_status": "alive",
                             "retry_count": 0,
                             "note": "",
@@ -661,7 +661,7 @@ class T11TuiBackendTests(unittest.TestCase):
                             "work_dir": str(project_dir),
                             "result_status": "running",
                             "workflow_stage": "turn_running",
-                            "provider_phase": "processing",
+                            "agent_state": "BUSY",
                             "health_status": "alive",
                             "retry_count": 0,
                             "note": "",
@@ -704,7 +704,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "running",
                         "workflow_stage": "turn_running",
-                        "provider_phase": "processing",
+                        "agent_state": "BUSY",
                         "health_status": "alive",
                         "retry_count": 0,
                         "note": "",
@@ -726,7 +726,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "running",
                         "workflow_stage": "turn_running",
-                        "provider_phase": "processing",
+                        "agent_state": "BUSY",
                         "health_status": "alive",
                         "retry_count": 0,
                         "note": "",
@@ -763,7 +763,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:requirements_review_round_2",
                         "updated_at": "2026-04-20T14:06:58+08:00",
@@ -783,7 +783,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "running",
                         "workflow_stage": "pending",
-                        "provider_phase": "processing",
+                        "agent_state": "BUSY",
                         "health_status": "alive",
                         "note": "turn:detailed_design_feedback_round_2",
                         "updated_at": "2026-04-20T14:05:58+08:00",
@@ -815,7 +815,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:requirements_review_feedback_round_2",
                         "updated_at": "2026-04-22T17:01:00+08:00",
@@ -835,7 +835,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:requirements_clarification_round_1",
                         "updated_at": "2026-04-22T17:02:00+08:00",
@@ -867,7 +867,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "running",
                         "workflow_stage": "turn_running",
-                        "provider_phase": "processing",
+                        "agent_state": "BUSY",
                         "health_status": "alive",
                         "note": "turn:requirements_clarification_round_1",
                         "updated_at": "2026-04-20T14:05:58+08:00",
@@ -947,7 +947,7 @@ class T11TuiBackendTests(unittest.TestCase):
                             "work_dir": str(project_dir),
                             "result_status": "running",
                             "workflow_stage": "turn_running",
-                            "provider_phase": "processing",
+                            "agent_state": "BUSY",
                             "health_status": "alive",
                             "retry_count": 0,
                             "note": "",
@@ -1002,7 +1002,7 @@ class T11TuiBackendTests(unittest.TestCase):
                             "work_dir": str(project_dir),
                             "result_status": "running",
                             "workflow_stage": "turn_running",
-                            "provider_phase": "processing",
+                            "agent_state": "BUSY",
                             "health_status": "alive",
                             "retry_count": 0,
                             "note": "",
@@ -1088,7 +1088,7 @@ class T11TuiBackendTests(unittest.TestCase):
                             "result_status": "running",
                             "workflow_stage": "turn_running",
                             "workflow_action": "stage.a08.start",
-                            "provider_phase": "processing",
+                            "agent_state": "BUSY",
                             "health_status": "alive",
                             "retry_count": 0,
                             "note": "",
@@ -1159,7 +1159,7 @@ class T11TuiBackendTests(unittest.TestCase):
                             "work_dir": str(project_dir),
                             "result_status": status,
                             "workflow_stage": "turn_running",
-                            "provider_phase": "processing",
+                            "agent_state": "BUSY",
                             "health_status": "alive",
                             "note": "",
                             "updated_at": updated_at,
@@ -1196,7 +1196,7 @@ class T11TuiBackendTests(unittest.TestCase):
                             "work_dir": str(project_dir),
                             "result_status": status,
                             "workflow_stage": "pending",
-                            "provider_phase": "error" if status == "failed" else "idle_ready",
+                            "agent_state": "DEAD" if status == "failed" else "READY",
                             "health_status": "alive",
                             "note": "error:development_reviewer_init_需求分析师" if status == "failed" else "done:development_developer_init",
                             "updated_at": updated_at,
@@ -1476,8 +1476,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "result_status": "ready",
                         "workflow_stage": "pending",
                         "current_command": "zsh",
-                        "provider_phase": "shell",
-                        "agent_state": "DEAD",
+                        "agent_state": "STARTING",
                         "agent_started": False,
                         "health_status": "alive",
                         "note": "session_created",
@@ -1514,7 +1513,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:task_split_review_init_测试工程师_round_1",
                         "current_turn_phase": "任务拆分",
@@ -1537,7 +1536,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "running",
                         "workflow_stage": "turn_running",
-                        "provider_phase": "processing",
+                        "agent_state": "BUSY",
                         "health_status": "alive",
                         "note": "turn:task_split_review_init_架构师_round_1",
                         "current_turn_phase": "任务拆分",
@@ -1572,7 +1571,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "timeout:detailed_design_review_again_架构师_round_4",
                         "current_turn_phase": "详细设计",
@@ -1951,6 +1950,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertIn("stage.a08.start", messages[0]["payload"]["commands"])
         self.assertIn("capabilities", messages[0]["payload"])
         self.assertIn("snapshots", messages[0]["payload"])
+        self.assertEqual(len(messages), 1)
 
     def test_stage_a05_start_runs_in_background(self):
         writer = io.StringIO()
@@ -2165,7 +2165,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:development_reviewer_init_需求分析师",
                         "updated_at": "2026-04-21T16:52:24+08:00",
@@ -2206,8 +2206,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "result_status": "ready",
                         "workflow_stage": "pending",
                         "current_command": "zsh",
-                        "provider_phase": "shell",
-                        "agent_state": "DEAD",
+                        "agent_state": "STARTING",
                         "agent_started": False,
                         "health_status": "alive",
                         "note": "session_created",
@@ -2313,7 +2312,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:development_reviewer_init_需求分析师",
                         "updated_at": "2026-04-21T16:52:24+08:00",
@@ -2479,6 +2478,9 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertTrue(any(item["payload"]["status"] == "awaiting-input" for item in stage_events))
         app_snapshots = [item for item in messages_before_resolve if item.get("kind") == "event" and item.get("type") == "snapshot.app"]
         self.assertTrue(any(item["payload"].get("pending_hitl") for item in app_snapshots))
+        self.assertEqual(len(app_snapshots), 1)
+        hitl_snapshots = [item for item in messages_before_resolve if item.get("kind") == "event" and item.get("type") == "snapshot.hitl"]
+        self.assertEqual(len(hitl_snapshots), 1)
         responses = [item for item in messages if item.get("kind") == "response" and item.get("id") == "req_ready_timeout"]
         self.assertTrue(responses)
         self.assertTrue(responses[-1]["ok"])
@@ -2694,6 +2696,8 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(payload["control_id"], "run_demo")
         self.assertEqual(payload["status_text"], "status text")
         self.assertEqual(payload["workers"][0]["session_name"], "sess-1")
+        event_types = [item.get("type") for item in messages[1:] if item.get("kind") == "event"]
+        self.assertEqual(event_types, ["snapshot.control"])
 
     def test_worker_attach_returns_tmux_attach_command(self):
         writer = io.StringIO()
@@ -2921,7 +2925,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": "/tmp/project",
                         "status": "running",
                         "workflow_stage": "create_running",
-                        "provider_phase": "waiting_input",
+                        "agent_state": "READY",
                         "health_status": "alive",
                     },
                     ensure_ascii=False,
@@ -3016,9 +3020,9 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(runtime_root),
                         "status": "running",
                         "workflow_stage": "turn_running",
-                        "provider_phase": "waiting_input",
+                        "agent_state": "READY",
                         "health_status": "alive",
-                        "health_note": "waiting_input",
+                        "health_note": "alive",
                         "config": {
                             "vendor": "gemini",
                             "model": "pro",
@@ -3036,7 +3040,7 @@ class T11TuiBackendTests(unittest.TestCase):
                     self.kwargs = kwargs
                     payload = json.loads(state_path.read_text(encoding="utf-8"))
                     payload["agent_state"] = "BUSY"
-                    payload["health_note"] = "processing"
+                    payload["health_note"] = "alive"
                     payload["last_heartbeat_at"] = "2026-04-20T16:00:00+08:00"
                     state_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
@@ -3049,7 +3053,94 @@ class T11TuiBackendTests(unittest.TestCase):
                 workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
 
         self.assertEqual(workers[0]["agent_state"], "BUSY")
-        self.assertEqual(workers[0]["health_note"], "processing")
+        self.assertEqual(workers[0]["health_note"], "alive")
+
+    def test_runtime_scanned_stale_dead_worker_refreshes_when_session_is_live(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            worker_root = runtime_root / "worker-1"
+            worker_root.mkdir(parents=True)
+            state_path = worker_root / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "development-developer",
+                        "session_name": "sess-runtime",
+                        "pane_id": "%1",
+                        "work_dir": str(runtime_root),
+                        "status": "failed",
+                        "result_status": "failed",
+                        "workflow_stage": "turn_running",
+                        "agent_state": "DEAD",
+                        "health_status": "dead",
+                        "health_note": "generic turn error",
+                        "config": {
+                            "vendor": "codex",
+                            "model": "gpt-5.4",
+                            "reasoning_effort": "high",
+                            "proxy_url": "",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            class _RefreshedWorker:
+                def refresh_health(self, **kwargs) -> None:  # noqa: ANN003
+                    payload = json.loads(state_path.read_text(encoding="utf-8"))
+                    payload["agent_state"] = "READY"
+                    payload["health_status"] = "alive"
+                    payload["health_note"] = "alive"
+                    payload["last_heartbeat_at"] = "2026-04-20T16:00:00+08:00"
+                    state_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = SimpleNamespace(  # noqa: SLF001
+                session_exists=lambda name: name == "sess-runtime",
+                backend=object(),
+            )
+            with patch("canopy_core.bridge.backend.load_worker_from_state_path", return_value=_RefreshedWorker()):
+                workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
+
+        self.assertTrue(workers[0]["session_exists"])
+        self.assertEqual(workers[0]["agent_state"], "READY")
+        self.assertEqual(workers[0]["health_status"], "alive")
+
+    def test_runtime_scan_does_not_infer_busy_from_current_command_when_agent_state_is_invalid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            worker_root = runtime_root / "worker-1"
+            worker_root.mkdir(parents=True)
+            (worker_root / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "requirements-review-r3",
+                        "session_name": "sess-runtime",
+                        "pane_id": "%1",
+                        "work_dir": str(runtime_root),
+                        "status": "running",
+                        "workflow_stage": "turn_running",
+                        "agent_state": "not-a-runtime-state",
+                        "agent_alive": True,
+                        "agent_started": True,
+                        "current_command": "codex",
+                        "health_status": "alive",
+                        "health_note": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = SimpleNamespace(  # noqa: SLF001
+                session_exists=lambda name: name == "sess-runtime",
+                backend=None,
+            )
+
+            workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
+
+        self.assertEqual(workers[0]["agent_state"], "")
 
     def test_runtime_scan_refresh_disables_reentrant_runtime_notifications(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3091,7 +3182,7 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertEqual(worker.kwargs, {"notify_on_change": False})
 
-    def test_runtime_scanned_worker_snapshots_prefer_alive_health_note_over_stale_processing_phase(self):
+    def test_runtime_scanned_worker_snapshots_keep_alive_health_note_for_ready_agent(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             worker_root = runtime_root / "worker-1"
@@ -3106,7 +3197,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "workflow_stage": "turn_done",
                         "agent_state": "READY",
                         "health_status": "alive",
-                        "health_note": "waiting_input",
+                        "health_note": "alive",
                         "updated_at": "2026-04-17T10:00:00+08:00",
                         "last_heartbeat_at": "2026-04-17T10:00:02+08:00",
                     },
@@ -3118,7 +3209,40 @@ class T11TuiBackendTests(unittest.TestCase):
             server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-reviewer")  # noqa: SLF001
             workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
         self.assertEqual(workers[0]["agent_state"], "READY")
-        self.assertEqual(workers[0]["health_note"], "waiting_input")
+        self.assertEqual(workers[0]["health_note"], "alive")
+
+    def test_runtime_scanned_worker_snapshots_keep_running_ready_agent_ready(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            worker_root = runtime_root / "worker-1"
+            worker_root.mkdir(parents=True)
+            state_path = worker_root / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "sess-reviewer",
+                        "work_dir": "/tmp/project",
+                        "result_status": "running",
+                        "workflow_stage": "turn_running",
+                        "agent_state": "READY",
+                        "agent_started": True,
+                        "agent_alive": True,
+                        "current_command": "gemini",
+                        "current_task_runtime_status": "running",
+                        "health_status": "alive",
+                        "health_note": "alive",
+                        "updated_at": "2026-04-17T10:00:00+08:00",
+                        "last_heartbeat_at": "2026-04-17T10:00:02+08:00",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-reviewer", backend=None)  # noqa: SLF001
+            workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
+        self.assertEqual(workers[0]["agent_state"], "READY")
+        self.assertEqual(workers[0]["health_note"], "alive")
 
     def test_runtime_scanned_worker_snapshots_prefer_fresher_alive_health_note_while_turn_is_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3135,7 +3259,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "workflow_stage": "turn_running",
                         "agent_state": "BUSY",
                         "health_status": "alive",
-                        "health_note": "processing",
+                        "health_note": "alive",
                         "updated_at": "2026-04-17T10:00:00+08:00",
                         "last_heartbeat_at": "2026-04-17T10:00:03+08:00",
                     },
@@ -3147,9 +3271,9 @@ class T11TuiBackendTests(unittest.TestCase):
             server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-active")  # noqa: SLF001
             workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
         self.assertEqual(workers[0]["agent_state"], "BUSY")
-        self.assertEqual(workers[0]["health_note"], "processing")
+        self.assertEqual(workers[0]["health_note"], "alive")
 
-    def test_runtime_scanned_worker_snapshots_keep_newer_processing_phase_while_turn_is_running(self):
+    def test_runtime_scanned_worker_snapshots_keep_newer_alive_health_note_while_turn_is_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             worker_root = runtime_root / "worker-1"
@@ -3164,7 +3288,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "workflow_stage": "turn_running",
                         "agent_state": "BUSY",
                         "health_status": "alive",
-                        "health_note": "waiting_input",
+                        "health_note": "alive",
                         "updated_at": "2026-04-17T10:00:03+08:00",
                         "last_heartbeat_at": "2026-04-17T10:00:00+08:00",
                     },
@@ -3176,7 +3300,7 @@ class T11TuiBackendTests(unittest.TestCase):
             server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-active")  # noqa: SLF001
             workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
         self.assertEqual(workers[0]["agent_state"], "BUSY")
-        self.assertEqual(workers[0]["health_note"], "waiting_input")
+        self.assertEqual(workers[0]["health_note"], "alive")
 
     def test_requirements_snapshot_prefers_latest_failed_worker_when_session_name_reused(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3193,7 +3317,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "succeeded",
                         "workflow_stage": "pending",
-                        "provider_phase": "idle_ready",
+                        "agent_state": "READY",
                         "health_status": "alive",
                         "note": "done:requirements_clarification_round_2",
                         "updated_at": "2026-04-20T14:04:58+08:00",
@@ -3209,7 +3333,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:requirements_clarification_round_3",
                         "updated_at": "2026-04-20T14:06:58+08:00",
@@ -3240,7 +3364,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:requirements_clarification_round_3",
                         "updated_at": "2026-04-20T14:06:58+08:00",
@@ -3274,7 +3398,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "result_status": "failed",
                         "workflow_stage": "pending",
-                        "provider_phase": "error",
+                        "agent_state": "DEAD",
                         "health_status": "alive",
                         "note": "error:notion_round_1",
                         "updated_at": "2026-04-20T14:06:58+08:00",
@@ -3321,7 +3445,7 @@ class T11TuiBackendTests(unittest.TestCase):
                                 "session_name": "sess-routing",
                                 "workflow_stage": "create_running",
                                 "result_status": "running",
-                                "provider_phase": "waiting_input",
+                                "agent_state": "READY",
                                 "health_status": "alive",
                                 "state_path": "",
                                 "transcript_path": "",
@@ -3339,7 +3463,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["workers"][0]["session_name"], "sess-routing")
         self.assertTrue(snapshot["workers"][0]["session_exists"])
 
-    def test_manifest_backed_prelaunch_routing_worker_stays_starting_and_does_not_fail_stage(self):
+    def test_manifest_backed_prelaunch_routing_worker_with_missing_session_marks_dead(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
             project_dir.mkdir(parents=True)
@@ -3368,7 +3492,7 @@ class T11TuiBackendTests(unittest.TestCase):
                                 "session_name": "sess-routing-prelaunch",
                                 "workflow_stage": "pending",
                                 "result_status": "pending",
-                                "agent_state": "DEAD",
+                                "agent_state": "STARTING",
                                 "agent_alive": False,
                                 "agent_started": False,
                                 "health_status": "unknown",
@@ -3389,8 +3513,8 @@ class T11TuiBackendTests(unittest.TestCase):
             snapshot = server._build_routing_snapshot()  # noqa: SLF001
             status = server._infer_runtime_stage_status("stage.a01.start")  # noqa: SLF001
 
-        self.assertEqual(snapshot["workers"][0]["agent_state"], "STARTING")
-        self.assertEqual(status, "running")
+        self.assertEqual(snapshot["workers"][0]["agent_state"], "DEAD")
+        self.assertEqual(status, "failed")
 
     def test_manifest_backed_busy_routing_worker_marks_stage_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3494,10 +3618,12 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["workers"][0]["health_status"], "dead")
         self.assertEqual(snapshot["workers"][0]["health_note"], "tmux session missing")
 
-    def test_bridge_ui_runtime_state_change_notifier_emits_snapshots(self):
+    def test_bridge_ui_runtime_state_change_notifier_debounces_app_and_current_stage_snapshots(self):
         writer = io.StringIO()
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+        server._set_context(action="stage.a03.start")  # noqa: SLF001
         server._bridge_ui.notify_runtime_state_changed()  # noqa: SLF001
+        server._flush_dirty_snapshots()  # noqa: SLF001
         messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         event_types = [item.get("type") for item in messages if item.get("kind") == "event"]
         self.assertIn("snapshot.app", event_types)
@@ -3516,7 +3642,7 @@ class T11TuiBackendTests(unittest.TestCase):
                         "work_dir": str(project_dir),
                         "status": "running",
                         "workflow_stage": "requirements_analysis",
-                        "provider_phase": "waiting_input",
+                        "agent_state": "READY",
                         "health_status": "alive",
                         "retry_count": 0,
                         "note": "requirements_analysis_round_1",
@@ -3530,6 +3656,7 @@ class T11TuiBackendTests(unittest.TestCase):
             server._set_context(project_dir=str(project_dir), requirement_name="贪吃蛇", action="stage.a02.start")  # noqa: SLF001
             server._tmux_runtime = SimpleNamespace(session_exists=lambda session_name: session_name == "sess-requirements")  # noqa: SLF001
             server._bridge_ui.notify_runtime_state_changed()  # noqa: SLF001
+            server._flush_dirty_snapshots()  # noqa: SLF001
             messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         requirement_snapshots = [
             item["payload"]["snapshot"]
@@ -3542,6 +3669,207 @@ class T11TuiBackendTests(unittest.TestCase):
         latest_snapshot = requirement_snapshots[-1]
         self.assertEqual(latest_snapshot["workers"][0]["session_name"], "sess-requirements")
         self.assertTrue(latest_snapshot["workers"][0]["session_exists"])
+
+    def test_runtime_state_change_emits_hitl_snapshot_when_worker_question_is_pending(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            requirement_name = "需求A"
+            paths = build_development_paths(project_dir, requirement_name)
+            for path in (
+                paths["task_md_path"],
+                paths["task_json_path"],
+                paths["developer_output_path"],
+                paths["merged_review_path"],
+                paths["detailed_design_path"],
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("ok\n", encoding="utf-8")
+            paths["task_json_path"].write_text(json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False), encoding="utf-8")
+            paths["ask_human_path"].write_text("请确认评审冲突\n", encoding="utf-8")
+            runtime_dir = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / "worker-hitl"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "development-developer",
+                        "session_name": "开发工程师-天魁星",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "requirement_name": requirement_name,
+                        "workflow_action": "stage.a07.start",
+                        "result_status": "running",
+                        "workflow_stage": "turn_running",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "question_path": str(paths["ask_human_path"]),
+                        "answer_path": str(paths["hitl_record_path"]),
+                        "updated_at": "2026-04-23T10:00:00+08:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            server._set_context(project_dir=str(project_dir), requirement_name=requirement_name, action="stage.a07.start")  # noqa: SLF001
+            server._bridge_ui.notify_runtime_state_changed()  # noqa: SLF001
+            server._flush_dirty_snapshots()  # noqa: SLF001
+            messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+
+        hitl_events = [
+            item["payload"]
+            for item in messages
+            if item.get("kind") == "event" and item.get("type") == "snapshot.hitl"
+        ]
+        self.assertTrue(hitl_events)
+        self.assertTrue(hitl_events[-1]["pending"])
+        self.assertEqual(hitl_events[-1]["question_path"], str(paths["ask_human_path"]))
+
+    def test_app_recent_artifacts_use_cache_and_current_stage_when_stage_update_is_partial(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            routing_file = root / "routing.md"
+            development_file = root / "development.md"
+            routing_file.write_text("routing\n", encoding="utf-8")
+            development_file.write_text("development\n", encoding="utf-8")
+            files_by_route = {
+                "routing": [{"path": str(routing_file)}],
+                "development": [{"path": str(development_file)}],
+            }
+            built_routes: list[str] = []
+
+            def fake_stage_snapshot(route: str) -> dict[str, object]:
+                built_routes.append(route)
+                return {"files": files_by_route.get(route, []), "workers": []}
+
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            with patch.object(server, "_build_stage_snapshot_by_route", side_effect=fake_stage_snapshot):
+                server._emit_snapshot_update(include_app=True, include_all_stages=True)  # noqa: SLF001
+                built_routes.clear()
+                server._emit_snapshot_update(include_app=True, stage_routes=("development",))  # noqa: SLF001
+            messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+
+        app_events = [
+            item["payload"]
+            for item in messages
+            if item.get("kind") == "event" and item.get("type") == "snapshot.app"
+        ]
+        artifact_paths = {item["path"] for item in app_events[-1]["recent_artifacts"]}
+        self.assertIn(str(routing_file.resolve()), artifact_paths)
+        self.assertIn(str(development_file.resolve()), artifact_paths)
+        self.assertEqual(built_routes, ["development"])
+
+    def test_artifact_item_builder_filters_empty_and_missing_candidates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            existing = Path(tmpdir) / "artifact.md"
+            existing.write_text("artifact\n", encoding="utf-8")
+            missing = Path(tmpdir) / "missing.md"
+
+            items = TuiBackendServer._artifact_items_from_candidates(["", str(missing), str(existing)])  # noqa: SLF001
+
+        self.assertEqual([item["path"] for item in items], [str(existing.resolve())])
+
+    def test_artifact_index_is_scoped_by_project_and_requirement(self):
+        with tempfile.TemporaryDirectory() as project_a, tempfile.TemporaryDirectory() as project_b:
+            old_file = Path(project_a) / "old.md"
+            new_file = Path(project_b) / "new.md"
+            old_file.write_text("old\n", encoding="utf-8")
+            new_file.write_text("new\n", encoding="utf-8")
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+
+            server._set_context(project_dir=project_a, requirement_name="req-a")  # noqa: SLF001
+            seeded = server._build_artifacts_snapshot(  # noqa: SLF001
+                stages={"development": {"files": [{"path": str(old_file)}]}},
+                control={"workers": []},
+            )
+            self.assertEqual([item["path"] for item in seeded["items"]], [str(old_file.resolve())])
+
+            server._set_context(project_dir=project_b, requirement_name="req-b")  # noqa: SLF001
+            current = server._build_artifacts_snapshot(  # noqa: SLF001
+                stages={"development": {"files": [{"path": str(new_file)}]}},
+                control={"workers": []},
+            )
+            partial = server._build_artifacts_snapshot(stages={}, control={"workers": []})  # noqa: SLF001
+
+        self.assertEqual([item["path"] for item in current["items"]], [str(new_file.resolve())])
+        self.assertEqual([item["path"] for item in partial["items"]], [str(new_file.resolve())])
+
+    def test_snapshot_stage_registry_rejects_unknown_and_dedupes_routes(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        with self.assertRaises(KeyError):
+            server._build_stage_snapshot_by_route("missing")  # noqa: SLF001
+
+        with patch.object(server, "_build_routing_snapshot", return_value={"files": [], "workers": []}) as builder:
+            snapshots = server._build_stage_snapshots(["routing", "routing"])  # noqa: SLF001
+
+        self.assertEqual(list(snapshots), ["routing"])
+        builder.assert_called_once()
+
+    def test_snapshot_update_logs_builder_failures_and_continues_with_fallbacks(self):
+        writer = io.StringIO()
+        server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+        with patch.object(server, "_build_stage_snapshots", side_effect=RuntimeError("stage boom")), patch.object(
+            server,
+            "_build_control_snapshot_for_session",
+            side_effect=RuntimeError("control boom"),
+        ), patch.object(server, "_build_hitl_snapshot", side_effect=RuntimeError("hitl boom")), patch.object(
+            server._attention_manager,
+            "snapshot",
+            side_effect=RuntimeError("attention boom"),
+        ), patch.object(server, "_build_artifacts_snapshot", side_effect=RuntimeError("artifacts boom")):
+            server._emit_snapshot_update(  # noqa: SLF001
+                include_app=True,
+                include_control=True,
+                include_hitl=True,
+                include_artifacts=True,
+                stage_routes=("routing",),
+            )
+
+        messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+        log_text = "\n".join(str(item.get("payload", {}).get("text", "")) for item in messages if item.get("type") == "log.append")
+        self.assertIn("stage boom", log_text)
+        self.assertIn("control boom", log_text)
+        self.assertIn("hitl boom", log_text)
+        self.assertIn("attention boom", log_text)
+        self.assertIn("artifacts boom", log_text)
+        self.assertTrue(any(item.get("type") == "snapshot.app" for item in messages))
+
+    def test_snapshot_dirty_scheduler_noops_empty_updates_and_shutdown_cancels_timer(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._schedule_snapshot_update(sections=set(), stage_routes=())  # noqa: SLF001
+        self.assertIsNone(server._snapshot_debounce_timer)  # noqa: SLF001
+
+        server._schedule_snapshot_update(sections={"app"}, delay_sec=10.0)  # noqa: SLF001
+        self.assertIsNotNone(server._snapshot_debounce_timer)  # noqa: SLF001
+        server._schedule_snapshot_update(sections={"hitl"}, delay_sec=10.0)  # noqa: SLF001
+        self.assertEqual(server._snapshot_dirty_sections, {"app", "hitl"})  # noqa: SLF001
+        server.shutdown(cleanup_tmux=False)
+        self.assertIsNone(server._snapshot_debounce_timer)  # noqa: SLF001
+
+    def test_worker_control_actions_emit_control_and_app_snapshots_only(self):
+        for action in ("worker.detach", "worker.kill", "worker.restart", "worker.retry"):
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            server._controls["run_demo"] = ControlSessionState(control_id="run_demo", center=_FakeCenter())  # noqa: SLF001
+            server.handle_request(build_request(action, {"control_id": "run_demo", "argument": "1"}, message_id=f"req_{action}"))
+            messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+            event_types = [item.get("type") for item in messages if item.get("kind") == "event"]
+            self.assertIn("snapshot.app", event_types)
+            self.assertIn("snapshot.control", event_types)
+            self.assertNotIn("snapshot.stage", event_types)
+
+    def test_emit_all_snapshots_uses_single_full_bundle_path(self):
+        writer = io.StringIO()
+        server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+        server._emit_all_snapshots()  # noqa: SLF001
+        messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+        event_types = [item.get("type") for item in messages if item.get("kind") == "event"]
+        self.assertIn("snapshot.app", event_types)
+        self.assertIn("snapshot.control", event_types)
+        self.assertIn("snapshot.hitl", event_types)
+        self.assertIn("snapshot.artifacts", event_types)
 
 
 if __name__ == "__main__":

@@ -109,6 +109,67 @@ class TurnOutputGoalsTests(unittest.TestCase):
             self.assertEqual(len(worker.prompts), 2)
             self.assertIn("遗漏了本轮协议要求的产物", worker.prompts[1])
             self.assertIn(str(ask_human), worker.prompts[1])
+            self.assertNotIn("result.json", worker.prompts[1])
+            self.assertNotIn("_result.json", worker.prompts[1])
+            self.assertNotIn("task_runtime", worker.prompts[1])
+            self.assertNotIn(".development_runtime", worker.prompts[1])
+
+    def test_run_task_result_turn_with_repair_does_not_ask_agent_to_write_internal_result_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            result_path = (
+                root
+                / ".development_runtime"
+                / "twr"
+                / "task_runtime"
+                / "开发工程师_development-developer-hitl-reply_attempt_1_result.json"
+            )
+            ask_human = root / "与人类交流.md"
+            ask_human.write_text("", encoding="utf-8")
+            contract = TaskResultContract(
+                turn_id="a07_developer_human_reply",
+                phase="a07_developer_human_reply",
+                task_kind="a07_developer_human_reply",
+                mode="a07_developer_human_reply",
+                expected_statuses=("ready", "hitl"),
+                optional_artifacts={"ask_human": ask_human},
+                outcome_artifacts={
+                    "ready": {"forbids": ("ask_human",)},
+                    "hitl": {"requires": ("ask_human",)},
+                },
+            )
+
+            def response(*, result_contract=None, completion_contract=None):  # noqa: ANN001, ARG001
+                worker.current_task_result_path = str(result_path)
+                return SimpleNamespace(
+                    ok=False,
+                    clean_output=(
+                        f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: "
+                        f"phase=a07_developer_human_reply result_path={result_path} "
+                        f"error=缺少 result.json: {result_path}"
+                    ),
+                )
+
+            worker = _FakeTaskWorker([response])
+            with self.assertRaisesRegex(RuntimeError, "internal task result materialization missing"):
+                run_task_result_turn_with_repair(
+                    worker=worker,
+                    label="development_developer_hitl_reply_round_1",
+                    prompt="原始 prompt",
+                    result_contract=contract,
+                    parse_result_payload=json.loads,
+                    turn_goal=TaskTurnGoal(
+                        goal_id="a07_developer_human_reply",
+                        outcomes={
+                            "ready": OutcomeGoal(status="ready"),
+                            "hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",)),
+                        },
+                    ),
+                    stage_label="任务开发",
+                    role_label="开发工程师",
+                )
+
+            self.assertEqual(len(worker.prompts), 1)
 
     def test_run_task_result_turn_with_repair_uses_repair_result_contract_on_retry(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -122,7 +183,6 @@ class TurnOutputGoalsTests(unittest.TestCase):
                 mode="mode",
                 expected_statuses=("completed",),
                 required_artifacts={"developer_output": output_path},
-                terminal_status_tokens={"completed": ("修改完成",)},
             )
             repair_contract = TaskResultContract(
                 turn_id="turn-repair",
@@ -131,7 +191,6 @@ class TurnOutputGoalsTests(unittest.TestCase):
                 mode="mode",
                 expected_statuses=("completed",),
                 required_artifacts={"developer_output": output_path},
-                terminal_status_tokens={"completed": ("任务完成", "修改完成")},
             )
 
             def first_response(*, result_contract=None, completion_contract=None):  # noqa: ANN001, ARG001
@@ -169,6 +228,47 @@ class TurnOutputGoalsTests(unittest.TestCase):
         self.assertEqual(payload["status"], "completed")
         self.assertIs(worker.result_contracts[0], initial_contract)
         self.assertIs(worker.result_contracts[1], repair_contract)
+
+    def test_run_task_result_turn_accepts_valid_contract_when_terminal_failed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            result_path = root / "result.json"
+            output_path = root / "developer.md"
+            output_path.write_text("实现摘要\n", encoding="utf-8")
+            contract = TaskResultContract(
+                turn_id="turn-contract-valid",
+                phase="phase",
+                task_kind="kind",
+                mode="mode",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": output_path},
+            )
+
+            def response(*, result_contract=None, completion_contract=None):  # noqa: ANN001, ARG001
+                materialize_task_result(
+                    contract=contract,
+                    result_path=result_path,
+                    status="completed",
+                    summary="文件契约有效",
+                )
+                worker.current_task_result_path = str(result_path)
+                return SimpleNamespace(ok=False, clean_output="terminal command returned failure")
+
+            worker = _FakeTaskWorker([response])
+            payload = run_task_result_turn_with_repair(
+                worker=worker,
+                label="contract_valid_terminal_failed",
+                prompt="原始 prompt",
+                result_contract=contract,
+                parse_result_payload=json.loads,
+                turn_goal=TaskTurnGoal(
+                    goal_id="contract_valid",
+                    outcomes={"completed": OutcomeGoal(status="completed", required_aliases=("developer_output",))},
+                ),
+            )
+
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(len(worker.prompts), 1)
 
     def test_run_completion_turn_with_repair_retries_when_review_md_missing(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

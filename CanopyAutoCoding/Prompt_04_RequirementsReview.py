@@ -11,7 +11,24 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from T04_common_prompt import main_agent_workflow_after_review, task_start_prompt, state_machine_output
+from canopy_core.prompt_contracts.spec import (
+    ACCESS_READ,
+    ACCESS_READ_WRITE,
+    ACCESS_WRITE,
+    CHANGE_MAY_CHANGE,
+    CHANGE_MUST_CHANGE,
+    CHANGE_NONE,
+    CLEANUP_AGENT_INSIDE_FILE,
+    CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+    SPECIAL_OPEN_HITL,
+    SPECIAL_REVIEW_FAIL,
+    SPECIAL_REVIEW_PASS,
+    FileSpec,
+    OutcomeSpec,
+    agent_prompt,
+    prompt_helper,
+)
+from T04_common_prompt import task_start_prompt, state_machine_output
 from Prompt_03_RequirementsClarification import output_protocol, fintech_ba
 
 # [审核器] 人格定位提示词 (系统设置的智能体,仅用于需求澄清)
@@ -28,6 +45,7 @@ auditor = f"""* 角色属性：逻辑网关 / 确定性校验器 / 审核器
 
 
 # 触发 [HITL] 之后的通用提示词
+@prompt_helper(no_turn=True)
 def human_reply_sop(human_msg, *, ask_human_md='name_与人类交流.md',
                     requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
     output_protocol_prompt = output_protocol(requirements_clear_md, ask_human_md)
@@ -74,6 +92,35 @@ def human_reply_sop(human_msg, *, ask_human_md='name_与人类交流.md',
 
 
 # [人类] 审核需求澄清文档后,若提出疑问或建议
+@agent_prompt(
+    prompt_id="a03.requirements_review.human_feedback",
+    stage="a03",
+    role="requirements_analyst",
+    intent="human_feedback",
+    mode="a03_human_feedback",
+    files={
+        "ask_human": FileSpec(
+            path_arg="ask_human_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求分析师对人类反馈后的追问或清空信号",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_OPEN_HITL,
+        ),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ_WRITE, change=CHANGE_MUST_CHANGE),
+        "hitl_record": FileSpec(
+            path_arg="hitl_record_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="人类反馈解析后的事实缓存",
+            cleanup=CLEANUP_AGENT_INSIDE_FILE,
+        ),
+    },
+    outcomes={
+        "completed": OutcomeSpec(status="completed", requires=("requirements_clear", "hitl_record"), forbids=("ask_human",)),
+        "hitl": OutcomeSpec(status="hitl", requires=("ask_human", "hitl_record"), special=SPECIAL_OPEN_HITL),
+    },
+)
 def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
                    requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
     human_reply_sop_prompt = human_reply_sop(human_msg, ask_human_md=ask_human_md,
@@ -87,6 +134,20 @@ def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
 
 
 # [需求分析师] resume初始化
+@agent_prompt(
+    prompt_id="a03.requirements_review.ba_resume",
+    stage="a03",
+    role="requirements_analyst",
+    intent="ready",
+    mode="a03_ba_resume",
+    files={
+        "ask_human": FileSpec(path_arg="ask_human_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+    },
+    outcomes={"ready": OutcomeSpec(status="ready")},
+)
 def resume_ba(human_msg=None, ba_desc=fintech_ba, init_prompt=task_start_prompt,
               ask_human_md='name_与人类交流.md', original_requirement_md='name_原始需求.md',
               requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md'):
@@ -115,6 +176,36 @@ def resume_ba(human_msg=None, ba_desc=fintech_ba, init_prompt=task_start_prompt,
 
 
 # 初始化 [审核器] 智能体, 并要求审核 '需求澄清'
+@agent_prompt(
+    prompt_id="a03.requirements_review.reviewer_round",
+    stage="a03",
+    role="reviewer",
+    intent="review",
+    mode="a03_reviewer_round",
+    files={
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "review_md": FileSpec(
+            path_arg="requirement_review_md",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求评审未通过时的详细问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "review_json": FileSpec(
+            path_arg="requirement_review_json",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求评审 pass/fail 结构化事实源",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+    },
+    outcomes={
+        "review_pass": OutcomeSpec(status="review_pass", requires=("review_json",), forbids=("review_md",), special=SPECIAL_REVIEW_PASS),
+        "review_fail": OutcomeSpec(status="review_fail", requires=("review_json", "review_md"), special=SPECIAL_REVIEW_FAIL),
+    },
+)
 def requirements_review_init(auditor_desc=auditor, init_prompt=task_start_prompt, task_name="需求评审",
                              *, original_requirement_md='name_原始需求.md',
                              hitl_record_md='name_人机交互澄清记录.md',
@@ -154,11 +245,73 @@ def requirements_review_init(auditor_desc=auditor, init_prompt=task_start_prompt
 
 
 # 将 [审核器] 的评审结果发给 [需求分析师], 要求分析
+@agent_prompt(
+    prompt_id="a03.requirements_review.feedback",
+    stage="a03",
+    role="requirements_analyst",
+    intent="review_feedback",
+    mode="a03_ba_feedback",
+    files={
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "ask_human": FileSpec(
+            path_arg="ask_human_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="评审反馈信息不足时的 HITL 问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_OPEN_HITL,
+        ),
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(
+            path_arg="requirements_clear_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MAY_CHANGE,
+            meaning="存在属实评审问题时修订后的需求澄清",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "ba_feedback": FileSpec(
+            path_arg="what_just_change",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求分析师对评审意见的修复说明",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+    },
+    outcomes={
+        "hitl": OutcomeSpec(status="hitl", requires=("ask_human",), forbids=("ba_feedback",), special=SPECIAL_OPEN_HITL),
+        "completed": OutcomeSpec(status="completed", requires=("ba_feedback",), optional=("requirements_clear",), forbids=("ask_human",)),
+    },
+)
 def review_feedback(review_msg, *, original_requirement_md='name_原始需求.md',
                     ask_human_md='name_与人类交流.md', hitl_record_md='name_人机交互澄清记录.md',
                     requirements_clear_md='name_需求澄清.md', what_just_change='name_需求分析师反馈.md'):
-    main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(hitl_record_md=hitl_record_md,
-                                                                               ask_human_md=ask_human_md)
+    review_feedback_workflow_prompt = f"""## Workflow (SOP)
+
+### Step 1: 审计项预处理
+1. 语义去重：将不同审核员针对同一逻辑点的重复问题合并为单一审计项。
+2. 冲突消解：若不同审核员意见矛盾，必须基于《{original_requirement_md}》、《{hitl_record_md}》和代码事实判定。
+
+### Step 2: 评审意见解析与定性
+逐条归类为：
+1. `[属实问题]`：必须修复到《{requirements_clear_md}》。
+2. `[误判问题]`：不得修改《{requirements_clear_md}》，只在《{what_just_change}》说明驳回理由。
+3. `[待决疑问/歧义]`：现有信息不足以唯一决策，必须进入 HITL。
+
+### Step 3: 状态路由与文件写入
+只能选择一个分支：
+
+#### 分支 A: `HITL`
+- 触发条件：存在必须人类拍板的业务分歧、信息不足或无法唯一裁决的问题。
+- 文件动作：只覆盖写入非空《{ask_human_md}》。
+- 不要写入《{what_just_change}》；《{requirements_clear_md}》可保持原样。
+- 返回：`HITL`
+
+#### 分支 B: `修改完成`
+- 触发条件：所有评审项均可依靠现有信息解决。
+- 文件动作：如果存在 `[属实问题]`，必须更新《{requirements_clear_md}》；如果全是 `[误判问题]`，不要修改《{requirements_clear_md}》。
+- 无论是否修改《{requirements_clear_md}》，都必须覆盖写入《{what_just_change}》说明修复/驳回/裁决结果。
+- 《{ask_human_md}》必须为空。
+- 返回：`修改完成`"""
     review_feedback_prompt = f"""## 任务背景
 审计员已基于《{original_requirement_md}》+《{hitl_record_md}》对比了你的《{requirements_clear_md}》。
 你需要对这些审计员提出的评审意见进行鉴定、修复，并在信息不足时向人类发起求助。
@@ -169,20 +322,52 @@ def review_feedback(review_msg, *, original_requirement_md='name_原始需求.md
 {review_msg}
 [REVIEW MSG END]
 
-{main_agent_workflow_after_review_prompt}
+{review_feedback_workflow_prompt}
+
+## 本轮文件写入分支 (必须按状态二选一)
+- `HITL`: 只覆盖写入非空《{ask_human_md}》，不要写入《{what_just_change}》，《{requirements_clear_md}》可保持原样。
+- `修改完成`: 必须覆盖写入《{what_just_change}》；只有存在属实评审问题时才更新《{requirements_clear_md}》；《{ask_human_md}》必须为空。
 
 ## 约束
 * 禁止猜测：对于人类未回答的缺口，不允许自行假设默认值，必须进行追问。
 * 你的工作范围仅限 **业务逻辑决断** 与 **需求边界澄清**。严禁在答复或文档中进行任何“数据库表设计”、“技术架构选型”、或“代码实现论证”。
 * 冷酷执行：不需要对人类说“谢谢您的回复”或“好的，我已记录”，保持纯净的机器输出逻辑。
-* 输出禁令: 只允许返回 `信息足够` 或 `修改完成`，禁止返回其他内容。
-    * 如果输出 `修改完成` 那么《{ask_human_md}》必须为空
-    * 如果输出 `HITL` 那么《{ask_human_md}》必须为非空
+* 输出禁令: 只允许返回 `HITL` 或 `修改完成`，禁止返回其他内容。
+    * 如果输出 `修改完成`，必须更新《{what_just_change}》；只有存在属实评审问题时才更新《{requirements_clear_md}》；《{ask_human_md}》必须为空。
+    * 如果输出 `HITL`，只写入非空《{ask_human_md}》，不要写入《{what_just_change}》。
 * 修改禁令: 禁止修改除了《{what_just_change}》/《{requirements_clear_md}》/《{ask_human_md}》之外的文档或源代码。"""
     return review_feedback_prompt
 
 
 # 将 [需求分析师] 的回复发回给 [审核器] 智能体, 并要求重新审核
+@agent_prompt(
+    prompt_id="a03.requirements_review.reply_review",
+    stage="a03",
+    role="reviewer",
+    intent="review_reply",
+    mode="a03_reviewer_round",
+    files={
+        "review_md": FileSpec(
+            path_arg="requirement_review_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求评审未通过时的剩余问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "review_json": FileSpec(
+            path_arg="requirement_review_json",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求复评 pass/fail 结构化事实源",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+    },
+    outcomes={
+        "review_pass": OutcomeSpec(status="review_pass", requires=("review_json",), forbids=("review_md",), special=SPECIAL_REVIEW_PASS),
+        "review_fail": OutcomeSpec(status="review_fail", requires=("review_json", "review_md"), special=SPECIAL_REVIEW_FAIL),
+    },
+)
 def requirements_review_reply(ba_reply, task_name="需求评审", *,
                               requirement_review_md='name_需求评审记录_agent.md',
                               requirement_review_json='name_需求评审记录_agent.json',

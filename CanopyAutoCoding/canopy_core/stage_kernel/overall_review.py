@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
@@ -22,7 +22,7 @@ from canopy_core.prompt_contracts.overall_review import (
     review_all_code,
     review_all_code_again,
 )
-from canopy_core.runtime.contracts import TaskResultContract
+from canopy_core.runtime.contracts import TaskResultContract, TurnFileContract
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     cleanup_registered_tmux_workers,
@@ -74,11 +74,19 @@ from canopy_core.stage_kernel.shared_review import (
     ReviewAgentSelection,
     ReviewStageProgress,
     ReviewerRuntime,
+    build_reviewer_failure_reconfiguration_reason,
+    carry_reviewer_failure_state,
     collect_reviewer_agent_selections,
+    describe_reviewer_failure_reason,
     ensure_empty_file,
+    ensure_review_artifacts,
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
+    note_reviewer_failure,
+    resolve_stage_agent_config,
+    reviewer_requires_manual_model_reconfiguration,
     worker_has_provider_auth_error,
+    worker_has_provider_runtime_error,
 )
 from canopy_core.stage_kernel.turn_output_goals import (
     OutcomeGoal,
@@ -114,11 +122,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="复核阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
-    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|qwen|kimi|opencode")
+    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")
     parser.add_argument("--developer-role-prompt", default="", help="开发工程师自定义角色定义提示词")
+    parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=<key>,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖复核角色列表")
     parser.add_argument("--reviewer-role-prompt", action="append", default=[], help="重复传入以覆盖对应角色提示词")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
@@ -294,6 +303,112 @@ def _selection_from_runtime_state(payload: dict[str, object]) -> ReviewAgentSele
     )
 
 
+def _workflow_action_priority(action: str) -> int:
+    normalized = str(action or "").strip()
+    if normalized == "stage.a08.start":
+        return 2
+    if normalized == "stage.a07.start":
+        return 1
+    return 0
+
+
+def _worker_runtime_metadata(worker) -> dict[str, str]:
+    if worker is None:
+        return {}
+    runtime_metadata = getattr(worker, "runtime_metadata", None)
+    if callable(runtime_metadata):
+        with contextlib.suppress(Exception):
+            payload = runtime_metadata()
+            if isinstance(payload, dict):
+                return {
+                    str(key): "" if value is None else str(value)
+                    for key, value in payload.items()
+                    if str(key).strip()
+                }
+    raw_metadata = getattr(worker, "_runtime_metadata", {})
+    if isinstance(raw_metadata, dict):
+        return {
+            str(key): "" if value is None else str(value)
+            for key, value in raw_metadata.items()
+            if str(key).strip()
+        }
+    return {}
+
+
+def _handoff_workflow_action(handoff, *, default: str = "stage.a07.start") -> str:
+    worker = getattr(handoff, "worker", None)
+    metadata = _worker_runtime_metadata(worker)
+    return str(metadata.get("workflow_action", "")).strip() or default
+
+
+def _handoff_updated_at(handoff) -> str:
+    worker = getattr(handoff, "worker", None)
+    metadata = _worker_runtime_metadata(worker)
+    return str(metadata.get("updated_at", "")).strip()
+
+
+def _prefer_handoff(current, candidate, *, current_default_action: str = "stage.a07.start", candidate_default_action: str = "stage.a07.start"):
+    if current is None:
+        return candidate
+    if candidate is None:
+        return current
+    current_key = (
+        _workflow_action_priority(_handoff_workflow_action(current, default=current_default_action)),
+        _handoff_updated_at(current),
+    )
+    candidate_key = (
+        _workflow_action_priority(_handoff_workflow_action(candidate, default=candidate_default_action)),
+        _handoff_updated_at(candidate),
+    )
+    return candidate if candidate_key > current_key else current
+
+
+def _merge_preferred_reviewer_handoffs(
+    explicit_handoffs: Sequence[ReviewAgentHandoff],
+    discovered_handoffs: Sequence[ReviewAgentHandoff],
+) -> tuple[ReviewAgentHandoff, ...]:
+    merged: dict[str, ReviewAgentHandoff] = {}
+    for handoff in explicit_handoffs:
+        reviewer_key = str(handoff.reviewer_key).strip()
+        if reviewer_key:
+            merged[reviewer_key] = handoff
+    for handoff in discovered_handoffs:
+        reviewer_key = str(handoff.reviewer_key).strip()
+        if not reviewer_key:
+            continue
+        merged[reviewer_key] = _prefer_handoff(
+            merged.get(reviewer_key),
+            handoff,
+        )
+    return tuple(merged.values())
+
+
+def _workflow_action_label(action: str) -> str:
+    normalized = str(action or "").strip()
+    if normalized == "stage.a08.start":
+        return "复核阶段"
+    if normalized == "stage.a07.start":
+        return "任务开发阶段"
+    return normalized or "未知阶段"
+
+
+def _render_live_handoff_source_summary(
+    developer_handoff: DevelopmentAgentHandoff | None,
+    reviewer_handoffs: Sequence[ReviewAgentHandoff],
+) -> str:
+    parts: list[str] = []
+    if developer_handoff is not None:
+        parts.append(f"开发工程师来源: {_workflow_action_label(_handoff_workflow_action(developer_handoff))}")
+    if reviewer_handoffs:
+        counts: dict[str, int] = {}
+        for handoff in reviewer_handoffs:
+            label = _workflow_action_label(_handoff_workflow_action(handoff))
+            counts[label] = counts.get(label, 0) + 1
+        reviewer_source_text = ", ".join(f"{label}{count}个" for label, count in sorted(counts.items()))
+        parts.append(f"审核器来源: {reviewer_source_text}")
+    return "；".join(parts)
+
+
 def discover_live_development_handoffs(
     project_dir: str | Path,
     requirement_name: str,
@@ -313,7 +428,8 @@ def discover_live_development_handoffs(
         payload = _load_runtime_state_payload(state_path)
         if not payload:
             continue
-        if str(payload.get("workflow_action", "")).strip() != "stage.a07.start":
+        workflow_action = str(payload.get("workflow_action", "")).strip()
+        if workflow_action not in {"stage.a07.start", "stage.a08.start"}:
             continue
         if str(payload.get("project_dir", payload.get("work_dir", ""))).strip() != resolved_project_dir:
             continue
@@ -334,6 +450,7 @@ def discover_live_development_handoffs(
         except Exception:
             continue
         updated_at = str(payload.get("updated_at", "")).strip()
+        candidate_sort_key = f"{_workflow_action_priority(workflow_action)}|{updated_at}"
         worker_id = str(payload.get("worker_id", "")).strip()
         if worker_id == build_developer_worker_id():
             candidate = DevelopmentAgentHandoff(
@@ -341,8 +458,10 @@ def discover_live_development_handoffs(
                 role_prompt=str(payload.get("role_prompt", "")).strip(),
                 worker=worker,
             )
-            if candidate_developer is None or updated_at >= candidate_developer[0]:
-                candidate_developer = (updated_at, candidate)
+            if not _is_live_developer_handoff(candidate):
+                continue
+            if candidate_developer is None or candidate_sort_key >= candidate_developer[0]:
+                candidate_developer = (candidate_sort_key, candidate)
             continue
         if not worker_id.startswith("development-review-"):
             continue
@@ -361,9 +480,11 @@ def discover_live_development_handoffs(
             selection=selection,
             worker=worker,
         )
+        if not _is_live_reviewer_handoff(candidate):
+            continue
         existing = reviewer_candidates.get(reviewer_key)
-        if existing is None or updated_at >= existing[0]:
-            reviewer_candidates[reviewer_key] = (updated_at, candidate)
+        if existing is None or candidate_sort_key >= existing[0]:
+            reviewer_candidates[reviewer_key] = (candidate_sort_key, candidate)
     developer_handoff = candidate_developer[1] if candidate_developer is not None else None
     reviewer_handoffs = tuple(reviewer_candidates[key][1] for key in sorted(reviewer_candidates))
     return developer_handoff, reviewer_handoffs
@@ -407,14 +528,53 @@ def bind_reviewer_runtime_from_handoff(
     reviewer_name = str(getattr(handoff.worker, "session_name", "") or "").strip() or handoff.role_name
     _set_worker_stage_metadata(handoff.worker, project_dir=project_dir, requirement_name=requirement_name)
     review_md_path, review_json_path = build_overall_review_reviewer_artifact_paths(project_dir, requirement_name, reviewer_name)
-    ensure_empty_file(review_md_path)
-    return ReviewerRuntime(
+    ensure_review_artifacts(review_md_path, review_json_path)
+    reviewer = ReviewerRuntime(
         reviewer_name=handoff.reviewer_key,
         selection=handoff.selection,
         worker=handoff.worker,
         review_md_path=review_md_path,
         review_json_path=review_json_path,
         contract=build_placeholder_reviewer_contract(review_json_path),
+        failure_streak=getattr(handoff, "failure_streak", 0) or 0,
+        last_failure_reason=str(getattr(handoff, "last_failure_reason", "") or "").strip(),
+    )
+    return normalize_overall_review_reviewer_runtime(
+        reviewer,
+        project_dir=project_dir,
+        requirement_name=requirement_name,
+    )
+
+
+def normalize_overall_review_reviewer_runtime(
+    reviewer: ReviewerRuntime,
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+) -> ReviewerRuntime:
+    artifact_reviewer_name = str(getattr(reviewer.worker, "session_name", "") or "").strip() or reviewer.reviewer_name
+    review_md_path, review_json_path = build_overall_review_reviewer_artifact_paths(
+        project_dir,
+        requirement_name,
+        artifact_reviewer_name,
+    )
+    ensure_review_artifacts(review_md_path, review_json_path)
+    current_status_path = Path(getattr(reviewer.contract, "status_path", review_json_path)).expanduser().resolve()
+    if (
+        reviewer.review_md_path.resolve() == review_md_path.resolve()
+        and reviewer.review_json_path.resolve() == review_json_path.resolve()
+        and current_status_path == review_json_path.resolve()
+    ):
+        return reviewer
+    return ReviewerRuntime(
+        reviewer_name=reviewer.reviewer_name,
+        selection=reviewer.selection,
+        worker=reviewer.worker,
+        review_md_path=review_md_path,
+        review_json_path=review_json_path,
+        contract=build_placeholder_reviewer_contract(review_json_path),
+        failure_streak=getattr(reviewer, "failure_streak", 0) or 0,
+        last_failure_reason=str(getattr(reviewer, "last_failure_reason", "") or "").strip(),
     )
 
 
@@ -462,10 +622,14 @@ def build_reviewer_workers(
         live_handoff = live_handoffs_by_key.get(reviewer_key)
         if live_handoff is not None:
             reviewers.append(
-                bind_reviewer_runtime_from_handoff(
+                normalize_overall_review_reviewer_runtime(
+                    bind_reviewer_runtime_from_handoff(
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        handoff=live_handoff,
+                    ),
                     project_dir=project_dir,
                     requirement_name=requirement_name,
-                    handoff=live_handoff,
                 )
             )
             continue
@@ -485,20 +649,11 @@ def build_reviewer_workers(
             selection=selection,
         )
         _set_worker_stage_metadata(reviewer.worker, project_dir=project_dir, requirement_name=requirement_name)
-        review_md_path, review_json_path = build_overall_review_reviewer_artifact_paths(
-            project_dir,
-            requirement_name,
-            str(reviewer.worker.session_name).strip() or reviewer_spec.role_name,
-        )
-        ensure_empty_file(review_md_path)
         reviewers.append(
-            ReviewerRuntime(
-                reviewer_name=reviewer.reviewer_name,
-                selection=reviewer.selection,
-                worker=reviewer.worker,
-                review_md_path=review_md_path,
-                review_json_path=review_json_path,
-                contract=build_placeholder_reviewer_contract(review_json_path),
+            normalize_overall_review_reviewer_runtime(
+                reviewer,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
             )
         )
     return reviewers
@@ -530,8 +685,6 @@ def build_overall_review_init_result_contract(paths: dict[str, Path], *, mode: s
             "task_md": paths["task_md_path"],
             "task_json": paths["task_json_path"],
         },
-        terminal_status_tokens={"ready": ("完成",)},
-        terminal_status_summaries={"ready": "智能体已完成复核阶段初始化"},
     )
 
 
@@ -552,16 +705,36 @@ def build_overall_review_refine_result_contract(paths: dict[str, Path]) -> TaskR
             "task_md": paths["task_md_path"],
             "task_json": paths["task_json_path"],
         },
-        terminal_status_tokens={"completed": ("修改完成",)},
-        terminal_status_summaries={"completed": "开发工程师已完成复核阶段代码修订"},
     )
 
 
 def build_overall_review_metadata_repair_result_contract(paths: dict[str, Path]) -> TaskResultContract:
-    contract = build_overall_review_refine_result_contract(paths)
-    return replace(
-        contract,
-        terminal_status_tokens={"completed": ("任务完成", "修改完成")},
+    return build_overall_review_refine_result_contract(paths)
+
+
+def build_overall_review_reviewer_completion_contract(
+    *,
+    reviewer_name: str,
+    task_name: str,
+    review_md_path: Path,
+    review_json_path: Path,
+) -> TurnFileContract:
+    base_contract = build_reviewer_completion_contract(
+        reviewer_name=reviewer_name,
+        task_name=task_name,
+        review_md_path=review_md_path,
+        review_json_path=review_json_path,
+    )
+    return TurnFileContract(
+        turn_id=f"overall_review_{sanitize_requirement_name(task_name)}_{sanitize_requirement_name(reviewer_name)}",
+        phase="复核阶段",
+        status_path=review_json_path,
+        validator=base_contract.validator,
+        quiet_window_sec=base_contract.quiet_window_sec,
+        kind=base_contract.kind,
+        tracked_artifacts=base_contract.tracked_artifacts,
+        artifact_rules=base_contract.artifact_rules,
+        outcome_artifacts=base_contract.outcome_artifacts,
     )
 
 
@@ -755,6 +928,11 @@ def _run_single_overall_review_reviewer_init(
     init_contract = build_overall_review_init_result_contract(paths, mode="a08_reviewer_init")
     current_reviewer = reviewer
     while True:
+        current_reviewer = normalize_overall_review_reviewer_runtime(
+            current_reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
         reviewer_spec = reviewer_specs_by_name[current_reviewer.reviewer_name]
         try:
             run_task_result_turn_with_repair(
@@ -774,12 +952,58 @@ def _run_single_overall_review_reviewer_init(
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
             if is_worker_death_error(error):
-                message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
-                return None
+                failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
+                failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
+                if reviewer_requires_manual_model_reconfiguration(failed_reviewer):
+                    reason_text = build_reviewer_failure_reconfiguration_reason(
+                        failed_reviewer,
+                        role_label=reviewer_display_name,
+                        failure_reason=failure_reason,
+                    )
+                    mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
+                    replacement = recreate_development_reviewer_runtime(
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer=failed_reviewer,
+                        reviewer_spec=reviewer_spec,
+                        progress=progress,
+                        force_model_change=True,
+                        required_reconfiguration=True,
+                        reason_text=reason_text,
+                    )
+                    if replacement is None:
+                        raise RuntimeError(f"{reviewer_display_name} 初始化失败，且未能重建审核智能体") from error
+                    _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
+                    current_reviewer = normalize_overall_review_reviewer_runtime(
+                        replacement,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                    )
+                    continue
+                replacement = recreate_development_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=failed_reviewer,
+                    reviewer_spec=reviewer_spec,
+                    progress=progress,
+                    force_model_change=False,
+                )
+                if replacement is None:
+                    message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
+                    return None
+                _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
+                current_reviewer = normalize_overall_review_reviewer_runtime(
+                    carry_reviewer_failure_state(replacement, previous=failed_reviewer),
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                )
+                continue
             if is_recoverable_startup_failure(error, current_reviewer.worker):
                 reason_text = (
                     f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
                     if is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+                    else f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
+                    if worker_has_provider_runtime_error(current_reviewer.worker)
                     else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
@@ -796,7 +1020,11 @@ def _run_single_overall_review_reviewer_init(
                 if replacement is None:
                     raise RuntimeError(f"{reviewer_display_name} 初始化失败，且未能重建审核智能体") from error
                 _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
-                current_reviewer = replacement
+                current_reviewer = normalize_overall_review_reviewer_runtime(
+                    replacement,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                )
                 continue
             raise
 
@@ -841,13 +1069,18 @@ def run_overall_review_turn_with_recreation(
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
+        current_reviewer = normalize_overall_review_reviewer_runtime(
+            current_reviewer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
         try:
             run_completion_turn_with_repair(
                 worker=current_reviewer.worker,
                 label=label,
                 prompt=prompt,
-                completion_contract=build_reviewer_completion_contract(
+                completion_contract=build_overall_review_reviewer_completion_contract(
                     reviewer_name=current_reviewer.reviewer_name,
                     task_name=OVERALL_REVIEW_TASK_NAME,
                     review_md_path=current_reviewer.review_md_path,
@@ -870,12 +1103,15 @@ def run_overall_review_turn_with_recreation(
             ):
                 return current_reviewer
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
-            auth_error = is_provider_auth_error(error)
+            auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+            provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
-            if auth_error or ready_timeout_error:
+            if auth_error or provider_runtime_error or ready_timeout_error:
                 reason_text = (
                     f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
                     if auth_error
+                    else f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
+                    if provider_runtime_error
                     else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
@@ -905,18 +1141,40 @@ def run_overall_review_turn_with_recreation(
                 current_reviewer = initialized
                 continue
             if is_worker_death_error(error):
-                replacement = recreate_development_reviewer_runtime(
-                    project_dir=project_dir,
-                    requirement_name=requirement_name,
-                    reviewer=current_reviewer,
-                    reviewer_spec=reviewer_spec,
-                    progress=progress,
-                    force_model_change=False,
-                )
+                failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
+                failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
+                if reviewer_requires_manual_model_reconfiguration(failed_reviewer):
+                    reason_text = build_reviewer_failure_reconfiguration_reason(
+                        failed_reviewer,
+                        role_label=reviewer_display_name,
+                        failure_reason=failure_reason,
+                    )
+                    mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
+                    replacement = recreate_development_reviewer_runtime(
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer=failed_reviewer,
+                        reviewer_spec=reviewer_spec,
+                        progress=progress,
+                        force_model_change=True,
+                        required_reconfiguration=True,
+                        reason_text=reason_text,
+                    )
+                else:
+                    replacement = recreate_development_reviewer_runtime(
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer=failed_reviewer,
+                        reviewer_spec=reviewer_spec,
+                        progress=progress,
+                        force_model_change=False,
+                    )
                 if replacement is None:
                     message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
                     return None
                 _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
+                if not reviewer_requires_manual_model_reconfiguration(failed_reviewer):
+                    replacement = carry_reviewer_failure_state(replacement, previous=failed_reviewer)
                 initialized = _run_single_overall_review_reviewer_init(
                     replacement,
                     project_dir=project_dir,
@@ -1068,21 +1326,22 @@ def run_overall_review_stage(
     cleanup_paths: list[str] = []
     try:
         paths = ensure_overall_review_inputs(project_dir=project_dir, requirement_name=requirement_name)
-        live_developer_handoff = developer_handoff if _is_live_developer_handoff(developer_handoff) else None
-        live_reviewer_handoffs = tuple(item for item in reviewer_handoff if _is_live_reviewer_handoff(item))
-        if live_developer_handoff is None or not live_reviewer_handoffs:
-            discovered_developer_handoff, discovered_reviewer_handoffs = discover_live_development_handoffs(
-                project_dir=project_dir,
-                requirement_name=requirement_name,
-            )
-            if live_developer_handoff is None:
-                live_developer_handoff = discovered_developer_handoff
-            if not live_reviewer_handoffs:
-                live_reviewer_handoffs = tuple(
-                    item for item in discovered_reviewer_handoffs if _is_live_reviewer_handoff(item)
-                )
+        explicit_live_developer_handoff = developer_handoff if _is_live_developer_handoff(developer_handoff) else None
+        explicit_live_reviewer_handoffs = tuple(item for item in reviewer_handoff if _is_live_reviewer_handoff(item))
+        discovered_developer_handoff, discovered_reviewer_handoffs = discover_live_development_handoffs(
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
+        live_developer_handoff = _prefer_handoff(explicit_live_developer_handoff, discovered_developer_handoff)
+        live_reviewer_handoffs = _merge_preferred_reviewer_handoffs(
+            explicit_live_reviewer_handoffs,
+            tuple(item for item in discovered_reviewer_handoffs if _is_live_reviewer_handoff(item)),
+        )
         if live_developer_handoff is not None or live_reviewer_handoffs:
-            message("检测到任务开发阶段仍存活的智能体，将直接复用进入复核阶段")
+            message("检测到当前需求下仍存活的开发/复核智能体，将直接复用进入复核阶段")
+            source_summary = _render_live_handoff_source_summary(live_developer_handoff, live_reviewer_handoffs)
+            if source_summary:
+                message(source_summary)
         else:
             cleanup_paths.extend(cleanup_runtime_dirs_by_scope(
                 runtime_root=Path(project_dir).expanduser().resolve() / DEVELOPMENT_RUNTIME_ROOT_NAME,
@@ -1111,18 +1370,32 @@ def run_overall_review_stage(
             progress=progress,
         )
         reviewer_specs_by_name = {str(item.reviewer_key or item.role_name).strip(): item for item in reviewer_specs}
-        reviewer_selections_by_name = collect_reviewer_agent_selections(
-            project_dir=project_dir,
-            reviewer_specs=reviewer_specs,
-            display_name_resolver=lambda current_project_dir, reviewer_spec, occupied_session_names: _predict_worker_display_name(
-                project_dir=current_project_dir,
-                worker_id=build_development_reviewer_worker_id(getattr(reviewer_spec, "role_name", "")),
-                occupied_session_names=occupied_session_names,
-            ),
-            progress=progress,
-            skip_reviewer_keys=[item.reviewer_key for item in live_reviewer_handoffs],
-            reserved_session_names=(_developer_display_name(project_dir=project_dir),),
-        )
+        agent_config = resolve_stage_agent_config(args)
+        reviewer_selections_by_name = dict(agent_config.reviewers or {})
+        live_reviewer_keys = {str(item.reviewer_key).strip() for item in live_reviewer_handoffs if str(item.reviewer_key).strip()}
+        missing_reviewer_specs = [
+            item for item in reviewer_specs
+            if str(item.reviewer_key or item.role_name).strip()
+            and str(item.reviewer_key or item.role_name).strip() not in live_reviewer_keys
+            and str(item.reviewer_key or item.role_name).strip() not in reviewer_selections_by_name
+        ]
+        if missing_reviewer_specs:
+            reviewer_selections_by_name.update(
+                collect_reviewer_agent_selections(
+                    project_dir=project_dir,
+                    reviewer_specs=missing_reviewer_specs,
+                    display_name_resolver=lambda current_project_dir, reviewer_spec, occupied_session_names: _predict_worker_display_name(
+                        project_dir=current_project_dir,
+                        worker_id=build_development_reviewer_worker_id(getattr(reviewer_spec, "role_name", "")),
+                        occupied_session_names=occupied_session_names,
+                    ),
+                    progress=progress,
+                    reserved_session_names=(
+                        _developer_display_name(project_dir=project_dir),
+                        *(str(item.worker.session_name or "").strip() for item in live_reviewer_handoffs if str(item.worker.session_name or "").strip()),
+                    ),
+                )
+            )
         reviewers = build_reviewer_workers(
             args,
             project_dir=project_dir,

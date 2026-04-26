@@ -133,6 +133,7 @@ def run_main_phase_with_death_handling(
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
+        allow_completed_nonready=True,
     )
     return result, current_reviewers, updated_main
 
@@ -156,11 +157,13 @@ def run_reviewer_phase_with_death_handling(
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
-    ensure_reviewers_ready(
+    # Reviewer startup is intentionally lazy here: stage-specific reviewer turn
+    # wrappers know how to recreate or drop a reviewer after provider/auth/ready
+    # failures, while this shared layer only guarantees the main owner is ready.
+    ensure_main_ready(
         current_main,
-        current_reviewers,
+        (),
         main_label=main_label,
-        reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
     )
     updated_reviewers = run_phase(current_reviewers)
@@ -177,6 +180,7 @@ def run_reviewer_phase_with_death_handling(
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
+        allow_completed_nonready=True,
     )
     return updated_reviewers, current_main
 

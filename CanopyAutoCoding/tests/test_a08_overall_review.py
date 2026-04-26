@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import tempfile
 import unittest
@@ -16,16 +17,22 @@ from A07_Development import (
 )
 from A08_OverallReview import (
     OverallReviewStageResult,
+    bind_reviewer_runtime_from_handoff,
+    build_overall_review_reviewer_completion_contract,
     build_overall_review_metadata_repair_result_contract,
     build_overall_review_paths,
     build_overall_review_refine_result_contract,
     discover_live_development_handoffs,
     ensure_overall_review_inputs,
+    normalize_overall_review_reviewer_runtime,
     refine_overall_review_code,
     run_overall_review_stage,
+    run_overall_review_turn_with_recreation,
+    build_reviewer_workers,
     _run_overall_review_developer_turn,
     _shutdown_workers as shutdown_overall_review_workers,
 )
+from canopy_core.runtime.contracts import TaskResultContract, resolve_task_result_decision
 from canopy_core.stage_kernel.shared_review import ReviewAgentHandoff, ReviewAgentSelection, ReviewerRuntime
 
 
@@ -37,6 +44,7 @@ class _FakeWorker:
         runtime_root: str | Path = "/tmp/runtime",
         runtime_dir: str | Path = "/tmp/runtime/worker",
         session_exists_value: bool = True,
+        runtime_metadata_payload: dict[str, object] | None = None,
     ) -> None:
         self.session_name = session_name
         self.runtime_root = Path(runtime_root)
@@ -44,6 +52,11 @@ class _FakeWorker:
         self.runtime_root.mkdir(parents=True, exist_ok=True)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._session_exists_value = session_exists_value
+        self._runtime_metadata = {
+            str(key): value
+            for key, value in dict(runtime_metadata_payload or {}).items()
+            if str(key).strip()
+        }
         self.metadata_updates: list[dict[str, object]] = []
         self.killed = False
 
@@ -56,6 +69,17 @@ class _FakeWorker:
 
     def set_runtime_metadata(self, **kwargs) -> None:  # noqa: ANN003
         self.metadata_updates.append(dict(kwargs))
+        self._runtime_metadata.update(dict(kwargs))
+
+    def runtime_metadata(self) -> dict[str, str]:
+        payload = {
+            "session_name": self.session_name,
+            "runtime_root": str(self.runtime_root),
+            "runtime_dir": str(self.runtime_dir),
+        }
+        for key, value in self._runtime_metadata.items():
+            payload[str(key)] = "" if value is None else str(value)
+        return payload
 
 
 def _dummy_contract():
@@ -70,6 +94,106 @@ def _write_required_inputs(paths: dict[str, Path]) -> None:
 
 
 class A08OverallReviewTests(unittest.TestCase):
+    def test_build_overall_review_reviewer_completion_contract_uses_a08_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            review_md_path = project_dir / "需求A_整体代码复核记录_测试工程师.md"
+            review_json_path = project_dir / "需求A_整体复核记录_测试工程师.json"
+            review_md_path.write_text("存在问题\n", encoding="utf-8")
+            review_json_path.write_text(
+                json.dumps([{"task_name": "全面复核", "review_pass": False}], ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            contract = build_overall_review_reviewer_completion_contract(
+                reviewer_name="测试工程师",
+                task_name="全面复核",
+                review_md_path=review_md_path,
+                review_json_path=review_json_path,
+            )
+
+        self.assertEqual(contract.turn_id, "overall_review_全面复核_测试工程师")
+        self.assertEqual(contract.phase, "复核阶段")
+        self.assertEqual(contract.status_path, review_json_path.resolve())
+
+    def test_normalize_overall_review_reviewer_runtime_rebinds_development_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            legacy_review_md = project_dir / "需求A_代码评审记录_测试工程师.md"
+            legacy_review_json = project_dir / "需求A_评审记录_测试工程师.json"
+            legacy_review_md.write_text("旧开发评审\n", encoding="utf-8")
+            legacy_review_json.write_text("[]", encoding="utf-8")
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+                review_md_path=legacy_review_md,
+                review_json_path=legacy_review_json,
+                contract=_dummy_contract(),
+            )
+
+            normalized = normalize_overall_review_reviewer_runtime(
+                reviewer,
+                project_dir=project_dir,
+                requirement_name="需求A",
+            )
+
+            self.assertTrue(normalized.review_md_path.exists())
+            self.assertEqual(json.loads(normalized.review_json_path.read_text(encoding="utf-8")), [])
+            self.assertTrue(legacy_review_md.exists())
+            self.assertTrue(legacy_review_json.exists())
+
+        self.assertEqual(normalized.review_md_path.name, "需求A_整体代码复核记录_测试工程师-天英星.md")
+        self.assertEqual(normalized.review_json_path.name, "需求A_整体复核记录_测试工程师-天英星.json")
+
+    def test_bind_reviewer_runtime_precreates_empty_review_json(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            handoff = ReviewAgentHandoff(
+                reviewer_key="测试工程师",
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+            )
+
+            reviewer = bind_reviewer_runtime_from_handoff(
+                project_dir=project_dir,
+                requirement_name="需求A",
+                handoff=handoff,
+            )
+
+            self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
+            self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [])
+
+    def test_build_reviewer_workers_rebinds_created_development_reviewer_paths(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            legacy_reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+            legacy_reviewer.review_md_path.write_text("", encoding="utf-8")
+            legacy_reviewer.review_json_path.write_text("[]", encoding="utf-8")
+
+            with patch("A08_OverallReview.create_reviewer_runtime", return_value=legacy_reviewer):
+                reviewers = build_reviewer_workers(
+                    argparse.Namespace(),
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    reviewer_specs=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+                    reviewer_handoff=(),
+                    reviewer_selections_by_name={"测试工程师": legacy_reviewer.selection},
+                )
+
+        self.assertEqual(len(reviewers), 1)
+        self.assertEqual(reviewers[0].review_md_path.name, "需求A_整体代码复核记录_测试工程师-天英星.md")
+        self.assertEqual(reviewers[0].review_json_path.name, "需求A_整体复核记录_测试工程师-天英星.json")
+
     def test_build_overall_review_paths_uses_distinct_review_artifacts(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             development_paths = build_development_paths(tmp_dir, "需求A")
@@ -121,14 +245,36 @@ class A08OverallReviewTests(unittest.TestCase):
             self.assertIn(str(developer.worker.runtime_dir.resolve()), removed)
             self.assertIn(str(reviewer.worker.runtime_dir.resolve()), removed)
 
-    def test_metadata_repair_contract_accepts_check_develop_job_completion_token(self):
+    def test_metadata_repair_contract_uses_file_contract_only(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             paths = build_overall_review_paths(tmp_dir, "需求A")
             normal_contract = build_overall_review_refine_result_contract(paths)
             repair_contract = build_overall_review_metadata_repair_result_contract(paths)
 
-        self.assertEqual(normal_contract.terminal_status_tokens["completed"], ("修改完成",))
-        self.assertEqual(repair_contract.terminal_status_tokens["completed"], ("任务完成", "修改完成"))
+        self.assertEqual(repair_contract.mode, normal_contract.mode)
+        self.assertEqual(repair_contract.expected_statuses, ("completed",))
+        self.assertEqual(repair_contract.required_artifacts, normal_contract.required_artifacts)
+
+    def test_overall_review_refine_contract_resolves_from_developer_output_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = build_overall_review_paths(tmp_dir, "需求A")
+            contract = build_overall_review_refine_result_contract(paths)
+            empty_contract = TaskResultContract(
+                turn_id="a08_developer_refine_all_code",
+                phase="a08_developer_refine_all_code",
+                task_kind="a08_developer_refine_all_code",
+                mode="a08_developer_refine_all_code",
+                expected_statuses=("completed",),
+                optional_artifacts={"developer_output": paths["developer_output_path"]},
+            )
+            with self.assertRaisesRegex(ValueError, "复核阶段开发元数据"):
+                resolve_task_result_decision(empty_contract)
+
+            paths["developer_output_path"].write_text("修订摘要\n", encoding="utf-8")
+            decision = resolve_task_result_decision(contract)
+
+        self.assertEqual(decision.status, "completed")
+        self.assertIn("developer_output", decision.artifacts)
 
     def test_refine_overall_review_code_uses_repair_contract_only_for_metadata_repair(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -163,8 +309,10 @@ class A08OverallReviewTests(unittest.TestCase):
             [call["label"] for call in calls],
             ["overall_review_refine_all_code", "overall_review_refine_all_code_metadata_repair"],
         )
-        self.assertEqual(calls[0]["result_contract"].terminal_status_tokens["completed"], ("修改完成",))
-        self.assertEqual(calls[1]["result_contract"].terminal_status_tokens["completed"], ("任务完成", "修改完成"))
+        self.assertEqual(calls[0]["result_contract"].mode, "a08_developer_refine_all_code")
+        self.assertEqual(calls[1]["result_contract"].mode, "a08_developer_refine_all_code")
+        self.assertEqual(calls[0]["result_contract"].expected_statuses, ("completed",))
+        self.assertEqual(calls[1]["result_contract"].expected_statuses, ("completed",))
 
     def test_overall_review_refine_turn_uses_repair_contract_for_internal_repair_attempts(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -195,8 +343,9 @@ class A08OverallReviewTests(unittest.TestCase):
                 )
 
         self.assertIs(returned, developer)
-        self.assertEqual(calls[0]["result_contract"].terminal_status_tokens["completed"], ("修改完成",))
-        self.assertEqual(calls[0]["repair_result_contract"].terminal_status_tokens["completed"], ("任务完成", "修改完成"))
+        self.assertEqual(calls[0]["repair_result_contract"].mode, "a08_developer_refine_all_code")
+        self.assertEqual(calls[0]["result_contract"].expected_statuses, ("completed",))
+        self.assertEqual(calls[0]["repair_result_contract"].expected_statuses, ("completed",))
 
     def test_ensure_overall_review_inputs_requires_all_tasks_completed(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -343,6 +492,150 @@ class A08OverallReviewTests(unittest.TestCase):
             refine_mock.assert_called_once()
             self.assertTrue(json.loads(Path(result.state_path).read_text(encoding="utf-8"))["passed"])
 
+    def test_run_overall_review_turn_with_recreation_rebinds_recreated_reviewer_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            initial_reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+            replacement = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=initial_reviewer.selection,
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+            completion_paths = []
+
+            def fake_run_completion_turn_with_repair(**kwargs):  # noqa: ANN003
+                completion_paths.append(
+                    (
+                        kwargs["completion_contract"].turn_id,
+                        kwargs["completion_contract"].phase,
+                        kwargs["completion_contract"].status_path.name,
+                        kwargs["completion_contract"].tracked_artifacts["review_md"].name,
+                    )
+                )
+                if len(completion_paths) == 1:
+                    raise RuntimeError("dead worker")
+                return {}
+
+            with patch(
+                "A08_OverallReview.run_completion_turn_with_repair",
+                side_effect=fake_run_completion_turn_with_repair,
+            ), patch(
+                "A08_OverallReview.is_worker_death_error",
+                side_effect=lambda error: str(error) == "dead worker",
+            ), patch(
+                "A08_OverallReview.recreate_development_reviewer_runtime",
+                return_value=replacement,
+            ), patch(
+                "A08_OverallReview._run_single_overall_review_reviewer_init",
+                return_value=replacement,
+            ):
+                result = run_overall_review_turn_with_recreation(
+                    initial_reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    reviewer_spec=DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师"),
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")},
+                    label="overall_review_initial_测试工程师_round_1",
+                    prompt="执行复核",
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(len(completion_paths), 2)
+        self.assertEqual(completion_paths[0][0], "overall_review_全面复核_测试工程师")
+        self.assertEqual(completion_paths[0][1], "复核阶段")
+        self.assertEqual(completion_paths[0][2], "需求A_整体复核记录_测试工程师-天英星.json")
+        self.assertEqual(completion_paths[0][3], "需求A_整体代码复核记录_测试工程师-天英星.md")
+        self.assertEqual(completion_paths[1], completion_paths[0])
+
+    def test_run_overall_review_turn_with_recreation_escalates_repeated_death_to_manual_reconfiguration(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            initial_reviewer = ReviewerRuntime(
+                reviewer_name="架构师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="架构师-天究星"),
+                review_md_path=project_dir / "需求A_代码评审记录_架构师.md",
+                review_json_path=project_dir / "需求A_评审记录_架构师.json",
+                contract=_dummy_contract(),
+            )
+            replacement1 = ReviewerRuntime(
+                reviewer_name="架构师",
+                selection=initial_reviewer.selection,
+                worker=_FakeWorker(session_name="架构师-天究星#2"),
+                review_md_path=initial_reviewer.review_md_path,
+                review_json_path=initial_reviewer.review_json_path,
+                contract=_dummy_contract(),
+            )
+            replacement2 = ReviewerRuntime(
+                reviewer_name="架构师",
+                selection=ReviewAgentSelection("claude", "sonnet", "high", ""),
+                worker=_FakeWorker(session_name="架构师-天究星#3"),
+                review_md_path=initial_reviewer.review_md_path,
+                review_json_path=initial_reviewer.review_json_path,
+                contract=_dummy_contract(),
+            )
+            attempts = {"count": 0}
+
+            def death_death_success(**kwargs):  # noqa: ANN003
+                attempts["count"] += 1
+                if attempts["count"] <= 2:
+                    raise RuntimeError("tmux pane died")
+                return {}
+
+            with patch(
+                "A08_OverallReview.run_completion_turn_with_repair",
+                side_effect=death_death_success,
+            ), patch(
+                "A08_OverallReview.recreate_development_reviewer_runtime",
+                side_effect=[replacement1, replacement2],
+            ) as recreate_runtime, patch(
+                "A08_OverallReview._run_single_overall_review_reviewer_init",
+                side_effect=lambda reviewer, **kwargs: reviewer,
+            ):
+                result = run_overall_review_turn_with_recreation(
+                    initial_reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    reviewer_spec=DevelopmentReviewerSpec(role_name="架构师", role_prompt="架构视角", reviewer_key="架构师"),
+                    paths=paths,
+                    reviewer_specs_by_name={"架构师": DevelopmentReviewerSpec(role_name="架构师", role_prompt="架构视角", reviewer_key="架构师")},
+                    label="overall_review_initial_架构师_round_1",
+                    prompt="执行复核",
+                )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result.worker.session_name, replacement2.worker.session_name)
+        self.assertEqual(result.selection.vendor, replacement2.selection.vendor)
+        self.assertEqual(attempts["count"], 3)
+        self.assertEqual(recreate_runtime.call_args_list[0].kwargs["force_model_change"], False)
+        self.assertEqual(recreate_runtime.call_args_list[1].kwargs["force_model_change"], True)
+        self.assertTrue(recreate_runtime.call_args_list[1].kwargs["required_reconfiguration"])
+        self.assertIn("连续 2 次死亡/失败", recreate_runtime.call_args_list[1].kwargs["reason_text"])
+        self.assertIn("智能体进程已死亡或退出", recreate_runtime.call_args_list[1].kwargs["reason_text"])
+
     def test_discover_live_development_handoffs_reads_a07_runtime_state(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -410,6 +703,106 @@ class A08OverallReviewTests(unittest.TestCase):
         self.assertEqual(len(reviewer_handoff), 1)
         self.assertEqual(reviewer_handoff[0].reviewer_key, "测试工程师")
         self.assertEqual(reviewer_handoff[0].role_prompt, "测试视角")
+
+    def test_discover_live_development_handoffs_prefers_stage_a08_runtime_over_a07(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            resolved_project_dir = str(project_dir.resolve())
+            runtime_root = project_dir / ".development_runtime"
+            payloads = {
+                runtime_root / "a07-dev" / "worker.state.json": {
+                    "worker_id": "development-developer",
+                    "session_name": "开发工程师-天魁星",
+                    "work_dir": resolved_project_dir,
+                    "project_dir": resolved_project_dir,
+                    "requirement_name": "需求A",
+                    "workflow_action": "stage.a07.start",
+                    "role_prompt": "A07 实现视角",
+                    "updated_at": "2026-04-26T10:00:02+08:00",
+                    "config": {
+                        "vendor": "codex",
+                        "model": "gpt-5.4",
+                        "reasoning_effort": "high",
+                        "proxy_url": "",
+                    },
+                },
+                runtime_root / "a08-dev" / "worker.state.json": {
+                    "worker_id": "development-developer",
+                    "session_name": "开发工程师-地默星",
+                    "work_dir": resolved_project_dir,
+                    "project_dir": resolved_project_dir,
+                    "requirement_name": "需求A",
+                    "workflow_action": "stage.a08.start",
+                    "role_prompt": "A08 实现视角",
+                    "updated_at": "2026-04-26T10:00:01+08:00",
+                    "config": {
+                        "vendor": "claude",
+                        "model": "sonnet",
+                        "reasoning_effort": "high",
+                        "proxy_url": "",
+                    },
+                },
+                runtime_root / "a07-review" / "worker.state.json": {
+                    "worker_id": "development-review-测试工程师",
+                    "session_name": "测试工程师-天英星",
+                    "work_dir": resolved_project_dir,
+                    "project_dir": resolved_project_dir,
+                    "requirement_name": "需求A",
+                    "workflow_action": "stage.a07.start",
+                    "role_prompt": "A07 测试视角",
+                    "role_name": "测试工程师",
+                    "reviewer_key": "测试工程师",
+                    "updated_at": "2026-04-26T10:00:03+08:00",
+                    "config": {
+                        "vendor": "codex",
+                        "model": "gpt-5.4",
+                        "reasoning_effort": "high",
+                        "proxy_url": "",
+                    },
+                },
+                runtime_root / "a08-review" / "worker.state.json": {
+                    "worker_id": "development-review-测试工程师",
+                    "session_name": "测试工程师-张月鹿",
+                    "work_dir": resolved_project_dir,
+                    "project_dir": resolved_project_dir,
+                    "requirement_name": "需求A",
+                    "workflow_action": "stage.a08.start",
+                    "role_prompt": "A08 测试视角",
+                    "role_name": "测试工程师",
+                    "reviewer_key": "测试工程师",
+                    "updated_at": "2026-04-26T10:00:00+08:00",
+                    "config": {
+                        "vendor": "claude",
+                        "model": "sonnet",
+                        "reasoning_effort": "high",
+                        "proxy_url": "",
+                    },
+                },
+            }
+            workers_by_path: dict[str, _FakeWorker] = {}
+            for state_path, payload in payloads.items():
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                workers_by_path[str(state_path.resolve())] = _FakeWorker(
+                    session_name=str(payload["session_name"]),
+                    runtime_metadata_payload={
+                        "workflow_action": payload["workflow_action"],
+                        "updated_at": payload["updated_at"],
+                    },
+                )
+
+            with patch(
+                "A08_OverallReview.load_worker_from_state_path",
+                side_effect=lambda state_path: workers_by_path[str(Path(state_path).resolve())],
+            ):
+                developer_handoff, reviewer_handoff = discover_live_development_handoffs(project_dir, "需求A")
+
+        self.assertIsNotNone(developer_handoff)
+        self.assertEqual(developer_handoff.worker.session_name, "开发工程师-地默星")
+        self.assertEqual(developer_handoff.selection.vendor, "claude")
+        self.assertEqual(len(reviewer_handoff), 1)
+        self.assertEqual(reviewer_handoff[0].worker.session_name, "测试工程师-张月鹿")
+        self.assertEqual(reviewer_handoff[0].selection.vendor, "claude")
 
     def test_run_overall_review_stage_uses_discovered_live_reviewer_handoff_for_specs_and_workers(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -495,3 +888,117 @@ class A08OverallReviewTests(unittest.TestCase):
                 build_reviewer_workers_mock.call_args.kwargs.get("reviewer_handoff"),
                 (live_reviewer_handoff,),
             )
+
+    def test_run_overall_review_stage_prefers_discovered_stage_a08_handoffs_without_reprompting(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            explicit_a07_developer_handoff = DevelopmentAgentHandoff(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                role_prompt="A07 实现视角",
+                worker=_FakeWorker(
+                    session_name="开发工程师-天魁星",
+                    runtime_metadata_payload={"workflow_action": "stage.a07.start", "updated_at": "2026-04-26T10:00:02+08:00"},
+                ),
+            )
+            explicit_a07_reviewer_handoff = ReviewAgentHandoff(
+                reviewer_key="测试工程师",
+                role_name="测试工程师",
+                role_prompt="A07 测试视角",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(
+                    session_name="测试工程师-天英星",
+                    runtime_metadata_payload={"workflow_action": "stage.a07.start", "updated_at": "2026-04-26T10:00:03+08:00"},
+                ),
+            )
+            live_a08_developer_handoff = DevelopmentAgentHandoff(
+                selection=ReviewAgentSelection("claude", "sonnet", "high", ""),
+                role_prompt="A08 实现视角",
+                worker=_FakeWorker(
+                    session_name="开发工程师-地默星",
+                    runtime_metadata_payload={"workflow_action": "stage.a08.start", "updated_at": "2026-04-26T10:00:01+08:00"},
+                ),
+            )
+            live_a08_reviewer_handoff = ReviewAgentHandoff(
+                reviewer_key="测试工程师",
+                role_name="测试工程师",
+                role_prompt="A08 测试视角",
+                selection=ReviewAgentSelection("claude", "sonnet", "high", ""),
+                worker=_FakeWorker(
+                    session_name="测试工程师-张月鹿",
+                    runtime_metadata_payload={"workflow_action": "stage.a08.start", "updated_at": "2026-04-26T10:00:00+08:00"},
+                ),
+            )
+            live_reviewer_runtime = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=live_a08_reviewer_handoff.selection,
+                worker=live_a08_reviewer_handoff.worker,
+                review_md_path=project_dir / "需求A_整体代码复核记录_测试工程师-张月鹿.md",
+                review_json_path=project_dir / "需求A_整体复核记录_测试工程师-张月鹿.json",
+                contract=_dummy_contract(),
+            )
+            bound_developer = DeveloperRuntime(
+                selection=live_a08_developer_handoff.selection,
+                worker=live_a08_developer_handoff.worker,
+                role_prompt=live_a08_developer_handoff.role_prompt,
+            )
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["merged_review_path"].write_text("", encoding="utf-8")
+                return True
+
+            with patch(
+                "A08_OverallReview.discover_live_development_handoffs",
+                return_value=(live_a08_developer_handoff, (live_a08_reviewer_handoff,)),
+            ), patch(
+                "A08_OverallReview.bind_developer_runtime_from_handoff",
+                return_value=bound_developer,
+            ) as bind_developer_mock, patch(
+                "A08_OverallReview.resolve_overall_review_reviewer_specs",
+                return_value=[DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试视角", reviewer_key="测试工程师")],
+            ), patch(
+                "A08_OverallReview.collect_reviewer_agent_selections",
+            ) as collect_reviewers_mock, patch(
+                "A08_OverallReview.build_reviewer_workers",
+                return_value=[live_reviewer_runtime],
+            ) as build_reviewer_workers_mock, patch(
+                "A08_OverallReview.initialize_overall_review_reviewers",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview._run_parallel_overall_reviewers",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview.repair_overall_review_outputs",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A08_OverallReview.resolve_developer_plan",
+            ) as resolve_developer_plan_mock, patch(
+                "A08_OverallReview.create_developer_runtime",
+            ) as create_developer_runtime_mock, patch(
+                "A08_OverallReview._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_overall_review_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                    developer_handoff=explicit_a07_developer_handoff,
+                    reviewer_handoff=(explicit_a07_reviewer_handoff,),
+                )
+
+        self.assertTrue(result.completed)
+        bind_kwargs = bind_developer_mock.call_args.kwargs
+        self.assertEqual(bind_kwargs.get("handoff"), live_a08_developer_handoff)
+        self.assertEqual(
+            build_reviewer_workers_mock.call_args.kwargs.get("reviewer_handoff"),
+            (live_a08_reviewer_handoff,),
+        )
+        collect_reviewers_mock.assert_not_called()
+        resolve_developer_plan_mock.assert_not_called()
+        create_developer_runtime_mock.assert_not_called()

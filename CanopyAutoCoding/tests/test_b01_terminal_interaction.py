@@ -305,14 +305,14 @@ class B01TerminalInteractionTests(unittest.TestCase):
             session_name = "aginit-demo"
             agent_ready = True
             recoverable = False
-            provider_phase = "unknown"
+            agent_state = "STARTING"
             restart_calls = 0
 
             def request_restart(self):
                 self.restart_calls += 1
                 self.agent_ready = False
                 self.recoverable = True
-                self.provider_phase = "recovering"
+                self.agent_state = "STARTING"
                 return self.session_name
 
         handle = SimpleNamespace(session_name="aginit-demo", work_dir="/tmp/project", worker=FakeWorker())
@@ -340,7 +340,7 @@ class B01TerminalInteractionTests(unittest.TestCase):
         self.assertEqual(handle.worker.restart_calls, 1)
         self.assertFalse(handle.worker.agent_ready)
         self.assertTrue(handle.worker.recoverable)
-        self.assertEqual(handle.worker.provider_phase, "recovering")
+        self.assertEqual(handle.worker.agent_state, "STARTING")
         self.assertEqual(binding_calls, [("/tmp/project", {"recoverable": True, "health_note": "manual_restart_requested"})])
         self.assertEqual(event_calls, [("manual_restart", {"work_dir": "/tmp/project", "session_name": "aginit-demo"})])
 

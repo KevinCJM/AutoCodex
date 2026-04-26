@@ -6,10 +6,48 @@
 @Descriptions: 任务拆分阶段提示词
 """
 
+from canopy_core.prompt_contracts.spec import (
+    ACCESS_READ,
+    ACCESS_READ_WRITE,
+    ACCESS_WRITE,
+    CHANGE_MUST_CHANGE,
+    CHANGE_NONE,
+    CLEANUP_NONE,
+    CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+    SPECIAL_OPEN_HITL,
+    SPECIAL_REVIEW_FAIL,
+    SPECIAL_REVIEW_PASS,
+    SPECIAL_STAGE_ARTIFACT,
+    FileSpec,
+    OutcomeSpec,
+    agent_prompt,
+)
 from T04_common_prompt import task_start_prompt, state_machine_output, main_agent_workflow_after_review
 
 
 # [需求分析师] 生成任务单
+@agent_prompt(
+    prompt_id="a06.task_split.generate",
+    stage="a06",
+    role="requirements_analyst",
+    intent="generate_task_split",
+    mode="a06_task_split_generate",
+    files={
+        "task_md": FileSpec(
+            path_arg="task_md",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="Markdown 任务单",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_STAGE_ARTIFACT,
+        ),
+        "detailed_design": FileSpec(path_arg="detail_design_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+    },
+    outcomes={"completed": OutcomeSpec(status="completed", requires=("task_md",))},
+)
 def task_split(task_md='name_任务单.md', detail_design_md='name_详细设计.md', hitl_record_md='name_人机交互澄清记录.md',
                original_requirement_md='name_原始需求.md', requirements_clear_md='name_需求澄清.md'):
     task_split_prompt = f"""# Role: 高级技术产品经理 (Technical PM) / 交付架构师
@@ -72,6 +110,20 @@ def task_split(task_md='name_任务单.md', detail_design_md='name_详细设计.
 
 
 # 初始化智能体
+@agent_prompt(
+    prompt_id="a06.task_split.ba_init",
+    stage="a06",
+    role="requirements_analyst",
+    intent="ready",
+    mode="a06_ba_init",
+    files={
+        "detailed_design": FileSpec(path_arg="detail_design_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+    },
+    outcomes={"ready": OutcomeSpec(status="ready")},
+)
 def create_task_split_ba(ba_desc, init_prompt=task_start_prompt,
                          detail_design_md='name_详细设计.md', hitl_record_md='name_人机交互澄清记录.md',
                          original_requirement_md='name_原始需求.md', requirements_clear_md='name_需求澄清.md'):
@@ -96,6 +148,38 @@ def create_task_split_ba(ba_desc, init_prompt=task_start_prompt,
 
 
 # [审核员] 审核任务单安排
+@agent_prompt(
+    prompt_id="a06.task_split.reviewer_round",
+    stage="a06",
+    role="reviewer",
+    intent="review",
+    mode="a06_reviewer_round",
+    files={
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "task_md": FileSpec(path_arg="task_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "detailed_design": FileSpec(path_arg="detail_design_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "review_md": FileSpec(
+            path_arg="task_review_md",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="任务拆分未通过时的评审问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "review_json": FileSpec(
+            path_arg="task_review_json",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="任务拆分评审 pass/fail 结构化事实源",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+    },
+    outcomes={
+        "review_pass": OutcomeSpec(status="review_pass", requires=("review_json",), forbids=("review_md",), special=SPECIAL_REVIEW_PASS),
+        "review_fail": OutcomeSpec(status="review_fail", requires=("review_json", "review_md"), special=SPECIAL_REVIEW_FAIL),
+    },
+)
 def review_task(agent_desc, task_name='任务拆分', *, original_requirement_md='name_原始需求.md',
                 requirements_clear_md='name_需求澄清.md', hitl_record_md='name_人机交互澄清记录.md',
                 task_md='name_任务单.md', detail_design_md='name_详细设计.md',
@@ -147,8 +231,44 @@ def review_task(agent_desc, task_name='任务拆分', *, original_requirement_md
 
 
 # [需求分析师] 根据评审文档优化详细设计
+@agent_prompt(
+    prompt_id="a06.task_split.modify",
+    stage="a06",
+    role="requirements_analyst",
+    intent="review_feedback",
+    mode="a06_task_split_feedback",
+    files={
+        "task_md": FileSpec(
+            path_arg="task_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="评审修订后的任务单",
+            cleanup=CLEANUP_NONE,
+        ),
+        "ba_feedback": FileSpec(
+            path_arg="what_just_change",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="需求分析师对任务拆分评审的修复说明",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "ask_human": FileSpec(
+            path_arg="ask_human_md",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="任务拆分评审信息不足时的 HITL 问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_OPEN_HITL,
+        ),
+    },
+    outcomes={
+        "completed": OutcomeSpec(status="completed", requires=("task_md", "ba_feedback"), forbids=("ask_human",)),
+        "hitl": OutcomeSpec(status="hitl", requires=("ask_human",), forbids=("ba_feedback",), special=SPECIAL_OPEN_HITL),
+    },
+)
 def modify_task(review_msg, *,
-                task_md='name_任务单.md', what_just_change='name_需求分析师反馈.md'):
+                task_md='name_任务单.md', what_just_change='name_需求分析师反馈.md',
+                ask_human_md='name_与人类交流.md'):
     main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(what_just_change=what_just_change)
     modify_task_prompt = f"""## 任务背景
 审计员审核了任务单《{task_md}》。你需要对这些审计员提出的评审意见进行鉴定、修复，并在信息不足时向人类发起求助。
@@ -162,12 +282,42 @@ def modify_task(review_msg, *,
 {main_agent_workflow_after_review_prompt}
 
 ## 约束
-- 禁止修改源代码, 禁止修改除了《{what_just_change}》/《{task_md}》之外的文档;
-- 只能输出 `修改完成`。"""
+- 禁止修改源代码, 禁止修改除了《{what_just_change}》/《{task_md}》/《{ask_human_md}》之外的文档;
+- 如果信息不足，覆盖写入《{ask_human_md}》并输出 `HITL`。
+- 如果可以修复，清空《{ask_human_md}》，修改《{task_md}》，写入《{what_just_change}》，输出 `修改完成`。
+- 只能输出 `HITL` 或 `修改完成`。"""
     return modify_task_prompt
 
 
 # [审核员] 根据优化后的详细设计再次评审
+@agent_prompt(
+    prompt_id="a06.task_split.re_review",
+    stage="a06",
+    role="reviewer",
+    intent="review_reply",
+    mode="a06_reviewer_round",
+    files={
+        "task_md": FileSpec(path_arg="task_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "review_md": FileSpec(
+            path_arg="task_review_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="任务拆分复评未通过时的剩余问题",
+            cleanup=CLEANUP_NONE,
+        ),
+        "review_json": FileSpec(
+            path_arg="task_review_json",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="任务拆分复评 pass/fail 结构化事实源",
+            cleanup=CLEANUP_NONE,
+        ),
+    },
+    outcomes={
+        "review_pass": OutcomeSpec(status="review_pass", requires=("review_json",), forbids=("review_md",), special=SPECIAL_REVIEW_PASS),
+        "review_fail": OutcomeSpec(status="review_fail", requires=("review_json", "review_md"), special=SPECIAL_REVIEW_FAIL),
+    },
+)
 def again_review_task(modify_summary, task_name='任务拆分', *, task_md='name_任务单.md',
                       task_review_md='name_任务单评审记录_agent.md', task_review_json='name_评审记录_agent.json'):
     state_machine_output_prompt = state_machine_output(
@@ -222,6 +372,25 @@ def again_review_task(modify_summary, task_name='任务拆分', *, task_md='name
 
 
 # [需求分析师] 将任务单转为 json 格式
+@agent_prompt(
+    prompt_id="a06.task_split.md_to_json",
+    stage="a06",
+    role="requirements_analyst",
+    intent="task_json",
+    mode="a06_task_split_json_generate",
+    files={
+        "task_md": FileSpec(path_arg="task_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "task_json": FileSpec(
+            path_arg="task_json",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="任务单 JSON 状态索引",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_STAGE_ARTIFACT,
+        ),
+    },
+    outcomes={"completed": OutcomeSpec(status="completed", requires=("task_json",))},
+)
 def task_md_to_json(task_md='name_任务单.md', task_json='name_任务单.json'):
     task_md_to_json_prompt = f"""## 角色定位
 你是一个【结构化数据转换专家】，负责将 Markdown 任务单转换为机器友好的状态索引JSON文件。
@@ -254,6 +423,25 @@ def task_md_to_json(task_md='name_任务单.md', task_json='name_任务单.json'
     return task_md_to_json_prompt
 
 
+@agent_prompt(
+    prompt_id="a06.task_split.re_md_to_json",
+    stage="a06",
+    role="requirements_analyst",
+    intent="task_json_repair",
+    mode="a06_task_split_json_generate",
+    files={
+        "task_md": FileSpec(path_arg="task_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "task_json": FileSpec(
+            path_arg="task_json",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="修复后的任务单 JSON 状态索引",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_STAGE_ARTIFACT,
+        ),
+    },
+    outcomes={"completed": OutcomeSpec(status="completed", requires=("task_json",))},
+)
 def re_task_md_to_json(task_md='name_任务单.md', task_json='name_任务单.json'):
     re_task_md_to_json_prompt = f"""## 问题描述
 你上一轮在《{task_json}》的内容不符合要求的JSON.
@@ -276,7 +464,7 @@ def re_task_md_to_json(task_md='name_任务单.md', task_json='name_任务单.js
 ```
 
 重新解析《{task_md}》覆盖输出到《{task_json}》"""
-    print(re_task_md_to_json_prompt)
+    return re_task_md_to_json_prompt
 
 
 if __name__ == '__main__':

@@ -196,7 +196,14 @@ def state_machine_output(task_title, review_md='name_代码评审记录_AgentNam
     :param blocked_condition:
     :return:
     """
+    exact_task_name_json = json.dumps(str(task_title), ensure_ascii=False)
     state_machine_output_prompt = f"""## 交互协议 (State Machine Output)
+
+### JSON task_name 精确匹配要求
+`task_name` 字段必须逐字等于这个 JSON 字符串值，不要删除反引号、标点、空格或代码标识符：
+```json
+{exact_task_name_json}
+```
 
 ### 场景 A：审核通过 (Pass)
 **触发条件**：{pass_condition}

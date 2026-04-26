@@ -127,8 +127,94 @@ def missing_routing_layer_files(work_dir: str | Path) -> list[str]:
     return missing
 
 
+def _load_routing_json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise ValueError(f"{path.relative_to(path.parents[1])} JSON 非法: {error.msg}") from error
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.relative_to(path.parents[1])} 根节点必须是 object")
+    return payload
+
+
+def routing_layer_artifact_errors(work_dir: str | Path) -> list[str]:
+    root = resolve_existing_directory(work_dir)
+    missing = missing_routing_layer_files(root)
+    if missing:
+        return [f"缺少路由层文件: {item}" for item in missing]
+
+    repo_map_path = root / "docs" / "repo_map.json"
+    task_routes_path = root / "docs" / "task_routes.json"
+    pitfalls_path = root / "docs" / "pitfalls.json"
+    errors: list[str] = []
+    try:
+        repo_map = _load_routing_json(repo_map_path)
+        task_routes = _load_routing_json(task_routes_path)
+        pitfalls = _load_routing_json(pitfalls_path)
+    except ValueError as error:
+        return [str(error)]
+
+    modules = repo_map.get("modules")
+    if not isinstance(modules, list) or not modules:
+        errors.append("docs/repo_map.json 缺少非空 modules[]")
+        module_ids: set[str] = set()
+    else:
+        module_ids = {
+            str(item.get("id", "")).strip()
+            for item in modules
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        }
+        if not module_ids:
+            errors.append("docs/repo_map.json modules[] 缺少有效 id")
+
+    routes = task_routes.get("routes")
+    if not isinstance(routes, list) or not routes:
+        errors.append("docs/task_routes.json 缺少非空 routes[]")
+        routes = []
+
+    pitfall_items = pitfalls.get("pitfalls")
+    if not isinstance(pitfall_items, list):
+        errors.append("docs/pitfalls.json 缺少 pitfalls[]")
+        pitfall_ids: set[str] = set()
+    else:
+        pitfall_ids = {
+            str(item.get("id", "")).strip()
+            for item in pitfall_items
+            if isinstance(item, dict) and str(item.get("id", "")).strip()
+        }
+
+    for route in routes:
+        if not isinstance(route, dict):
+            errors.append("docs/task_routes.json routes[] 项必须是 object")
+            continue
+        route_id = str(route.get("id", "")).strip() or "unknown_route"
+        for module_id in route.get("first_read_modules", ()) or ():
+            module_id_text = str(module_id).strip()
+            if module_id_text and module_id_text not in module_ids:
+                errors.append(f"route {route_id} first_read_modules 引用不存在模块: {module_id_text}")
+        for pitfall_id in route.get("pitfall_ids", ()) or ():
+            pitfall_id_text = str(pitfall_id).strip()
+            if pitfall_id_text and pitfall_id_text not in pitfall_ids:
+                errors.append(f"route {route_id} pitfall_ids 引用不存在风险: {pitfall_id_text}")
+    return errors
+
+
+def validate_routing_layer_artifacts(work_dir: str | Path) -> None:
+    errors = routing_layer_artifact_errors(work_dir)
+    if errors:
+        raise ValueError("; ".join(errors))
+
+
+def routing_layer_readiness_issues(work_dir: str | Path) -> list[str]:
+    return routing_layer_artifact_errors(work_dir)
+
+
 def has_complete_routing_layer(work_dir: str | Path) -> bool:
-    return not missing_routing_layer_files(work_dir)
+    try:
+        validate_routing_layer_artifacts(work_dir)
+    except Exception:
+        return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -169,7 +255,7 @@ def resolve_target_selection(
     for target in target_dirs:
         add_candidate(resolve_target_path(project_root, target))
 
-    project_missing = tuple(missing_routing_layer_files(project_root))
+    project_missing = tuple(routing_layer_readiness_issues(project_root))
     skipped_dirs: list[str] = []
     selected_dirs: list[str] = []
     forced_dirs: list[str] = []
@@ -1516,6 +1602,10 @@ def run_directory_initialization_with_worker(
         missing_after = missing_routing_layer_files(target_dir)
         if missing_after:
             return fail("required_files_missing_after_pass")
+        try:
+            validate_routing_layer_artifacts(target_dir)
+        except ValueError as error:
+            return fail(f"routing_layer_artifacts_invalid: {error}")
         result = DirectoryInitResult(
             work_dir=str(target_dir),
             forced=forced,

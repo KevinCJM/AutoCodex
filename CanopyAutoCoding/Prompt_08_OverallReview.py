@@ -6,11 +6,40 @@
 @Descriptions: 复核阶段提示词
 """
 
+from canopy_core.prompt_contracts.spec import (
+    ACCESS_READ,
+    ACCESS_READ_WRITE,
+    ACCESS_WRITE,
+    CHANGE_MUST_CHANGE,
+    CHANGE_NONE,
+    CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+    SPECIAL_REVIEW_FAIL,
+    SPECIAL_REVIEW_PASS,
+    SPECIAL_STAGE_ARTIFACT,
+    FileSpec,
+    OutcomeSpec,
+    agent_prompt,
+)
 from T04_common_prompt import task_start_prompt, state_machine_output
 from pathlib import Path
 
 
 # 初始化 [审核员] 智能体
+@agent_prompt(
+    prompt_id="a08.reviewer.init",
+    stage="a08",
+    role="reviewer",
+    intent="ready",
+    mode="a08_reviewer_init",
+    files={
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "detailed_design": FileSpec(path_arg="detailed_design_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "task_md": FileSpec(path_arg="task_split_md", access=ACCESS_READ, change=CHANGE_NONE),
+    },
+    outcomes={"ready": OutcomeSpec(status="ready")},
+)
 def init_reviewer(init_prompt=task_start_prompt,
                   *,
                   hitl_record_md='name_人机交互澄清记录.md',
@@ -42,6 +71,38 @@ def init_reviewer(init_prompt=task_start_prompt,
 
 
 # [审核员] 智能体, 重新全面评估完成开发后的代码
+@agent_prompt(
+    prompt_id="a08.reviewer.review_all_code",
+    stage="a08",
+    role="reviewer",
+    intent="overall_review",
+    mode="a08_reviewer_round",
+    files={
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "detailed_design": FileSpec(path_arg="detailed_design_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "task_md": FileSpec(path_arg="task_split_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "review_md": FileSpec(
+            path_arg="review_md",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="整体复核未通过时的问题记录",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "review_json": FileSpec(
+            path_arg="review_json",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="整体复核 pass/fail 结构化事实源",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+    },
+    outcomes={
+        "review_pass": OutcomeSpec(status="review_pass", requires=("review_json",), forbids=("review_md",), special=SPECIAL_REVIEW_PASS),
+        "review_fail": OutcomeSpec(status="review_fail", requires=("review_json", "review_md"), special=SPECIAL_REVIEW_FAIL),
+    },
+)
 def review_all_code(agent_role, task_title,
                     *,
                     hitl_record_md='name_人机交互澄清记录.md',
@@ -83,6 +144,28 @@ def review_all_code(agent_role, task_title,
 
 
 # [开发工程师] 基于审核员的评审优化代码
+@agent_prompt(
+    prompt_id="a08.developer.refine_all_code",
+    stage="a08",
+    role="developer",
+    intent="overall_refine",
+    mode="a08_developer_refine_all_code",
+    files={
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "detailed_design": FileSpec(path_arg="detailed_design_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "developer_output": FileSpec(
+            path_arg="what_just_dev",
+            access=ACCESS_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="整体复核修复与去重元数据",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+            special=SPECIAL_STAGE_ARTIFACT,
+        ),
+    },
+    outcomes={"completed": OutcomeSpec(status="completed", requires=("developer_output",))},
+)
 def refine_all_code(code_review_msg,
                     hitl_record_md='name_人机交互澄清记录.md',
                     requirements_clear_md='name_需求澄清.md',
@@ -142,6 +225,37 @@ def refine_all_code(code_review_msg,
 
 
 # [审核员] 智能体, 检查工程师的修改记录, 再次检查代码
+@agent_prompt(
+    prompt_id="a08.reviewer.review_all_code_again",
+    stage="a08",
+    role="reviewer",
+    intent="overall_review_reply",
+    mode="a08_reviewer_round",
+    files={
+        "hitl_record": FileSpec(path_arg="hitl_record_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "requirements_clear": FileSpec(path_arg="requirements_clear_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "original_requirement": FileSpec(path_arg="original_requirement_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "detailed_design": FileSpec(path_arg="detailed_design_md", access=ACCESS_READ, change=CHANGE_NONE),
+        "review_md": FileSpec(
+            path_arg="review_md",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="整体复核复评未通过时的剩余问题",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+        "review_json": FileSpec(
+            path_arg="review_json",
+            access=ACCESS_READ_WRITE,
+            change=CHANGE_MUST_CHANGE,
+            meaning="整体复核复评 pass/fail 结构化事实源",
+            cleanup=CLEANUP_SYSTEM_BEFORE_STAGE_OR_RETRY,
+        ),
+    },
+    outcomes={
+        "review_pass": OutcomeSpec(status="review_pass", requires=("review_json",), forbids=("review_md",), special=SPECIAL_REVIEW_PASS),
+        "review_fail": OutcomeSpec(status="review_fail", requires=("review_json", "review_md"), special=SPECIAL_REVIEW_FAIL),
+    },
+)
 def review_all_code_again(code_review_msg, code_change_msg, task_title,
                           *,
                           hitl_record_md='name_人机交互澄清记录.md',

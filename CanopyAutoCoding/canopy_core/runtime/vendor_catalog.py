@@ -13,23 +13,19 @@ from typing import Any, Callable, Sequence
 
 SCHEMA_VERSION = "1.0"
 SCAN_TIMEOUT_SEC = 12.0
-VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "qwen", "kimi", "opencode")
+VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode")
 NORMALIZED_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 NATIVE_REASONING_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
 LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
     "codex": "gpt-5.4",
     "claude": "sonnet",
     "gemini": "auto",
-    "qwen": "qwen3-coder",
-    "kimi": "kimi-k2",
     "opencode": "default",
 }
 LEGACY_MODEL_CHOICES_BY_VENDOR: dict[str, tuple[str, ...]] = {
     "codex": ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"),
     "claude": ("sonnet", "opus", "haiku"),
-    "gemini": ("auto", "pro", "flash"),
-    "qwen": ("qwen3-coder", "qwen3-coder-plus", "qwen3-235b-a22b", "qwen3-32b"),
-    "kimi": ("kimi-k2", "kimi-k2-turbo"),
+    "gemini": ("auto", "flash", "pro"),
     "opencode": (),
 }
 LEGACY_MODEL_ALIASES_BY_VENDOR: dict[str, dict[str, str]] = {
@@ -55,8 +51,6 @@ CONFIDENCE_MEDIUM = "medium"
 CONFIDENCE_LOW = "low"
 REASONING_NATIVE = "native"
 REASONING_MAPPED = "mapped"
-REASONING_BOOLEAN_TOGGLE = "boolean_toggle"
-REASONING_PROMPT_ONLY = "prompt_only"
 REASONING_IMPLICIT_DEFAULT = "implicit_default"
 REASONING_UNSUPPORTED = "unsupported"
 REASONING_MODEL_FAMILY_ROUTING = "model_family_routing"
@@ -470,34 +464,6 @@ def _fallback_reasoning_for_vendor(vendor_id: str, model_id: str, *, source_kind
                 notes=("legacy_synthetic_family_alias",),
             )
         return _unsupported_reasoning(vendor_id, model_id, source_kind=source_kind, confidence=confidence, note="legacy_fallback")
-    if vendor_id == "qwen":
-        return ReasoningInventory(
-            vendor_id=vendor_id,
-            model_id=model_id,
-            source_kind=source_kind,
-            confidence=confidence,
-            reasoning_control_mode=REASONING_PROMPT_ONLY,
-            supports_reasoning=True,
-            native_reasoning_levels=(),
-            normalized_reasoning_levels=_full_normalized_levels(),
-            default_normalized_effort="high",
-            default_native_level="",
-            notes=("legacy_fallback",),
-        )
-    if vendor_id == "kimi":
-        return ReasoningInventory(
-            vendor_id=vendor_id,
-            model_id=model_id,
-            source_kind=source_kind,
-            confidence=confidence,
-            reasoning_control_mode=REASONING_BOOLEAN_TOGGLE,
-            supports_reasoning=True,
-            native_reasoning_levels=("thinking_off", "thinking_on"),
-            normalized_reasoning_levels=_full_normalized_levels(),
-            default_normalized_effort="high",
-            default_native_level="thinking_on",
-            notes=("legacy_fallback",),
-        )
     return _unsupported_reasoning(vendor_id, model_id, source_kind=source_kind, confidence=confidence, note="legacy_fallback")
 
 
@@ -630,62 +596,6 @@ def _extract_gemini_models(binary_path: str) -> tuple[str, ...]:
                         continue
                     matches.add(normalized)
     return tuple(sorted(matches))
-
-
-def _extract_qwen_config() -> dict[str, Any]:
-    settings_path = Path.home().expanduser().resolve() / ".qwen" / "settings.json"
-    if not settings_path.exists() or not settings_path.is_file():
-        return {}
-    return _read_json_file(settings_path)
-
-
-def _extract_qwen_models(payload: dict[str, Any]) -> tuple[str, ...]:
-    models: list[str] = []
-    current_model = str(((payload.get("model") or {}).get("name") or "")).strip()
-    if current_model:
-        models.append(current_model)
-    model_providers = payload.get("modelProviders", [])
-    if isinstance(model_providers, list):
-        for provider in model_providers:
-            if not isinstance(provider, dict):
-                continue
-            provider_models = provider.get("models", [])
-            if isinstance(provider_models, list):
-                for item in provider_models:
-                    if isinstance(item, dict):
-                        name = str(item.get("name", "")).strip()
-                    else:
-                        name = str(item).strip()
-                    if name:
-                        models.append(name)
-    return tuple(dict.fromkeys(models))
-
-
-def _extract_kimi_config_text() -> str:
-    config_path = Path.home().expanduser().resolve() / ".kimi" / "config.toml"
-    if not config_path.exists() or not config_path.is_file():
-        return ""
-    return _read_text(config_path)
-
-
-def _extract_toml_string(text: str, key: str) -> str:
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*\"([^\"]+)\"", text, re.MULTILINE)
-    return str(match.group(1)).strip() if match else ""
-
-
-def _extract_toml_bool(text: str, key: str) -> bool | None:
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*(true|false)", text, re.MULTILINE | re.IGNORECASE)
-    if not match:
-        return None
-    return match.group(1).lower() == "true"
-
-
-def _extract_toml_array_strings(text: str, key: str) -> tuple[str, ...]:
-    match = re.search(rf"^\s*{re.escape(key)}\s*=\s*\[(.*?)\]", text, re.MULTILINE | re.DOTALL)
-    if not match:
-        return ()
-    raw = match.group(1)
-    return tuple(dict.fromkeys(re.findall(r'"([^"]+)"', raw)))
 
 
 def parse_codex_models_output(stdout: str) -> tuple[dict[str, Any], ...]:
@@ -921,24 +831,7 @@ def _build_claude_models(model_ids: Sequence[str], effort_levels: Sequence[str])
 
 def _build_gemini_models(model_ids: Sequence[str]) -> tuple[ModelInventory, ...]:
     models: list[ModelInventory] = []
-    for model_id in model_ids:
-        models.append(
-            _build_model(
-                "gemini",
-                model_id,
-                source_kind=SOURCE_PACKAGE_METADATA,
-                confidence=CONFIDENCE_MEDIUM,
-                reasoning=_unsupported_reasoning(
-                    "gemini",
-                    model_id,
-                    source_kind=SOURCE_PACKAGE_METADATA,
-                    confidence=CONFIDENCE_MEDIUM,
-                    note="explicit_model_has_no_native_effort_catalog",
-                ),
-                notes=("package_metadata",),
-            )
-        )
-    for synthetic_model in ("auto", "pro", "flash"):
+    for synthetic_model in ("auto", "flash", "pro"):
         models.append(
             _build_model(
                 "gemini",
@@ -962,75 +855,27 @@ def _build_gemini_models(model_ids: Sequence[str]) -> tuple[ModelInventory, ...]
                 notes=("synthetic_family_alias",),
             )
         )
-    return _unique_models(models)
-
-
-def _build_qwen_models(config_payload: dict[str, Any]) -> tuple[ModelInventory, ...]:
-    active_models = _extract_qwen_models(config_payload)
-    notes: list[str] = []
-    auth_type = str((((config_payload.get("security") or {}).get("auth") or {}).get("selectedType") or "")).strip()
-    if auth_type:
-        notes.append(f"auth_type={auth_type}")
-    primary = [
-        _build_model(
-            "qwen",
-            model_id,
-            source_kind=SOURCE_CONFIG_FILE,
-            confidence=CONFIDENCE_MEDIUM,
-            reasoning=ReasoningInventory(
-                vendor_id="qwen",
-                model_id=model_id,
-                source_kind=SOURCE_CONFIG_FILE,
-                confidence=CONFIDENCE_MEDIUM,
-                reasoning_control_mode=REASONING_PROMPT_ONLY,
-                supports_reasoning=True,
-                native_reasoning_levels=(),
-                normalized_reasoning_levels=_full_normalized_levels(),
-                default_normalized_effort="high",
-                default_native_level="",
-                notes=tuple(notes),
-            ),
-            notes=tuple(notes),
-        )
-        for model_id in active_models
-    ]
-    return _unique_models([*primary, *_legacy_models("qwen")])
-
-
-def _build_kimi_models(config_text: str, help_text: str) -> tuple[ModelInventory, ...]:
-    active_model = _extract_toml_string(config_text, "model")
-    thinking_flag_supported = "--thinking" in help_text and "--no-thinking" in help_text
-    default_thinking = _extract_toml_bool(config_text, "default_thinking")
-    capabilities = _extract_toml_array_strings(config_text, "capabilities")
-    supports_reasoning = thinking_flag_supported or "thinking" in capabilities or default_thinking is not None
-    primary: list[ModelInventory] = []
-    if active_model:
-        notes = []
-        if default_thinking is not None:
-            notes.append(f"default_thinking={'on' if default_thinking else 'off'}")
-        primary.append(
-            _build_model(
-                "kimi",
-                active_model,
-                source_kind=SOURCE_CONFIG_FILE,
-                confidence=CONFIDENCE_MEDIUM,
-                reasoning=ReasoningInventory(
-                    vendor_id="kimi",
-                    model_id=active_model,
-                    source_kind=SOURCE_CONFIG_FILE,
+    if os.environ.get("CANOPY_GEMINI_EXPERIMENTAL_MODELS") == "1":
+        for model_id in model_ids:
+            if model_id in {"auto", "flash", "pro"}:
+                continue
+            models.append(
+                _build_model(
+                    "gemini",
+                    model_id,
+                    source_kind=SOURCE_PACKAGE_METADATA,
                     confidence=CONFIDENCE_MEDIUM,
-                    reasoning_control_mode=REASONING_BOOLEAN_TOGGLE if supports_reasoning else REASONING_UNSUPPORTED,
-                    supports_reasoning=supports_reasoning,
-                    native_reasoning_levels=("thinking_off", "thinking_on") if supports_reasoning else (),
-                    normalized_reasoning_levels=_full_normalized_levels() if supports_reasoning else ("high",),
-                    default_normalized_effort="high",
-                    default_native_level="thinking_on" if default_thinking is not False else "thinking_off",
-                    notes=tuple(notes),
-                ),
-                notes=tuple(notes),
+                    reasoning=_unsupported_reasoning(
+                        "gemini",
+                        model_id,
+                        source_kind=SOURCE_PACKAGE_METADATA,
+                        confidence=CONFIDENCE_MEDIUM,
+                        note="explicit_model_has_no_native_effort_catalog",
+                    ),
+                    notes=("package_metadata", "experimental_model"),
+                )
             )
-        )
-    return _unique_models([*primary, *_legacy_models("kimi")])
+    return _unique_models(models)
 
 
 def _scan_codex_vendor(binary_path: str) -> VendorInventory:
@@ -1144,51 +989,10 @@ def _scan_gemini_vendor(binary_path: str) -> VendorInventory:
     )
 
 
-def _scan_qwen_vendor(binary_path: str) -> VendorInventory:
-    config_payload = _extract_qwen_config()
-    models = _build_qwen_models(config_payload)
-    default_model = ""
-    if config_payload:
-        default_model = str(((config_payload.get("model") or {}).get("name") or "")).strip()
-    resolved_default = _resolve_default_model(models, preferred=default_model, fallback_vendor="qwen")
-    return VendorInventory(
-        vendor_id="qwen",
-        installed=True,
-        scan_status=OK_SCAN_STATUS if config_payload else DEGRADED_SCAN_STATUS,
-        source_kind=SOURCE_CONFIG_FILE if config_payload else SOURCE_LEGACY_FALLBACK,
-        confidence=CONFIDENCE_MEDIUM if config_payload else CONFIDENCE_LOW,
-        binary_path=binary_path,
-        models=_prioritize_default_model(models, resolved_default),
-        default_model=resolved_default,
-        notes=tuple(item for item in ("config_file" if config_payload else "", "legacy_models_appended") if item),
-    )
-
-
-def _scan_kimi_vendor(binary_path: str) -> VendorInventory:
-    config_text = _extract_kimi_config_text()
-    help_probe = _command_probe(["kimi", "--help"])
-    models = _build_kimi_models(config_text, help_probe.stdout or help_probe.stderr)
-    default_model = _extract_toml_string(config_text, "model")
-    resolved_default = _resolve_default_model(models, preferred=default_model, fallback_vendor="kimi")
-    return VendorInventory(
-        vendor_id="kimi",
-        installed=True,
-        scan_status=OK_SCAN_STATUS if config_text else DEGRADED_SCAN_STATUS,
-        source_kind=SOURCE_CONFIG_FILE if config_text else SOURCE_LEGACY_FALLBACK,
-        confidence=CONFIDENCE_MEDIUM if config_text else CONFIDENCE_LOW,
-        binary_path=binary_path,
-        models=_prioritize_default_model(models, resolved_default),
-        default_model=resolved_default,
-        notes=tuple(item for item in ("config_file" if config_text else "", "legacy_models_appended") if item),
-    )
-
-
 _SCANNERS: dict[str, Callable[[str], VendorInventory]] = {
     "codex": _scan_codex_vendor,
     "claude": _scan_claude_vendor,
     "gemini": _scan_gemini_vendor,
-    "qwen": _scan_qwen_vendor,
-    "kimi": _scan_kimi_vendor,
     "opencode": _scan_opencode_vendor,
 }
 
@@ -1333,15 +1137,13 @@ def resolve_launch(
     elif mode == REASONING_MAPPED:
         resolved_variant = _map_native_effort(normalized_vendor, normalized_effort, model.reasoning.native_reasoning_levels)
         native_reasoning_level = resolved_variant
-    elif mode == REASONING_BOOLEAN_TOGGLE:
-        native_reasoning_level = "thinking_off" if normalized_effort == "low" else "thinking_on"
     elif mode == REASONING_MODEL_FAMILY_ROUTING:
         if model.model_id == "auto":
             resolved_model = "flash" if normalized_effort in {"low", "medium"} else "pro"
             notes.append(f"auto_family_resolved={resolved_model}")
         else:
             resolved_model = model.model_id
-    elif mode in {REASONING_PROMPT_ONLY, REASONING_IMPLICIT_DEFAULT, REASONING_UNSUPPORTED}:
+    elif mode in {REASONING_IMPLICIT_DEFAULT, REASONING_UNSUPPORTED}:
         native_reasoning_level = ""
 
     return LaunchResolution(

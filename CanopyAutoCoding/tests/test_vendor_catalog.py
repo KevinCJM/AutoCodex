@@ -2,21 +2,18 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 from canopy_core.runtime.vendor_catalog import (
     CatalogSnapshot,
     CONFIDENCE_HIGH,
     CONFIDENCE_MEDIUM,
-    LaunchResolution,
     ModelInventory,
     OK_SCAN_STATUS,
-    REASONING_BOOLEAN_TOGGLE,
     REASONING_MAPPED,
     REASONING_MODEL_FAMILY_ROUTING,
     REASONING_NATIVE,
-    REASONING_PROMPT_ONLY,
     ReasoningInventory,
-    SOURCE_CONFIG_FILE,
     SOURCE_DYNAMIC_CLI,
     SOURCE_PACKAGE_METADATA,
     VendorInventory,
@@ -24,10 +21,12 @@ from canopy_core.runtime.vendor_catalog import (
     get_default_model_for_vendor,
     get_model_choices,
     get_vendor_inventory,
+    normalize_vendor_id,
     parse_codex_models_output,
     parse_opencode_debug_config_output,
     parse_opencode_verbose_output,
     resolve_launch,
+    _build_gemini_models,
 )
 
 
@@ -60,6 +59,21 @@ class VendorCatalogTests(unittest.TestCase):
         items = parse_codex_models_output(payload)
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["slug"], "gpt-5.4")
+
+    def test_gemini_models_default_to_cli_family_aliases(self):
+        models = _build_gemini_models(("gemini-2.0-flash", "gemini-cli", "gemini-3-pro-preview"))
+
+        self.assertEqual([item.model_id for item in models], ["auto", "flash", "pro"])
+        self.assertTrue(all(item.synthetic for item in models))
+
+    def test_gemini_explicit_package_models_are_opt_in(self):
+        with patch.dict(os.environ, {"CANOPY_GEMINI_EXPERIMENTAL_MODELS": "1"}):
+            models = _build_gemini_models(("gemini-2.0-flash", "gemini-3-pro-preview"))
+
+        self.assertEqual(
+            [item.model_id for item in models],
+            ["auto", "flash", "pro", "gemini-2.0-flash", "gemini-3-pro-preview"],
+        )
 
     def test_parse_opencode_verbose_output_extracts_full_model_ids(self):
         payload = """
@@ -206,66 +220,6 @@ kimi-code/kimi-for-coding
                         ),
                     ),
                 ),
-                VendorInventory(
-                    vendor_id="qwen",
-                    installed=True,
-                    scan_status=OK_SCAN_STATUS,
-                    source_kind=SOURCE_CONFIG_FILE,
-                    confidence=CONFIDENCE_MEDIUM,
-                    binary_path="/usr/bin/qwen",
-                    default_model="coder-model",
-                    models=(
-                        ModelInventory(
-                            vendor_id="qwen",
-                            model_id="coder-model",
-                            display_name="coder-model",
-                            source_kind=SOURCE_CONFIG_FILE,
-                            confidence=CONFIDENCE_MEDIUM,
-                            reasoning=ReasoningInventory(
-                                vendor_id="qwen",
-                                model_id="coder-model",
-                                source_kind=SOURCE_CONFIG_FILE,
-                                confidence=CONFIDENCE_MEDIUM,
-                                reasoning_control_mode=REASONING_PROMPT_ONLY,
-                                supports_reasoning=True,
-                                native_reasoning_levels=(),
-                                normalized_reasoning_levels=("low", "medium", "high", "xhigh", "max"),
-                                default_normalized_effort="high",
-                                default_native_level="",
-                            ),
-                        ),
-                    ),
-                ),
-                VendorInventory(
-                    vendor_id="kimi",
-                    installed=True,
-                    scan_status=OK_SCAN_STATUS,
-                    source_kind=SOURCE_CONFIG_FILE,
-                    confidence=CONFIDENCE_MEDIUM,
-                    binary_path="/usr/bin/kimi",
-                    default_model="kimi-for-coding",
-                    models=(
-                        ModelInventory(
-                            vendor_id="kimi",
-                            model_id="kimi-for-coding",
-                            display_name="kimi-for-coding",
-                            source_kind=SOURCE_CONFIG_FILE,
-                            confidence=CONFIDENCE_MEDIUM,
-                            reasoning=ReasoningInventory(
-                                vendor_id="kimi",
-                                model_id="kimi-for-coding",
-                                source_kind=SOURCE_CONFIG_FILE,
-                                confidence=CONFIDENCE_MEDIUM,
-                                reasoning_control_mode=REASONING_BOOLEAN_TOGGLE,
-                                supports_reasoning=True,
-                                native_reasoning_levels=("thinking_off", "thinking_on"),
-                                normalized_reasoning_levels=("low", "medium", "high", "xhigh", "max"),
-                                default_normalized_effort="high",
-                                default_native_level="thinking_on",
-                            ),
-                        ),
-                    ),
-                ),
             ),
         )
 
@@ -278,12 +232,13 @@ kimi-code/kimi-for-coding
         gemini_resolution = resolve_launch("gemini", "auto", "medium", catalog=catalog)
         self.assertEqual(gemini_resolution.resolved_model, "flash")
 
-        qwen_resolution = resolve_launch("qwen", "coder-model", "xhigh", catalog=catalog)
-        self.assertEqual(qwen_resolution.reasoning_control_mode, REASONING_PROMPT_ONLY)
-        self.assertEqual(qwen_resolution.native_reasoning_level, "")
-
-        kimi_resolution = resolve_launch("kimi", "kimi-for-coding", "low", catalog=catalog)
-        self.assertEqual(kimi_resolution.native_reasoning_level, "thinking_off")
+    def test_removed_qwen_and_kimi_vendors_are_rejected(self):
+        for vendor_id in ("qwen", "kimi"):
+            with self.subTest(vendor=vendor_id):
+                with self.assertRaises(ValueError):
+                    normalize_vendor_id(vendor_id)
+                with self.assertRaises(ValueError):
+                    resolve_launch(vendor_id, "default", "medium")
 
     @unittest.skipUnless(os.environ.get("CANOPY_RUN_VENDOR_DISCOVERY_SMOKE") == "1", "vendor smoke tests are opt-in")
     def test_live_vendor_catalog_smoke(self):
@@ -292,4 +247,3 @@ kimi-code/kimi-for-coding
         self.assertTrue(get_default_model_for_vendor("opencode"))
         self.assertGreater(len(get_model_choices("codex")), 0)
         self.assertGreater(len(get_model_choices("opencode")), 0)
-

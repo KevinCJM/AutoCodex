@@ -250,6 +250,7 @@ class T09TerminalOpsTests(unittest.TestCase):
             patch("T09_terminal_ops.sys.stdout.isatty", return_value=True),
             patch("T09_terminal_ops.ensure_tui_dependencies_installed"),
             patch("T09_terminal_ops.attach_external_process", side_effect=RuntimeError("bun missing")),
+            patch("T09_terminal_ops.sys.argv", ["A00_main.py"]),
         ):
             with self.assertRaisesRegex(RuntimeError, "bun missing"):
                 maybe_launch_tui(None, route="home", action="workflow.a00.start")
@@ -260,12 +261,27 @@ class T09TerminalOpsTests(unittest.TestCase):
             patch("T09_terminal_ops.sys.stdout.isatty", return_value=True),
             patch("T09_terminal_ops.ensure_tui_dependencies_installed") as ensure_install,
             patch("T09_terminal_ops.attach_external_process", return_value=0) as attach_process,
+            patch("T09_terminal_ops.sys.argv", ["A00_main.py"]),
         ):
             redirected, payload = maybe_launch_tui(None, route="home", action="workflow.a00.start")
         self.assertTrue(redirected)
         self.assertEqual(payload, 0)
         ensure_install.assert_called_once_with()
         attach_process.assert_called_once()
+
+    def test_maybe_launch_tui_keeps_explicit_cli_args_in_legacy_path(self):
+        with (
+            patch("T09_terminal_ops.sys.stdin.isatty", return_value=True),
+            patch("T09_terminal_ops.sys.stdout.isatty", return_value=True),
+            patch("T09_terminal_ops.ensure_tui_dependencies_installed") as ensure_install,
+            patch("T09_terminal_ops.attach_external_process") as attach_process,
+            patch("T09_terminal_ops.sys.argv", ["A06_TaskSplit.py", "--project-dir", "/tmp/project"]),
+        ):
+            redirected, payload = maybe_launch_tui(None, route="task-split", action="stage.a06.start")
+        self.assertFalse(redirected)
+        self.assertEqual(payload, ["--project-dir", "/tmp/project"])
+        ensure_install.assert_not_called()
+        attach_process.assert_not_called()
 
     def test_maybe_launch_tui_preserves_legacy_cli_escape_hatch(self):
         redirected, payload = maybe_launch_tui(["--legacy-cli", "--help"], route="home", action="workflow.a00.start")

@@ -103,7 +103,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="需求澄清阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
-    parser.add_argument("--vendor", help="需求澄清阶段厂商: codex|claude|gemini|qwen|kimi|opencode")
+    parser.add_argument("--vendor", help="需求澄清阶段厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="需求澄清阶段模型名称")
     parser.add_argument("--effort", help="需求澄清阶段推理强度")
     parser.add_argument("--proxy-url", default="", help="需求澄清阶段代理端口或完整代理 URL")

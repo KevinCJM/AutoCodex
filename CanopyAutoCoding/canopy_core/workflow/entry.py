@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Sequence
 
 from canopy_core.runtime.tmux_runtime import cleanup_registered_tmux_workers
+from canopy_core.stage_kernel.shared_review import ReviewAgentSelection, StageAgentConfig, resolve_stage_agent_config
 from canopy_core.stage_kernel.requirement_intake import run_requirement_intake_stage
 from canopy_core.stage_kernel.requirements_clarification import run_requirements_clarification_stage
 from canopy_core.stage_kernel.detailed_design import run_detailed_design_stage
@@ -65,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detailed-design-review-max-rounds", default="", help="详细设计评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--task-split-review-max-rounds", default="", help="任务拆分评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--development-review-max-rounds", default="", help="任务开发评审最多重试几轮；传 infinite 表示不设上限")
+    parser.add_argument("--main-agent", default="", help="主工作智能体配置: vendor=...,model=...,effort=...,proxy=...")
+    parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体配置，可重复: name=<key>,vendor=...,model=...,effort=...,proxy=...")
+    parser.add_argument("--agent-config", default="", help="模型配置 JSON；命令行 --main-agent/--reviewer-agent 优先")
+    parser.add_argument("--skip-overall-review", action="store_true", help="A07 后直接结束当前已实现流程，不启动 A08")
     parser.add_argument("--yes", action="store_true", help="传递给当前已实现阶段，跳过非关键确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
@@ -77,15 +82,55 @@ def build_stage_args(
         auto_confirm: bool,
         requirement_name: str = "",
         review_max_rounds: str = "",
+        main_agent: ReviewAgentSelection | None = None,
+        reviewer_agents: Sequence[str] = (),
+        main_proxy_arg: str = "--proxy-url",
+        include_ui_flags: bool = False,
+        no_tui: bool = False,
+        legacy_cli: bool = False,
 ) -> list[str]:
     args = ["--project-dir", project_dir]
     if str(requirement_name).strip():
         args.extend(["--requirement-name", str(requirement_name).strip()])
     if str(review_max_rounds).strip():
         args.extend(["--review-max-rounds", str(review_max_rounds).strip()])
+    if main_agent is not None:
+        args.extend(["--vendor", main_agent.vendor, "--model", main_agent.model, "--effort", main_agent.reasoning_effort])
+        if str(main_agent.proxy_url or "").strip():
+            args.extend([main_proxy_arg, str(main_agent.proxy_url).strip()])
+    for reviewer_agent in reviewer_agents:
+        reviewer_text = str(reviewer_agent or "").strip()
+        if reviewer_text:
+            args.extend(["--reviewer-agent", reviewer_text])
     if auto_confirm:
         args.append("--yes")
+    if include_ui_flags and no_tui:
+        args.append("--no-tui")
+    if include_ui_flags and legacy_cli:
+        args.append("--legacy-cli")
     return args
+
+
+def _format_reviewer_agent_arg(name: str, selection: ReviewAgentSelection) -> str:
+    parts = [
+        f"name={name}",
+        f"vendor={selection.vendor}",
+        f"model={selection.model}",
+        f"effort={selection.reasoning_effort}",
+    ]
+    if str(selection.proxy_url or "").strip():
+        parts.append(f"proxy={str(selection.proxy_url).strip()}")
+    return ",".join(parts)
+
+
+def _workflow_reviewer_agent_args(agent_config: StageAgentConfig) -> tuple[str, ...]:
+    args: list[str] = []
+    for reviewer_name in agent_config.reviewer_order:
+        selection = agent_config.reviewer_selection(reviewer_name)
+        if selection is None:
+            continue
+        args.append(_format_reviewer_agent_arg(reviewer_name, selection))
+    return tuple(args)
 
 
 def render_remaining_stage_placeholders() -> str:
@@ -113,15 +158,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     project_dir = str(args.project_dir).strip() if args.project_dir else prompt_project_dir("")
     requirement_name = str(getattr(args, "requirement_name", "") or "").strip()
-    stage_args = build_stage_args(
+    agent_config = resolve_stage_agent_config(args)
+    reviewer_agent_args = _workflow_reviewer_agent_args(agent_config)
+    routing_stage_args = build_stage_args(
         project_dir,
         auto_confirm=bool(args.yes),
         requirement_name=requirement_name,
+        main_agent=agent_config.main,
+        main_proxy_arg="--proxy-port",
+        include_ui_flags=True,
+        no_tui=bool(args.no_tui),
+        legacy_cli=bool(args.legacy_cli),
+    )
+    intake_stage_args = build_stage_args(
+        project_dir,
+        auto_confirm=bool(args.yes),
+        requirement_name=requirement_name,
+        include_ui_flags=True,
+        no_tui=bool(args.no_tui),
+        legacy_cli=bool(args.legacy_cli),
     )
 
     message("\n===== AGENT初始化阶段 =====")
     notify_stage_action_changed("stage.a01.start")
-    routing_result = routing_stage_main(stage_args)
+    routing_result = routing_stage_main(routing_stage_args)
     routing_exit_code = int(getattr(routing_result, "exit_code", routing_result))
     if routing_exit_code != 0:
         return routing_exit_code
@@ -139,7 +199,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     message("\n===== 需求录入阶段 =====")
     notify_stage_action_changed("stage.a02.start")
     try:
-        intake_result = run_requirement_intake_stage(stage_args)
+        intake_result = run_requirement_intake_stage(intake_stage_args)
     except Exception as error:  # noqa: BLE001
         if _bridge_terminal_active():
             raise
@@ -159,6 +219,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             project_dir,
             auto_confirm=bool(args.yes),
             requirement_name=workflow_requirement_name,
+            main_agent=agent_config.main,
+            include_ui_flags=True,
+            no_tui=bool(args.no_tui),
+            legacy_cli=bool(args.legacy_cli),
         )
         message("\n===== 需求澄清阶段 =====")
         notify_stage_action_changed("stage.a03.start")
@@ -179,6 +243,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             auto_confirm=bool(args.yes),
             requirement_name=requirements_result.requirement_name,
             review_max_rounds=str(args.requirements_review_max_rounds or "").strip(),
+            reviewer_agents=reviewer_agent_args,
+            include_ui_flags=True,
+            no_tui=bool(args.no_tui),
+            legacy_cli=bool(args.legacy_cli),
         )
         message("\n===== 需求评审阶段 =====")
         notify_stage_action_changed("stage.a04.start")
@@ -200,6 +268,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             auto_confirm=bool(args.yes),
             requirement_name=review_result.requirement_name,
             review_max_rounds=str(args.detailed_design_review_max_rounds or "").strip(),
+            main_agent=agent_config.main,
+            reviewer_agents=reviewer_agent_args,
+            include_ui_flags=True,
+            no_tui=bool(args.no_tui),
+            legacy_cli=bool(args.legacy_cli),
         )
         message("\n===== 详细设计阶段 =====")
         notify_stage_action_changed("stage.a05.start")
@@ -221,6 +294,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             auto_confirm=bool(args.yes),
             requirement_name=design_result.requirement_name,
             review_max_rounds=str(args.task_split_review_max_rounds or "").strip(),
+            main_agent=agent_config.main,
+            reviewer_agents=reviewer_agent_args,
+            include_ui_flags=True,
+            no_tui=bool(args.no_tui),
+            legacy_cli=bool(args.legacy_cli),
         )
         message("\n===== 任务拆分阶段 =====")
         notify_stage_action_changed("stage.a06.start")
@@ -242,6 +320,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             auto_confirm=bool(args.yes),
             requirement_name=task_split_result.requirement_name,
             review_max_rounds=str(args.development_review_max_rounds or "").strip(),
+            main_agent=agent_config.main,
+            reviewer_agents=reviewer_agent_args,
+            include_ui_flags=True,
+            no_tui=bool(args.no_tui),
+            legacy_cli=bool(args.legacy_cli),
         )
         message("\n===== 任务开发阶段 =====")
         cleanup_stale_development_runtime_state(project_dir, task_split_result.requirement_name)
@@ -257,11 +340,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             message(error)
             return 1
 
+        if bool(args.skip_overall_review):
+            message()
+            message(render_remaining_stage_placeholders())
+            return 0
+
         clear_pending_tty_input()
         overall_review_stage_args = build_stage_args(
             project_dir,
             auto_confirm=bool(args.yes),
             requirement_name=task_split_result.requirement_name,
+            main_agent=agent_config.main,
+            reviewer_agents=reviewer_agent_args,
+            include_ui_flags=True,
+            no_tui=bool(args.no_tui),
+            legacy_cli=bool(args.legacy_cli),
         )
         message("\n===== 复核阶段 =====")
         notify_stage_action_changed("stage.a08.start")

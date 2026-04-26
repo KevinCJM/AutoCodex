@@ -79,6 +79,13 @@ test('PromptTextarea persists draft and remembers submitted history for prompt r
   expect(content.includes('scrollTextareaBy(direction === \'up\' ? -1 : 1)')).toBe(true)
 })
 
+test('PromptTextarea submits the live textarea contents instead of a possibly stale signal', () => {
+  const content = readFileSync(join(import.meta.dir, 'ui/PromptTextarea.tsx'), 'utf8')
+  expect(content.includes('const submittedValue = textarea?.plainText ?? value()')).toBe(true)
+  expect(content.includes('rememberPromptValue(props.draftKey, submittedValue)')).toBe(true)
+  expect(content.includes('props.onSubmit(submittedValue)')).toBe(true)
+})
+
 test('DialogSelect uses terminal-aware sizing and width clipping so long option lists remain navigable inside the dialog border', () => {
   const content = readFileSync(join(import.meta.dir, 'ui/DialogSelect.tsx'), 'utf8')
   expect(content.includes('type { ScrollBoxRenderable }')).toBe(true)

@@ -38,7 +38,7 @@ from T03_agent_init_workflow import (
     RunStore,
     cleanup_routing_stage_artifacts,
     kill_run_tmux_sessions,
-    missing_routing_layer_files,
+    routing_layer_readiness_issues,
     resolve_existing_directory,
     resolve_target_selection,
     run_batch_initialization,
@@ -58,9 +58,7 @@ VENDOR_ALIASES = {
     "1": "codex",
     "2": "claude",
     "3": "gemini",
-    "4": "qwen",
-    "5": "kimi",
-    "6": "opencode",
+    "4": "opencode",
     "claude code": "claude",
     "claude-code": "claude",
     "open code": "opencode",
@@ -98,8 +96,11 @@ class RoutingStageResult:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="AGENT初始化阶段：tmux + coding agent 路由层初始化")
     parser.add_argument("--project-dir", help="项目工作目录")
+    # Workflow entry forwards a shared argv shape to every stage.
+    # Routing init does not use requirement_name, but must accept it for compatibility.
+    parser.add_argument("--requirement-name", default="", help=argparse.SUPPRESS)
     parser.add_argument("--target-dir", action="append", default=[], help="额外目标目录，可重复传入")
-    parser.add_argument("--vendor", help="厂商: codex|claude|gemini|qwen|kimi|opencode")
+    parser.add_argument("--vendor", help="厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="模型名称")
     parser.add_argument("--effort", help="推理强度")
     parser.add_argument("--proxy-port", default="", help="代理端口或完整代理 URL")
@@ -366,7 +367,7 @@ def collect_cli_request(args: argparse.Namespace) -> CliRequest:
         if args.project_dir
         else prompt_project_dir("")
     )
-    project_missing_files = tuple(missing_routing_layer_files(project_dir))
+    project_missing_files = tuple(routing_layer_readiness_issues(project_dir))
     if project_missing_files:
         requested_run_init = True
     else:

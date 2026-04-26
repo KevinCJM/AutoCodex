@@ -113,6 +113,33 @@ test('bootstrap infers running when active stage has a busy worker', () => {
   ).toBe('running')
 })
 
+test('bootstrap maps control session action to routing stage workers', () => {
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'control.b01.open',
+          pending_hitl: false,
+        },
+        stages: {
+          routing: {
+            workers: [
+              {
+                session_name: '路由初始化-角木蛟',
+                status: 'running',
+                agent_state: 'BUSY',
+                health_status: 'alive',
+                current_task_runtime_status: 'running',
+                session_exists: true,
+              },
+            ],
+          },
+        },
+      },
+    }),
+  ).toBe('running')
+})
+
 test('bootstrap keeps awaiting-input ahead of worker activity', () => {
   expect(
     inferBootstrapStatus({

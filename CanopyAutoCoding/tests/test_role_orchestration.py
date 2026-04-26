@@ -37,6 +37,26 @@ class _HealthAwareWorker(_FakeWorker):
         return SimpleNamespace()
 
 
+class _CompletedBusyWorker(_FakeWorker):
+    def __init__(self) -> None:
+        super().__init__("READY")
+        self.completed = False
+
+    def read_state(self):
+        if not self.completed:
+            return {}
+        return {
+            "status": "succeeded",
+            "result_status": "succeeded",
+            "current_task_runtime_status": "done",
+        }
+
+    def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
+        _ = timeout_sec
+        self.ensure_calls += 1
+        self.state = "READY"
+
+
 class _DeathAwareFakeWorker:
     def __init__(self, state: str, *, launched: bool) -> None:
         self.state = state
@@ -151,6 +171,28 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(observed, ["R1,R2"])
         self.assertEqual([item.worker.state for item in updated], ["READY", "READY"])
         self.assertEqual([item.worker.ensure_calls for item in updated], [2, 0])
+
+    def test_run_reviewer_phase_allows_completed_busy_reviewer_after_round(self):
+        main = SimpleNamespace(worker=_FakeWorker("READY"))
+        reviewer_worker = _CompletedBusyWorker()
+        reviewers = [SimpleNamespace(worker=reviewer_worker, reviewer_name="R1")]
+
+        def _run_phase(active_reviewers):  # noqa: ANN001
+            reviewer_worker.completed = True
+            reviewer_worker.state = "BUSY"
+            return list(active_reviewers)
+
+        updated = run_reviewer_phase(
+            main,
+            reviewers,
+            run_phase=_run_phase,
+            main_label="主工作智能体",
+            reviewer_label_getter=lambda item, index: item.reviewer_name or f"R{index}",
+        )
+
+        self.assertEqual([item.reviewer_name for item in updated], ["R1"])
+        self.assertEqual(reviewer_worker.ensure_calls, 0)
+        self.assertEqual(reviewer_worker.state, "BUSY")
 
     def test_drop_dead_reviewers_keeps_fresh_dead_workers_until_launch(self):
         fresh = SimpleNamespace(worker=_DeathAwareFakeWorker("DEAD", launched=False), reviewer_name="fresh")

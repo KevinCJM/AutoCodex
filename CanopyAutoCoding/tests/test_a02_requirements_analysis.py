@@ -1608,7 +1608,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         }
                     return {
                         "health_status": "alive",
-                        "health_note": "waiting_input",
+                        "health_note": "alive",
                     }
 
             with patch("A02_RequirementsAnalysis.TmuxBatchWorker", FakeTmuxWorker), patch(
@@ -1687,7 +1687,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 def read_state(self):
                     return {
                         "health_status": "alive",
-                        "health_note": "waiting_input",
+                        "health_note": "alive",
                     }
 
             with patch("A02_RequirementsAnalysis.TmuxBatchWorker", FakeTmuxWorker), patch(

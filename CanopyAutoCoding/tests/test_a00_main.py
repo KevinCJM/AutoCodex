@@ -20,6 +20,7 @@ from A00_main import (
     render_remaining_stage_placeholders,
 )
 from canopy_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from canopy_core.stage_kernel.shared_review import ReviewAgentSelection
 
 
 @dataclass
@@ -58,6 +59,44 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(
             build_stage_args("/tmp/project", auto_confirm=False, review_max_rounds="infinite"),
             ["--project-dir", "/tmp/project", "--review-max-rounds", "infinite"],
+        )
+
+    def test_build_stage_args_can_include_main_and_two_reviewers(self):
+        main_agent = ReviewAgentSelection("codex", "gpt-5.4", "high", "10900")
+
+        args = build_stage_args(
+            "/tmp/project",
+            auto_confirm=True,
+            requirement_name="需求A",
+            main_agent=main_agent,
+            main_proxy_arg="--proxy-port",
+            reviewer_agents=(
+                "name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium,proxy=10900",
+                "name=R2,vendor=codex,model=gpt-5.4,effort=high",
+            ),
+        )
+
+        self.assertEqual(
+            args,
+            [
+                "--project-dir",
+                "/tmp/project",
+                "--requirement-name",
+                "需求A",
+                "--vendor",
+                "codex",
+                "--model",
+                "gpt-5.4",
+                "--effort",
+                "high",
+                "--proxy-port",
+                "10900",
+                "--reviewer-agent",
+                "name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium,proxy=10900",
+                "--reviewer-agent",
+                "name=R2,vendor=codex,model=gpt-5.4,effort=high",
+                "--yes",
+            ],
         )
 
     def test_render_remaining_stage_placeholders_lists_future_stages(self):
@@ -184,6 +223,80 @@ class A00MainTests(unittest.TestCase):
                 json.loads(record_path.read_text(encoding="utf-8")),
                 build_pre_development_task_record_payload(),
             )
+
+    def test_main_forwards_agent_config_and_can_skip_overall_review(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            calls: dict[str, list[str]] = {}
+            stage_notifications: list[str] = []
+            config_path = Path(tmpdir) / "agents.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "main": {"vendor": "codex", "model": "gpt-5.4", "effort": "high", "proxy": "10900"},
+                        "reviewers": [
+                            {"name": "R1", "vendor": "codex", "model": "gpt-5.4-mini", "effort": "medium", "proxy": "10900"},
+                            {"name": "R2", "vendor": "codex", "model": "gpt-5.4", "effort": "high"},
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            def remember(stage: str, result: _RequirementsStageResult):  # noqa: ANN001
+                def _runner(argv, *args, **kwargs):  # noqa: ANN001
+                    _ = args, kwargs
+                    calls[stage] = list(argv)
+                    return result
+
+                return _runner
+
+            with patch("A00_main.routing_stage_main", side_effect=remember("a01", 0)), patch(
+                "A00_main.run_requirement_intake_stage",
+                side_effect=remember("a02", _RequirementsStageResult(requirement_name="需求A")),
+            ), patch(
+                "A00_main.run_requirements_clarification_stage",
+                side_effect=remember("a03", _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")),
+            ), patch(
+                "A00_main.run_requirements_review_stage",
+                side_effect=remember("a04", _RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba")),
+            ), patch(
+                "A00_main.run_detailed_design_stage",
+                side_effect=remember("a05", _RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=())),
+            ), patch(
+                "A00_main.run_task_split_stage",
+                side_effect=remember("a06", _RequirementsStageResult(requirement_name="需求A")),
+            ), patch(
+                "A00_main.run_development_stage",
+                side_effect=remember("a07", _RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=())),
+            ), patch(
+                "A00_main.run_overall_review_stage",
+            ) as a08_mock, patch(
+                "A00_main.notify_stage_action_changed",
+                side_effect=stage_notifications.append,
+            ):
+                exit_code = main(
+                    [
+                        "--project-dir",
+                        tmpdir,
+                        "--requirement-name",
+                        "需求A",
+                        "--agent-config",
+                        str(config_path),
+                        "--skip-overall-review",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(calls["a01"][-8:], ["--vendor", "codex", "--model", "gpt-5.4", "--effort", "high", "--proxy-port", "10900"])
+        self.assertIn("--proxy-url", calls["a03"])
+        self.assertNotIn("--proxy-port", calls["a03"])
+        for stage in ("a04", "a05", "a06", "a07"):
+            self.assertEqual(calls[stage].count("--reviewer-agent"), 2)
+        self.assertIn("name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium,proxy=10900", calls["a04"])
+        self.assertIn("name=R2,vendor=codex,model=gpt-5.4,effort=high", calls["a07"])
+        a08_mock.assert_not_called()
+        self.assertNotIn("stage.a08.start", stage_notifications)
 
     def test_main_reraises_stage_exception_in_bridge_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -532,6 +645,15 @@ class A00MainTests(unittest.TestCase):
                 "4",
                 "--development-review-max-rounds",
                 "infinite",
+                "--main-agent",
+                "vendor=codex,model=gpt-5.4,effort=high,proxy=10900",
+                "--reviewer-agent",
+                "name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium",
+                "--reviewer-agent",
+                "name=R2,vendor=codex,model=gpt-5.4,effort=high",
+                "--agent-config",
+                "/tmp/agents.json",
+                "--skip-overall-review",
             ]
         )
         self.assertEqual(args.project_dir, "/tmp/project")
@@ -541,6 +663,16 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(args.detailed_design_review_max_rounds, "3")
         self.assertEqual(args.task_split_review_max_rounds, "4")
         self.assertEqual(args.development_review_max_rounds, "infinite")
+        self.assertEqual(args.main_agent, "vendor=codex,model=gpt-5.4,effort=high,proxy=10900")
+        self.assertEqual(
+            args.reviewer_agent,
+            [
+                "name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium",
+                "name=R2,vendor=codex,model=gpt-5.4,effort=high",
+            ],
+        )
+        self.assertEqual(args.agent_config, "/tmp/agents.json")
+        self.assertTrue(args.skip_overall_review)
 
     def test_main_routes_each_stage_review_limit_to_matching_stage_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:

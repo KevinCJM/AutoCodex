@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from canopy_core.runtime.contracts import resolve_task_result_decision
+
 from A05_DetailedDesign import (
     DetailedDesignReviewerSpec,
     ReviewAgentSelection,
@@ -16,6 +18,7 @@ from A05_DetailedDesign import (
     _run_parallel_reviewers,
     build_detailed_design_init_prompt,
     build_detailed_design_prompt,
+    build_detailed_design_feedback_contract,
     build_parser,
     cleanup_stale_detailed_design_runtime_state,
     build_reviewer_workers,
@@ -78,6 +81,35 @@ class _FreshReviewerWorker:
 
 
 class A05DetailedDesignTests(unittest.TestCase):
+    def test_review_limit_force_hitl_contract_uses_outcome_scoped_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = build_detailed_design_paths(tmpdir, "需求A")
+            paths["detailed_design_path"].write_text("旧详细设计\n", encoding="utf-8")
+            paths["ask_human_path"].write_text("请决策\n", encoding="utf-8")
+
+            contract = build_detailed_design_feedback_contract(
+                paths,
+                mode="a05_detailed_design_review_limit_force_hitl",
+            )
+            decision = resolve_task_result_decision(contract)
+
+        self.assertEqual(decision.status, "hitl")
+        self.assertIn("ask_human", decision.artifacts)
+        self.assertNotIn("detailed_design", decision.artifacts)
+
+    def test_feedback_contract_completed_branch_requires_design_and_feedback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = build_detailed_design_paths(tmpdir, "需求A")
+            paths["detailed_design_path"].write_text("新详细设计\n", encoding="utf-8")
+            paths["ba_feedback_path"].write_text("已处理评审\n", encoding="utf-8")
+
+            contract = build_detailed_design_feedback_contract(paths)
+            decision = resolve_task_result_decision(contract)
+
+        self.assertEqual(decision.status, "completed")
+        self.assertIn("detailed_design", decision.artifacts)
+        self.assertIn("ba_feedback", decision.artifacts)
+
     def test_resolve_review_max_rounds_supports_default_and_infinite(self):
         args = build_parser().parse_args([])
         self.assertEqual(resolve_review_max_rounds(args), 5)

@@ -189,6 +189,10 @@ class TaskResultContractsTests(unittest.TestCase):
             review_md.write_text("未通过\n", encoding="utf-8")
             self.assertEqual(resolve_task_result_decision(contract).status, TASK_RESULT_REVIEW_FAIL)
 
+            review_json.write_text(json.dumps({"task_name": "需求评审", "review_pass": True}, ensure_ascii=False), encoding="utf-8")
+            review_md.write_text("", encoding="utf-8")
+            self.assertEqual(resolve_task_result_decision(contract).status, TASK_RESULT_REVIEW_PASS)
+
     def test_resolve_task_result_decision_supports_requirement_intake_variants(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)
@@ -210,7 +214,7 @@ class TaskResultContractsTests(unittest.TestCase):
             self.assertEqual(resolve_task_result_decision(contract).status, TASK_RESULT_HITL)
 
             hitl_record.write_text("", encoding="utf-8")
-            self.assertEqual(resolve_task_result_decision(contract).status, TASK_RESULT_ERROR)
+            self.assertEqual(resolve_task_result_decision(contract).status, TASK_RESULT_HITL)
 
             original_requirement.write_text("正文\n", encoding="utf-8")
             self.assertEqual(resolve_task_result_decision(contract).status, TASK_RESULT_COMPLETED)

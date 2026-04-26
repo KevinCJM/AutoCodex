@@ -47,7 +47,25 @@ from T03_agent_init_workflow import (
     run_batch_initialization,
     run_directory_initialization_with_worker,
     routing_turn_status_path,
+    validate_routing_layer_artifacts,
 )
+
+
+def _write_valid_routing_layer(project_dir: Path) -> None:
+    (project_dir / "docs").mkdir(exist_ok=True)
+    (project_dir / "AGENTS.md").write_text("ok\n", encoding="utf-8")
+    (project_dir / "docs" / "repo_map.json").write_text(
+        json.dumps({"modules": [{"id": "M01", "name": "root"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (project_dir / "docs" / "task_routes.json").write_text(
+        json.dumps({"routes": [{"id": "R01", "first_read_modules": ["M01"], "pitfall_ids": ["P01"]}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (project_dir / "docs" / "pitfalls.json").write_text(
+        json.dumps({"pitfalls": [{"id": "P01", "title": "risk"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 class FakeWorker:
@@ -87,7 +105,7 @@ class FakeWorker:
                 "workflow_stage": "pending",
                 "workflow_round": 0,
                 "result_status": "pending",
-                "provider_phase": "unknown",
+                "agent_state": "STARTING",
                 "retry_count": 0,
                 "last_log_offset": 0,
                 "log_path": str(self.log_path),
@@ -149,7 +167,13 @@ class FakeWorker:
     def run_turn(self, *, label, prompt, required_tokens=(), completion_contract=None, timeout_sec=None):
         step = self.script.pop(0)
         create_files = step.get("create_files", ())
+        handled_create_files: set[str] = set()
+        if set(str(item) for item in create_files) >= set(ROUTING_LAYER_REQUIRED_FILES):
+            _write_valid_routing_layer(self.work_dir)
+            handled_create_files = set(ROUTING_LAYER_REQUIRED_FILES)
         for relative_path in create_files:
+            if str(relative_path) in handled_create_files:
+                continue
             path = self.work_dir / str(relative_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text("ok\n", encoding="utf-8")
@@ -242,6 +266,49 @@ class AgentInitWorkflowTests(unittest.TestCase):
             )
             self.assertFalse(has_complete_routing_layer(root))
 
+    def test_validate_routing_layer_artifacts_accepts_minimal_valid_docs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_valid_routing_layer(root)
+
+            validate_routing_layer_artifacts(root)
+            self.assertTrue(has_complete_routing_layer(root))
+
+    def test_validate_routing_layer_artifacts_rejects_empty_json_objects(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "docs").mkdir(parents=True)
+            (root / "AGENTS.md").write_text("ok\n", encoding="utf-8")
+            for name in ("repo_map.json", "task_routes.json", "pitfalls.json"):
+                (root / "docs" / name).write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "modules|routes|pitfalls"):
+                validate_routing_layer_artifacts(root)
+            self.assertFalse(has_complete_routing_layer(root))
+
+    def test_validate_routing_layer_artifacts_rejects_unresolved_refs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_valid_routing_layer(root)
+            (root / "docs" / "task_routes.json").write_text(
+                json.dumps(
+                    {
+                        "routes": [
+                            {
+                                "id": "R01",
+                                "first_read_modules": ["M99"],
+                                "pitfall_ids": ["P99"],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "M99|P99"):
+                validate_routing_layer_artifacts(root)
+
     def test_cleanup_routing_stage_artifacts_removes_audit_files_and_runtime_dir_on_success(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -323,10 +390,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
             project_dir = (Path(tmpdir) / "project").resolve()
             calc_dir = (project_dir / "calc").resolve()
             calc_dir.mkdir(parents=True)
-            for relative in ROUTING_LAYER_REQUIRED_FILES:
-                path = project_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("ok\n", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
 
             selection = resolve_target_selection(
                 project_dir=project_dir,
@@ -988,10 +1052,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = (Path(tmpdir) / "project").resolve()
             project_dir.mkdir(parents=True)
-            for relative in ROUTING_LAYER_REQUIRED_FILES:
-                path = project_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("ok\n", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
 
             selection = resolve_target_selection(project_dir=project_dir, run_init=False)
             config = AgentRunConfig(vendor="codex", model="gpt-5")
@@ -1218,10 +1279,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = (Path(tmpdir) / "project").resolve()
             project_dir.mkdir(parents=True)
-            for relative in ROUTING_LAYER_REQUIRED_FILES:
-                path = project_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("ok\n", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             (project_dir / ROUTING_AUDIT_RECORD_FILE).write_text(
                 "- verdict: usable_but_drift_prone\n- missing: area=escalation_conditions | effect=agents may not know when to stop | direction=add stop_and_verify_when\n- recommendation: minor_structural_fixes\n",
                 encoding="utf-8",

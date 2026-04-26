@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -36,6 +37,23 @@ from A01_Routing_LayerPlanning import (
 from T03_agent_init_workflow import BatchInitResult, DirectoryInitResult, RoutingCleanupResult, RunManifest, RunStore, TargetSelection, WorkerManifestEntry
 
 
+def _write_valid_routing_layer(project_dir: Path) -> None:
+    (project_dir / "docs").mkdir(exist_ok=True)
+    (project_dir / "AGENTS.md").write_text("ok", encoding="utf-8")
+    (project_dir / "docs" / "repo_map.json").write_text(
+        json.dumps({"modules": [{"id": "M01", "name": "root"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (project_dir / "docs" / "task_routes.json").write_text(
+        json.dumps({"routes": [{"id": "R01", "first_read_modules": ["M01"], "pitfall_ids": ["P01"]}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    (project_dir / "docs" / "pitfalls.json").write_text(
+        json.dumps({"pitfalls": [{"id": "P01", "title": "risk"}]}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 class RoutingLayerCliTests(unittest.TestCase):
     def test_terminal_progress_monitor_redraws_in_place_for_tty(self):
         class _TTYBuffer(io.StringIO):
@@ -65,9 +83,12 @@ class RoutingLayerCliTests(unittest.TestCase):
 
     def test_normalize_vendor_choice_supports_aliases(self):
         self.assertEqual("claude", normalize_vendor_choice("claude code"))
-        self.assertEqual("qwen", normalize_vendor_choice("4"))
-        self.assertEqual("opencode", normalize_vendor_choice("6"))
+        self.assertEqual("opencode", normalize_vendor_choice("4"))
         self.assertEqual("codex", normalize_vendor_choice("codex"))
+        with self.assertRaises(ValueError):
+            normalize_vendor_choice("qwen")
+        with self.assertRaises(ValueError):
+            normalize_vendor_choice("kimi")
 
     def test_normalize_model_and_effort_support_numeric_aliases(self):
         self.assertEqual("gpt-5.4", normalize_model_choice("codex", "1"))
@@ -97,11 +118,7 @@ class RoutingLayerCliTests(unittest.TestCase):
         parser = build_parser()
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
-            (project_dir / "docs").mkdir()
-            (project_dir / "AGENTS.md").write_text("ok", encoding="utf-8")
-            (project_dir / "docs" / "repo_map.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "task_routes.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "pitfalls.json").write_text("{}", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             args = parser.parse_args(
                 [
                     "--project-dir",
@@ -120,6 +137,12 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertEqual(request.vendor, "opencode")
         self.assertEqual(request.model, get_default_model_for_vendor("opencode"))
         self.assertEqual(request.reasoning_effort, get_normalized_effort_choices("opencode", request.model)[0])
+
+    def test_build_parser_accepts_requirement_name_for_workflow_compat(self):
+        parser = build_parser()
+        args = parser.parse_args(["--project-dir", "/tmp/project", "--requirement-name", "需求A"])
+        self.assertEqual(args.project_dir, "/tmp/project")
+        self.assertEqual(args.requirement_name, "需求A")
 
     def test_normalize_run_init_choice_parses_yes_no_variants(self):
         self.assertTrue(normalize_run_init_choice("yes"))
@@ -384,11 +407,7 @@ class RoutingLayerCliTests(unittest.TestCase):
     def test_collect_cli_request_with_project_dir_only_still_prompts_run_init(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
-            (project_dir / "docs").mkdir()
-            (project_dir / "AGENTS.md").write_text("ok", encoding="utf-8")
-            (project_dir / "docs" / "repo_map.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "task_routes.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "pitfalls.json").write_text("{}", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             parser = build_parser()
             args = parser.parse_args(["--project-dir", tmpdir])
             with patch("builtins.input", side_effect=["no"]):
@@ -403,11 +422,7 @@ class RoutingLayerCliTests(unittest.TestCase):
     def test_collect_cli_request_with_project_dir_only_prompts_target_dirs_and_effort(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
-            (project_dir / "docs").mkdir()
-            (project_dir / "AGENTS.md").write_text("ok", encoding="utf-8")
-            (project_dir / "docs" / "repo_map.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "task_routes.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "pitfalls.json").write_text("{}", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             parser = build_parser()
             args = parser.parse_args(["--project-dir", tmpdir])
             with patch(
@@ -434,11 +449,7 @@ class RoutingLayerCliTests(unittest.TestCase):
         args = parser.parse_args(["--yes"])
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
-            (project_dir / "docs").mkdir()
-            (project_dir / "AGENTS.md").write_text("ok", encoding="utf-8")
-            (project_dir / "docs" / "repo_map.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "task_routes.json").write_text("{}", encoding="utf-8")
-            (project_dir / "docs" / "pitfalls.json").write_text("{}", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             with patch(
                 "builtins.input",
                 side_effect=[

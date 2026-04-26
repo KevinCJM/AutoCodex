@@ -17,6 +17,7 @@ from A06_TaskSplit import (
     _run_reviewer_result_turn,
     _run_reviewer_turn_with_resume,
     build_parser,
+    build_reviewer_init_result_contract,
     build_reviewer_workers,
     build_task_split_paths,
     cleanup_stale_task_split_runtime_state,
@@ -1473,7 +1474,7 @@ class A06TaskSplitTests(unittest.TestCase):
                     reviewer,
                     label="task_split_reviewer_init_测试工程师",
                     prompt="init",
-                    result_contract=SimpleNamespace(mode="a06_ba_init"),
+                    result_contract=SimpleNamespace(mode="a06_reviewer_init"),
                     project_dir=project_dir,
                     requirement_name="需求A",
                     reviewer_spec=TaskSplitReviewerSpec(
@@ -1487,6 +1488,15 @@ class A06TaskSplitTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 2)
         self.assertIn("启动超时", reviewer.worker.reconfig_reason)
         recreate_runtime.assert_called_once()
+
+    def test_build_reviewer_init_result_contract_uses_reviewer_mode(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = build_task_split_paths(tmp_dir, "需求A")
+
+            contract = build_reviewer_init_result_contract(paths)
+
+            self.assertEqual(contract.turn_id, "a06_reviewer_init")
+            self.assertEqual(contract.mode, "a06_reviewer_init")
 
     def test_generate_task_split_json_raises_after_repair_attempts_exhausted(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

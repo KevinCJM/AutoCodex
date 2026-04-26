@@ -33,7 +33,12 @@ from canopy_core.prompt_contracts.task_split import (
     task_md_to_json,
     task_split,
 )
-from canopy_core.runtime.contracts import TaskResultContract, TurnFileContract, TurnFileResult
+from canopy_core.runtime.contracts import (
+    TaskResultContract,
+    TurnFileContract,
+    TurnFileResult,
+    normalize_review_status_payload,
+)
 from canopy_core.runtime.hitl import build_prefixed_sha256
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -80,6 +85,7 @@ from canopy_core.stage_kernel.shared_review import (
     ReviewerRuntime,
     collect_reviewer_agent_selections,
     ensure_empty_file,
+    ensure_review_artifacts,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
     prompt_required_replacement_review_agent_selection,
@@ -90,9 +96,11 @@ from canopy_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    resolve_stage_agent_config,
     collect_review_limit_hitl_response,
     run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
+    worker_has_provider_runtime_error,
 )
 from canopy_core.stage_kernel.turn_output_goals import (
     CompletionTurnGoal,
@@ -149,11 +157,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="任务拆分阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
-    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|qwen|kimi|opencode")
+    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
     parser.add_argument("--review-max-rounds", default="", help="任务拆分评审最多重试几轮；传 infinite 表示不设上限")
+    parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=<key>,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖任务拆分评审角色列表")
     parser.add_argument("--reviewer-role-prompt", action="append", default=[], help="重复传入以覆盖对应角色提示词")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
@@ -181,6 +190,24 @@ def build_task_split_paths(project_dir: str | Path, requirement_name: str) -> di
         "merged_review_path": project_root / f"{safe_name}_任务单评审记录.md",
         "ba_feedback_path": project_root / f"{safe_name}_需求分析师反馈.md",
     }
+
+
+def build_task_split_runtime_root(project_dir: str | Path, requirement_name: str = "") -> Path:
+    project_root = Path(project_dir).expanduser().resolve()
+    safe_requirement = sanitize_requirement_name(requirement_name) if str(requirement_name or "").strip() else ""
+    runtime_root = project_root / TASK_SPLIT_RUNTIME_ROOT_NAME
+    return runtime_root / safe_requirement if safe_requirement else runtime_root
+
+
+def _infer_task_split_runtime_scope(worker: object, project_dir: str | Path) -> str:
+    try:
+        worker_root = Path(getattr(worker, "runtime_root", "")).expanduser().resolve()
+        legacy_root = Path(project_dir).expanduser().resolve() / TASK_SPLIT_RUNTIME_ROOT_NAME
+    except Exception:
+        return ""
+    if worker_root.parent == legacy_root:
+        return worker_root.name
+    return ""
 
 
 def build_reviewer_artifact_paths(project_dir: str | Path, requirement_name: str, reviewer_name: str) -> tuple[Path, Path]:
@@ -537,6 +564,7 @@ def decide_existing_task_split_mode(
 def create_task_split_ba_handoff(
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     selection: ReviewAgentSelection,
 ) -> RequirementsAnalystHandoff:
     project_root = Path(project_dir).expanduser().resolve()
@@ -549,9 +577,10 @@ def create_task_split_ba_handoff(
             reasoning_effort=selection.reasoning_effort,
             proxy_url=selection.proxy_url,
         ),
-        runtime_root=project_root / TASK_SPLIT_RUNTIME_ROOT_NAME,
+        runtime_root=build_task_split_runtime_root(project_root, requirement_name),
         runtime_metadata={
             "project_dir": str(project_root),
+            "requirement_name": str(requirement_name or "").strip(),
             "workflow_action": "stage.a06.start",
         },
     )
@@ -577,7 +606,11 @@ def prepare_task_split_ba_handoff(
     role_label = _task_split_ba_display_name(project_dir=project_dir)
     selection = collect_ba_agent_selection(args, role_label=role_label)
     message(render_review_agent_selection("进入任务拆分阶段（需求分析师）", selection))
-    return create_task_split_ba_handoff(project_dir=project_dir, selection=selection), True
+    create_kwargs: dict[str, object] = {"project_dir": project_dir, "selection": selection}
+    requirement_name = str(getattr(args, "requirement_name", "") or "").strip()
+    if requirement_name:
+        create_kwargs["requirement_name"] = requirement_name
+    return create_task_split_ba_handoff(**create_kwargs), True
 
 
 def build_task_split_init_prompt(paths: dict[str, Path], *, role_desc: str = TASK_SPLIT_BA_ROLE_DESC) -> str:
@@ -614,8 +647,23 @@ def build_ba_init_result_contract(paths: dict[str, Path]) -> TaskResultContract:
             "hitl_record": paths["hitl_record_path"],
             "detailed_design": paths["detailed_design_path"],
         },
-        terminal_status_tokens={"ready": ("完成",)},
-        terminal_status_summaries={"ready": "任务拆分阶段智能体已完成初始化"},
+    )
+
+
+def build_reviewer_init_result_contract(paths: dict[str, Path]) -> TaskResultContract:
+    return TaskResultContract(
+        turn_id="a06_reviewer_init",
+        phase="a06_reviewer_init",
+        task_kind="a06_reviewer_init",
+        mode="a06_reviewer_init",
+        expected_statuses=("ready",),
+        stage_name=TASK_SPLIT_TASK_NAME,
+        optional_artifacts={
+            "original_requirement": paths["original_requirement_path"],
+            "requirements_clear": paths["requirements_clear_path"],
+            "hitl_record": paths["hitl_record_path"],
+            "detailed_design": paths["detailed_design_path"],
+        },
     )
 
 
@@ -634,8 +682,6 @@ def build_task_split_generate_result_contract(paths: dict[str, Path]) -> TaskRes
             "hitl_record": paths["hitl_record_path"],
             "detailed_design": paths["detailed_design_path"],
         },
-        terminal_status_tokens={"completed": ("完成",)},
-        terminal_status_summaries={"completed": "需求分析师已生成任务单文档"},
     )
 
 
@@ -649,8 +695,25 @@ def build_task_split_feedback_contract(
     mode: str = "a06_task_split_feedback",
 ) -> TaskResultContract:
     expected_statuses = ("hitl", "completed")
+    outcome_artifacts = {
+        "hitl": {
+            "requires": ("ask_human",),
+            "optional": ("hitl_record",),
+            "forbids": ("ba_feedback",),
+        },
+        "completed": {
+            "requires": ("ba_feedback", "task_md"),
+            "optional": ("hitl_record",),
+        },
+    }
     if mode == "a06_task_split_review_limit_force_hitl":
         expected_statuses = ("hitl",)
+        outcome_artifacts = {
+            "hitl": {
+                "requires": ("ask_human",),
+                "optional": ("hitl_record",),
+            },
+        }
     return TaskResultContract(
         turn_id=mode,
         phase=mode,
@@ -664,11 +727,12 @@ def build_task_split_feedback_contract(
             "task_md": paths["task_md_path"],
             "hitl_record": paths["hitl_record_path"],
         },
+        outcome_artifacts=outcome_artifacts,
     )
 
 
 def _build_ba_turn_goal(contract: TaskResultContract) -> TaskTurnGoal | None:
-    if contract.mode == "a06_ba_init":
+    if contract.mode in {"a06_ba_init", "a06_reviewer_init"}:
         return TaskTurnGoal(goal_id=contract.mode, outcomes={"ready": OutcomeGoal(status="ready")})
     if contract.mode == "a06_task_split_generate":
         return TaskTurnGoal(
@@ -706,8 +770,6 @@ def build_task_split_json_result_contract(paths: dict[str, Path]) -> TaskResultC
         stage_name=TASK_SPLIT_TASK_NAME,
         required_artifacts={"task_json": paths["task_json_path"]},
         optional_artifacts={"task_md": paths["task_md_path"]},
-        terminal_status_tokens={"completed": ("完成",)},
-        terminal_status_summaries={"completed": "需求分析师已生成任务单 JSON"},
     )
 
 
@@ -745,6 +807,7 @@ def _run_ba_turn(
 def recreate_task_split_ba_handoff(
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     previous_handoff: RequirementsAnalystHandoff,
     progress: ReviewStageProgress | None = None,
     required_reconfiguration: bool = False,
@@ -780,7 +843,7 @@ def recreate_task_split_ba_handoff(
     )
     if selection is None:
         return None
-    return create_task_split_ba_handoff(project_dir=project_dir, selection=selection)
+    return create_task_split_ba_handoff(project_dir=project_dir, requirement_name=requirement_name, selection=selection)
 
 
 def run_ba_turn_with_recovery(
@@ -817,16 +880,24 @@ def run_ba_turn_with_recovery(
         except Exception as error:  # noqa: BLE001
             ba_display_name = _task_split_ba_display_name(project_dir=project_dir, handoff=current_handoff)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_handoff.worker)
+            provider_runtime_error = worker_has_provider_runtime_error(current_handoff.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
-            if auth_error or ready_timeout_error:
+            if auth_error or provider_runtime_error or ready_timeout_error:
+                effective_requirement_name = requirement_name or _infer_task_split_runtime_scope(
+                    current_handoff.worker,
+                    project_dir,
+                )
                 reason_text = (
                     f"检测到{ba_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
                     if auth_error
+                    else f"检测到{ba_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
+                    if provider_runtime_error
                     else f"{ba_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
                 mark_worker_awaiting_reconfiguration(current_handoff.worker, reason_text=reason_text)
                 replacement = recreate_task_split_ba_handoff(
                     project_dir=project_dir,
+                    requirement_name=effective_requirement_name,
                     previous_handoff=current_handoff,
                     progress=progress,
                     required_reconfiguration=True,
@@ -838,8 +909,13 @@ def run_ba_turn_with_recovery(
                 needs_initialize = initialize_on_replacement
                 continue
             if is_worker_death_error(error):
+                effective_requirement_name = requirement_name or _infer_task_split_runtime_scope(
+                    current_handoff.worker,
+                    project_dir,
+                )
                 replacement = recreate_task_split_ba_handoff(
                     project_dir=project_dir,
+                    requirement_name=effective_requirement_name,
                     previous_handoff=current_handoff,
                     progress=progress,
                 )
@@ -898,20 +974,12 @@ def build_reviewer_completion_contract(
         if not status_path.exists():
             raise FileNotFoundError(f"缺少审核 JSON 文件: {status_path}")
         payload = json.loads(status_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            raise ValueError(f"审核 JSON 必须是 list: {status_path}")
-        matched_item: dict[str, object] | None = None
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("task_name", "")).strip() == TASK_SPLIT_TASK_NAME:
-                matched_item = item
-                break
-        if matched_item is None:
-            raise ValueError(f"{status_path.name} 缺少 {TASK_SPLIT_TASK_NAME} 状态项")
-        review_pass = matched_item.get("review_pass")
-        if not isinstance(review_pass, bool):
-            raise ValueError(f"{status_path.name} 中 {TASK_SPLIT_TASK_NAME}.review_pass 必须是 bool")
+        matched_item = normalize_review_status_payload(
+            payload,
+            task_name=TASK_SPLIT_TASK_NAME,
+            source=status_path.name,
+        )
+        review_pass = matched_item["review_pass"]
         review_md_empty = is_file_empty(review_md_path)
         if review_pass and not review_md_empty:
             raise ValueError(f"{reviewer_name} 已审核通过，但 {review_md_path.name} 不为空")
@@ -961,14 +1029,15 @@ def _reviewer_has_materialized_outputs(reviewer: ReviewerRuntime) -> bool:
         payload = json.loads(reviewer.review_json_path.read_text(encoding="utf-8"))
     except Exception:
         payload = None
-    if isinstance(payload, list):
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("task_name", "")).strip() != TASK_SPLIT_TASK_NAME:
-                continue
-            if isinstance(item.get("review_pass"), bool):
-                return True
+    try:
+        normalize_review_status_payload(
+            payload,
+            task_name=TASK_SPLIT_TASK_NAME,
+            source=str(reviewer.review_json_path),
+        )
+        return True
+    except ValueError:
+        pass
     return not is_file_empty(reviewer.review_md_path)
 
 
@@ -991,7 +1060,7 @@ def create_reviewer_runtime(
     selection: ReviewAgentSelection,
 ) -> ReviewerRuntime:
     reviewer_identity = _reviewer_spec_identity(reviewer_spec)
-    runtime_root = Path(project_dir).expanduser().resolve() / TASK_SPLIT_RUNTIME_ROOT_NAME
+    runtime_root = build_task_split_runtime_root(project_dir, requirement_name)
     worker = TmuxBatchWorker(
         worker_id=build_task_split_reviewer_worker_id(reviewer_spec.role_name),
         work_dir=Path(project_dir).expanduser().resolve(),
@@ -1013,7 +1082,7 @@ def create_reviewer_runtime(
         requirement_name,
         str(worker.session_name).strip() or reviewer_spec.role_name,
     )
-    ensure_empty_file(review_md_path)
+    ensure_review_artifacts(review_md_path, review_json_path)
     message(render_tmux_start_summary(str(worker.session_name).strip() or reviewer_spec.role_name, worker))
     return ReviewerRuntime(
         reviewer_name=reviewer_identity,
@@ -1089,9 +1158,9 @@ def bind_reviewer_runtime_from_handoff(
             project_dir=str(Path(project_dir).expanduser().resolve()),
             requirement_name=str(requirement_name).strip(),
             workflow_action="stage.a06.start",
-        )
+    )
     review_md_path, review_json_path = build_reviewer_artifact_paths(project_dir, requirement_name, reviewer_name)
-    ensure_empty_file(review_md_path)
+    ensure_review_artifacts(review_md_path, review_json_path)
     return ReviewerRuntime(
         reviewer_name=handoff.reviewer_key,
         selection=handoff.selection,
@@ -1149,6 +1218,7 @@ def build_reviewer_workers(
         message("复用仍存活的详细设计审核智能体继续审核任务单")
     if reviewer_handoff and len(live_handoffs_by_key) != len(reviewer_handoff):
         message("部分详细设计审核智能体已失效，仅重建失效的任务拆分审核智能体")
+    agent_config = resolve_stage_agent_config(args)
     for reviewer_spec in reviewer_specs:
         reviewer_key = _reviewer_spec_identity(reviewer_spec)
         live_handoff = live_handoffs_by_key.get(reviewer_key)
@@ -1167,7 +1237,7 @@ def build_reviewer_workers(
             occupied_session_names=sorted(predicted_session_names),
         )
         predicted_session_names.add(reviewer_display_name)
-        selection = (reviewer_selections_by_name or {}).get(reviewer_key)
+        selection = (reviewer_selections_by_name or {}).get(reviewer_key) or agent_config.reviewer_selection(reviewer_key)
         if selection is None and interactive:
             selection = prompt_review_agent_selection(
                 DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
@@ -1204,6 +1274,7 @@ def _run_reviewer_result_turn(
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
+        ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
         try:
             run_task_result_turn_with_repair(
                 worker=current_reviewer.worker,
@@ -1223,14 +1294,17 @@ def _run_reviewer_result_turn(
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+            provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             if is_worker_death_error(error):
                 message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
                 return None
-            if auth_error or ready_timeout_error:
+            if auth_error or provider_runtime_error or ready_timeout_error:
                 reason_text = (
                     f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
                     if auth_error
+                    else f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
+                    if provider_runtime_error
                     else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
@@ -1266,6 +1340,7 @@ def _run_reviewer_turn_with_resume(
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
+        ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
         try:
             run_completion_turn_with_repair(
@@ -1289,14 +1364,17 @@ def _run_reviewer_turn_with_resume(
                 return current_reviewer
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+            provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             if is_worker_death_error(error):
                 message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
                 return None
-            if auth_error or ready_timeout_error:
+            if auth_error or provider_runtime_error or ready_timeout_error:
                 reason_text = (
                     f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
                     if auth_error
+                    else f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
+                    if provider_runtime_error
                     else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
                 )
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
@@ -1364,7 +1442,7 @@ def initialize_task_split_workers(
                     paths,
                     role_desc=reviewer_specs_by_name[reviewer.reviewer_name].role_prompt,
                 ),
-                result_contract=build_ba_init_result_contract(paths),
+                result_contract=build_reviewer_init_result_contract(paths),
                 reviewer_spec=reviewer_specs_by_name[reviewer.reviewer_name],
                 progress=progress,
             ),
@@ -1644,12 +1722,15 @@ def _shutdown_workers(
     ba_handoff: RequirementsAnalystHandoff | None,
     reviewers: Sequence[ReviewerRuntime],
     *,
+    project_dir: str | Path,
+    requirement_name: str = "",
     cleanup_runtime: bool,
 ) -> tuple[str, ...]:
     return shutdown_stage_workers(
         ba_handoff,
         reviewers,
         cleanup_runtime=cleanup_runtime,
+        runtime_root_filter=build_task_split_runtime_root(project_dir, requirement_name),
     )
 
 
@@ -1731,7 +1812,8 @@ def run_task_split_stage(
             for item in active_reviewer_handoff
             if _is_live_reviewer_handoff(item)
         )
-        reviewer_selections_by_name = collect_reviewer_agent_selections(
+        agent_config = resolve_stage_agent_config(args)
+        reviewer_selections_by_name = agent_config.reviewers or collect_reviewer_agent_selections(
             project_dir=project_dir,
             reviewer_specs=reviewer_specs,
             display_name_resolver=lambda current_project_dir, reviewer_spec, occupied_session_names: _predict_worker_display_name(
@@ -2076,6 +2158,8 @@ def run_task_split_stage(
                 cleanup_paths = _shutdown_workers(
                     active_ba_handoff,
                     reviewer_workers,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
                     cleanup_runtime=True,
                 )
                 return TaskSplitStageResult(
@@ -2122,6 +2206,8 @@ def run_task_split_stage(
         _shutdown_workers(
             active_ba_handoff,
             reviewer_workers,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
             cleanup_runtime=False,
         )
         raise

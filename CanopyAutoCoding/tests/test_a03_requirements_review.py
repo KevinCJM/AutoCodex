@@ -131,14 +131,14 @@ class A03RequirementsReviewTests(unittest.TestCase):
         self.assertFalse(reviewer_worker.killed)
         self.assertFalse(ba_worker.killed)
 
-    def test_build_ba_resume_result_contract_accepts_terminal_ready_reply_without_helper(self):
+    def test_build_ba_resume_result_contract_uses_file_contract_ready_only(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             paths = build_requirements_review_paths(tmpdir, "需求A")
             contract = build_ba_resume_result_contract(paths)
 
         self.assertEqual(contract.expected_statuses, ("ready",))
-        self.assertEqual(contract.terminal_status_tokens.get("ready"), ("准备完毕",))
-        self.assertEqual(contract.terminal_status_summaries.get("ready"), "需求分析师已进入需求评审准备态")
+        self.assertEqual(contract.mode, "a03_ba_resume")
+        self.assertIn("requirements_clear", contract.optional_artifacts)
 
     def test_create_reviewer_runtime_uses_worker_session_name_for_artifacts(self):
         import A04_RequirementsReview as review_module

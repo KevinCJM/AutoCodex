@@ -150,9 +150,10 @@ export function PromptTextarea(props: Props) {
             { name: 'return', action: 'submit' },
           ]}
           onSubmit={() => {
-            rememberPromptValue(props.draftKey, value())
+            const submittedValue = textarea?.plainText ?? value()
+            rememberPromptValue(props.draftKey, submittedValue)
             clearPromptDraft(props.draftKey)
-            props.onSubmit(value())
+            props.onSubmit(submittedValue)
           }}
         />
       </box>

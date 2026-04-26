@@ -31,7 +31,12 @@ from canopy_core.prompt_contracts.requirements_review import (
     resume_ba,
     review_feedback,
 )
-from canopy_core.runtime.contracts import TaskResultContract, TurnFileContract, TurnFileResult
+from canopy_core.runtime.contracts import (
+    TaskResultContract,
+    TurnFileContract,
+    TurnFileResult,
+    normalize_review_status_payload,
+)
 from canopy_core.runtime.hitl import HitlPromptContext, build_prefixed_sha256, run_hitl_agent_loop
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -69,6 +74,7 @@ from canopy_core.stage_kernel.shared_review import (
     ReviewAgentSelection,
     ReviewerRuntime,
     ensure_empty_file,
+    ensure_review_artifacts,
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
@@ -77,8 +83,10 @@ from canopy_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
+    worker_has_provider_runtime_error,
 )
 from canopy_core.stage_kernel.turn_output_goals import (
     CompletionTurnGoal,
@@ -302,6 +310,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--review-max-rounds", default="", help="需求评审最多重试几轮；传 infinite 表示不设上限")
+    parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=R1,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
@@ -497,7 +506,7 @@ def create_reviewer_runtime(
         requirement_name,
         str(worker.session_name).strip() or reviewer_name,
     )
-    ensure_empty_file(review_md_path)
+    ensure_review_artifacts(review_md_path, review_json_path)
     message(render_tmux_start_summary(str(worker.session_name).strip() or f"审核器 {reviewer_name}", worker))
     return ReviewerRuntime(
         reviewer_name=reviewer_name,
@@ -577,20 +586,12 @@ def build_reviewer_completion_contract(
         if not status_path.exists():
             raise FileNotFoundError(f"缺少审核 JSON 文件: {status_path}")
         payload = json.loads(status_path.read_text(encoding="utf-8"))
-        if not isinstance(payload, list):
-            raise ValueError(f"审核 JSON 必须是 list: {status_path}")
-        matched_item: dict[str, object] | None = None
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            if str(item.get("task_name", "")).strip() == REQUIREMENTS_REVIEW_TASK_NAME:
-                matched_item = item
-                break
-        if matched_item is None:
-            raise ValueError(f"{status_path.name} 缺少 {REQUIREMENTS_REVIEW_TASK_NAME} 状态项")
-        review_pass = matched_item.get("review_pass")
-        if not isinstance(review_pass, bool):
-            raise ValueError(f"{status_path.name} 中 {REQUIREMENTS_REVIEW_TASK_NAME}.review_pass 必须是 bool")
+        matched_item = normalize_review_status_payload(
+            payload,
+            task_name=REQUIREMENTS_REVIEW_TASK_NAME,
+            source=status_path.name,
+        )
+        review_pass = matched_item["review_pass"]
         review_md_empty = is_file_empty(review_md_path)
         if review_pass and not review_md_empty:
             raise ValueError(f"{reviewer_name} 已审核通过，但 {review_md_path.name} 不为空")
@@ -638,12 +639,6 @@ def build_ba_resume_result_contract(paths: dict[str, Path]) -> TaskResultContrac
             "requirements_clear": paths["requirements_clear_path"],
             "hitl_record": paths["hitl_record_path"],
         },
-        terminal_status_tokens={
-            "ready": ("准备完毕",),
-        },
-        terminal_status_summaries={
-            "ready": "需求分析师已进入需求评审准备态",
-        },
     )
 
 
@@ -675,8 +670,25 @@ def build_requirements_feedback_result_contract(
     mode: str = "a03_ba_feedback",
 ) -> TaskResultContract:
     expected_statuses = ("hitl", "completed")
+    outcome_artifacts = {
+        "hitl": {
+            "requires": ("ask_human",),
+            "optional": ("hitl_record",),
+            "forbids": ("ba_feedback",),
+        },
+        "completed": {
+            "requires": ("ba_feedback", "requirements_clear"),
+            "optional": ("hitl_record",),
+        },
+    }
     if mode == "a03_ba_review_limit_force_hitl":
         expected_statuses = ("hitl",)
+        outcome_artifacts = {
+            "hitl": {
+                "requires": ("ask_human",),
+                "optional": ("hitl_record",),
+            },
+        }
     return TaskResultContract(
         turn_id=mode,
         phase=mode,
@@ -690,6 +702,7 @@ def build_requirements_feedback_result_contract(
             "requirements_clear": paths["requirements_clear_path"],
             "hitl_record": paths["hitl_record_path"],
         },
+        outcome_artifacts=outcome_artifacts,
     )
 
 
@@ -770,6 +783,7 @@ def _run_reviewer_turn(
         label: str,
         prompt: str,
 ) -> None:
+    ensure_review_artifacts(reviewer.review_md_path, reviewer.review_json_path)
     run_completion_turn_with_repair(
         worker=reviewer.worker,
         label=label,
@@ -804,11 +818,14 @@ def run_ba_turn_with_recreation(
             return current_handoff, payload
         except Exception as error:  # noqa: BLE001
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_handoff.worker)
+            provider_runtime_error = worker_has_provider_runtime_error(current_handoff.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             ba_display_name = _review_ba_display_name(project_dir=project_dir, handoff=current_handoff)
-            if auth_error:
+            if auth_error or provider_runtime_error:
                 reason_text = (
                     f"检测到{ba_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                    if auth_error
+                    else f"检测到{ba_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
                 )
                 mark_worker_awaiting_reconfiguration(current_handoff.worker, reason_text=reason_text)
                 selection = prompt_required_replacement_review_agent_selection(
@@ -910,13 +927,16 @@ def run_reviewer_turn_with_recreation(
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
+            provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
             if is_turn_artifact_contract_error(error):
                 return current_reviewer
-            if auth_error:
+            if auth_error or provider_runtime_error:
                 reason_text = (
                     f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+                    if auth_error
+                    else f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
                 )
                 mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
                 selection = prompt_required_replacement_review_agent_selection(
@@ -1334,6 +1354,7 @@ def _run_review_clarification_continuation(
 
 def build_reviewer_workers(
         *,
+        args: argparse.Namespace | None = None,
         project_dir: str | Path,
         requirement_name: str,
         progress: ReviewStageProgress | None = None,
@@ -1341,8 +1362,12 @@ def build_reviewer_workers(
     progress = _resolve_review_progress(progress)
     if progress is not None:
         progress.set_phase("启动审核器中")
-    reviewer_count = prompt_positive_int("请输入审核器数量", DEFAULT_REVIEWER_COUNT, progress=progress)
-    reviewer_names = [f"R{index}" for index in range(1, reviewer_count + 1)]
+    agent_config = resolve_stage_agent_config(args or argparse.Namespace(reviewer_agent=[]))
+    if agent_config.reviewer_order:
+        reviewer_names = list(agent_config.reviewer_order)
+    else:
+        reviewer_count = prompt_positive_int("请输入审核器数量", DEFAULT_REVIEWER_COUNT, progress=progress)
+        reviewer_names = [f"R{index}" for index in range(1, reviewer_count + 1)]
     reviewers: list[ReviewerRuntime] = []
     predicted_session_names: set[str] = set()
     for reviewer_name in reviewer_names:
@@ -1352,13 +1377,15 @@ def build_reviewer_workers(
             occupied_session_names=predicted_session_names,
         )
         predicted_session_names.add(reviewer_display_name)
-        message(f"配置审核器 {reviewer_display_name}")
-        selection = prompt_review_agent_selection(
-            DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
-            role_label=reviewer_display_name,
-            progress=progress,
-        )
-        message(render_review_agent_selection(f"审核器 {reviewer_display_name} 配置", selection))
+        selection = agent_config.reviewer_selection(reviewer_name)
+        if selection is None:
+            message(f"配置审核器 {reviewer_display_name}")
+            selection = prompt_review_agent_selection(
+                DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+                role_label=reviewer_display_name,
+                progress=progress,
+            )
+            message(render_review_agent_selection(f"审核器 {reviewer_display_name} 配置", selection))
         reviewers.append(
             create_reviewer_runtime(
                 project_dir=project_dir,
@@ -1723,7 +1750,7 @@ def run_requirements_review_stage(
             preserve_workers=preserved_workers,
         )
         cleanup_existing_review_artifacts(paths, requirement_name)
-        reviewer_workers = build_reviewer_workers(project_dir=project_dir, requirement_name=requirement_name)
+        reviewer_workers = build_reviewer_workers(args=args, project_dir=project_dir, requirement_name=requirement_name)
 
         def initial_prompt_builder(reviewer: ReviewerRuntime) -> str:
             return requirements_review_init(

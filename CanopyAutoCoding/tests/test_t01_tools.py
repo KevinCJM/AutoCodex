@@ -5,10 +5,48 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from T01_tools import check_all_reviews_passed, task_done
+from T01_tools import check_all_reviews_passed, check_task_exists, get_task_review_status, task_done
 
 
 class T01ToolsTests(unittest.TestCase):
+    def test_review_status_helpers_accept_single_object_payload(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            review_json = root / "评审记录_R1.json"
+            review_json.write_text(
+                json.dumps({"task_name": "M1-T1", "review_pass": True}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            self.assertTrue(check_task_exists(review_json, "M1-T1"))
+            self.assertTrue(get_task_review_status(review_json, "M1-T1"))
+            self.assertTrue(check_all_reviews_passed(root, "M1-T1", json_files=[review_json]))
+
+    def test_review_status_helpers_reject_wrong_single_object_task(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            review_json = root / "评审记录_R1.json"
+            review_json.write_text(
+                json.dumps({"task_name": "M1-T2", "review_pass": True}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(check_task_exists(review_json, "M1-T1"))
+            self.assertIsNone(get_task_review_status(review_json, "M1-T1"))
+            self.assertFalse(check_all_reviews_passed(root, "M1-T1", json_files=[review_json]))
+
+    def test_review_status_helpers_reject_non_bool_review_pass(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            review_json = root / "评审记录_R1.json"
+            review_json.write_text(
+                json.dumps({"task_name": "M1-T1", "review_pass": "true"}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            self.assertFalse(check_task_exists(review_json, "M1-T1"))
+            self.assertIsNone(get_task_review_status(review_json, "M1-T1"))
+
     def test_check_all_reviews_passed_returns_false_when_explicit_required_json_is_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

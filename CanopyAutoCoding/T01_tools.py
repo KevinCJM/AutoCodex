@@ -11,6 +11,8 @@ import json
 import sys
 from pathlib import Path
 
+from canopy_core.runtime.contracts import normalize_review_status_payload
+
 
 def _normalize_required_files(
         file_paths: list[str | Path] | None,
@@ -153,22 +155,18 @@ def check_all_reviews_passed(
         try:
             with file_path.open(encoding=encoding) as f:
                 data = json.load(f)
-
-            # 确保数据是列表格式
-            if not isinstance(data, list):
-                return False
-
-            # 在列表中寻找 task_name 匹配的项
-            for item in data:
-                if item.get("task_name") == task_name:
-                    # 找到任务，返回其 review_pass 状态（缺省为 False）
-                    return item.get("review_pass", False)
-
-            # 如果遍历完整个列表都没找到指定的 task_name
-            return False
+            return bool(
+                normalize_review_status_payload(
+                    data,
+                    task_name=task_name,
+                    source=str(file_path),
+                )["review_pass"]
+            )
 
         except (json.JSONDecodeError, IOError, AttributeError):
             # 文件损坏、读取错误或数据格式异常
+            return False
+        except ValueError:
             return False
 
     # 只有当所有文件中该任务的 review_pass 均为 True 时，才返回 True
@@ -336,17 +334,17 @@ def get_task_review_status(
     try:
         with path.open("r", encoding=encoding) as f:
             data = json.load(f)
-
-        if not isinstance(data, list):
-            return None
-
-        # 遍历列表寻找匹配的 task_name
-        for item in data:
-            if item.get("task_name") == target_task:
-                # 返回找到的 review_pass 值，如果该键不存在则默认为 False
-                return item.get("review_pass", False)
+        return bool(
+            normalize_review_status_payload(
+                data,
+                task_name=target_task,
+                source=str(path),
+            )["review_pass"]
+        )
 
     except (json.JSONDecodeError, IOError):
+        return None
+    except ValueError:
         return None
 
     # 如果遍历结束仍未找到匹配项
@@ -364,16 +362,13 @@ def check_task_exists(file_path: str | Path, target_task: str, encoding: str = "
     try:
         with path.open("r", encoding=encoding) as f:
             data = json.load(f)
-
-        # 确保数据是列表格式
-        if not isinstance(data, list):
-            return False
-
-        # 遍历列表，检查是否有任何一项的 task_name 匹配
-        return any(item.get("task_name") == target_task for item in data)
+        normalize_review_status_payload(data, task_name=target_task, source=str(path))
+        return True
 
     except (json.JSONDecodeError, IOError):
         # 如果文件损坏或读取失败，返回 False
+        return False
+    except ValueError:
         return False
 
 

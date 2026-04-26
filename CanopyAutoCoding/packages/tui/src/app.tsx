@@ -562,7 +562,7 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     sessionName: String(value.session_name ?? value.sessionName ?? ''),
     status: String(value.status ?? ''),
     workflowStage: String(value.workflow_stage ?? value.workflowStage ?? ''),
-    agentState: String(value.agent_state ?? value.agentState ?? value.provider_phase ?? value.providerPhase ?? ''),
+    agentState: String(value.agent_state ?? value.agentState ?? ''),
     healthStatus: String(value.health_status ?? value.healthStatus ?? ''),
     currentTaskRuntimeStatus: String(value.current_task_runtime_status ?? value.currentTaskRuntimeStatus ?? ''),
     retryCount: Number(value.retry_count ?? value.retryCount ?? 0),
@@ -817,16 +817,19 @@ export function App(props: StartupOptions) {
     }
   })
   const homeAgents = createMemo<HomeAgentItem[]>(() =>
-    buildHomeAgents([
-      { source: 'control', workers: controlSnapshot()?.workers ?? [] },
-      { source: 'routing', workers: routingSnapshot().workers },
-      { source: 'requirements', workers: requirementsSnapshot().workers },
-      { source: 'review', workers: reviewSnapshot().workers },
-      { source: 'design', workers: designSnapshot().workers },
-      { source: 'task-split', workers: taskSplitSnapshot().workers },
-      { source: 'development', workers: developmentSnapshot().workers },
-      { source: 'overall-review', workers: overallReviewSnapshot().workers },
-    ]),
+    buildHomeAgents(
+      [
+        { source: 'control', workers: controlSnapshot()?.workers ?? [] },
+        { source: 'routing', workers: routingSnapshot().workers },
+        { source: 'requirements', workers: requirementsSnapshot().workers },
+        { source: 'review', workers: reviewSnapshot().workers },
+        { source: 'design', workers: designSnapshot().workers },
+        { source: 'task-split', workers: taskSplitSnapshot().workers },
+        { source: 'development', workers: developmentSnapshot().workers },
+        { source: 'overall-review', workers: overallReviewSnapshot().workers },
+      ],
+      displayAppSnapshot().activeStage,
+    ),
   )
   const footerPrompt = createMemo<PromptState | null>(() => {
     const active = prompt()
@@ -1206,7 +1209,7 @@ export function App(props: StartupOptions) {
   onMount(async () => {
     const spinnerTimer = setInterval(() => {
       setFooterSpinnerTick((prev) => prev + 1)
-    }, 200)
+    }, 500)
     onCleanup(() => clearInterval(spinnerTimer))
     try {
       await client.start()

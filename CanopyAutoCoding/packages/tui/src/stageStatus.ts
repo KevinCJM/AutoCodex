@@ -1,3 +1,5 @@
+import { stageRouteForAction } from './stageRegistry'
+
 export type StageCursor = {
   activeAction: string
   activeStageSeq: number
@@ -104,14 +106,8 @@ function workerHasLiveWork(worker: Record<string, unknown>): boolean {
 
 function stageSnapshotForAction(snapshots: Record<string, unknown>, activeStage: string): unknown {
   const stages = getObject(snapshots.stages)
-  if (activeStage === 'stage.a01.start') return stages.routing
-  if (activeStage === 'stage.a02.start' || activeStage === 'stage.a03.start') return stages.requirements
-  if (activeStage === 'stage.a04.start') return stages.review
-  if (activeStage === 'stage.a05.start') return stages.design
-  if (activeStage === 'stage.a06.start') return stages['task-split']
-  if (activeStage === 'stage.a07.start') return stages.development
-  if (activeStage === 'stage.a08.start') return stages['overall-review']
-  return undefined
+  const route = stageRouteForAction(activeStage)
+  return route ? stages[route] : undefined
 }
 
 export function inferBootstrapStatus(payload: Record<string, unknown>): string {

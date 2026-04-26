@@ -16,7 +16,7 @@ function AgentStatusMarker(props: { agentState: string }) {
   const timer = setInterval(() => {
     if (!isBusy()) return
     setFrameIndex((prev) => (prev + 1) % HOME_AGENT_SPINNER_FRAMES.length)
-  }, 120)
+  }, 400)
   onCleanup(() => clearInterval(timer))
 
   const marker = createMemo(() => (isBusy() ? HOME_AGENT_SPINNER_FRAMES[frameIndex()] : '•'))

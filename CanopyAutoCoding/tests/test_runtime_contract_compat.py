@@ -23,3 +23,18 @@ class RuntimeContractCompatTests(unittest.TestCase):
         self.assertTrue(hasattr(contracts, "materialize_task_result"))
         self.assertIs(hitl.TurnFileContract, contracts.TurnFileContract)
         self.assertIs(hitl.TurnFileResult, contracts.TurnFileResult)
+
+    def test_a06_reviewer_init_resolves_ready_independently_from_ba_init(self):
+        contract = contracts.TaskResultContract(
+            turn_id="a06_reviewer_init",
+            phase="a06_reviewer_init",
+            task_kind="a06_reviewer_init",
+            mode="a06_reviewer_init",
+            expected_statuses=(contracts.TASK_RESULT_READY,),
+            stage_name="任务拆分阶段",
+        )
+
+        decision = contracts.resolve_task_result_decision(contract)
+
+        self.assertEqual(decision.status, contracts.TASK_RESULT_READY)
+        self.assertIn("审核智能体", decision.summary)
