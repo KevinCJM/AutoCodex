@@ -25,6 +25,7 @@ import { OverallReviewRoute } from './routes/OverallReviewRoute'
 import { ControlRoute } from './routes/ControlRoute'
 import { resolveFooterProgressLine } from './footerProgress'
 import { buildHomeAgents } from './homeAgents'
+import { promptAllowsBack, resolvePromptBackValue, withPromptBackOption } from './promptBack'
 import { resolvePromptResponseTransition } from './promptTransition'
 import {
   applyStageChanged,
@@ -32,6 +33,7 @@ import {
   inferBootstrapStatus,
   markTerminalStage,
   shouldAcceptProgressEvent,
+  shouldRecoverRunningFromStageSnapshot,
 } from './stageStatus'
 import { DialogSelect } from './ui/DialogSelect'
 import { DialogConfirm } from './ui/DialogConfirm'
@@ -365,6 +367,8 @@ function isOverlayPromptType(promptType: string): boolean {
 
 function FooterPromptHost(props: FooterPromptHostProps) {
   const title = createMemo(() => String(props.active.payload.title ?? props.active.payload.prompt_text ?? '请输入'))
+  const allowBack = createMemo(() => promptAllowsBack(props.active.payload))
+  const backValue = createMemo(() => resolvePromptBackValue(props.active.payload))
   return (
     <box
       borderStyle="single"
@@ -382,6 +386,7 @@ function FooterPromptHost(props: FooterPromptHostProps) {
         focused={props.focused}
         mode={props.active.promptType === 'multiline' ? 'multiline' : 'singleline'}
         showSubmitHelper={false}
+        onBack={allowBack() ? () => void props.onSubmit(backValue()) : undefined}
         onSubmit={(value) => void props.onSubmit(value)}
       />
     </box>
@@ -419,6 +424,10 @@ function DialogOverlay(props: DialogOverlayProps) {
 
 function DialogPromptLayer(props: { active: PromptState; dialogActive: boolean; onSubmit: (value: unknown) => void }) {
   const hasPreview = createMemo(() => Boolean(resolvePreviewPath(props.active.payload)))
+  const selectOptions = createMemo(() => withPromptBackOption(
+    Array.isArray(props.active.payload.options) ? (props.active.payload.options as { value: string; label: string }[]) : [],
+    props.active.payload,
+  ))
   return (
     <DialogOverlay helperText={hasPreview() ? '↑/↓ 或 j/k 选择，Enter 提交，Ctrl+K 查看文档' : '↑/↓ 或 j/k 选择，Enter 提交'}>
       <Switch>
@@ -427,6 +436,8 @@ function DialogPromptLayer(props: { active: PromptState; dialogActive: boolean; 
             title={String(props.active.payload.prompt_text ?? '请确认')}
             defaultValue={Boolean(props.active.payload.default)}
             active={props.dialogActive}
+            allowBack={promptAllowsBack(props.active.payload)}
+            backValue={resolvePromptBackValue(props.active.payload)}
             onSubmit={(value) => void props.onSubmit(value)}
           />
         </Match>
@@ -434,7 +445,7 @@ function DialogPromptLayer(props: { active: PromptState; dialogActive: boolean; 
           <DialogSelect
             title={String(props.active.payload.title ?? props.active.payload.prompt_text ?? '请选择')}
             defaultValue={String(props.active.payload.default_value ?? '')}
-            options={Array.isArray(props.active.payload.options) ? (props.active.payload.options as { value: string; label: string }[]) : []}
+            options={selectOptions()}
             active={props.dialogActive}
             onSubmit={(value) => void props.onSubmit(value)}
           />
@@ -1143,6 +1154,10 @@ export function App(props: StartupOptions) {
       if (stageRoute === 'task-split') setTaskSplitSnapshot(normalizeTaskSplitSnapshot(stageSnapshot))
       if (stageRoute === 'development') setDevelopmentSnapshot(normalizeDevelopmentSnapshot(stageSnapshot))
       if (stageRoute === 'overall-review') setOverallReviewSnapshot(normalizeOverallReviewSnapshot(stageSnapshot))
+      const activeStage = displayAppSnapshot().activeStage !== 'idle' ? displayAppSnapshot().activeStage : stageCursor().activeAction
+      if (shouldRecoverRunningFromStageSnapshot(status(), activeStage, stageRoute, stageSnapshot)) {
+        setStatus('running')
+      }
       return
     }
     if (event.type === 'snapshot.control') {

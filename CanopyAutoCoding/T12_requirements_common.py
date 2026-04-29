@@ -18,7 +18,7 @@ from canopy_core.requirements_scope import (
     CREATE_NEW_REQUIREMENT_SELECTION_VALUE,
 )
 from T03_agent_init_workflow import resolve_existing_directory
-from T09_terminal_ops import prompt_select_option, terminal_ui_is_interactive
+from T09_terminal_ops import prompt_metadata, prompt_select_option, terminal_ui_is_interactive
 from T09_terminal_ops import prompt_with_default as terminal_prompt_with_default
 
 
@@ -64,13 +64,19 @@ def sanitize_requirement_name(name: str) -> str:
 
 
 def prompt_project_dir(default: str = "") -> str:
+    last_error = ""
     while True:
-        candidate = prompt_with_default("输入项目工作目录", default)
+        with prompt_metadata(error_message=last_error):
+            candidate = str(prompt_with_default("输入项目工作目录", default)).strip()
+        default = candidate
         try:
+            if not Path(candidate).expanduser().is_absolute():
+                raise ValueError("请输入绝对路径")
             return str(resolve_existing_directory(candidate))
         except Exception as error:  # noqa: BLE001
             from T09_terminal_ops import message
-            message(f"目录无效: {error}")
+            last_error = f"目录无效: {error}"
+            message(last_error)
 
 
 def prompt_requirement_name(default: str = "") -> str:

@@ -6,6 +6,7 @@ import queue
 import signal
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -1420,6 +1421,60 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(action, "stage.a08.start")
         self.assertEqual(status, "running")
 
+    def test_stage_a08_completed_state_is_not_overridden_by_residual_live_worker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            paths["task_json_path"].parent.mkdir(parents=True, exist_ok=True)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            paths["state_path"].write_text(
+                json.dumps({"passed": True}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            runtime_dir = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / "worker-reviewer"
+            runtime_dir.mkdir(parents=True, exist_ok=True)
+            (runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "development-review-审核员",
+                        "session_name": "审核员-地阖星",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir.resolve()),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a08.start",
+                        "result_status": "succeeded",
+                        "agent_state": "READY",
+                        "agent_started": True,
+                        "agent_alive": True,
+                        "current_command": "codex",
+                        "health_status": "alive",
+                        "updated_at": "2026-04-24T12:00:00+08:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime.session_exists = lambda _session_name: True  # noqa: SLF001
+            server._tmux_runtime.backend.session_exists = lambda _session_name: True  # noqa: SLF001
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a08.start")  # noqa: SLF001
+            server._display_status = "completed"  # noqa: SLF001
+
+            with patch("canopy_core.bridge.backend.load_worker_from_state_path", return_value=None):
+                runtime_status = server._infer_runtime_stage_status("stage.a08.start")  # noqa: SLF001
+                action, status, _stage_seq = server._derive_display_stage_state(  # noqa: SLF001
+                    preferred_status="completed",
+                    preferred_action="stage.a08.start",
+                )
+
+        self.assertEqual(runtime_status, "")
+        self.assertEqual(action, "stage.a08.start")
+        self.assertEqual(status, "completed")
+
     def test_failed_stage_worker_summaries_filter_to_current_requirement_and_action(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
@@ -2406,10 +2461,22 @@ class T11TuiBackendTests(unittest.TestCase):
     def test_workflow_a00_start_runs_in_background(self):
         writer = io.StringIO()
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)
-        with patch("T11_tui_backend.a00_main", return_value=0):
+        release = threading.Event()
+
+        def delayed_main(_argv):  # noqa: ANN001
+            release.wait(timeout=2.0)
+            return 0
+
+        with patch("T11_tui_backend.a00_main", side_effect=delayed_main):
             server.handle_request(build_request("workflow.a00.start", {"argv": []}, message_id="req_2"))
-            for worker in list(server._workers.values()):  # noqa: SLF001
-                worker.join(timeout=2.0)
+            workers = list(server._workers.values())  # noqa: SLF001
+            try:
+                self.assertTrue(workers)
+                self.assertFalse(workers[0].daemon)
+            finally:
+                release.set()
+                for worker in workers:
+                    worker.join(timeout=2.0)
         messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
         self.assertTrue(any(item.get("kind") == "event" and item.get("type") == "stage.changed" for item in messages))
         self.assertTrue(any(item.get("kind") == "response" and item.get("id") == "req_2" for item in messages))
@@ -2595,7 +2662,7 @@ class T11TuiBackendTests(unittest.TestCase):
                 server.handle_request(
                     build_request(
                         "stage.a01.start",
-                        {"argv": ["--project-dir", tmpdir, "--yes"]},
+                        {"argv": ["--project-dir", tmpdir, "--requirement-name", "贪吃蛇", "--reuse-existing-original-requirement", "--yes"]},
                         message_id="req_a01",
                     )
                 )
@@ -2608,6 +2675,9 @@ class T11TuiBackendTests(unittest.TestCase):
 
             self.assertEqual(len(intake_calls), 1)
             self.assertEqual(intake_calls[0][:2], ["--project-dir", tmpdir])
+            self.assertIn("--requirement-name", intake_calls[0])
+            self.assertIn("贪吃蛇", intake_calls[0])
+            self.assertIn("--reuse-existing-original-requirement", intake_calls[0])
             self.assertIn("--yes", intake_calls[0])
             messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
             self.assertTrue(any(item.get("kind") == "event" and item.get("type") == "log.append" and "自动进入需求录入阶段" in item.get("payload", {}).get("text", "") for item in messages))
@@ -3004,6 +3074,96 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertFalse(workers[0]["session_exists"])
         self.assertEqual(workers[0]["agent_state"], "DEAD")
+
+    def test_runtime_scanned_busy_worker_keeps_live_session_when_context_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            project_dir = runtime_root / "project-a"
+            worker_root = runtime_root / "worker-1"
+            worker_root.mkdir(parents=True)
+            state_path = worker_root / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "shared-session",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a08.start",
+                        "status": "running",
+                        "result_status": "running",
+                        "workflow_stage": "turn_running",
+                        "agent_state": "BUSY",
+                        "current_task_runtime_status": "running",
+                        "health_status": "alive",
+                        "health_note": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeTmuxRuntime:
+                backend = None
+
+                def session_exists(self, name):
+                    return name == "shared-session"
+
+                def session_matches_worker_state(self, name, state, state_path):
+                    return False
+
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = FakeTmuxRuntime()  # noqa: SLF001
+            workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
+
+        self.assertTrue(workers[0]["session_exists"])
+        self.assertEqual(workers[0]["agent_state"], "BUSY")
+        self.assertEqual(workers[0]["health_status"], "alive")
+
+    def test_runtime_scanned_busy_worker_still_marks_dead_when_session_is_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            runtime_root = Path(tmpdir)
+            project_dir = runtime_root / "project-a"
+            worker_root = runtime_root / "worker-1"
+            worker_root.mkdir(parents=True)
+            state_path = worker_root / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "shared-session",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a08.start",
+                        "status": "running",
+                        "result_status": "running",
+                        "workflow_stage": "turn_running",
+                        "agent_state": "BUSY",
+                        "current_task_runtime_status": "running",
+                        "health_status": "alive",
+                        "health_note": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            class FakeTmuxRuntime:
+                backend = None
+
+                def session_exists(self, name):
+                    return False
+
+                def session_matches_worker_state(self, name, state, state_path):
+                    return False
+
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = FakeTmuxRuntime()  # noqa: SLF001
+            workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
+
+        self.assertFalse(workers[0]["session_exists"])
+        self.assertEqual(workers[0]["agent_state"], "DEAD")
+        self.assertEqual(workers[0]["health_status"], "dead")
 
     def test_runtime_scanned_running_worker_snapshots_refresh_health_via_tmux_runtime(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3463,7 +3623,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["workers"][0]["session_name"], "sess-routing")
         self.assertTrue(snapshot["workers"][0]["session_exists"])
 
-    def test_manifest_backed_prelaunch_routing_worker_with_missing_session_marks_dead(self):
+    def test_manifest_backed_prelaunch_routing_worker_with_missing_session_stays_starting(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir) / "project"
             project_dir.mkdir(parents=True)
@@ -3513,8 +3673,10 @@ class T11TuiBackendTests(unittest.TestCase):
             snapshot = server._build_routing_snapshot()  # noqa: SLF001
             status = server._infer_runtime_stage_status("stage.a01.start")  # noqa: SLF001
 
-        self.assertEqual(snapshot["workers"][0]["agent_state"], "DEAD")
-        self.assertEqual(status, "failed")
+        self.assertFalse(snapshot["workers"][0]["session_exists"])
+        self.assertEqual(snapshot["workers"][0]["agent_state"], "STARTING")
+        self.assertEqual(snapshot["workers"][0]["health_status"], "unknown")
+        self.assertEqual(status, "running")
 
     def test_manifest_backed_busy_routing_worker_marks_stage_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:

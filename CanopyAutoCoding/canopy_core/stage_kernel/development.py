@@ -45,7 +45,6 @@ from canopy_core.runtime.contracts import (
 from canopy_core.runtime.hitl import build_prefixed_sha256
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
-    AgentRunConfig,
     LaunchCoordinator,
     TmuxBatchWorker,
     Vendor,
@@ -104,6 +103,7 @@ from canopy_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     reviewer_requires_manual_model_reconfiguration,
     run_review_limit_hitl_cycle,
@@ -128,11 +128,13 @@ from T01_tools import (
 )
 from T08_pre_development import ensure_pre_development_task_record
 from T09_terminal_ops import (
+    PROMPT_BACK_VALUE,
     BridgeTerminalUI,
     collect_multiline_input,
     get_terminal_ui,
     maybe_launch_tui,
     message,
+    prompt_metadata,
 )
 from T12_requirements_common import (
     DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
@@ -252,6 +254,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="任务开发阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
@@ -267,6 +270,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
+
+
+def _consume_stage_back(allow_previous_stage_back: bool, will_prompt: bool) -> tuple[bool, bool]:
+    allow_back = bool(allow_previous_stage_back and will_prompt)
+    if will_prompt:
+        return allow_back, False
+    return False, bool(allow_previous_stage_back)
 
 
 def build_development_paths(project_dir: str | Path, requirement_name: str) -> dict[str, Path]:
@@ -485,13 +495,21 @@ def _prompt_reviewer_text(
         return prompt_with_default(prompt_text, default, allow_empty=allow_empty).strip()
 
 
-def collect_interactive_reviewer_specs(*, progress: ReviewStageProgress | None = None) -> list[DevelopmentReviewerSpec]:
+def collect_interactive_reviewer_specs(
+    *,
+    progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
+    stage_key: str = "development_reviewer_specs",
+) -> list[DevelopmentReviewerSpec]:
     if progress is not None:
         progress.set_phase("任务开发 / 配置审核器")
     reviewer_count = prompt_positive_int(
         "请输入代码评审智能体数量",
         len(DEFAULT_DEVELOPMENT_REVIEWER_ROLE_NAMES),
         progress=progress,
+        allow_back=allow_back_first_prompt,
+        stage_key=stage_key,
+        stage_step_index=0,
     )
     collected_specs: list[DevelopmentReviewerSpec] = []
     default_roles = list(DEFAULT_DEVELOPMENT_REVIEWER_ROLE_NAMES)
@@ -549,6 +567,7 @@ def resolve_reviewer_specs(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
 ) -> list[DevelopmentReviewerSpec]:
     agent_config = resolve_stage_agent_config(args)
     role_names = [str(item).strip() for item in getattr(args, "reviewer_role", []) if str(item).strip()]
@@ -567,7 +586,10 @@ def resolve_reviewer_specs(
             )
         return _finalize_reviewer_specs(specs)
     if stdin_is_interactive() and not role_names and not prompt_values:
-        return collect_interactive_reviewer_specs(progress=progress)
+        return collect_interactive_reviewer_specs(
+            progress=progress,
+            allow_back_first_prompt=allow_back_first_prompt,
+        )
     if role_names and prompt_values and len(prompt_values) != len(role_names):
         raise RuntimeError("--reviewer-role-prompt 数量必须与 --reviewer-role 数量一致。")
     if not role_names:
@@ -591,6 +613,7 @@ def resolve_developer_role_prompt(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> str:
     value = str(getattr(args, "developer_role_prompt", "") or "").strip()
     if value:
@@ -599,7 +622,14 @@ def resolve_developer_role_prompt(
         return fintech_developer_role
     from canopy_core.stage_kernel.shared_review import prompt_yes_no_choice
 
-    if prompt_yes_no_choice("开发工程师是否使用默认角色定义提示词", True, progress=progress):
+    if prompt_yes_no_choice(
+        "开发工程师是否使用默认角色定义提示词",
+        True,
+        progress=progress,
+        allow_back=allow_back,
+        stage_key="development",
+        stage_step_index=0,
+    ):
         return fintech_developer_role
     return _prompt_reviewer_text(
         "输入开发工程师的自定义角色定义提示词",
@@ -631,15 +661,14 @@ def create_developer_runtime(
     run_id: str = "",
 ) -> DeveloperRuntime:
     project_root = Path(project_dir).expanduser().resolve()
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=_developer_display_name(project_dir=project_root),
+    )
     worker = TmuxBatchWorker(
         worker_id=build_developer_worker_id(),
         work_dir=project_root,
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=build_development_runtime_root(project_root, requirement_name),
         launch_coordinator=launch_coordinator,
         runtime_metadata={
@@ -713,9 +742,20 @@ def resolve_developer_plan(
     *,
     project_dir: str | Path,
     progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
 ) -> DeveloperPlan:
-    role_prompt = resolve_developer_role_prompt(args, progress=progress)
-    selection = collect_ba_agent_selection(args, role_label=_developer_display_name(project_dir=project_dir))
+    role_prompt_prompted = stdin_is_interactive() and not str(getattr(args, "developer_role_prompt", "") or "").strip()
+    role_prompt = resolve_developer_role_prompt(
+        args,
+        progress=progress,
+        allow_back=allow_back_first_prompt and role_prompt_prompted,
+    )
+    selection = collect_ba_agent_selection(
+        args,
+        role_label=_developer_display_name(project_dir=project_dir),
+        allow_back_first_step=allow_back_first_prompt and not role_prompt_prompted,
+        stage_key="development_main",
+    )
     message(render_review_agent_selection("开发工程师 配置", selection))
     return DeveloperPlan(selection=selection, role_prompt=role_prompt)
 
@@ -775,6 +815,7 @@ def resolve_developer_max_turns(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> int | None:
     explicit = getattr(args, "developer_max_turns", None)
     if explicit is not None and str(explicit).strip():
@@ -785,10 +826,16 @@ def resolve_developer_max_turns(
         progress.set_phase("任务开发 / 配置开发工程师最大对话轮数")
     with progress.suspended() if progress is not None else nullcontext():
         while True:
-            value = prompt_with_default(
-                "输入开发工程师最大对话轮数（输入 infinite 表示不重建）",
-                str(DEFAULT_DEVELOPER_MAX_TURNS),
-            ).strip()
+            with prompt_metadata(
+                allow_back=allow_back,
+                back_value=PROMPT_BACK_VALUE,
+                stage_key="development",
+                stage_step_index=3,
+            ):
+                value = prompt_with_default(
+                    "输入开发工程师最大对话轮数（输入 infinite 表示不重建）",
+                    str(DEFAULT_DEVELOPER_MAX_TURNS),
+                ).strip()
             try:
                 return _parse_developer_max_turns(value, source="开发工程师最大对话轮数")
             except RuntimeError as error:
@@ -799,6 +846,7 @@ def resolve_review_max_rounds(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> int | None:
     explicit = getattr(args, "review_max_rounds", "")
     if str(explicit or "").strip():
@@ -814,6 +862,9 @@ def resolve_review_max_rounds(
     return prompt_review_max_rounds(
         default=MAX_DEVELOPMENT_REVIEW_ROUNDS,
         progress=progress,
+        allow_back=allow_back,
+        stage_key="development",
+        stage_step_index=4,
     )
 
 
@@ -1301,15 +1352,18 @@ def create_reviewer_runtime(
 ) -> ReviewerRuntime:
     reviewer_identity = str(reviewer_spec.reviewer_key or reviewer_spec.role_name).strip()
     runtime_root = build_development_runtime_root(project_dir, requirement_name)
+    reviewer_display_name = _predict_worker_display_name(
+        project_dir=project_dir,
+        worker_id=build_development_reviewer_worker_id(reviewer_spec.role_name),
+    )
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=reviewer_display_name,
+    )
     worker = TmuxBatchWorker(
         worker_id=build_development_reviewer_worker_id(reviewer_spec.role_name),
         work_dir=Path(project_dir).expanduser().resolve(),
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=runtime_root,
         launch_coordinator=launch_coordinator,
         runtime_metadata={
@@ -1395,12 +1449,15 @@ def collect_reviewer_agent_selections(
     reviewer_specs: Sequence[DevelopmentReviewerSpec],
     reserved_session_names: Sequence[str] = (),
     progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
+    stage_key: str = "development_reviewer_selection",
 ) -> dict[str, ReviewAgentSelection]:
     selections: dict[str, ReviewAgentSelection] = {}
     predicted_session_names: set[str] = {str(name).strip() for name in reserved_session_names if str(name).strip()}
     interactive = stdin_is_interactive()
     if progress is not None:
         progress.set_phase("任务开发 / 配置审核器模型")
+    next_allow_back = bool(allow_back_first_prompt)
     for reviewer_spec in reviewer_specs:
         reviewer_key = str(reviewer_spec.reviewer_key or reviewer_spec.role_name).strip()
         reviewer_display_name = _predict_worker_display_name(
@@ -1417,7 +1474,10 @@ def collect_reviewer_agent_selections(
                 default_proxy_url="",
                 role_label=reviewer_display_name,
                 progress=progress,
+                allow_back_first_step=next_allow_back,
+                stage_key=stage_key,
             )
+            next_allow_back = False
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
         else:
             selection = _reviewer_default_selection()
@@ -2293,6 +2353,7 @@ def resolve_subagent_num(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> int:
     explicit = getattr(args, "subagent_num", None)
     if explicit is not None:
@@ -2305,7 +2366,13 @@ def resolve_subagent_num(
         progress.set_phase("任务开发 / 配置 subagent 数量")
     with progress.suspended() if progress is not None else nullcontext():
         while True:
-            value = prompt_with_default("输入开发工程师可用的 subagent 数量", "0")
+            with prompt_metadata(
+                allow_back=allow_back,
+                back_value=PROMPT_BACK_VALUE,
+                stage_key="development",
+                stage_step_index=5,
+            ):
+                value = prompt_with_default("输入开发工程师可用的 subagent 数量", "0")
             if value.isdigit():
                 return int(value)
             message("请输入大于等于 0 的整数。")
@@ -2636,6 +2703,7 @@ def run_development_stage(
 ) -> DevelopmentStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     requirement_name = str(args.requirement_name).strip() if args.requirement_name else prompt_requirement_name_selection(project_dir, "").requirement_name
 
@@ -2669,18 +2737,65 @@ def run_development_stage(
                 reviewer_handoff=(),
             )
 
-        developer_plan = resolve_developer_plan(args, project_dir=project_dir, progress=progress)
-        reviewer_specs = resolve_reviewer_specs(args, progress=progress)
+        developer_plan_prompted = stdin_is_interactive() and (
+            not str(getattr(args, "developer_role_prompt", "") or "").strip()
+            or not any(str(getattr(args, key, "") or "").strip() for key in ("vendor", "model", "effort", "proxy_url"))
+        )
+        developer_plan_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            developer_plan_prompted,
+        )
+        developer_plan = resolve_developer_plan(
+            args,
+            project_dir=project_dir,
+            progress=progress,
+            allow_back_first_prompt=developer_plan_allow_back,
+        )
+        reviewer_specs_prompted = stdin_is_interactive() and not any(
+            str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
+        ) and not resolve_stage_agent_config(args).reviewer_order
+        reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            reviewer_specs_prompted,
+        )
+        reviewer_specs = resolve_reviewer_specs(
+            args,
+            progress=progress,
+            allow_back_first_prompt=reviewer_specs_allow_back,
+        )
         agent_config = resolve_stage_agent_config(args)
+        reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not bool(agent_config.reviewers) and bool(reviewer_specs),
+        )
         reviewer_selections_by_name = agent_config.reviewers or collect_reviewer_agent_selections(
             project_dir=project_dir,
             reviewer_specs=reviewer_specs,
             reserved_session_names=(_developer_display_name(project_dir=project_dir),),
             progress=progress,
+            allow_back_first_prompt=reviewer_selection_allow_back,
         )
-        developer_turn_policy = DeveloperTurnPolicy(resolve_developer_max_turns(args, progress=progress))
-        review_round_limit = resolve_review_max_rounds(args, progress=progress)
-        subagent_num = resolve_subagent_num(args, progress=progress)
+        developer_max_turns_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and getattr(args, "developer_max_turns", None) in {None, ""},
+        )
+        developer_turn_policy = DeveloperTurnPolicy(
+            resolve_developer_max_turns(args, progress=progress, allow_back=developer_max_turns_allow_back)
+        )
+        review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not str(getattr(args, "review_max_rounds", "") or "").strip(),
+        )
+        review_round_limit = resolve_review_max_rounds(
+            args,
+            progress=progress,
+            allow_back=review_round_allow_back,
+        )
+        subagent_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and getattr(args, "subagent_num", None) is None,
+        )
+        subagent_num = resolve_subagent_num(args, progress=progress, allow_back=subagent_allow_back)
         developer = create_developer_runtime(
             project_dir=project_dir,
             requirement_name=requirement_name,

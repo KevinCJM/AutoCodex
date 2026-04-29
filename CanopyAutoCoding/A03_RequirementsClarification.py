@@ -43,13 +43,17 @@ from T02_tmux_agents import (
     is_worker_death_error,
 )
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop
+from canopy_core.stage_kernel.shared_review import is_agent_config_error
 from canopy_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from T08_pre_development import mark_requirement_clarification_completed
 from T09_terminal_ops import (
+    PROMPT_BACK_VALUE,
+    PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
     maybe_launch_tui,
     message,
+    prompt_metadata,
     terminal_ui_is_interactive,
     prompt_yes_no as terminal_prompt_yes_no,
 )
@@ -103,6 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="需求澄清阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vendor", help="需求澄清阶段厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="需求澄清阶段模型名称")
     parser.add_argument("--effort", help="需求澄清阶段推理强度")
@@ -116,6 +121,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def prompt_proxy_url(default: str = "") -> str:
     return prompt_with_default("输入代理端口或完整代理 URL（可留空）", default, allow_empty=True)
+
+
+def _clarification_prompt_step(step_index: int, *, allow_back: bool):
+    return prompt_metadata(
+        allow_back=allow_back,
+        back_value=PROMPT_BACK_VALUE,
+        stage_key="requirements_clarification",
+        stage_step_index=step_index,
+    )
 
 
 def prompt_yes_no(prompt_text: str, default: bool = False) -> bool:
@@ -137,6 +151,7 @@ def should_reuse_existing_requirements_clarification(
         *,
         overwrite: bool,
         interactive: bool,
+        allow_back: bool = False,
 ) -> bool:
     _, requirements_clear_path, _, _ = build_requirements_clarification_paths(project_dir, requirement_name)
     if not get_markdown_content(requirements_clear_path).strip():
@@ -144,7 +159,8 @@ def should_reuse_existing_requirements_clarification(
     if not interactive:
         return not overwrite
     message(f"检测项目内已有需求澄清: {requirements_clear_path.name}")
-    return prompt_yes_no("是否直接复用已有的需求澄清并跳入需求评审阶段", True)
+    with _clarification_prompt_step(0, allow_back=allow_back):
+        return prompt_yes_no("是否直接复用已有的需求澄清并跳入需求评审阶段", True)
 
 
 def reuse_existing_requirements_clarification(project_dir: str | Path, requirement_name: str) -> RequirementsClarificationStageResult:
@@ -207,33 +223,90 @@ def render_requirements_clarification_progress_line(*, worker: TmuxBatchWorker, 
 def collect_requirements_clarification_agent_selection(args: argparse.Namespace) -> RequirementsClarificationAgentSelection:
     interactive = stdin_is_interactive()
     vendor_value = str(getattr(args, "vendor", "") or "").strip()
-    if vendor_value:
-        vendor = normalize_vendor_choice(vendor_value)
-    elif interactive:
-        vendor = prompt_vendor(DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
-    else:
-        raise RuntimeError("需求澄清阶段需要选择厂商；非交互模式请传入 --vendor、--model、--effort。")
-
-    model_value = str(getattr(args, "model", "") or "").strip()
-    if model_value:
-        model = normalize_model_choice(vendor, model_value)
-    elif interactive:
-        model = prompt_model(vendor, get_default_model_for_vendor(vendor))
-    else:
-        raise RuntimeError("需求澄清阶段需要选择模型；非交互模式请传入 --vendor、--model、--effort。")
-
-    effort_value = str(getattr(args, "effort", "") or "").strip()
-    if effort_value:
-        reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
-    elif interactive:
-        reasoning_effort = prompt_effort(vendor, model, DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
-    else:
-        raise RuntimeError("需求澄清阶段需要选择推理强度；非交互模式请传入 --vendor、--model、--effort。")
-
     proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
-    if interactive:
+    allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
+    try:
+        model_value = str(getattr(args, "model", "") or "").strip()
+        effort_value = str(getattr(args, "effort", "") or "").strip()
+        if interactive:
+            vendor = normalize_vendor_choice(vendor_value) if vendor_value else DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR
+            model = model_value
+            reasoning_effort = effort_value or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT
+            first_prompt_step = 0 if not vendor_value else (1 if not model_value else (2 if not effort_value else 3))
+            step = first_prompt_step
+            while step < 4:
+                try:
+                    if step == 0:
+                        with _clarification_prompt_step(
+                            0,
+                            allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
+                        ):
+                            vendor = prompt_vendor(vendor)
+                        if model:
+                            try:
+                                normalize_model_choice(vendor, model)
+                            except ValueError:
+                                model = ""
+                        step = 1
+                        continue
+                    if step == 1:
+                        if model_value and step < first_prompt_step:
+                            model = normalize_model_choice(vendor, model_value)
+                        else:
+                            with _clarification_prompt_step(
+                                1,
+                                allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
+                            ):
+                                model = prompt_model(vendor, model or get_default_model_for_vendor(vendor))
+                        step = 2
+                        continue
+                    if step == 2:
+                        if effort_value and step < first_prompt_step:
+                            reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
+                        else:
+                            with _clarification_prompt_step(
+                                2,
+                                allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
+                            ):
+                                reasoning_effort = prompt_effort(vendor, model, reasoning_effort or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
+                        step = 3
+                        continue
+                    if step == 3:
+                        with _clarification_prompt_step(
+                            3,
+                            allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
+                        ):
+                            proxy_url = prompt_proxy_url(proxy_url)
+                        step = 4
+                        continue
+                except PromptBackRequested:
+                    if step == first_prompt_step:
+                        if allow_previous_stage_back:
+                            raise
+                        continue
+                    step = max(first_prompt_step, step - 1)
+        else:
+            if not vendor_value:
+                raise RuntimeError("需求澄清阶段需要选择厂商；非交互模式请传入 --vendor、--model、--effort。")
+            vendor = normalize_vendor_choice(vendor_value)
+            if not model_value:
+                raise RuntimeError("需求澄清阶段需要选择模型；非交互模式请传入 --vendor、--model、--effort。")
+            model = normalize_model_choice(vendor, model_value)
+            if not effort_value:
+                raise RuntimeError("需求澄清阶段需要选择推理强度；非交互模式请传入 --vendor、--model、--effort。")
+            reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
+    except Exception as error:  # noqa: BLE001
+        if not interactive or not is_agent_config_error(error):
+            raise
+        message(f"需求分析师模型配置不可用: {error}\n请重新选择厂商、模型和推理强度。")
+        vendor = prompt_vendor(DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
+        model = prompt_model(vendor, get_default_model_for_vendor(vendor))
+        reasoning_effort = prompt_effort(vendor, model, DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
         proxy_url = prompt_proxy_url(proxy_url)
 
+    vendor = normalize_vendor_choice(vendor)
+    model = normalize_model_choice(vendor, model)
+    reasoning_effort = normalize_effort_choice(vendor, model, reasoning_effort)
     return RequirementsClarificationAgentSelection(
         vendor=vendor,
         model=model,
@@ -384,17 +457,41 @@ def run_requirements_clarification(
 
     try:
         while True:
-            worker = TmuxBatchWorker(
-                worker_id="requirements-analyst",
-                work_dir=project_root,
-                config=AgentRunConfig(
-                    vendor=current_vendor,
-                    model=current_model,
-                    reasoning_effort=current_reasoning_effort,
-                    proxy_url=current_proxy_url,
-                ),
-                runtime_root=runtime_root,
-            )
+            try:
+                worker = TmuxBatchWorker(
+                    worker_id="requirements-analyst",
+                    work_dir=project_root,
+                    config=AgentRunConfig(
+                        vendor=current_vendor,
+                        model=current_model,
+                        reasoning_effort=current_reasoning_effort,
+                        proxy_url=current_proxy_url,
+                    ),
+                    runtime_root=runtime_root,
+                )
+            except Exception as error:  # noqa: BLE001
+                stop_progress()
+                stop_boot_progress()
+                if not is_agent_config_error(error):
+                    raise
+                selection = prompt_recreate_requirements_clarification_agent(
+                    reason_text=f"需求分析师模型配置不可用: {error}\n请重新选择模型后继续当前阶段。",
+                    requirement_name=requirement_name,
+                    current_vendor=current_vendor,
+                    current_model=current_model,
+                    current_reasoning_effort=current_reasoning_effort,
+                    current_proxy_url=current_proxy_url,
+                    force_model_change=False,
+                )
+                if selection is not None:
+                    current_vendor = selection.vendor
+                    current_model = selection.model
+                    current_reasoning_effort = selection.reasoning_effort
+                    current_proxy_url = selection.proxy_url
+                    current_resume_existing = current_resume_existing or bool(get_markdown_content(requirements_clear_path).strip())
+                    keep_worker_alive = False
+                    continue
+                raise RuntimeError("需求分析师模型配置不可用，且用户未重新选择模型") from error
             runtime_dir = worker.runtime_dir
             stage_status_path = runtime_dir / "requirements_clarification_status.json"
             turns_root = runtime_dir / "turns"
@@ -589,6 +686,7 @@ def run_requirements_clarification_stage(
                     requirement_name,
                     overwrite=bool(args.overwrite),
                     interactive=stdin_is_interactive(),
+                    allow_back=bool(getattr(args, "allow_previous_stage_back", False)),
             ):
                 message("复用已有的需求澄清，直接进入需求评审阶段")
                 result = reuse_existing_requirements_clarification(project_dir, requirement_name)

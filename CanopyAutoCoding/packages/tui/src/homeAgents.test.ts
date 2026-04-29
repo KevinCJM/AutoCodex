@@ -31,6 +31,10 @@ test('isRunningWorker keeps workers already marked DEAD so home can show failed 
   expect(isRunningWorker(worker({ sessionExists: true, agentState: 'DEAD' }))).toBe(true)
 })
 
+test('isRunningWorker keeps prelaunch STARTING workers before tmux session exists', () => {
+  expect(isRunningWorker(worker({ sessionExists: false, agentState: 'STARTING', healthStatus: 'unknown' }))).toBe(true)
+})
+
 test('buildHomeAgents prefers newer DEAD snapshot over older READY snapshot for the same session', () => {
   const agents = buildHomeAgents([
     {
@@ -237,5 +241,33 @@ test('buildHomeAgents keeps backend READY state for running development worker',
     source: 'development',
     sessionName: '开发工程师-亢金龙',
     agentState: 'READY',
+  })
+})
+
+test('buildHomeAgents shows prelaunch routing workers as STARTING', () => {
+  const agents = buildHomeAgents(
+    [
+      {
+        source: 'routing',
+        workers: [
+          worker({
+            sessionName: '路由器-天伤星',
+            sessionExists: false,
+            agentState: 'STARTING',
+            healthStatus: 'unknown',
+            status: 'pending',
+            workflowStage: 'pending',
+          }),
+        ],
+      },
+    ],
+    'stage.a01.start',
+  )
+  expect(agents).toHaveLength(1)
+  expect(agents[0]).toMatchObject({
+    source: 'routing',
+    sessionName: '路由器-天伤星',
+    healthStatus: 'unknown',
+    agentState: 'STARTING',
   })
 })

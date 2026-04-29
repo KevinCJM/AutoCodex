@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import A01_Routing_LayerPlanning as routing_stage
 from canopy_core.stage_kernel import detailed_design, requirements_review, reviewer_orchestration, shared_review
+from T09_terminal_ops import PromptBackRequested
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +54,25 @@ class StageKernelSharedTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertEqual(prompt_mock.call_args_list[0].args[0], "输入最大审核轮次（输入 infinite 表示不设上限）")
         self.assertTrue(any("必须是正整数或 infinite" in str(call.args[0]) for call in message_mock.call_args_list if call.args))
+
+    def test_collect_reviewer_agent_selections_bubbles_back_from_first_prompt_when_enabled(self):
+        reviewer_spec = type("ReviewerSpec", (), {"reviewer_key": "R1", "role_name": "Reviewer"})()
+        with patch.object(shared_review, "stdin_is_interactive", return_value=True), patch.object(
+            shared_review,
+            "prompt_review_agent_selection",
+            side_effect=PromptBackRequested(),
+        ) as prompt_mock:
+            with self.assertRaises(PromptBackRequested):
+                shared_review.collect_reviewer_agent_selections(
+                    project_dir="/tmp/project",
+                    reviewer_specs=[reviewer_spec],
+                    display_name_resolver=lambda *_args: "R1-display",
+                    allow_back_first_prompt=True,
+                    stage_key="requirements_review_reviewer_selection",
+                )
+
+        self.assertTrue(prompt_mock.call_args.kwargs["allow_back_first_step"])
+        self.assertEqual(prompt_mock.call_args.kwargs["stage_key"], "requirements_review_reviewer_selection")
 
     def test_review_round_policy_resets_quota_without_resetting_initial_flag(self):
         policy = shared_review.ReviewRoundPolicy(max_rounds=2)
@@ -102,3 +123,117 @@ class StageKernelSharedTests(unittest.TestCase):
         self.assertEqual(config.reviewer_order, ("R1", "R2"))
         self.assertEqual(config.reviewer_selection("R1").model, "gpt-5.4-mini")
         self.assertEqual(config.reviewer_selection("R2").model, "gpt-5.4")
+
+    def test_resolve_stage_agent_config_uses_stage_specific_overrides_with_global_fallback(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "agents.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "main": {"vendor": "codex", "model": "gpt-5.4", "effort": "high"},
+                        "reviewers": [{"name": "R1", "vendor": "codex", "model": "gpt-5.4-mini", "effort": "medium"}],
+                        "stages": {
+                            "development": {
+                                "main": {"vendor": "gemini", "model": "flash", "effort": "medium", "proxy": "10809"},
+                                "reviewers": [{"name": "R1", "vendor": "opencode", "model": "opencode/big-pickle", "effort": "xhigh"}],
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            args = type("Args", (), {"agent_config": str(config_path), "main_agent": "", "reviewer_agent": []})()
+
+            development = shared_review.resolve_stage_agent_config(args, stage_key="development")
+            design = shared_review.resolve_stage_agent_config(args, stage_key="detailed_design")
+
+        self.assertEqual(development.main.vendor, "gemini")
+        self.assertEqual(development.main.model, "flash")
+        self.assertEqual(development.main.proxy_url, "10809")
+        self.assertEqual(development.reviewer_selection("R1").vendor, "opencode")
+        self.assertEqual(development.reviewer_selection("R1").reasoning_effort, "xhigh")
+        self.assertEqual(design.main.vendor, "codex")
+        self.assertEqual(design.reviewer_selection("R1").model, "gpt-5.4-mini")
+
+    def test_prompt_effort_falls_back_when_default_is_not_allowed(self):
+        with patch.object(routing_stage, "normalize_vendor_choice", return_value="codex"), patch.object(
+            routing_stage,
+            "normalize_model_choice",
+            return_value="gpt-x",
+        ), patch.object(
+            routing_stage,
+            "get_normalized_effort_choices",
+            return_value=("high",),
+        ), patch.object(
+            routing_stage,
+            "normalize_effort_choice",
+            side_effect=[ValueError("gpt-x 不支持的推理强度: max"), "high"],
+        ), patch.object(
+            routing_stage,
+            "prompt_select_option",
+            return_value="high",
+        ) as prompt_mock:
+            effort = routing_stage.prompt_effort("codex", "gpt-x", "max", role_label="审核员")
+
+        self.assertEqual(effort, "high")
+        self.assertEqual(prompt_mock.call_args.kwargs["default_value"], "high")
+
+    def test_resolve_stage_agent_config_records_invalid_reviewer_without_raising(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "agent_config": "",
+                "main_agent": "",
+                "reviewer_agent": [
+                    "name=审核员,vendor=codex,model=gpt-5.4,effort=max",
+                ],
+            },
+        )()
+        with patch.object(
+            shared_review,
+            "parse_agent_selection_spec",
+            side_effect=ValueError("gpt-5.4 不支持的推理强度: max"),
+        ):
+            config = shared_review.resolve_stage_agent_config(args)
+
+        self.assertEqual(config.reviewer_order, ("审核员",))
+        self.assertIsNone(config.reviewer_selection("审核员"))
+        self.assertIn("审核员", config.invalid_reviewers)
+        self.assertIn("不支持的推理强度", config.invalid_reviewers["审核员"].error)
+
+    def test_agent_run_config_creation_error_prompts_reselection(self):
+        invalid = shared_review.ReviewAgentSelection("opencode", "ark-coding-plan/doubao-seed-2.0-pro", "max", "")
+        replacement = shared_review.ReviewAgentSelection("opencode", "ark-coding-plan/doubao-seed-2.0-pro", "high", "")
+        fake_config = object()
+
+        with patch.object(shared_review, "stdin_is_interactive", return_value=True), patch.object(
+            shared_review,
+            "AgentRunConfig",
+            side_effect=[ValueError("ark-coding-plan/doubao-seed-2.0-pro 不支持的推理强度: max"), fake_config],
+        ), patch.object(
+            shared_review,
+            "prompt_review_agent_selection",
+            return_value=replacement,
+        ) as prompt_mock, patch.object(shared_review, "message"):
+            selection, config = shared_review.resolve_agent_run_config_with_recovery(
+                invalid,
+                role_label="审核员",
+            )
+
+        self.assertEqual(selection.reasoning_effort, "high")
+        self.assertIs(config, fake_config)
+        prompt_mock.assert_called_once()
+
+    def test_requirements_review_proxy_prompt_does_not_recurse_after_binding_sync(self):
+        requirements_review._sync_shared_review_bindings()
+        with patch.object(requirements_review, "prompt_with_default", return_value="10900") as prompt_mock:
+            proxy_url = requirements_review.prompt_proxy_url("7890", role_label="审核员")
+
+        self.assertEqual(proxy_url, "10900")
+        prompt_mock.assert_called_once_with(
+            "为 审核员 输入代理端口或完整代理 URL（可留空）",
+            "7890",
+            allow_empty=True,
+        )

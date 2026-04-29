@@ -7,11 +7,14 @@ from unittest.mock import Mock, patch
 from T09_terminal_ops import (
     BridgePromptRequest,
     BridgeTerminalUI,
+    PROMPT_BACK_VALUE,
+    PromptBackRequested,
     StdioTerminalUI,
     ensure_tui_dependencies_installed,
     terminal_ui_is_interactive,
     message,
     maybe_launch_tui,
+    prompt_metadata,
     prompt_select_option,
     prompt_with_default,
     set_terminal_ui,
@@ -106,6 +109,30 @@ class T09TerminalOpsTests(unittest.TestCase):
         self.assertEqual(value, "abc")
         self.assertEqual(events[0][0], "log.append")
         self.assertEqual(events[0][1]["text"], "line\n")
+
+    def test_bridge_terminal_ui_prompt_metadata_supports_back_request(self):
+        captured: list[BridgePromptRequest] = []
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured.append(request)
+            return {"value": PROMPT_BACK_VALUE}
+
+        ui = BridgeTerminalUI(emit_event=lambda *_args, **_kwargs: None, request_prompt=request_prompt)
+        with self.assertRaises(PromptBackRequested):
+            with prompt_metadata(allow_back=True, back_value=PROMPT_BACK_VALUE, stage_key="routing", stage_step_index=2):
+                ui.prompt_text("输入")
+
+        self.assertEqual(captured[0].payload["allow_back"], True)
+        self.assertEqual(captured[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(captured[0].payload["stage_key"], "routing")
+        self.assertEqual(captured[0].payload["stage_step_index"], 2)
+
+    def test_bridge_terminal_ui_back_value_is_plain_text_without_allow_back(self):
+        ui = BridgeTerminalUI(
+            emit_event=lambda *_args, **_kwargs: None,
+            request_prompt=lambda _request: {"value": PROMPT_BACK_VALUE},
+        )
+        self.assertEqual(ui.prompt_text("输入"), PROMPT_BACK_VALUE)
 
     def test_bridge_terminal_ui_multiline_prompt_preserves_hitl_paths(self):
         captured: list[BridgePromptRequest] = []

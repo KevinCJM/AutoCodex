@@ -5,6 +5,7 @@ import {
   inferBootstrapStatus,
   markTerminalStage,
   shouldAcceptProgressEvent,
+  shouldRecoverRunningFromStageSnapshot,
 } from './stageStatus'
 
 test('failed stage keeps later progress from the same stage sequence from reviving running state', () => {
@@ -165,4 +166,47 @@ test('bootstrap keeps awaiting-input ahead of worker activity', () => {
       },
     }),
   ).toBe('awaiting-input')
+})
+
+test('failed status recovers when current routing snapshot still has live workers', () => {
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'failed',
+      'stage.a01.start',
+      'routing',
+      {
+        workers: [
+          {
+            session_name: '路由器-地微星',
+            status: 'running',
+            agent_state: 'BUSY',
+            health_status: 'alive',
+            current_task_runtime_status: 'running',
+            session_exists: true,
+          },
+        ],
+      },
+    ),
+  ).toBe(true)
+})
+
+test('failed status is not recovered from unrelated stage snapshots', () => {
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'failed',
+      'stage.a01.start',
+      'development',
+      {
+        workers: [
+          {
+            session_name: '开发工程师-天速星',
+            status: 'running',
+            agent_state: 'BUSY',
+            health_status: 'alive',
+            session_exists: true,
+          },
+        ],
+      },
+    ),
+  ).toBe(false)
 })

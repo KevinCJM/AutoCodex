@@ -1807,6 +1807,7 @@ class AgentRuntimeClassifierContext:
     cached_state: AgentRuntimeState
     pane_id: str
     expected_current_commands: tuple[str, ...]
+    task_running: bool = False
     title_ready: bool = False
     title_busy: bool = False
 
@@ -1836,9 +1837,12 @@ def classify_agent_runtime_state(
     if context.title_ready:
         return AgentRuntimeState.READY
     if context.title_busy:
-        if context.vendor == Vendor.CODEX and str(observation.visible_text or "").strip() and not str(
-                observation.raw_log_tail or ""
-        ).strip():
+        if (
+                context.vendor == Vendor.CODEX
+                and not context.task_running
+                and str(observation.visible_text or "").strip()
+                and not str(observation.raw_log_tail or "").strip()
+        ):
             detected_state = detector.classify_agent_state(observation)
             if detected_state != AgentRuntimeState.BUSY:
                 return detected_state
@@ -3186,6 +3190,150 @@ class TmuxBatchWorker:
         except Exception:
             return None
 
+    def _busy_agent_observation_after_turn_timeout(self) -> WorkerObservation | None:
+        observation = self._probe_agent_liveness_for_file_wait()
+        if not observation.session_exists:
+            raise RuntimeError("tmux pane exited while waiting for timed-out turn")
+        if observation.pane_dead:
+            raise RuntimeError(f"tmux pane died while waiting for timed-out turn:\n{self._diagnostic_visible_tail(160)}")
+        current_command = observation.current_command or self.current_command
+        if current_command in SHELL_COMMANDS:
+            self.agent_ready = False
+            self.wrapper_state = WrapperState.NOT_READY
+            return None
+        if not self._agent_running(current_command):
+            return None
+        self._raise_on_provider_runtime_error(observation, context="waiting for timed-out turn")
+        if self.get_agent_state(observation) != AgentRuntimeState.BUSY:
+            return None
+        self.agent_ready = False
+        self.agent_started = True
+        self.agent_state = AgentRuntimeState.BUSY
+        self.wrapper_state = WrapperState.NOT_READY
+        self.current_command = current_command
+        self.current_path = observation.current_path or self.current_path
+        self.last_heartbeat_at = observation.observed_at
+        return observation
+
+    def _record_turn_timeout_extended_for_busy_agent(
+            self,
+            *,
+            label: str,
+            attempt: int,
+            timeout_sec: float,
+            task_status_path: Path,
+            observation: WorkerObservation,
+    ) -> None:
+        self._log_event(
+            "turn_timeout_wait_extended_for_busy_agent",
+            label=label,
+            attempt=attempt,
+            timeout_sec=timeout_sec,
+            current_command=observation.current_command,
+            pane_title=observation.pane_title,
+        )
+        self._write_state(
+            WorkerStatus.RUNNING,
+            note=f"still_running:{label}",
+            extra={
+                "label": label,
+                "retry_count": attempt - 1,
+                "result_status": "running",
+                "agent_ready": False,
+                "agent_state": AgentRuntimeState.BUSY.value,
+                "current_command": observation.current_command,
+                "current_path": observation.current_path,
+                "current_task_status_path": str(task_status_path),
+                "current_task_result_path": self.current_task_result_path,
+                "current_task_runtime_status": self.current_task_runtime_status,
+            },
+        )
+
+    def _wait_for_turn_artifacts_while_agent_busy_after_timeout(
+            self,
+            *,
+            label: str,
+            attempt: int,
+            timeout_sec: float,
+            contract: TurnFileContract,
+            task_status_path: Path,
+            prompt_submission_observed: bool,
+    ) -> TurnFileResult | None:
+        if not prompt_submission_observed:
+            return None
+        while True:
+            observation = self._busy_agent_observation_after_turn_timeout()
+            if observation is None:
+                return None
+            self._record_turn_timeout_extended_for_busy_agent(
+                label=label,
+                attempt=attempt,
+                timeout_sec=timeout_sec,
+                task_status_path=task_status_path,
+                observation=observation,
+            )
+            try:
+                return self.wait_for_turn_artifacts(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    timeout_sec=timeout_sec,
+                )
+            except TimeoutError:
+                file_result = self._try_finalize_turn_artifacts_after_timeout(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    prompt_submission_observed=prompt_submission_observed,
+                )
+                if file_result is not None:
+                    return file_result
+
+    def _wait_for_task_result_while_agent_busy_after_timeout(
+            self,
+            *,
+            label: str,
+            attempt: int,
+            timeout_sec: float,
+            contract: TaskResultContract,
+            task_status_path: Path,
+            result_path: Path,
+            baseline_visible: str,
+            baseline_raw_log_tail: str,
+            prompt_submission_observed: bool,
+    ) -> TaskResultFile | None:
+        if not prompt_submission_observed:
+            return None
+        while True:
+            observation = self._busy_agent_observation_after_turn_timeout()
+            if observation is None:
+                return None
+            self._record_turn_timeout_extended_for_busy_agent(
+                label=label,
+                attempt=attempt,
+                timeout_sec=timeout_sec,
+                task_status_path=task_status_path,
+                observation=observation,
+            )
+            try:
+                return self.wait_for_task_result(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    timeout_sec=timeout_sec,
+                    baseline_visible=baseline_visible,
+                    baseline_raw_log_tail=baseline_raw_log_tail,
+                )
+            except TimeoutError:
+                task_result = self._try_finalize_task_result_after_prompt_timeout(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    baseline_visible=baseline_visible,
+                    baseline_raw_log_tail=baseline_raw_log_tail,
+                    prompt_submission_observed=prompt_submission_observed,
+                )
+                if task_result is not None:
+                    return task_result
+
     def _turn_failure_runtime_state_extra(self, clean_output: str) -> dict[str, object]:
         if is_provider_runtime_error(clean_output):
             self.agent_ready = False
@@ -4030,6 +4178,7 @@ class TmuxBatchWorker:
                 cached_state=self.agent_state,
                 pane_id=self.pane_id,
                 expected_current_commands=self.config.expected_current_commands(),
+                task_running=self.current_task_runtime_status == TASK_STATUS_RUNNING,
                 title_ready=self._title_indicates_ready(observation.pane_title),
                 title_busy=self._title_indicates_busy(observation.pane_title),
             ),
@@ -4308,6 +4457,67 @@ class TmuxBatchWorker:
             return
 
         self._wait_for_agent_ready(timeout_sec=timeout_sec)
+
+    def _confirm_busy_agent_for_turn_start_ready_wait(
+            self,
+            *,
+            error: Exception,
+            timeout_sec: float,
+    ) -> None:
+        observation = self._probe_agent_liveness_for_file_wait()
+        if not observation.session_exists:
+            raise RuntimeError("tmux pane exited while waiting for agent ready") from error
+        if observation.pane_dead:
+            raise RuntimeError(
+                f"tmux pane died while waiting for agent ready:\n{self._diagnostic_visible_tail(160)}"
+            ) from error
+        current_command = observation.current_command or self.current_command
+        if current_command in SHELL_COMMANDS:
+            self.agent_ready = False
+            self.wrapper_state = WrapperState.NOT_READY
+            raise RuntimeError(
+                f"agent exited back to shell while waiting for agent ready:\n{self._diagnostic_visible_tail(160)}"
+            ) from error
+        if not self._agent_running(current_command):
+            raise error
+        self._raise_on_provider_runtime_error(observation, context="waiting for agent ready before turn")
+        agent_state = self.get_agent_state(observation)
+        if agent_state != AgentRuntimeState.BUSY:
+            raise error
+        self.agent_ready = False
+        self.agent_started = True
+        self.agent_state = AgentRuntimeState.BUSY
+        self.wrapper_state = WrapperState.NOT_READY
+        self.current_command = current_command
+        self.current_path = observation.current_path or self.current_path
+        self.last_heartbeat_at = observation.observed_at
+        self._log_event(
+            "turn_start_ready_wait_extended_for_busy_agent",
+            timeout_sec=timeout_sec,
+            current_command=current_command,
+            pane_title=observation.pane_title,
+        )
+
+    def _ensure_agent_ready_for_turn_start(self, *, timeout_sec: float) -> None:
+        try:
+            self.ensure_agent_ready()
+            return
+        except Exception as error:
+            if not is_agent_ready_timeout_error(error):
+                raise
+            current_error = error
+        while True:
+            self._confirm_busy_agent_for_turn_start_ready_wait(
+                error=current_error,
+                timeout_sec=timeout_sec,
+            )
+            try:
+                self.ensure_agent_ready(timeout_sec=timeout_sec)
+                return
+            except Exception as error:
+                if not is_agent_ready_timeout_error(error):
+                    raise
+                current_error = error
 
     def _build_turn_prompt(
             self,
@@ -4666,7 +4876,7 @@ class TmuxBatchWorker:
             )
 
             try:
-                self.ensure_agent_ready()
+                self._ensure_agent_ready_for_turn_start(timeout_sec=timeout_sec)
                 baseline_observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
                 baseline_visible = baseline_observation.visible_text
                 baseline_raw_log_tail = baseline_observation.raw_log_tail
@@ -4816,6 +5026,90 @@ class TmuxBatchWorker:
                         return result
                 if result_contract is not None:
                     task_result = self._try_finalize_task_result_after_prompt_timeout(
+                        contract=result_contract,
+                        task_status_path=task_status_path,
+                        result_path=result_path,
+                        baseline_visible=locals().get("baseline_visible", ""),
+                        baseline_raw_log_tail=locals().get("baseline_raw_log_tail", ""),
+                        prompt_submission_observed=prompt_submission_observed,
+                    )
+                    if task_result is not None:
+                        reply = json.dumps(task_result.payload, ensure_ascii=False, indent=2)
+                        finished_at = _now_iso()
+                        result = CommandResult(
+                            label=label,
+                            command=submitted_prompt,
+                            exit_code=0,
+                            raw_output=reply,
+                            clean_output=reply,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                        )
+                        self._record_result(
+                            result,
+                            status=WorkerStatus.SUCCEEDED,
+                            note=f"done:{label}",
+                            extra={
+                                "label": label,
+                                "result_status": "succeeded",
+                                "retry_count": attempt - 1,
+                                "current_task_status_path": str(task_status_path),
+                                "current_task_result_path": self.current_task_result_path,
+                                "current_task_runtime_status": self.current_task_runtime_status,
+                            },
+                        )
+                        return result
+                if completion_contract is not None:
+                    file_result = self._wait_for_turn_artifacts_while_agent_busy_after_timeout(
+                        label=label,
+                        attempt=attempt,
+                        timeout_sec=timeout_sec,
+                        contract=completion_contract,
+                        task_status_path=task_status_path,
+                        prompt_submission_observed=prompt_submission_observed,
+                    )
+                    if file_result is not None:
+                        reply = json.dumps(
+                            {
+                                "status_path": file_result.status_path,
+                                "artifact_paths": file_result.artifact_paths,
+                                "artifact_hashes": file_result.artifact_hashes,
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        finished_at = _now_iso()
+                        result = CommandResult(
+                            label=label,
+                            command=submitted_prompt,
+                            exit_code=0,
+                            raw_output=reply,
+                            clean_output=reply,
+                            started_at=started_at,
+                            finished_at=finished_at,
+                        )
+                        self._record_result(
+                            result,
+                            status=WorkerStatus.SUCCEEDED,
+                            note=f"done:{label}",
+                            extra={
+                                "label": label,
+                                "result_status": "succeeded",
+                                "retry_count": attempt - 1,
+                                "current_turn_id": completion_contract.turn_id,
+                                "current_turn_phase": completion_contract.phase,
+                                "current_turn_status_path": str(completion_contract.status_path),
+                                "current_task_status_path": str(task_status_path),
+                                "current_task_result_path": self.current_task_result_path,
+                                "current_task_runtime_status": self.current_task_runtime_status,
+                            },
+                        )
+                        return result
+                if result_contract is not None:
+                    task_result = self._wait_for_task_result_while_agent_busy_after_timeout(
+                        label=label,
+                        attempt=attempt,
+                        timeout_sec=timeout_sec,
                         contract=result_contract,
                         task_status_path=task_status_path,
                         result_path=result_path,

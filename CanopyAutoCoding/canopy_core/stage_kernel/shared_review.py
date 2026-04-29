@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -18,6 +18,7 @@ from A01_Routing_LayerPlanning import (
 )
 from canopy_core.runtime.contracts import TurnFileContract
 from canopy_core.runtime.tmux_runtime import (
+    AgentRunConfig,
     TmuxBatchWorker,
     Vendor,
     is_agent_ready_timeout_error,
@@ -26,10 +27,13 @@ from canopy_core.runtime.tmux_runtime import (
     is_worker_death_error,
 )
 from T09_terminal_ops import (
+    PROMPT_BACK_VALUE,
+    PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
     collect_multiline_input,
     message,
+    prompt_metadata,
     prompt_select_option,
     prompt_positive_int as terminal_prompt_positive_int,
     prompt_with_default,
@@ -59,6 +63,14 @@ class ReviewAgentSelection:
 
 
 @dataclass(frozen=True)
+class InvalidAgentSelection:
+    name: str
+    source: str
+    raw_spec: object
+    error: str
+
+
+@dataclass(frozen=True)
 class ReviewerRuntime:
     reviewer_name: str
     selection: ReviewAgentSelection
@@ -84,6 +96,8 @@ class StageAgentConfig:
     main: ReviewAgentSelection | None = None
     reviewers: dict[str, ReviewAgentSelection] | None = None
     reviewer_order: tuple[str, ...] = ()
+    invalid_main: InvalidAgentSelection | None = None
+    invalid_reviewers: dict[str, InvalidAgentSelection] = field(default_factory=dict)
 
     def reviewer_selection(self, reviewer_key: str) -> ReviewAgentSelection | None:
         selections = self.reviewers or {}
@@ -139,6 +153,36 @@ def _review_worker_state(worker: TmuxBatchWorker | None) -> dict[str, object]:
     return dict(state) if isinstance(state, Mapping) else {}
 
 
+AGENT_CONFIG_ERROR_MARKERS = (
+    "不支持的推理强度",
+    "不支持的厂商",
+    "不支持的模型",
+    "模型不能为空",
+    "model 不能为空",
+    "未安装",
+    "没有可用模型",
+    "无法选择模型",
+    "unsupported vendor",
+    "unsupported reasoning effort",
+    "does not support normalized effort",
+    "model unavailable",
+    "model cannot be empty",
+    "model is required",
+    "not installed",
+    "no available model",
+    "scanned catalog",
+    "vendor catalog",
+)
+
+
+def is_agent_config_error(error: Exception | BaseException | str) -> bool:
+    text = str(error or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in text or marker in lowered for marker in AGENT_CONFIG_ERROR_MARKERS)
+
+
 def describe_reviewer_failure_reason(
     error: Exception | BaseException | str,
     worker: TmuxBatchWorker | None = None,
@@ -147,6 +191,9 @@ def describe_reviewer_failure_reason(
     lowered = message_text.lower()
     state = _review_worker_state(worker)
     health_status = str(state.get("health_status", "")).strip().lower()
+    if is_agent_config_error(error):
+        first_line = message_text.splitlines()[0].strip() if message_text else ""
+        return first_line[:160] if first_line else "智能体模型配置不可用"
     if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):
         return "模型认证已失效"
     if is_provider_runtime_error(error) or worker_has_provider_runtime_error(worker):
@@ -274,10 +321,24 @@ def prompt_proxy_url(default: str = "", *, role_label: str = "") -> str:
     return prompt_with_default(prompt_text, default, allow_empty=True)
 
 
-def prompt_positive_int(prompt_text: str, default: int = 1, *, progress: ReviewStageProgress | None = None) -> int:
+def prompt_positive_int(
+    prompt_text: str,
+    default: int = 1,
+    *,
+    progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
+    stage_key: str = "",
+    stage_step_index: int = 0,
+) -> int:
     progress = resolve_review_progress(progress)
     with progress.suspended() if progress is not None else nullcontext():
-        return terminal_prompt_positive_int(prompt_text, default)
+        with prompt_metadata(
+            allow_back=allow_back,
+            back_value=PROMPT_BACK_VALUE,
+            stage_key=stage_key,
+            stage_step_index=stage_step_index,
+        ):
+            return terminal_prompt_positive_int(prompt_text, default)
 
 
 def _parse_spec_text(value: str, *, source: str) -> dict[str, str]:
@@ -364,6 +425,21 @@ def parse_agent_selection_spec(
     )
 
 
+def _agent_spec_name(spec: object, *, default_name: str, source: str) -> str:
+    try:
+        fields = _coerce_agent_spec_fields(spec, source=source)
+    except Exception:
+        return str(default_name or "").strip()
+    return str(
+        fields.get("name")
+        or fields.get("key")
+        or fields.get("role")
+        or fields.get("reviewer")
+        or default_name
+        or ""
+    ).strip()
+
+
 def _load_agent_config_payload(path_value: object) -> dict[str, Any]:
     text = str(path_value or "").strip()
     if not text:
@@ -389,43 +465,83 @@ def _config_reviewer_specs(payload: Mapping[str, Any]) -> list[object]:
     return []
 
 
+def _stage_config_payload(payload: Mapping[str, Any], stage_key: str) -> Mapping[str, Any]:
+    key = str(stage_key or "").strip()
+    if not key:
+        return {}
+    stages = payload.get("stages")
+    if not isinstance(stages, Mapping):
+        return {}
+    stage_payload = stages.get(key)
+    if not isinstance(stage_payload, Mapping):
+        return {}
+    return stage_payload
+
+
 def resolve_stage_agent_config(
     args: object,
     *,
+    stage_key: str = "",
     default_reviewer_names: Sequence[str] = (),
 ) -> StageAgentConfig:
     config_payload = _load_agent_config_payload(getattr(args, "agent_config", ""))
-    main_spec = config_payload.get("main") or config_payload.get("main_agent")
+    stage_payload = _stage_config_payload(config_payload, stage_key)
+    main_spec = stage_payload.get("main") or stage_payload.get("main_agent") or config_payload.get("main") or config_payload.get("main_agent")
     cli_main = getattr(args, "main_agent", "")
     if str(cli_main or "").strip():
         main_spec = cli_main
     main_selection: ReviewAgentSelection | None = None
+    invalid_main: InvalidAgentSelection | None = None
     if main_spec:
-        _, main_selection = parse_agent_selection_spec(main_spec, source="main-agent")
+        try:
+            _, main_selection = parse_agent_selection_spec(main_spec, source="main-agent")
+        except Exception as error:  # noqa: BLE001
+            invalid_main = InvalidAgentSelection(
+                name=_agent_spec_name(main_spec, default_name="main", source="main-agent"),
+                source="main-agent",
+                raw_spec=main_spec,
+                error=str(error),
+            )
 
-    reviewer_specs: list[object] = _config_reviewer_specs(config_payload)
+    reviewer_specs: list[object] = _config_reviewer_specs(stage_payload) if stage_payload else []
+    if not reviewer_specs:
+        reviewer_specs = _config_reviewer_specs(config_payload)
     cli_reviewers = list(getattr(args, "reviewer_agent", []) or [])
     if cli_reviewers:
         reviewer_specs = cli_reviewers
 
     reviewers: dict[str, ReviewAgentSelection] = {}
+    invalid_reviewers: dict[str, InvalidAgentSelection] = {}
     reviewer_order: list[str] = []
     default_names = [str(item).strip() for item in default_reviewer_names if str(item).strip()]
     for index, reviewer_spec in enumerate(reviewer_specs):
         default_name = default_names[index] if index < len(default_names) else f"R{index + 1}"
-        reviewer_name, selection = parse_agent_selection_spec(
-            reviewer_spec,
-            default_name=default_name,
-            source=f"reviewer-agent[{index + 1}]",
-        )
+        source = f"reviewer-agent[{index + 1}]"
+        reviewer_name = _agent_spec_name(reviewer_spec, default_name=default_name, source=source)
         if not reviewer_name:
             reviewer_name = default_name
-        reviewers[reviewer_name] = selection
         reviewer_order.append(reviewer_name)
+        try:
+            _, selection = parse_agent_selection_spec(
+                reviewer_spec,
+                default_name=default_name,
+                source=source,
+            )
+        except Exception as error:  # noqa: BLE001
+            invalid_reviewers[reviewer_name] = InvalidAgentSelection(
+                name=reviewer_name,
+                source=source,
+                raw_spec=reviewer_spec,
+                error=str(error),
+            )
+            continue
+        reviewers[reviewer_name] = selection
     return StageAgentConfig(
         main=main_selection,
         reviewers=reviewers,
         reviewer_order=tuple(reviewer_order),
+        invalid_main=invalid_main,
+        invalid_reviewers=invalid_reviewers,
     )
 
 
@@ -437,20 +553,105 @@ def prompt_review_agent_selection(
     *,
     role_label: str = "",
     progress: ReviewStageProgress | None = None,
+    allow_back_first_step: bool = False,
+    stage_key: str = "agent_selection",
 ) -> ReviewAgentSelection:
     progress = resolve_review_progress(progress)
-    with progress.suspended() if progress is not None else nullcontext():
-        vendor = prompt_vendor(default_vendor, role_label=role_label)
-        preferred_model = default_model if default_model and vendor == default_vendor else get_default_model_for_vendor(vendor)
-        model = prompt_model(vendor, preferred_model, role_label=role_label)
-        reasoning_effort = prompt_effort(vendor, model, default_reasoning_effort, role_label=role_label)
-        proxy_url = prompt_proxy_url(default_proxy_url, role_label=role_label)
-    return ReviewAgentSelection(
-        vendor=vendor,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        proxy_url=proxy_url,
-    )
+    while True:
+        try:
+            vendor = default_vendor
+            model = default_model
+            reasoning_effort = default_reasoning_effort
+            proxy_url = default_proxy_url
+            step = 0
+            while step < 4:
+                try:
+                    with progress.suspended() if progress is not None else nullcontext():
+                        with prompt_metadata(
+                            allow_back=allow_back_first_step if step == 0 else True,
+                            back_value=PROMPT_BACK_VALUE,
+                            stage_key=stage_key,
+                            stage_step_index=step,
+                        ):
+                            if step == 0:
+                                vendor = prompt_vendor(vendor or default_vendor, role_label=role_label)
+                                if model:
+                                    try:
+                                        normalize_model_choice(vendor, model)
+                                    except ValueError:
+                                        model = ""
+                                step = 1
+                                continue
+                            if step == 1:
+                                preferred_model = model if model and vendor == default_vendor else get_default_model_for_vendor(vendor)
+                                model = prompt_model(vendor, preferred_model, role_label=role_label)
+                                step = 2
+                                continue
+                            if step == 2:
+                                reasoning_effort = prompt_effort(vendor, model, reasoning_effort or default_reasoning_effort, role_label=role_label)
+                                step = 3
+                                continue
+                            if step == 3:
+                                proxy_url = prompt_proxy_url(proxy_url, role_label=role_label)
+                                step = 4
+                                continue
+                except PromptBackRequested:
+                    if step == 0:
+                        continue
+                    step -= 1
+            return ReviewAgentSelection(
+                vendor=vendor,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                proxy_url=proxy_url,
+            )
+        except Exception as error:  # noqa: BLE001
+            if not is_agent_config_error(error):
+                raise
+            if not stdin_is_interactive():
+                raise
+            role_text = str(role_label or "").strip() or "智能体"
+            message(f"{role_text} 模型配置不可用: {error}\n请重新选择厂商、模型和推理强度。")
+
+
+def resolve_agent_run_config_with_recovery(
+    selection: ReviewAgentSelection,
+    *,
+    role_label: str,
+    progress: ReviewStageProgress | None = None,
+    reason_text: str = "",
+) -> tuple[ReviewAgentSelection, AgentRunConfig]:
+    progress = resolve_review_progress(progress)
+    current_selection = selection
+    role_text = str(role_label or "").strip() or "智能体"
+    while True:
+        try:
+            config = AgentRunConfig(
+                vendor=current_selection.vendor,
+                model=current_selection.model,
+                reasoning_effort=current_selection.reasoning_effort,
+                proxy_url=current_selection.proxy_url,
+            )
+            return current_selection, config
+        except Exception as error:  # noqa: BLE001
+            if not is_agent_config_error(error):
+                raise
+            prompt_is_patched = getattr(prompt_review_agent_selection, "__module__", __name__) != __name__
+            if not stdin_is_interactive() and not prompt_is_patched:
+                raise RuntimeError(f"{role_text} 模型配置不可用: {error}；当前环境无法交互重新选择模型。") from error
+            message(
+                str(reason_text or "").strip()
+                or f"{role_text} 模型配置不可用: {error}\n请重新选择模型配置后继续当前阶段。"
+            )
+            current_selection = prompt_review_agent_selection(
+                default_vendor=current_selection.vendor,
+                default_model=current_selection.model,
+                default_reasoning_effort=current_selection.reasoning_effort,
+                default_proxy_url=current_selection.proxy_url,
+                role_label=role_text,
+                progress=progress,
+            )
+            message(render_review_agent_selection(f"{role_text} 新配置", current_selection))
 
 
 def render_review_agent_selection(title: str, selection: ReviewAgentSelection) -> str:
@@ -473,11 +674,14 @@ def collect_reviewer_agent_selections(
     progress: ReviewStageProgress | None = None,
     skip_reviewer_keys: Sequence[str] = (),
     reserved_session_names: Sequence[str] = (),
+    allow_back_first_prompt: bool = False,
+    stage_key: str = "reviewer_selection",
 ) -> dict[str, ReviewAgentSelection]:
     selections: dict[str, ReviewAgentSelection] = {}
     predicted_session_names: set[str] = {str(name).strip() for name in reserved_session_names if str(name).strip()}
     skip_keys = {str(item).strip() for item in skip_reviewer_keys if str(item).strip()}
     interactive = stdin_is_interactive()
+    next_allow_back = bool(allow_back_first_prompt)
     for reviewer_spec in reviewer_specs:
         reviewer_key = str(
             getattr(reviewer_spec, "reviewer_key", "") or getattr(reviewer_spec, "role_name", "")
@@ -494,7 +698,10 @@ def collect_reviewer_agent_selections(
                 default_proxy_url="",
                 role_label=reviewer_display_name,
                 progress=progress,
+                allow_back_first_step=next_allow_back,
+                stage_key=stage_key,
             )
+            next_allow_back = False
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
         else:
             selection = ReviewAgentSelection(
@@ -514,15 +721,24 @@ def prompt_yes_no_choice(
     progress: ReviewStageProgress | None = None,
     preview_path: str | Path | None = None,
     preview_title: str = "",
+    allow_back: bool = False,
+    stage_key: str = "",
+    stage_step_index: int = 0,
 ) -> bool:
     progress = resolve_review_progress(progress)
     with progress.suspended() if progress is not None else nullcontext():
-        return terminal_prompt_yes_no(
-            prompt_text,
-            default,
-            preview_path=preview_path,
-            preview_title=preview_title,
-        )
+        with prompt_metadata(
+            allow_back=allow_back,
+            back_value=PROMPT_BACK_VALUE,
+            stage_key=stage_key,
+            stage_step_index=stage_step_index,
+        ):
+            return terminal_prompt_yes_no(
+                prompt_text,
+                default,
+                preview_path=preview_path,
+                preview_title=preview_title,
+            )
 
 
 def prompt_replacement_review_agent_selection(
@@ -629,6 +845,8 @@ def worker_has_provider_runtime_error(worker: TmuxBatchWorker | None) -> bool:
 
 def is_recoverable_startup_failure(error: Exception, worker: TmuxBatchWorker | None = None) -> bool:
     message_text = str(error or "").strip().lower()
+    if is_agent_config_error(error):
+        return True
     if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):
         return True
     if is_provider_runtime_error(error) or worker_has_provider_runtime_error(worker):
@@ -759,11 +977,20 @@ def prompt_review_max_rounds(
     progress: ReviewStageProgress | None = None,
     prompt_text: str = "输入最大审核轮次（输入 infinite 表示不设上限）",
     source: str = "最大审核轮次",
+    allow_back: bool = False,
+    stage_key: str = "",
+    stage_step_index: int = 0,
 ) -> int | None:
     progress = resolve_review_progress(progress)
     with progress.suspended() if progress is not None else nullcontext():
         while True:
-            value = prompt_with_default(prompt_text, str(default)).strip()
+            with prompt_metadata(
+                allow_back=allow_back,
+                back_value=PROMPT_BACK_VALUE,
+                stage_key=stage_key,
+                stage_step_index=stage_step_index,
+            ):
+                value = prompt_with_default(prompt_text, str(default)).strip()
             try:
                 return parse_review_max_rounds(value, source=source, default=default)
             except RuntimeError as error:

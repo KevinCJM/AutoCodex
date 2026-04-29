@@ -23,6 +23,9 @@ test('PromptInputPanel centralizes title, optional helper lines, and textarea wi
   expect(content.includes("mode?: 'singleline' | 'multiline'")).toBe(true)
   expect(content.includes('hintLines?: string[]')).toBe(true)
   expect(content.includes('showSubmitHelper?: boolean')).toBe(true)
+  expect(content.includes('onBack?: () => void')).toBe(true)
+  expect(content.includes("if (event.name !== 'escape') return")).toBe(true)
+  expect(content.includes('<text fg="#00d2ff">[上一步]</text>')).toBe(true)
   expect(content.includes("props.showSubmitHelper && multiline() ? 'Enter 提交，Shift+Enter / Meta+Enter / Ctrl+J 换行' : ''")).toBe(true)
   expect(content.includes('<PromptTextarea')).toBe(true)
   expect(content.includes('focusToken={props.focusToken}')).toBe(true)
@@ -107,6 +110,10 @@ test('DialogConfirm forwards dialog active state to the shared select renderer',
   const content = readFileSync(join(import.meta.dir, 'ui/DialogConfirm.tsx'), 'utf8')
   expect(content.includes('active?: boolean')).toBe(true)
   expect(content.includes('active={props.active}')).toBe(true)
+  expect(content.includes('allowBack?: boolean')).toBe(true)
+  expect(content.includes('backValue?: string')).toBe(true)
+  expect(content.includes('withPromptBackOption')).toBe(true)
+  expect(content.includes("value === backValue() ? backValue() : value === 'yes'")).toBe(true)
 })
 
 test('clipboard helper writes trimmed text to the system clipboard', () => {

@@ -36,7 +36,7 @@ from A03_RequirementsReview import (
     cleanup_existing_review_artifacts,
 )
 from T05_hitl_runtime import build_prefixed_sha256
-from T09_terminal_ops import BridgeTerminalUI
+from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, PromptBackRequested, use_terminal_ui
 from T08_pre_development import (
     build_pre_development_task_record_path,
     ensure_pre_development_task_record,
@@ -198,6 +198,91 @@ class A03RequirementsReviewTests(unittest.TestCase):
         self.assertEqual(prompts[1]["preview_path"], paths["requirements_clear_path"])
         self.assertEqual(prompts[0]["preview_title"], "需求澄清文档")
         self.assertEqual(prompts[1]["preview_title"], "需求澄清文档")
+        self.assertFalse(prompts[0]["allow_back"])
+        self.assertTrue(prompts[1]["allow_back"])
+        self.assertEqual(prompts[0]["stage_key"], "requirements_review")
+        self.assertEqual(prompts[1]["stage_key"], "requirements_review")
+        self.assertEqual(prompts[0]["stage_step_index"], 0)
+        self.assertEqual(prompts[1]["stage_step_index"], 1)
+
+    def test_run_human_check_loop_back_from_skip_review_returns_to_human_question_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = build_requirements_review_paths(tmpdir, "需求A")
+            paths["requirements_clear_path"].write_text("需求澄清正文\n", encoding="utf-8")
+            handoff = RequirementsAnalystHandoff(
+                worker=_FakeWorker(),
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            prompts: list[str] = []
+            skip_calls = 0
+
+            def fake_prompt(prompt_text, default=False, **kwargs):  # noqa: ANN001
+                nonlocal skip_calls
+                _ = default, kwargs
+                prompts.append(prompt_text)
+                if prompt_text == "是否跳过需求评审阶段":
+                    skip_calls += 1
+                    if skip_calls == 1:
+                        raise PromptBackRequested()
+                return False
+
+            with patch("A04_RequirementsReview.prompt_yes_no_choice", side_effect=fake_prompt):
+                result = run_human_check_loop(handoff=handoff, paths=paths, requirement_name="需求A")
+
+        self.assertIs(result, handoff)
+        self.assertEqual(
+            prompts,
+            [
+                "是否向需求分析师提出建议或问题",
+                "是否跳过需求评审阶段",
+                "是否向需求分析师提出建议或问题",
+                "是否跳过需求评审阶段",
+            ],
+        )
+
+    def test_run_human_check_loop_skip_review_prompt_allows_back_under_bridge_ui(self):
+        captured_requests: list[BridgePromptRequest] = []
+
+        def emit_event(_event_type: str, _payload: dict[str, object]) -> None:
+            return None
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            return {"value": "no"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = build_requirements_review_paths(tmpdir, "需求A")
+            paths["requirements_clear_path"].write_text("需求澄清正文\n", encoding="utf-8")
+            handoff = RequirementsAnalystHandoff(
+                worker=_FakeWorker(),
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            with use_terminal_ui(BridgeTerminalUI(emit_event=emit_event, request_prompt=request_prompt)):
+                result = run_human_check_loop(
+                    handoff=handoff,
+                    paths=paths,
+                    requirement_name="需求A",
+                    allow_previous_stage_back=True,
+                )
+
+        skip_requests = [
+            request
+            for request in captured_requests
+            if request.payload.get("prompt_text") == "是否跳过需求评审阶段"
+        ]
+        self.assertIs(result, handoff)
+        self.assertEqual(len(skip_requests), 1)
+        self.assertEqual(skip_requests[0].prompt_type, "select")
+        self.assertTrue(skip_requests[0].payload["allow_back"])
+        self.assertEqual(skip_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(skip_requests[0].payload["stage_key"], "requirements_review")
+        self.assertEqual(skip_requests[0].payload["stage_step_index"], 1)
 
     def test_run_human_check_loop_raises_skip_to_detailed_design_when_user_skips_review(self):
         import A04_RequirementsReview as review_module
@@ -275,7 +360,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
 
             with patch(
                 "A03_RequirementsReview.run_human_check_loop",
-                side_effect=lambda handoff, paths, requirement_name=None: calls.append("human_check") or handoff,
+                side_effect=lambda handoff, paths, requirement_name=None, **kwargs: calls.append("human_check") or handoff,
             ), patch(
                 "A03_RequirementsReview.resolve_review_max_rounds",
                 side_effect=lambda *args, **kwargs: calls.append("review_max_rounds") or 5,
@@ -454,7 +539,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 super().__init__(runtime_root=runtime_root, runtime_dir=Path(runtime_root) / "ba-worker")
                 self.session_name = "需求分析师-天佑星"
 
-        def fake_prompt_review_agent_selection(default_vendor, default_model="", default_reasoning_effort="high", default_proxy_url="", *, role_label="", progress=None):  # noqa: ANN001
+        def fake_prompt_review_agent_selection(default_vendor, default_model="", default_reasoning_effort="high", default_proxy_url="", *, role_label="", progress=None, **kwargs):  # noqa: ANN001
             observed["role_label"] = role_label
             return ReviewAgentSelection("codex", "gpt-5.4", "high", "")
 
@@ -490,7 +575,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
         observed_role_labels: list[str] = []
         observed_occupied_sets: list[set[str]] = []
 
-        def fake_prompt_review_agent_selection(default_vendor, default_model="", default_reasoning_effort="high", *, role_label="", progress=None):  # noqa: ANN001
+        def fake_prompt_review_agent_selection(default_vendor, default_model="", default_reasoning_effort="high", *, role_label="", progress=None, **kwargs):  # noqa: ANN001
             observed_role_labels.append(role_label)
             return ReviewAgentSelection("codex", "gpt-5.4", "high", "")
 
@@ -540,6 +625,25 @@ class A03RequirementsReviewTests(unittest.TestCase):
         self.assertEqual([item.reviewer_name for item in reviewers], ["R1", "R2"])
         self.assertEqual(observed_role_labels, ["审核器-天平星", "审核器-地隐星"])
         self.assertTrue(any("审核器-天勇星" in occupied for occupied in observed_occupied_sets))
+
+    def test_prompt_review_agent_selection_accepts_back_kwargs(self):
+        import A04_RequirementsReview as review_module
+
+        expected = ReviewAgentSelection("codex", "gpt-5.4", "high", "")
+        with patch(
+            "A04_RequirementsReview.shared_review.prompt_review_agent_selection",
+            return_value=expected,
+        ) as prompt_mock:
+            result = review_module.prompt_review_agent_selection(
+                "codex",
+                role_label="审核器-天慧星",
+                allow_back_first_step=True,
+                stage_key="requirements_review_reviewer_selection",
+            )
+
+        self.assertEqual(result, expected)
+        self.assertTrue(prompt_mock.call_args.kwargs["allow_back_first_step"])
+        self.assertEqual(prompt_mock.call_args.kwargs["stage_key"], "requirements_review_reviewer_selection")
 
     def test_prepare_ba_handoff_creates_new_ba_when_missing(self):
         created_workers: list[_FakeWorker] = []
@@ -1323,7 +1427,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 ),
             ), patch(
                 "A03_RequirementsReview.run_human_check_loop",
-                side_effect=lambda handoff, paths, requirement_name=None: handoff,
+                side_effect=lambda handoff, paths, requirement_name=None, **kwargs: handoff,
             ), patch(
                 "A03_RequirementsReview.build_reviewer_workers",
                 return_value=[reviewer],
@@ -1425,7 +1529,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 ),
             ), patch(
                 "A03_RequirementsReview.run_human_check_loop",
-                side_effect=lambda handoff, paths, requirement_name=None: handoff,
+                side_effect=lambda handoff, paths, requirement_name=None, **kwargs: handoff,
             ), patch(
                 "A03_RequirementsReview.build_reviewer_workers",
                 return_value=[reviewer],
@@ -1515,7 +1619,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
 
             with patch(
                 "A03_RequirementsReview.run_human_check_loop",
-                side_effect=lambda handoff, paths, requirement_name=None: handoff,
+                side_effect=lambda handoff, paths, requirement_name=None, **kwargs: handoff,
             ), patch(
                 "A03_RequirementsReview.build_reviewer_workers",
                 return_value=[reviewer],
@@ -1570,7 +1674,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 ),
             ), patch(
                 "A03_RequirementsReview.run_human_check_loop",
-                side_effect=lambda handoff, paths, requirement_name=None: handoff,
+                side_effect=lambda handoff, paths, requirement_name=None, **kwargs: handoff,
             ), patch(
                 "A03_RequirementsReview.build_reviewer_workers",
                 return_value=[reviewer],

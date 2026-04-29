@@ -1178,6 +1178,271 @@ workspace (/directory)                                                     branc
             running_notes = [item for item in worker.state_notes if item[0] == "running"]
             self.assertGreaterEqual(len(running_notes), 2)
 
+    def test_run_turn_extends_initial_ready_wait_when_agent_is_busy(self):
+        class BusyThenReadyWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.ensure_timeouts = []
+                self.sent_prompts = []
+
+            def _write_state(self, status, *, note, extra=None):
+                return None
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.ensure_timeouts.append(timeout_sec)
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                if len(self.ensure_timeouts) == 1:
+                    self.agent_ready = False
+                    self.agent_state = AgentRuntimeState.BUSY
+                    self.wrapper_state = WrapperState.NOT_READY
+                    raise RuntimeError("Timed out waiting for agent ready.\nworking")
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.last_pane_title = "AutoCodex"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                if not self.agent_ready:
+                    return WorkerObservation(
+                        visible_text="working",
+                        raw_log_delta="",
+                        raw_log_tail="esc to interrupt",
+                        current_command="node",
+                        current_path=str(self.work_dir),
+                        pane_dead=False,
+                        session_exists=True,
+                        log_mtime=0.0,
+                        observed_at="2026-04-28T17:23:00",
+                        pane_title="⠋ AutoCodex",
+                    )
+                return WorkerObservation(
+                    visible_text="›",
+                    raw_log_delta="",
+                    raw_log_tail="›",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-28T17:24:00",
+                    pane_title="AutoCodex",
+                )
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "fake-visible"
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+                write_task_status(self.current_task_status_path, status="done")
+
+            def _wait_for_turn_reply(self, **kwargs):
+                return "ok\n[[DONE]]"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = BusyThenReadyWorker(
+                worker_id="busy-start-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            result = worker.run_turn(label="busy_ready_start", prompt="hello", required_tokens=["[[DONE]]"], timeout_sec=2.0)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertGreaterEqual(len(worker.ensure_timeouts), 2)
+        self.assertEqual(worker.ensure_timeouts[0], 60.0)
+        self.assertEqual(worker.ensure_timeouts[1], 2.0)
+
+    def test_run_turn_keeps_extending_initial_ready_wait_while_agent_remains_busy(self):
+        class BusyTwiceThenReadyWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.ensure_timeouts = []
+                self.sent_prompts = []
+
+            def _write_state(self, status, *, note, extra=None):
+                return None
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.ensure_timeouts.append(timeout_sec)
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                if len(self.ensure_timeouts) <= 2:
+                    self.agent_ready = False
+                    self.agent_state = AgentRuntimeState.BUSY
+                    self.wrapper_state = WrapperState.NOT_READY
+                    raise RuntimeError("Timed out waiting for agent ready.\nworking")
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.last_pane_title = "AutoCodex"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="working" if not self.agent_ready else "›",
+                    raw_log_delta="",
+                    raw_log_tail="esc to interrupt" if not self.agent_ready else "›",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-28T17:23:00",
+                    pane_title="⠋ AutoCodex" if not self.agent_ready else "AutoCodex",
+                )
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "fake-visible"
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+                write_task_status(self.current_task_status_path, status="done")
+
+            def _wait_for_turn_reply(self, **kwargs):
+                return "ok\n[[DONE]]"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = BusyTwiceThenReadyWorker(
+                worker_id="busy-twice-start-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            result = worker.run_turn(label="busy_twice_ready_start", prompt="hello", required_tokens=["[[DONE]]"], timeout_sec=2.0)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertEqual(worker.ensure_timeouts[:3], [60.0, 2.0, 2.0])
+
+    def test_run_turn_keeps_waiting_for_same_completion_turn_when_timeout_agent_still_busy(self):
+        class SlowBusyCompletionWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+                self.wait_calls = 0
+                self.state_notes = []
+
+            def _write_state(self, status, *, note, extra=None):
+                self.state_notes.append((status.value, note, extra or {}))
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "AutoCodex"
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "working"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="working",
+                    raw_log_delta="",
+                    raw_log_tail="esc to interrupt",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-28T19:16:56",
+                    pane_title="⠋ AutoCodex",
+                )
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):
+                return self.observe()
+
+            def wait_for_turn_artifacts(self, *, contract, task_status_path=None, timeout_sec):
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise TimeoutError("等待 turn 文件结果超时")
+                artifact_path.write_text("", encoding="utf-8")
+                contract.status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "turn_id": contract.turn_id,
+                            "phase": contract.phase,
+                            "status": "done",
+                            "written_at": "2026-04-28T19:17:00+08:00",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                if task_status_path is not None:
+                    write_task_status(task_status_path, status="done")
+                self.current_task_runtime_status = "done"
+                return contract.validator(contract.status_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            contract_path = root / "review.json"
+            artifact_path = root / "review.md"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"review_md": str(artifact_path)},
+                    artifact_hashes={"review_md": "sha256:md"},
+                    validated_at="2026-04-28T19:17:01",
+                )
+
+            worker = SlowBusyCompletionWorker(
+                worker_id="slow-busy-completion-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=root / "runtime",
+            )
+            result = worker.run_turn(
+                label="overall_review_again_测试工程师_round_5",
+                prompt="write review files only",
+                completion_contract=TurnFileContract(
+                    turn_id="overall_review_全面复核_测试工程师",
+                    phase="复核阶段",
+                    status_path=contract_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                ),
+                timeout_sec=1.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertEqual(worker.wait_calls, 2)
+        self.assertTrue(any(note.startswith("still_running:") for _, note, _ in worker.state_notes))
+
     def test_run_turn_marks_wrapper_ready_after_success(self):
         class SubmitStateWorker(TmuxBatchWorker):
             def _append_transcript(self, title, body):
@@ -5791,6 +6056,34 @@ Do you trust the files in this folder?
             )
 
             self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.READY)
+
+    def test_codex_busy_title_wins_over_visible_ready_while_task_running(self):
+        with tempfile.TemporaryDirectory(prefix="canopy-api-v3-dev-parent-") as tmp_dir:
+            work_dir = Path(tmp_dir) / "canopy-api-v3-dev"
+            work_dir.mkdir()
+            worker = TmuxBatchWorker(
+                worker_id="codex-running-busy-title-worker",
+                work_dir=work_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            observation = WorkerObservation(
+                visible_text="› Explain this codebase\n  gpt-5.4 xhigh · ~/project",
+                raw_log_delta="",
+                raw_log_tail="",
+                current_command="node",
+                current_path=str(work_dir),
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-26T10:40:00",
+                pane_title=f"⠼ {worker.work_dir.name}",
+            )
+
+            self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.BUSY)
 
     def test_codex_passive_health_uses_visible_prompt_when_pane_title_is_stale_busy(self):
         class StaleBusyTitleWorker(TmuxBatchWorker):

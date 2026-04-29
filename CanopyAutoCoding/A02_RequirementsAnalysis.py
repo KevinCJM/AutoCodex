@@ -103,6 +103,7 @@ from T08_pre_development import (
 from T09_terminal_ops import SingleLineSpinnerMonitor, clear_pending_tty_input, maybe_launch_tui, message
 from T02_tmux_agents import TmuxBatchWorker
 from T05_hitl_runtime import build_prefixed_sha256
+from canopy_core.stage_kernel.shared_review import is_agent_config_error
 from T12_requirements_common import (
     DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT,
     DEFAULT_REQUIREMENTS_ANALYSIS_MODEL,
@@ -135,6 +136,7 @@ build_parser = build_intake_parser
 
 _INTAKE_BOOLEAN_FLAGS = {
     "--overwrite",
+    "--reuse-existing-original-requirement",
     "--yes",
     "--no-tui",
     "--legacy-cli",
@@ -239,31 +241,40 @@ def run_requirements_analysis(
 def collect_requirements_analysis_agent_selection(args) -> RequirementsClarificationAgentSelection:
     interactive = stdin_is_interactive()
     vendor_value = str(getattr(args, "vendor", "") or "").strip()
-    if vendor_value:
-        vendor = normalize_vendor_choice(vendor_value)
-    elif interactive:
-        vendor = prompt_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
-    else:
-        raise RuntimeError("需求澄清阶段需要选择厂商；非交互模式请传入 --vendor、--model、--effort。")
-
-    model_value = str(getattr(args, "model", "") or "").strip()
-    if model_value:
-        model = normalize_model_choice(vendor, model_value)
-    elif interactive:
-        model = prompt_model(vendor, get_default_model_for_vendor(vendor))
-    else:
-        raise RuntimeError("需求澄清阶段需要选择模型；非交互模式请传入 --vendor、--model、--effort。")
-
-    effort_value = str(getattr(args, "effort", "") or "").strip()
-    if effort_value:
-        reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
-    elif interactive:
-        reasoning_effort = prompt_effort(vendor, model, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)
-    else:
-        raise RuntimeError("需求澄清阶段需要选择推理强度；非交互模式请传入 --vendor、--model、--effort。")
-
     proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
-    if interactive:
+    try:
+        if vendor_value:
+            vendor = normalize_vendor_choice(vendor_value)
+        elif interactive:
+            vendor = prompt_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+        else:
+            raise RuntimeError("需求澄清阶段需要选择厂商；非交互模式请传入 --vendor、--model、--effort。")
+
+        model_value = str(getattr(args, "model", "") or "").strip()
+        if model_value:
+            model = normalize_model_choice(vendor, model_value)
+        elif interactive:
+            model = prompt_model(vendor, get_default_model_for_vendor(vendor))
+        else:
+            raise RuntimeError("需求澄清阶段需要选择模型；非交互模式请传入 --vendor、--model、--effort。")
+
+        effort_value = str(getattr(args, "effort", "") or "").strip()
+        if effort_value:
+            reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
+        elif interactive:
+            reasoning_effort = prompt_effort(vendor, model, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)
+        else:
+            raise RuntimeError("需求澄清阶段需要选择推理强度；非交互模式请传入 --vendor、--model、--effort。")
+
+        if interactive:
+            proxy_url = prompt_proxy_url(proxy_url)
+    except Exception as error:  # noqa: BLE001
+        if not interactive or not is_agent_config_error(error):
+            raise
+        message(f"需求分析师模型配置不可用: {error}\n请重新选择厂商、模型和推理强度。")
+        vendor = prompt_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+        model = prompt_model(vendor, get_default_model_for_vendor(vendor))
+        reasoning_effort = prompt_effort(vendor, model, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)
         proxy_url = prompt_proxy_url(proxy_url)
 
     return RequirementsClarificationAgentSelection(

@@ -18,6 +18,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -260,6 +261,7 @@ STAGE_ROUTE_BY_ACTION = {
 
 LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME = ".requirements_analysis_runtime"
 WORKFLOW_RECORD_ROOT_NAME = ".canopy_workflow"
+WEB_FILE_PREVIEW_MAX_BYTES = 256 * 1024
 
 
 class BridgeLogSink:
@@ -768,6 +770,31 @@ def _preview_text(path_value: str | Path, *, max_lines: int = 3, max_chars: int 
     return preview
 
 
+def _preview_path_text(path_value: str | Path, *, max_bytes: int = WEB_FILE_PREVIEW_MAX_BYTES) -> dict[str, Any]:
+    path = Path(path_value).expanduser().resolve()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f"文件不存在: {path}")
+    stat = path.stat()
+    byte_limit = max(1, min(int(max_bytes or WEB_FILE_PREVIEW_MAX_BYTES), WEB_FILE_PREVIEW_MAX_BYTES))
+    with path.open("rb") as file:
+        data = file.read(byte_limit + 1)
+    truncated = len(data) > byte_limit
+    payload = data[:byte_limit]
+    if b"\x00" in payload:
+        raise ValueError(f"文件不是可预览文本: {path}")
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError(f"文件不是 UTF-8 文本: {path}") from error
+    return {
+        "path": str(path),
+        "size": int(stat.st_size),
+        "updated_at": _iso_from_path(path),
+        "truncated": bool(truncated or stat.st_size > byte_limit),
+        "text": text,
+    }
+
+
 def _build_file_snapshot(path_value: str | Path, *, label: str = "") -> dict[str, Any]:
     path = Path(path_value).expanduser().resolve()
     exists = path.exists() and path.is_file()
@@ -915,6 +942,9 @@ def _normalize_worker_session_state(
     session_exists: bool,
     status: str,
     agent_state: str,
+    agent_started: bool = False,
+    workflow_stage: str = "",
+    note: str = "",
     health_status: str,
     health_note: str,
 ) -> tuple[str, str, str]:
@@ -922,7 +952,21 @@ def _normalize_worker_session_state(
     normalized_health_status = str(health_status or "").strip()
     normalized_health_note = str(health_note or "").strip()
     normalized_status = str(status or "").strip()
-    if session_name and not session_exists and normalized_status in {"ready", "running", "pending"}:
+    normalized_workflow_stage = str(workflow_stage or "").strip()
+    normalized_note = str(note or "").strip()
+    is_prelaunch_starting_worker = (
+        normalized_agent_state == "STARTING"
+        and not bool(agent_started)
+        and normalized_status in {"ready", "pending"}
+        and normalized_workflow_stage == "pending"
+        and normalized_note in {"", "worker_prepared", "session_created"}
+    )
+    if (
+        session_name
+        and not session_exists
+        and normalized_status in {"ready", "running", "pending"}
+        and not is_prelaunch_starting_worker
+    ):
         normalized_agent_state = "DEAD"
         if normalized_health_status in {"", "unknown", "alive", "auto_relaunched"}:
             normalized_health_status = "dead"
@@ -1023,6 +1067,13 @@ def _is_unscoped_dead_worker_snapshot(snapshot: Mapping[str, Any], *, context_kn
     return not Path(turn_status_path).exists()
 
 
+def _state_indicates_active_agent_execution(state: Mapping[str, Any]) -> bool:
+    return (
+        _normalize_worker_agent_state(state) == "BUSY"
+        or str(state.get("current_task_runtime_status", "")).strip().lower() == "running"
+    )
+
+
 def _read_worker_state_snapshot(
     state_path: str | Path,
     *,
@@ -1044,6 +1095,13 @@ def _read_worker_state_snapshot(
     if session_name and session_context_resolver is not None:
         with contextlib.suppress(Exception):
             session_exists = bool(session_context_resolver(session_name, state, state_path))
+        if (
+            not session_exists
+            and session_exists_resolver is not None
+            and _state_indicates_active_agent_execution(state)
+        ):
+            with contextlib.suppress(Exception):
+                session_exists = bool(session_exists_resolver(session_name))
     elif session_name and session_exists_resolver is not None:
         with contextlib.suppress(Exception):
             session_exists = bool(session_exists_resolver(session_name))
@@ -1058,6 +1116,9 @@ def _read_worker_state_snapshot(
         session_exists=session_exists,
         status=status,
         agent_state=agent_state,
+        agent_started=agent_started,
+        workflow_stage=str(state.get("workflow_stage", "pending")).strip(),
+        note=note,
         health_status=health_status,
         health_note=health_note,
     )
@@ -1476,6 +1537,9 @@ class BridgeCore:
             session_exists=session_exists,
             status=status,
             agent_state=agent_state,
+            agent_started=agent_started,
+            workflow_stage=str(snapshot.get("workflow_stage") or getattr(entry, "workflow_stage", "") or "pending").strip(),
+            note=note,
             health_status=health_status,
             health_note=health_note,
         )
@@ -2529,10 +2593,14 @@ class BridgeCore:
         return False
 
     def _infer_runtime_stage_status(self, action: str) -> str:
+        normalized_action = str(action or "").strip()
+        contract_gated_action = normalized_action == "stage.a08.start"
+        has_pending_contract_work = self._stage_has_pending_contract_work(normalized_action)
+        allow_worker_running_inference = not contract_gated_action or has_pending_contract_work
         workers = self._filter_workers_for_current_context(self._current_stage_workers(action), action)
         if not workers:
             return ""
-        if any(_is_recoverable_reconfig_snapshot(worker) for worker in workers):
+        if allow_worker_running_inference and any(_is_recoverable_reconfig_snapshot(worker) for worker in workers):
             return "running"
         alive_workers = [
             worker
@@ -2541,7 +2609,7 @@ class BridgeCore:
             and str(worker.get("agent_state", "")).strip().upper() in {"READY", "BUSY", "STARTING"}
             and str(worker.get("health_status", "")).strip().lower() != "dead"
         ]
-        if any(
+        if allow_worker_running_inference and any(
             (
                 str(worker.get("status", "")).strip() in {"running", "pending"}
                 or (
@@ -2557,7 +2625,7 @@ class BridgeCore:
             for worker in workers
         ):
             return "running"
-        if alive_workers:
+        if allow_worker_running_inference and alive_workers:
             return "running"
         has_failed_workers = any(self._worker_snapshot_has_failed_status(worker) for worker in workers)
         has_dead_workers = any(self._worker_snapshot_is_dead(worker) for worker in workers)
@@ -2566,7 +2634,7 @@ class BridgeCore:
             not has_failed_workers
             and not has_dead_workers
             and has_live_session
-            and self._stage_has_pending_contract_work(action)
+            and has_pending_contract_work
         ):
             return "running"
         if has_failed_workers:
@@ -2941,6 +3009,10 @@ class BridgeCore:
         if not project_dir:
             return []
         argv = ["--project-dir", project_dir]
+        if parsed is not None and str(getattr(parsed, "requirement_name", "") or "").strip():
+            argv.extend(["--requirement-name", str(getattr(parsed, "requirement_name", "") or "").strip()])
+        if parsed is not None and bool(getattr(parsed, "reuse_existing_original_requirement", False)):
+            argv.append("--reuse-existing-original-requirement")
         if parsed is not None and bool(getattr(parsed, "yes", False)):
             argv.append("--yes")
         if parsed is not None and bool(getattr(parsed, "no_tui", False)):
@@ -3145,7 +3217,9 @@ class BridgeCore:
             finally:
                 self._workers.pop(worker_key, None)
 
-        thread = threading.Thread(target=target, name=f"tui-backend-{action}-{request_id}", daemon=True)
+        # Stage runners own process-wide resources such as flock-based requirement locks.
+        # Keep them non-daemon so interpreter shutdown cannot interrupt their finally blocks.
+        thread = threading.Thread(target=target, name=f"tui-backend-{action}-{request_id}", daemon=False)
         self._workers[worker_key] = thread
         thread.start()
 
@@ -3339,12 +3413,97 @@ class BridgeCore:
         self._set_context(project_dir=project_dir)
         return {"runs": self._list_runs()}
 
+    @staticmethod
+    def _add_preview_path(allowed: set[str], value: object) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        try:
+            path = Path(text).expanduser().resolve()
+        except Exception:
+            return
+        if path.exists() and path.is_file():
+            allowed.add(str(path))
+
+    @classmethod
+    def _add_preview_paths_from_worker(cls, allowed: set[str], worker: Mapping[str, Any]) -> None:
+        for key in ("transcript_path", "turn_status_path", "question_path", "answer_path"):
+            cls._add_preview_path(allowed, worker.get(key, ""))
+        artifact_paths = worker.get("artifact_paths", [])
+        if isinstance(artifact_paths, Sequence) and not isinstance(artifact_paths, (str, bytes)):
+            for path in artifact_paths:
+                cls._add_preview_path(allowed, path)
+
+    @classmethod
+    def _add_preview_paths_from_prompt(cls, allowed: set[str], prompt: PendingPromptState) -> None:
+        for key in ("preview_path", "question_path", "answer_path"):
+            cls._add_preview_path(allowed, prompt.payload.get(key, ""))
+
+    def build_prompt_snapshot(self) -> dict[str, Any]:
+        prompt = self._latest_pending_prompt()
+        if prompt is None:
+            return {
+                "pending": False,
+                "prompt_id": "",
+                "prompt_type": "",
+                "payload": {},
+            }
+        return {
+            "pending": True,
+            "prompt_id": prompt.prompt_id,
+            "prompt_type": prompt.prompt_type,
+            "payload": dict(prompt.payload),
+        }
+
+    def _allowed_file_preview_paths(
+        self,
+        *,
+        stages: Mapping[str, Mapping[str, Any]] | None = None,
+        control: Mapping[str, Any] | None = None,
+        hitl: Mapping[str, Any] | None = None,
+        artifacts: Mapping[str, Any] | None = None,
+    ) -> set[str]:
+        allowed: set[str] = set()
+        stage_snapshots = dict(stages) if stages is not None else self._build_stage_snapshots()
+        control_snapshot = dict(control) if control is not None else self._build_control_snapshot_for_session(self._current_control_session())
+        hitl_snapshot = dict(hitl) if hitl is not None else self._build_hitl_snapshot()
+        artifacts_snapshot = dict(artifacts) if artifacts is not None else self._build_artifacts_snapshot(
+            stages=stage_snapshots,
+            control=control_snapshot,
+        )
+        for prompt in self._iter_pending_prompts():
+            self._add_preview_paths_from_prompt(allowed, prompt)
+        for key in ("question_path", "answer_path"):
+            self._add_preview_path(allowed, hitl_snapshot.get(key, ""))
+        for snapshot in stage_snapshots.values():
+            for file_item in snapshot.get("files", []):
+                if isinstance(file_item, Mapping):
+                    self._add_preview_path(allowed, file_item.get("path", ""))
+            for worker in snapshot.get("workers", []):
+                if isinstance(worker, Mapping):
+                    self._add_preview_paths_from_worker(allowed, worker)
+        for worker in control_snapshot.get("workers", []):
+            if isinstance(worker, Mapping):
+                self._add_preview_paths_from_worker(allowed, worker)
+        for artifact in artifacts_snapshot.get("items", []):
+            if isinstance(artifact, Mapping):
+                self._add_preview_path(allowed, artifact.get("path", ""))
+        return allowed
+
+    def build_file_preview(self, path_value: str | Path, *, max_bytes: int = WEB_FILE_PREVIEW_MAX_BYTES) -> dict[str, Any]:
+        requested = Path(path_value).expanduser().resolve()
+        allowed = self._allowed_file_preview_paths()
+        if str(requested) not in allowed:
+            raise PermissionError(f"文件未在当前 Web 快照中授权预览: {requested}")
+        return _preview_path_text(requested, max_bytes=max_bytes)
+
     def build_snapshots(self) -> dict[str, Any]:
         stages = self._build_stage_snapshots()
         control = self._build_control_snapshot_for_session(self._current_control_session())
         hitl = self._build_hitl_snapshot()
         attention = self._attention_manager.snapshot()
         artifacts = self._build_artifacts_snapshot(stages=stages, control=control)
+        prompt = self.build_prompt_snapshot()
         app = self._build_app_snapshot(
             runs=self._list_runs(),
             control=control,
@@ -3358,6 +3517,7 @@ class BridgeCore:
             "control": control,
             "hitl": hitl,
             "artifacts": artifacts,
+            "prompt": prompt,
         }
 
     def build_bootstrap_payload(self) -> dict[str, Any]:
@@ -3389,6 +3549,8 @@ class BridgeCore:
                 "structured_snapshots": True,
                 "run_resume_picker": True,
                 "bridge_only_terminal_ui": True,
+                "web_file_preview": True,
+                "pending_prompt_snapshot": True,
             },
             "snapshots": self.build_snapshots(),
         }
@@ -3439,6 +3601,7 @@ class BridgeCore:
             return result
         if normalized_action == "workflow.a00.start":
             argv = self._argv_from_payload(request_payload)
+            argv = self._argv_with_payload_agent_config(argv, request_payload)
             self._update_context_from_stage_args(normalized_action, argv)
             self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: a00_main(argv), respond=respond)
             return {"accepted": True, "deferred": True}
@@ -3573,6 +3736,19 @@ class BridgeCore:
         if isinstance(argv, list):
             return [str(item) for item in argv]
         raise ValueError("payload.argv 必须是数组")
+
+    @staticmethod
+    def _argv_with_payload_agent_config(argv: Sequence[str], payload: Mapping[str, Any]) -> list[str]:
+        agent_config = payload.get("agent_config")
+        if agent_config is None:
+            return list(argv)
+        if not isinstance(agent_config, Mapping):
+            raise ValueError("payload.agent_config 必须是对象")
+        root = Path(tempfile.gettempdir()) / "canopy-web-agent-config"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"agent-config-{dt.datetime.now().strftime('%Y%m%d%H%M%S%f')}.json"
+        path.write_text(json.dumps(dict(agent_config), ensure_ascii=False, indent=2), encoding="utf-8")
+        return [*list(argv), "--agent-config", str(path)]
 
     def handle_request(self, request: Mapping[str, Any]) -> None:
         request_id = str(request.get("id", "")).strip()

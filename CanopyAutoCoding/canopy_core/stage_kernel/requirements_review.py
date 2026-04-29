@@ -15,7 +15,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Sequence
 
-from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
     prompt_effort,
@@ -40,7 +39,6 @@ from canopy_core.runtime.contracts import (
 from canopy_core.runtime.hitl import HitlPromptContext, build_prefixed_sha256, run_hitl_agent_loop
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
-    AgentRunConfig,
     TmuxBatchWorker,
     Vendor,
     build_session_name,
@@ -83,6 +81,7 @@ from canopy_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
@@ -103,6 +102,7 @@ from T01_tools import (
 )
 from T09_terminal_ops import (
     BridgeTerminalUI,
+    PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
     collect_multiline_input,
@@ -159,6 +159,7 @@ def _sync_shared_review_bindings() -> None:
     shared_review.DEFAULT_MODEL_BY_VENDOR = DEFAULT_MODEL_BY_VENDOR
     shared_review.prompt_effort = prompt_effort
     shared_review.prompt_model = prompt_model
+    shared_review.prompt_proxy_url = prompt_proxy_url
     shared_review.prompt_vendor = prompt_vendor
     shared_review.SingleLineSpinnerMonitor = SingleLineSpinnerMonitor
     shared_review.TERMINAL_SPINNER_FRAMES = TERMINAL_SPINNER_FRAMES
@@ -178,14 +179,32 @@ def _resolve_review_progress(progress: ReviewStageProgress | None = None) -> Rev
     return shared_review.resolve_review_progress(progress)
 
 
-def prompt_positive_int(prompt_text: str, default: int = 1, *, progress: ReviewStageProgress | None = None) -> int:
+def prompt_positive_int(
+        prompt_text: str,
+        default: int = 1,
+        *,
+        progress: ReviewStageProgress | None = None,
+        allow_back: bool = False,
+        stage_key: str = "",
+        stage_step_index: int = 0,
+) -> int:
     _sync_shared_review_bindings()
-    return shared_review.prompt_positive_int(prompt_text, default, progress=progress)
+    return shared_review.prompt_positive_int(
+        prompt_text,
+        default,
+        progress=progress,
+        allow_back=allow_back,
+        stage_key=stage_key,
+        stage_step_index=stage_step_index,
+    )
 
 
 def prompt_proxy_url(default: str = "", *, role_label: str = "") -> str:
-    _sync_shared_review_bindings()
-    return shared_review.prompt_proxy_url(default, role_label=role_label)
+    role_text = str(role_label or "").strip()
+    prompt_text = "输入代理端口或完整代理 URL（可留空）"
+    if role_text:
+        prompt_text = f"为 {role_text} {prompt_text}"
+    return prompt_with_default(prompt_text, default, allow_empty=True)
 
 
 def prompt_review_agent_selection(
@@ -196,19 +215,19 @@ def prompt_review_agent_selection(
         *,
         role_label: str = "",
         progress: ReviewStageProgress | None = None,
+        allow_back_first_step: bool = False,
+        stage_key: str = "agent_selection",
 ) -> ReviewAgentSelection:
-    progress = _resolve_review_progress(progress)
-    with progress.suspended() if progress is not None else nullcontext():
-        vendor = prompt_vendor(default_vendor, role_label=role_label)
-        preferred_model = default_model if default_model and vendor == default_vendor else get_default_model_for_vendor(vendor)
-        model = prompt_model(vendor, preferred_model, role_label=role_label)
-        reasoning_effort = prompt_effort(vendor, model, default_reasoning_effort, role_label=role_label)
-        proxy_url = prompt_proxy_url(default_proxy_url, role_label=role_label)
-    return ReviewAgentSelection(
-        vendor=vendor,
-        model=model,
-        reasoning_effort=reasoning_effort,
-        proxy_url=proxy_url,
+    _sync_shared_review_bindings()
+    return shared_review.prompt_review_agent_selection(
+        default_vendor=default_vendor,
+        default_model=default_model,
+        default_reasoning_effort=default_reasoning_effort,
+        default_proxy_url=default_proxy_url,
+        role_label=role_label,
+        progress=progress,
+        allow_back_first_step=allow_back_first_step,
+        stage_key=stage_key,
     )
 
 
@@ -219,6 +238,9 @@ def prompt_yes_no_choice(
         progress: ReviewStageProgress | None = None,
         preview_path: str | Path | None = None,
         preview_title: str = "",
+        allow_back: bool = False,
+        stage_key: str = "",
+        stage_step_index: int = 0,
 ) -> bool:
     _sync_shared_review_bindings()
     return shared_review.prompt_yes_no_choice(
@@ -227,6 +249,9 @@ def prompt_yes_no_choice(
         progress=progress,
         preview_path=preview_path,
         preview_title=preview_title,
+        allow_back=allow_back,
+        stage_key=stage_key,
+        stage_step_index=stage_step_index,
     )
 
 
@@ -234,11 +259,17 @@ def prompt_review_max_rounds(
         *,
         default: int = MAX_REVIEW_ROUNDS,
         progress: ReviewStageProgress | None = None,
+        allow_back: bool = False,
+        stage_key: str = "",
+        stage_step_index: int = 0,
 ) -> int | None:
     _sync_shared_review_bindings()
     return shared_review.prompt_review_max_rounds(
         default=default,
         progress=progress,
+        allow_back=allow_back,
+        stage_key=stage_key,
+        stage_step_index=stage_step_index,
     )
 
 
@@ -309,12 +340,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="需求评审阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--review-max-rounds", default="", help="需求评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=R1,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
+
+
+def _consume_stage_back(allow_previous_stage_back: bool, will_prompt: bool) -> tuple[bool, bool]:
+    allow_back = bool(allow_previous_stage_back and will_prompt)
+    if will_prompt:
+        return allow_back, False
+    return False, bool(allow_previous_stage_back)
 
 
 def build_requirements_review_paths(
@@ -348,6 +387,7 @@ def resolve_review_max_rounds(
         args: argparse.Namespace,
         *,
         progress: ReviewStageProgress | None = None,
+        allow_back: bool = False,
 ) -> int | None:
     explicit = getattr(args, "review_max_rounds", "")
     if str(explicit or "").strip():
@@ -360,7 +400,13 @@ def resolve_review_max_rounds(
         return MAX_REVIEW_ROUNDS
     if progress is not None and hasattr(progress, "set_phase"):
         progress.set_phase("需求评审 / 配置最大审核轮次")
-    return prompt_review_max_rounds(default=MAX_REVIEW_ROUNDS, progress=progress)
+    return prompt_review_max_rounds(
+        default=MAX_REVIEW_ROUNDS,
+        progress=progress,
+        allow_back=allow_back,
+        stage_key="requirements_review",
+        stage_step_index=0,
+    )
 
 
 def build_requirements_review_limit_hitl_config(paths: dict[str, Path]) -> ReviewLimitHitlConfig:
@@ -485,15 +531,14 @@ def create_reviewer_runtime(
         selection: ReviewAgentSelection,
 ) -> ReviewerRuntime:
     runtime_root = Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=_predict_reviewer_display_name(project_dir=project_dir, reviewer_name=reviewer_name),
+    )
     worker = TmuxBatchWorker(
         worker_id=f"requirements-review-{reviewer_name.lower()}",
         work_dir=Path(project_dir).expanduser().resolve(),
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=runtime_root,
         runtime_metadata={
             "project_dir": str(Path(project_dir).expanduser().resolve()),
@@ -840,16 +885,16 @@ def run_ba_turn_with_recreation(
                     role_label=ba_display_name,
                     progress=progress,
                 )
+                selection, config = resolve_agent_run_config_with_recovery(
+                    selection,
+                    role_label=ba_display_name,
+                    progress=progress,
+                )
                 current_handoff = RequirementsAnalystHandoff(
                     worker=TmuxBatchWorker(
                         worker_id="requirements-review-analyst",
                         work_dir=Path(project_dir).expanduser().resolve(),
-                        config=AgentRunConfig(
-                            vendor=selection.vendor,
-                            model=selection.model,
-                            reasoning_effort=selection.reasoning_effort,
-                            proxy_url=selection.proxy_url,
-                        ),
+                        config=config,
                         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
                     ),
                     vendor=selection.vendor,
@@ -874,16 +919,16 @@ def run_ba_turn_with_recreation(
                     role_label=ba_display_name,
                     progress=progress,
                 )
+                selection, config = resolve_agent_run_config_with_recovery(
+                    selection,
+                    role_label=ba_display_name,
+                    progress=progress,
+                )
                 current_handoff = RequirementsAnalystHandoff(
                     worker=TmuxBatchWorker(
                         worker_id="requirements-review-analyst",
                         work_dir=Path(project_dir).expanduser().resolve(),
-                        config=AgentRunConfig(
-                            vendor=selection.vendor,
-                            model=selection.model,
-                            reasoning_effort=selection.reasoning_effort,
-                            proxy_url=selection.proxy_url,
-                        ),
+                        config=config,
                         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
                     ),
                     vendor=selection.vendor,
@@ -1036,15 +1081,15 @@ def _create_review_ba_handoff(
         progress=progress,
     )
     message(render_review_agent_selection(selection_title, selection))
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=ba_display_name,
+        progress=progress,
+    )
     worker = TmuxBatchWorker(
         worker_id="requirements-review-analyst",
         work_dir=Path(project_dir).expanduser().resolve(),
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
         runtime_metadata={
             "project_dir": str(Path(project_dir).expanduser().resolve()),
@@ -1083,15 +1128,15 @@ def recreate_ba_handoff(
     )
     if selection is None:
         return None
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=ba_display_name,
+        progress=progress,
+    )
     worker = TmuxBatchWorker(
         worker_id="requirements-review-analyst",
         work_dir=Path(project_dir).expanduser().resolve(),
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
         runtime_metadata={
             "project_dir": str(Path(project_dir).expanduser().resolve()),
@@ -1167,6 +1212,7 @@ def run_human_check_loop(
         paths: dict[str, Path],
         requirement_name: str,
         progress: ReviewStageProgress | None = None,
+        allow_previous_stage_back: bool = False,
 ) -> RequirementsAnalystHandoff | None:
     progress = _resolve_review_progress(progress)
     message("进入需求评审阶段")
@@ -1181,14 +1227,24 @@ def run_human_check_loop(
                 progress=progress,
                 preview_path=paths["requirements_clear_path"],
                 preview_title="需求澄清文档",
+                allow_back=allow_previous_stage_back,
+                stage_key="requirements_review",
+                stage_step_index=0,
         ):
-            if prompt_yes_no_choice(
-                    "是否跳过需求评审阶段",
-                    False,
-                    progress=progress,
-                    preview_path=paths["requirements_clear_path"],
-                    preview_title="需求澄清文档",
-            ):
+            try:
+                skip_review = prompt_yes_no_choice(
+                        "是否跳过需求评审阶段",
+                        False,
+                        progress=progress,
+                        preview_path=paths["requirements_clear_path"],
+                        preview_title="需求澄清文档",
+                        allow_back=True,
+                        stage_key="requirements_review",
+                        stage_step_index=1,
+                )
+            except PromptBackRequested:
+                continue
+            if skip_review:
                 raise _SkipToDetailedDesign(current_handoff)
             if current_handoff is None:
                 message("当前没有可复用的需求分析师，将新建需求分析师处理后续需求评审")
@@ -1358,6 +1414,7 @@ def build_reviewer_workers(
         project_dir: str | Path,
         requirement_name: str,
         progress: ReviewStageProgress | None = None,
+        allow_back_first_prompt: bool = False,
 ) -> list[ReviewerRuntime]:
     progress = _resolve_review_progress(progress)
     if progress is not None:
@@ -1366,10 +1423,18 @@ def build_reviewer_workers(
     if agent_config.reviewer_order:
         reviewer_names = list(agent_config.reviewer_order)
     else:
-        reviewer_count = prompt_positive_int("请输入审核器数量", DEFAULT_REVIEWER_COUNT, progress=progress)
+        reviewer_count = prompt_positive_int(
+            "请输入审核器数量",
+            DEFAULT_REVIEWER_COUNT,
+            progress=progress,
+            allow_back=allow_back_first_prompt,
+            stage_key="requirements_review",
+            stage_step_index=1,
+        )
         reviewer_names = [f"R{index}" for index in range(1, reviewer_count + 1)]
     reviewers: list[ReviewerRuntime] = []
     predicted_session_names: set[str] = set()
+    next_allow_back = bool(allow_back_first_prompt and agent_config.reviewer_order)
     for reviewer_name in reviewer_names:
         reviewer_display_name = _predict_reviewer_display_name(
             project_dir=project_dir,
@@ -1384,7 +1449,10 @@ def build_reviewer_workers(
                 DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
                 role_label=reviewer_display_name,
                 progress=progress,
+                allow_back_first_step=next_allow_back,
+                stage_key="requirements_review_reviewer_selection",
             )
+            next_allow_back = False
             message(render_review_agent_selection(f"审核器 {reviewer_display_name} 配置", selection))
         reviewers.append(
             create_reviewer_runtime(
@@ -1691,6 +1759,7 @@ def run_requirements_review_stage(
 ) -> RequirementsReviewStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     if args.requirement_name:
         requirement_name = str(args.requirement_name).strip()
@@ -1725,7 +1794,9 @@ def run_requirements_review_stage(
                 handoff=ba_handoff,
                 paths=paths,
                 requirement_name=requirement_name,
+                allow_previous_stage_back=allow_previous_stage_back,
             )
+            allow_previous_stage_back = False
         except _SkipToDetailedDesign as skip_to_design:
             cleanup_paths = cleanup_existing_review_artifacts(paths, requirement_name) + _shutdown_workers(
                 skip_to_design.handoff,
@@ -1742,7 +1813,11 @@ def run_requirements_review_stage(
                 cleanup_paths=cleanup_paths,
                 ba_handoff=None,
             )
-        review_round_limit = resolve_review_max_rounds(args, progress=progress)
+        review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not str(getattr(args, "review_max_rounds", "") or "").strip(),
+        )
+        review_round_limit = resolve_review_max_rounds(args, progress=progress, allow_back=review_round_allow_back)
         review_round_policy = ReviewRoundPolicy(review_round_limit)
         cleanup_stale_review_runtime_state(
             project_dir,
@@ -1750,7 +1825,20 @@ def run_requirements_review_stage(
             preserve_workers=preserved_workers,
         )
         cleanup_existing_review_artifacts(paths, requirement_name)
-        reviewer_workers = build_reviewer_workers(args=args, project_dir=project_dir, requirement_name=requirement_name)
+        agent_config = resolve_stage_agent_config(args or argparse.Namespace(reviewer_agent=[]))
+        reviewer_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and (
+                not agent_config.reviewer_order
+                or any(agent_config.reviewer_selection(name) is None for name in agent_config.reviewer_order)
+            ),
+        )
+        reviewer_workers = build_reviewer_workers(
+            args=args,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            allow_back_first_prompt=reviewer_allow_back,
+        )
 
         def initial_prompt_builder(reviewer: ReviewerRuntime) -> str:
             return requirements_review_init(

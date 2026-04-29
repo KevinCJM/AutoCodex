@@ -42,7 +42,6 @@ from canopy_core.runtime.contracts import (
 from canopy_core.runtime.hitl import build_prefixed_sha256
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
-    AgentRunConfig,
     TmuxBatchWorker,
     Vendor,
     build_session_name,
@@ -90,6 +89,8 @@ from canopy_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    is_agent_config_error,
+    resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
@@ -110,11 +111,13 @@ from T08_pre_development import (
     update_pre_development_task_status,
 )
 from T09_terminal_ops import (
+    PROMPT_BACK_VALUE,
     BridgeTerminalUI,
     collect_multiline_input,
     get_terminal_ui,
     maybe_launch_tui,
     message,
+    prompt_metadata,
     prompt_select_option,
     prompt_with_default,
 )
@@ -170,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="详细设计阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
@@ -184,6 +188,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
+
+
+def _consume_stage_back(allow_previous_stage_back: bool, will_prompt: bool) -> tuple[bool, bool]:
+    allow_back = bool(allow_previous_stage_back and will_prompt)
+    if will_prompt:
+        return allow_back, False
+    return False, bool(allow_previous_stage_back)
 
 
 def build_detailed_design_paths(project_dir: str | Path, requirement_name: str) -> dict[str, Path]:
@@ -236,6 +247,7 @@ def resolve_review_max_rounds(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> int | None:
     explicit = getattr(args, "review_max_rounds", "")
     if str(explicit or "").strip():
@@ -251,6 +263,9 @@ def resolve_review_max_rounds(
     return prompt_review_max_rounds(
         default=MAX_DETAILED_DESIGN_REVIEW_ROUNDS,
         progress=progress,
+        allow_back=allow_back,
+        stage_key="detailed_design",
+        stage_step_index=1,
     )
 
 
@@ -510,13 +525,21 @@ def _prompt_reviewer_text(
         return prompt_with_default(prompt_text, default, allow_empty=allow_empty).strip()
 
 
-def collect_interactive_reviewer_specs(*, progress: ReviewStageProgress | None = None) -> list[DetailedDesignReviewerSpec]:
+def collect_interactive_reviewer_specs(
+    *,
+    progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
+    stage_key: str = "detailed_design_reviewer_specs",
+) -> list[DetailedDesignReviewerSpec]:
     if progress is not None:
         progress.set_phase("详细设计 / 配置审核器")
     reviewer_count = prompt_positive_int(
         "请输入详细设计审核智能体数量",
         len(DEFAULT_REVIEWER_ROLE_NAMES),
         progress=progress,
+        allow_back=allow_back_first_prompt,
+        stage_key=stage_key,
+        stage_step_index=0,
     )
     collected_specs: list[DetailedDesignReviewerSpec] = []
     default_roles = list(DEFAULT_REVIEWER_ROLE_NAMES)
@@ -583,6 +606,7 @@ def resolve_reviewer_specs(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
 ) -> list[DetailedDesignReviewerSpec]:
     agent_config = resolve_stage_agent_config(args)
     role_names = [str(item).strip() for item in getattr(args, "reviewer_role", []) if str(item).strip()]
@@ -601,7 +625,10 @@ def resolve_reviewer_specs(
             )
         return _finalize_reviewer_specs(specs)
     if stdin_is_interactive() and not role_names and not prompt_values:
-        return collect_interactive_reviewer_specs(progress=progress)
+        return collect_interactive_reviewer_specs(
+            progress=progress,
+            allow_back_first_prompt=allow_back_first_prompt,
+        )
     if role_names and prompt_values and len(prompt_values) != len(role_names):
         raise RuntimeError("--reviewer-role-prompt 数量必须与 --reviewer-role 数量一致。")
     if not role_names:
@@ -624,7 +651,13 @@ def resolve_reviewer_specs(
     return _finalize_reviewer_specs(specs)
 
 
-def collect_ba_agent_selection(args: argparse.Namespace, *, role_label: str) -> ReviewAgentSelection:
+def collect_ba_agent_selection(
+    args: argparse.Namespace,
+    *,
+    role_label: str,
+    allow_back_first_step: bool = False,
+    stage_key: str = "detailed_design_main",
+) -> ReviewAgentSelection:
     interactive = stdin_is_interactive()
     vendor_value = str(getattr(args, "vendor", "") or "").strip()
     model_value = str(getattr(args, "model", "") or "").strip()
@@ -637,10 +670,26 @@ def collect_ba_agent_selection(args: argparse.Namespace, *, role_label: str) -> 
             default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
             default_proxy_url="",
             role_label=role_label,
+            allow_back_first_step=allow_back_first_step,
+            stage_key=stage_key,
         )
-    vendor = normalize_vendor_choice(vendor_value or DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
-    model = normalize_model_choice(vendor, model_value or get_default_model_for_vendor(vendor))
-    reasoning_effort = normalize_effort_choice(vendor, model, effort_value or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
+    try:
+        vendor = normalize_vendor_choice(vendor_value or DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR)
+        model = normalize_model_choice(vendor, model_value or get_default_model_for_vendor(vendor))
+        reasoning_effort = normalize_effort_choice(vendor, model, effort_value or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
+    except Exception as error:  # noqa: BLE001
+        if not interactive or not is_agent_config_error(error):
+            raise
+        message(f"{role_label} 模型配置不可用: {error}\n请重新选择厂商、模型和推理强度。")
+        return prompt_review_agent_selection(
+            DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+            default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
+            default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+            default_proxy_url=proxy_value,
+            role_label=role_label,
+            allow_back_first_step=allow_back_first_step,
+            stage_key=stage_key,
+        )
     return ReviewAgentSelection(
         vendor=vendor,
         model=model,
@@ -693,6 +742,7 @@ def decide_existing_detailed_design_mode(
     *,
     paths: dict[str, Path],
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> ExistingDetailedDesignMode:
     if bool(getattr(args, "yes", False)) or not stdin_is_interactive():
         return "rerun"
@@ -702,18 +752,24 @@ def decide_existing_detailed_design_mode(
     if progress is not None:
         progress.set_phase("详细设计 / 已有文档处理")
     with _review_progress_context(progress):
-        return prompt_select_option(
-            title=f"检测到已存在《{paths['detailed_design_path'].name}》",
-            options=(
-                ("skip", "跳过详细设计阶段"),
-                ("review_existing", "直接评审现有详细设计"),
-                ("rerun", "从头重跑并重新生成详细设计"),
-            ),
-            default_value="rerun",
-            prompt_text="请选择处理方式",
-            preview_path=paths["detailed_design_path"],
-            preview_title="现有详细设计",
-        )
+        with prompt_metadata(
+            allow_back=allow_back,
+            back_value=PROMPT_BACK_VALUE,
+            stage_key="detailed_design",
+            stage_step_index=0,
+        ):
+            return prompt_select_option(
+                title=f"检测到已存在《{paths['detailed_design_path'].name}》",
+                options=(
+                    ("skip", "跳过详细设计阶段"),
+                    ("review_existing", "直接评审现有详细设计"),
+                    ("rerun", "从头重跑并重新生成详细设计"),
+                ),
+                default_value="rerun",
+                prompt_text="请选择处理方式",
+                preview_path=paths["detailed_design_path"],
+                preview_title="现有详细设计",
+            )
 
 
 def decide_ba_strategy(
@@ -721,6 +777,7 @@ def decide_ba_strategy(
     *,
     project_dir: str | Path,
     ba_handoff: RequirementsAnalystHandoff | None,
+    allow_back: bool = False,
 ) -> str:
     if getattr(args, "rebuild_review_ba", False):
         return "rebuild"
@@ -733,6 +790,9 @@ def decide_ba_strategy(
     if prompt_yes_no_choice(
         "是否复用需求评审阶段的需求分析师继续详细设计阶段",
         True,
+        allow_back=allow_back,
+        stage_key="detailed_design",
+        stage_step_index=2,
     ):
         return "reuse"
     return "rebuild"
@@ -745,15 +805,14 @@ def create_design_ba_handoff(
     selection: ReviewAgentSelection,
 ) -> RequirementsAnalystHandoff:
     project_root = Path(project_dir).expanduser().resolve()
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=_detailed_design_ba_display_name(project_dir=project_root),
+    )
     worker = TmuxBatchWorker(
         worker_id="detailed-design-analyst",
         work_dir=project_root,
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=build_detailed_design_runtime_root(project_root, requirement_name),
         runtime_metadata={
             "project_dir": str(project_root),
@@ -777,15 +836,32 @@ def prepare_design_ba_handoff(
     project_dir: str | Path,
     requirement_name: str = "",
     ba_handoff: RequirementsAnalystHandoff | None,
+    allow_back_first_prompt: bool = False,
 ) -> tuple[RequirementsAnalystHandoff, bool]:
-    strategy = decide_ba_strategy(args, project_dir=project_dir, ba_handoff=ba_handoff)
+    strategy_prompted = (
+        ba_handoff is not None
+        and stdin_is_interactive()
+        and not bool(getattr(args, "yes", False))
+        and not getattr(args, "rebuild_review_ba", False)
+        and not getattr(args, "reuse_review_ba", False)
+    )
+    strategy = decide_ba_strategy(
+        args,
+        project_dir=project_dir,
+        ba_handoff=ba_handoff,
+        allow_back=allow_back_first_prompt and strategy_prompted,
+    )
     if strategy == "reuse" and _is_live_ba_handoff(ba_handoff):
         message("复用需求评审阶段的需求分析师继续生成详细设计")
         return ba_handoff, False
     if strategy == "reuse":
         message("请求复用需求评审阶段的需求分析师，但当前没有可复用的 live worker，将回退为重建需求分析师")
     role_label = _detailed_design_ba_display_name(project_dir=project_dir)
-    selection = collect_ba_agent_selection(args, role_label=role_label)
+    selection = collect_ba_agent_selection(
+        args,
+        role_label=role_label,
+        allow_back_first_step=allow_back_first_prompt and not strategy_prompted,
+    )
     message(render_review_agent_selection("进入详细设计阶段（需求分析师）", selection))
     create_kwargs: dict[str, object] = {"project_dir": project_dir, "selection": selection}
     if str(requirement_name or "").strip():
@@ -1238,15 +1314,18 @@ def create_reviewer_runtime(
 ) -> ReviewerRuntime:
     reviewer_identity = _reviewer_spec_identity(reviewer_spec)
     runtime_root = build_detailed_design_runtime_root(project_dir, requirement_name)
+    reviewer_display_name = _predict_reviewer_display_name(
+        project_dir=project_dir,
+        role_name=reviewer_spec.role_name,
+    )
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=reviewer_display_name,
+    )
     worker = TmuxBatchWorker(
         worker_id=build_detailed_design_reviewer_worker_id(reviewer_spec.role_name),
         work_dir=Path(project_dir).expanduser().resolve(),
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=runtime_root,
         runtime_metadata={
             "project_dir": str(Path(project_dir).expanduser().resolve()),
@@ -1731,6 +1810,7 @@ def run_detailed_design_stage(
 ) -> DetailedDesignStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     if args.project_dir:
         project_dir = str(Path(args.project_dir).expanduser().resolve())
     else:
@@ -1758,6 +1838,14 @@ def run_detailed_design_stage(
             args,
             paths=paths,
             progress=progress,
+            allow_back=_consume_stage_back(
+                allow_previous_stage_back,
+                stdin_is_interactive() and not bool(getattr(args, "yes", False)) and bool(get_markdown_content(paths["detailed_design_path"]).strip()),
+            )[0],
+        )
+        _, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not bool(getattr(args, "yes", False)) and bool(get_markdown_content(paths["detailed_design_path"]).strip()),
         )
         if existing_design_mode == "skip":
             message(f"检测到已存在《{paths['detailed_design_path'].name}》")
@@ -1785,18 +1873,54 @@ def run_detailed_design_stage(
             clear_detailed_design=existing_design_mode == "rerun",
         )
         reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"详设审核智能体 {index}"  # noqa: E731
-        review_round_limit = resolve_review_max_rounds(args, progress=progress)
+        review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not str(getattr(args, "review_max_rounds", "") or "").strip(),
+        )
+        review_round_limit = resolve_review_max_rounds(args, progress=progress, allow_back=review_round_allow_back)
         review_round_policy = ReviewRoundPolicy(review_round_limit)
         if existing_design_mode == "rerun":
+            ba_prompted = (
+                stdin_is_interactive()
+                and (
+                    (
+                        ba_handoff is not None
+                        and not bool(getattr(args, "yes", False))
+                        and not getattr(args, "rebuild_review_ba", False)
+                        and not getattr(args, "reuse_review_ba", False)
+                    )
+                    or not any(
+                        str(getattr(args, key, "") or "").strip()
+                        for key in ("vendor", "model", "effort", "proxy_url")
+                    )
+                )
+            )
+            ba_allow_back, allow_previous_stage_back = _consume_stage_back(allow_previous_stage_back, ba_prompted)
             active_ba_handoff, created_new_ba = prepare_design_ba_handoff(
                 args,
                 project_dir=project_dir,
                 requirement_name=requirement_name,
                 ba_handoff=ba_handoff,
+                allow_back_first_prompt=ba_allow_back,
             )
-            reviewer_specs = resolve_reviewer_specs(args, progress=progress)
+            reviewer_specs_prompted = stdin_is_interactive() and not any(
+                str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
+            ) and not resolve_stage_agent_config(args).reviewer_order
+            reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
+                allow_previous_stage_back,
+                reviewer_specs_prompted,
+            )
+            reviewer_specs = resolve_reviewer_specs(
+                args,
+                progress=progress,
+                allow_back_first_prompt=reviewer_specs_allow_back,
+            )
             reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
             agent_config = resolve_stage_agent_config(args)
+            reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
+                allow_previous_stage_back,
+                stdin_is_interactive() and not bool(agent_config.reviewers),
+            )
             reviewer_selections_by_name = agent_config.reviewers or collect_reviewer_agent_selections(
                 project_dir=project_dir,
                 reviewer_specs=reviewer_specs,
@@ -1806,6 +1930,8 @@ def run_detailed_design_stage(
                     occupied_session_names=occupied_session_names,
                 ),
                 progress=progress,
+                allow_back_first_prompt=reviewer_selection_allow_back,
+                stage_key="detailed_design_reviewer_selection",
             )
             _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
                 active_ba_handoff,
@@ -1836,9 +1962,24 @@ def run_detailed_design_stage(
             )
         else:
             pending_discard_ba_handoff = ba_handoff
-            reviewer_specs = resolve_reviewer_specs(args, progress=progress)
+            reviewer_specs_prompted = stdin_is_interactive() and not any(
+                str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
+            ) and not resolve_stage_agent_config(args).reviewer_order
+            reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
+                allow_previous_stage_back,
+                reviewer_specs_prompted,
+            )
+            reviewer_specs = resolve_reviewer_specs(
+                args,
+                progress=progress,
+                allow_back_first_prompt=reviewer_specs_allow_back,
+            )
             reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
             agent_config = resolve_stage_agent_config(args)
+            reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
+                allow_previous_stage_back,
+                stdin_is_interactive() and not bool(agent_config.reviewers),
+            )
             reviewer_selections_by_name = agent_config.reviewers or collect_reviewer_agent_selections(
                 project_dir=project_dir,
                 reviewer_specs=reviewer_specs,
@@ -1848,6 +1989,8 @@ def run_detailed_design_stage(
                     occupied_session_names=occupied_session_names,
                 ),
                 progress=progress,
+                allow_back_first_prompt=reviewer_selection_allow_back,
+                stage_key="detailed_design_reviewer_selection",
             )
             reviewer_workers = build_reviewer_workers(
                 args,

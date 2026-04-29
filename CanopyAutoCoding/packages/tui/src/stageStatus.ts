@@ -110,6 +110,10 @@ function stageSnapshotForAction(snapshots: Record<string, unknown>, activeStage:
   return route ? stages[route] : undefined
 }
 
+export function stageSnapshotHasLiveWork(snapshot: unknown): boolean {
+  return getWorkers(snapshot).some(workerHasLiveWork)
+}
+
 export function inferBootstrapStatus(payload: Record<string, unknown>): string {
   const snapshots = getObject(payload.snapshots)
   const app = getObject(snapshots.app)
@@ -118,6 +122,19 @@ export function inferBootstrapStatus(payload: Record<string, unknown>): string {
   const stageSnapshot = stageSnapshotForAction(snapshots, activeStage)
   if (getWorkers(stageSnapshot).some(workerHasLiveWork)) return 'running'
   return 'ready'
+}
+
+export function shouldRecoverRunningFromStageSnapshot(
+  currentStatus: string,
+  activeStage: string,
+  route: string,
+  snapshot: unknown,
+): boolean {
+  const normalizedStatus = String(currentStatus ?? '').trim().toLowerCase()
+  if (normalizedStatus !== 'failed' && normalizedStatus !== 'error') return false
+  const activeRoute = stageRouteForAction(activeStage)
+  if (!activeRoute || String(route || '').trim() !== activeRoute) return false
+  return stageSnapshotHasLiveWork(snapshot)
 }
 
 export function shouldAcceptProgressEvent(cursor: StageCursor, payload: ProgressPayload): boolean {

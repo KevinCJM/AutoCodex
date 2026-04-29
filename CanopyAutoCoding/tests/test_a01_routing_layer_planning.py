@@ -4,9 +4,9 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor, get_model_choices, get_normalized_effort_choices
 from A01_Routing_LayerPlanning import (
@@ -24,6 +24,7 @@ from A01_Routing_LayerPlanning import (
     normalize_vendor_choice,
     prompt_effort,
     prompt_confirmation,
+    prompt_project_dir,
     prompt_model,
     prompt_proxy_port,
     prompt_vendor,
@@ -34,6 +35,7 @@ from A01_Routing_LayerPlanning import (
     summarize_live_result_counts,
     split_target_dirs_text,
 )
+from T09_terminal_ops import PromptBackRequested
 from T03_agent_init_workflow import BatchInitResult, DirectoryInitResult, RoutingCleanupResult, RunManifest, RunStore, TargetSelection, WorkerManifestEntry
 
 
@@ -155,6 +157,28 @@ class RoutingLayerCliTests(unittest.TestCase):
             split_target_dirs_text("api, core/calculation , , ./docs"),
             ["api", "core/calculation", "./docs"],
         )
+
+    def test_prompt_project_dir_requires_absolute_path_and_reuses_invalid_input(self):
+        metadata_calls: list[dict[str, object]] = []
+
+        @contextmanager
+        def capture_prompt_metadata(**metadata):
+            metadata_calls.append(metadata)
+            yield
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompt_mock = Mock(side_effect=["relative/path", tmpdir])
+            with patch("A01_Routing_LayerPlanning.prompt_with_default", prompt_mock), patch(
+                "A01_Routing_LayerPlanning.prompt_metadata",
+                side_effect=capture_prompt_metadata,
+            ), patch("A01_Routing_LayerPlanning.message") as message_mock:
+                result = prompt_project_dir()
+
+        self.assertEqual(result, str(Path(tmpdir).resolve()))
+        self.assertEqual(prompt_mock.call_args_list[0].args, ("输入项目工作目录", ""))
+        self.assertEqual(prompt_mock.call_args_list[1].args, ("输入项目工作目录", "relative/path"))
+        self.assertEqual(metadata_calls[1]["error_message"], "目录无效: 请输入绝对路径")
+        message_mock.assert_any_call("目录无效: 请输入绝对路径")
 
     def test_display_status_label_prioritizes_failed_and_forced(self):
         failed = DirectoryInitResult(work_dir="/tmp/a", forced=True, status="failed", rounds_used=1)
@@ -418,6 +442,61 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertEqual(request.model, "gpt-5.4")
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(request.proxy_port, "")
+
+    def test_collect_cli_request_can_back_from_run_init_to_project_dir(self):
+        parser = build_parser()
+        args = parser.parse_args([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            _write_valid_routing_layer(project_dir)
+            with patch("A01_Routing_LayerPlanning.prompt_project_dir", side_effect=[tmpdir, tmpdir]) as project_prompt, patch(
+                "A01_Routing_LayerPlanning.prompt_run_init",
+                side_effect=[PromptBackRequested(), False],
+            ):
+                request = collect_cli_request(args)
+        self.assertFalse(request.run_init)
+        self.assertEqual(project_prompt.call_count, 2)
+
+    def test_collect_cli_request_can_back_from_run_init_to_provided_project_dir_when_allowed(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            _write_valid_routing_layer(project_dir)
+            args = parser.parse_args(["--project-dir", tmpdir, "--allow-project-dir-back"])
+            with patch("A01_Routing_LayerPlanning.prompt_project_dir", return_value=tmpdir) as project_prompt, patch(
+                "A01_Routing_LayerPlanning.prompt_run_init",
+                side_effect=[PromptBackRequested(), False],
+            ):
+                request = collect_cli_request(args)
+        self.assertFalse(request.run_init)
+        project_prompt.assert_called_once_with(tmpdir)
+
+    def test_collect_cli_request_can_back_from_model_to_vendor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            _write_valid_routing_layer(project_dir)
+            parser = build_parser()
+            args = parser.parse_args(["--project-dir", tmpdir])
+            with patch("A01_Routing_LayerPlanning.prompt_run_init", return_value=True), patch(
+                "A01_Routing_LayerPlanning.prompt_target_dirs",
+                return_value=(),
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_vendor",
+                side_effect=["gemini", "codex"],
+            ) as vendor_prompt, patch(
+                "A01_Routing_LayerPlanning.prompt_model",
+                side_effect=[PromptBackRequested(), "gpt-5.4"],
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_effort",
+                return_value="high",
+            ), patch(
+                "A01_Routing_LayerPlanning.prompt_proxy_port",
+                return_value="",
+            ):
+                request = collect_cli_request(args)
+        self.assertEqual(request.vendor, "codex")
+        self.assertEqual(request.model, "gpt-5.4")
+        self.assertEqual(vendor_prompt.call_count, 2)
 
     def test_collect_cli_request_with_project_dir_only_prompts_target_dirs_and_effort(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -44,10 +44,13 @@ from T03_agent_init_workflow import (
     run_batch_initialization,
 )
 from T09_terminal_ops import (
+    PROMPT_BACK_VALUE,
+    PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
     message,
     maybe_launch_tui,
+    prompt_metadata,
     prompt_select_option,
     prompt_with_default,
 )
@@ -99,6 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
     # Workflow entry forwards a shared argv shape to every stage.
     # Routing init does not use requirement_name, but must accept it for compatibility.
     parser.add_argument("--requirement-name", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--reuse-existing-original-requirement", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--allow-project-dir-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--target-dir", action="append", default=[], help="额外目标目录，可重复传入")
     parser.add_argument("--vendor", help="厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="模型名称")
@@ -174,12 +179,18 @@ def split_target_dirs_text(value: str) -> list[str]:
 
 
 def prompt_project_dir(default: str = "") -> str:
+    last_error = ""
     while True:
-        candidate = prompt_with_default("输入项目工作目录", default)
+        with prompt_metadata(error_message=last_error):
+            candidate = str(prompt_with_default("输入项目工作目录", default)).strip()
+        default = candidate
         try:
+            if not Path(candidate).expanduser().is_absolute():
+                raise ValueError("请输入绝对路径")
             return str(resolve_existing_directory(candidate))
         except Exception as error:
-            message(f"目录无效: {error}")
+            last_error = f"目录无效: {error}"
+            message(last_error)
 
 
 def prompt_target_dirs(defaults: Sequence[str] = ()) -> tuple[str, ...]:
@@ -260,7 +271,23 @@ def prompt_model(vendor: str, default: str | None = None, *, role_label: str = "
     models = get_model_choices(normalized_vendor)
     if not models:
         raise ValueError(f"{normalized_vendor} 没有可用模型")
-    actual_default = default or get_default_model_for_vendor(normalized_vendor)
+    model_ids = tuple(item.model_id for item in models)
+    actual_default = ""
+    for candidate in (
+        default,
+        get_default_model_for_vendor(normalized_vendor),
+        DEFAULT_MODEL_BY_VENDOR.get(normalized_vendor),
+        model_ids[0] if model_ids else "",
+    ):
+        if not str(candidate or "").strip():
+            continue
+        try:
+            actual_default = normalize_model_choice(normalized_vendor, candidate)
+            break
+        except ValueError:
+            continue
+    if not actual_default and model_ids:
+        actual_default = model_ids[0]
     options = [
         (
             item.model_id,
@@ -275,7 +302,7 @@ def prompt_model(vendor: str, default: str | None = None, *, role_label: str = "
     candidate = prompt_select_option(
         title=scoped_title,
         options=options,
-        default_value=normalize_model_choice(normalized_vendor, actual_default),
+        default_value=actual_default,
         prompt_text=scoped_title,
     )
     return normalize_model_choice(normalized_vendor, candidate)
@@ -285,11 +312,15 @@ def prompt_effort(vendor: str, model: str, default: str = "high", *, role_label:
     normalized_vendor = normalize_vendor_choice(vendor)
     normalized_model = normalize_model_choice(normalized_vendor, model)
     allowed = get_normalized_effort_choices(normalized_vendor, normalized_model)
+    try:
+        actual_default = normalize_effort_choice(normalized_vendor, normalized_model, default)
+    except ValueError:
+        actual_default = "high" if "high" in allowed else allowed[0]
     scoped_title = _role_scoped_text(f"选择 {normalized_model} 推理强度", role_label)
     candidate = prompt_select_option(
         title=scoped_title,
         options=[(effort, effort) for effort in allowed],
-        default_value=normalize_effort_choice(normalized_vendor, normalized_model, default),
+        default_value=actual_default,
         prompt_text=scoped_title,
     )
     return normalize_effort_choice(normalized_vendor, normalized_model, candidate)
@@ -351,7 +382,129 @@ def prompt_confirmation(summary_text: str, *, force_yes: bool = False) -> bool:
         message("当前项目路由层文件缺失，必须执行初始化。请输入 yes 继续。")
 
 
-def collect_cli_request(args: argparse.Namespace) -> CliRequest:
+def _routing_prompt_step(step_index: int, *, allow_back: bool):
+    return prompt_metadata(
+        allow_back=allow_back,
+        back_value=PROMPT_BACK_VALUE,
+        stage_key="routing",
+        stage_step_index=step_index,
+    )
+
+
+def _collect_interactive_cli_request(
+        args: argparse.Namespace,
+        *,
+        initial_request: CliRequest | None = None,
+        start_step: int = 0,
+) -> CliRequest:
+    max_refine_rounds = int(args.max_refine_rounds or (initial_request.max_refine_rounds if initial_request else 3))
+    if max_refine_rounds < 1:
+        raise ValueError("max-refine-rounds 必须 >= 1")
+
+    project_dir = str(args.project_dir or (initial_request.project_dir if initial_request else "")).strip()
+    target_dirs = tuple(args.target_dir or (initial_request.target_dirs if initial_request else ()))
+    run_init = bool(initial_request.run_init) if initial_request else True
+    vendor = str(args.vendor or (initial_request.vendor if initial_request else "codex")).strip() or "codex"
+    model = str(args.model or (initial_request.model if initial_request else "")).strip()
+    reasoning_effort = str(args.effort or (initial_request.reasoning_effort if initial_request else "high")).strip() or "high"
+    proxy_port = str(args.proxy_port or (initial_request.proxy_port if initial_request else "")).strip()
+    project_missing_files: tuple[str, ...] = ()
+    allow_project_dir_back = bool(getattr(args, "allow_project_dir_back", False) and project_dir)
+    first_prompt_step = 0 if (not project_dir or allow_project_dir_back) else 1
+    initial_step = 1 if project_dir else 0
+    step = max(first_prompt_step, int(start_step or initial_step))
+
+    while step < 7:
+        try:
+            if step == 0:
+                with _routing_prompt_step(0, allow_back=False):
+                    project_dir = prompt_project_dir(project_dir)
+                project_missing_files = tuple(routing_layer_readiness_issues(project_dir))
+                step = 1
+                continue
+            if step == 1:
+                project_missing_files = tuple(routing_layer_readiness_issues(project_dir))
+                if project_missing_files:
+                    run_init = True
+                    if not args.run_init:
+                        message("当前项目路由层文件缺失, 强制执行路由初始化")
+                else:
+                    with _routing_prompt_step(1, allow_back=step > first_prompt_step):
+                        run_init = prompt_run_init(run_init)
+                step = 2
+                continue
+            if step == 2:
+                if run_init:
+                    with _routing_prompt_step(2, allow_back=step > first_prompt_step):
+                        target_dirs = prompt_target_dirs(target_dirs)
+                else:
+                    target_dirs = tuple()
+                step = 3
+                continue
+            if step == 3:
+                if not run_init:
+                    vendor = normalize_vendor_choice(vendor or "codex")
+                    model = normalize_model_choice(vendor, model or get_default_model_for_vendor(vendor))
+                    reasoning_effort = normalize_effort_choice(vendor, model, reasoning_effort or "high")
+                    proxy_port = ""
+                    step = 7
+                    continue
+                routing_role_label = _predict_routing_role_label(project_dir=project_dir, target_dirs=target_dirs, run_init=run_init)
+                with _routing_prompt_step(3, allow_back=step > first_prompt_step):
+                    vendor = prompt_vendor(vendor or "codex", role_label=routing_role_label)
+                if model:
+                    try:
+                        normalize_model_choice(vendor, model)
+                    except ValueError:
+                        model = ""
+                step = 4
+                continue
+            if step == 4:
+                routing_role_label = _predict_routing_role_label(project_dir=project_dir, target_dirs=target_dirs, run_init=run_init)
+                model_default = model or get_default_model_for_vendor(vendor)
+                with _routing_prompt_step(4, allow_back=step > first_prompt_step):
+                    model = prompt_model(vendor, model_default, role_label=routing_role_label)
+                step = 5
+                continue
+            if step == 5:
+                routing_role_label = _predict_routing_role_label(project_dir=project_dir, target_dirs=target_dirs, run_init=run_init)
+                with _routing_prompt_step(5, allow_back=step > first_prompt_step):
+                    reasoning_effort = prompt_effort(vendor, model, reasoning_effort or "high", role_label=routing_role_label)
+                step = 6
+                continue
+            if step == 6:
+                routing_role_label = _predict_routing_role_label(project_dir=project_dir, target_dirs=target_dirs, run_init=run_init)
+                with _routing_prompt_step(6, allow_back=step > first_prompt_step):
+                    proxy_port = prompt_proxy_port(proxy_port, role_label=routing_role_label)
+                step = 7
+                continue
+        except PromptBackRequested:
+            if step == first_prompt_step:
+                continue
+            if step == 2 and project_missing_files and not args.run_init:
+                step = 0
+            else:
+                step = max(first_prompt_step, step - 1)
+
+    return CliRequest(
+        project_dir=project_dir,
+        target_dirs=target_dirs,
+        vendor=vendor,
+        model=model,
+        reasoning_effort=reasoning_effort,
+        proxy_port=proxy_port,
+        run_init=run_init,
+        max_refine_rounds=max_refine_rounds,
+        auto_confirm=bool(args.yes),
+    )
+
+
+def collect_cli_request(
+        args: argparse.Namespace,
+        *,
+        initial_request: CliRequest | None = None,
+        start_step: int = 0,
+) -> CliRequest:
     parameter_mode = any(
         [
             args.target_dir,
@@ -362,6 +515,8 @@ def collect_cli_request(args: argparse.Namespace) -> CliRequest:
             args.run_init,
         ]
     )
+    if not parameter_mode:
+        return _collect_interactive_cli_request(args, initial_request=initial_request, start_step=start_step)
     project_dir = (
         str(resolve_existing_directory(args.project_dir))
         if args.project_dir
@@ -714,29 +869,37 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
     args = parser.parse_args(argv)
     if getattr(args, "resume_run", ""):
         parser.error("A01 不支持 --resume-run，请改用 B01_terminal_interaction.py")
-    request = collect_cli_request(args)
-    config, selection = prepare_batch_request(request)
+    request: CliRequest | None = None
+    while True:
+        request = collect_cli_request(args, initial_request=request, start_step=6 if request is not None else 0)
+        config, selection = prepare_batch_request(request)
 
-    if not selection.should_run:
-        message("当前项目路由层已完备，跳过路由初始化。")
-        message(render_requirements_stage_placeholder([]))
-        return RoutingStageResult(
-            project_dir=request.project_dir,
-            skipped=True,
-            exit_code=0,
-            cleanup_result=RoutingCleanupResult(),
-        )
+        if not selection.should_run:
+            message("当前项目路由层已完备，跳过路由初始化。")
+            message(render_requirements_stage_placeholder([]))
+            return RoutingStageResult(
+                project_dir=request.project_dir,
+                skipped=True,
+                exit_code=0,
+                cleanup_result=RoutingCleanupResult(),
+            )
 
-    preflight_summary = render_preflight_summary(request, config, selection)
-    force_confirmation = bool(selection.project_missing_files)
-    if not request.auto_confirm and not prompt_confirmation(preflight_summary, force_yes=force_confirmation):
-        message("已取消执行。")
-        return RoutingStageResult(
-            project_dir=request.project_dir,
-            skipped=True,
-            exit_code=0,
-            cleanup_result=RoutingCleanupResult(),
-        )
+        preflight_summary = render_preflight_summary(request, config, selection)
+        force_confirmation = bool(selection.project_missing_files)
+        try:
+            with _routing_prompt_step(7, allow_back=not request.auto_confirm):
+                confirmed = request.auto_confirm or prompt_confirmation(preflight_summary, force_yes=force_confirmation)
+        except PromptBackRequested:
+            continue
+        if not confirmed:
+            message("已取消执行。")
+            return RoutingStageResult(
+                project_dir=request.project_dir,
+                skipped=True,
+                exit_code=0,
+                cleanup_result=RoutingCleanupResult(),
+            )
+        break
 
     progress_monitor: TerminalProgressMonitor | None = None
 

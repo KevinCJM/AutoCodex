@@ -5,8 +5,9 @@ import json
 import tempfile
 import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from A02_RequirementsAnalysis import (
     DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR,
@@ -43,10 +44,12 @@ from A02_RequirementsAnalysis import (
     render_requirements_analysis_tmux_start_summary,
     render_notion_progress_line,
     render_notion_tmux_start_summary,
+    run_requirement_intake_stage,
     run_requirements_analysis,
     run_requirements_stage,
     prompt_requirement_name_selection,
     prompt_requirement_name_with_existing,
+    prompt_project_dir,
     sanitize_requirement_name,
     stdin_is_interactive,
     validate_notion_status,
@@ -67,6 +70,7 @@ from Prompt_03_RequirementsClarification import (
     requirements_understand,
     resume_requirements_understand,
 )
+from T09_terminal_ops import PromptBackRequested
 
 
 def _make_simple_pdf(text: str) -> bytes:
@@ -220,6 +224,28 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
         self.assertEqual(request.requirement_name, "需求A")
         self.assertEqual(request.input_type, "text")
 
+    def test_prompt_project_dir_requires_absolute_path_and_reuses_invalid_input(self):
+        metadata_calls: list[dict[str, object]] = []
+
+        @contextmanager
+        def capture_prompt_metadata(**metadata):
+            metadata_calls.append(metadata)
+            yield
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompt_mock = Mock(side_effect=["relative/path", tmpdir])
+            with patch("T12_requirements_common.prompt_with_default", prompt_mock), patch(
+                "T12_requirements_common.prompt_metadata",
+                side_effect=capture_prompt_metadata,
+            ), patch("T09_terminal_ops.message") as message_mock:
+                result = prompt_project_dir()
+
+        self.assertEqual(result, str(Path(tmpdir).resolve()))
+        self.assertEqual(prompt_mock.call_args_list[0].args, ("输入项目工作目录", ""))
+        self.assertEqual(prompt_mock.call_args_list[1].args, ("输入项目工作目录", "relative/path"))
+        self.assertEqual(metadata_calls[1]["error_message"], "目录无效: 请输入绝对路径")
+        message_mock.assert_any_call("目录无效: 请输入绝对路径")
+
     def test_collect_request_clears_existing_human_exchange_file_for_new_requirement(self):
         parser = build_parser()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -244,6 +270,130 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
             self.assertEqual(request.requirement_name, "需求A")
             self.assertTrue(request.reuse_existing_original_requirement)
             self.assertEqual(ask_human_path.read_text(encoding="utf-8"), "")
+
+    def test_collect_request_can_reuse_existing_requirement_from_args(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "需求A_原始需求.md").write_text("正文A\n", encoding="utf-8")
+            args = parser.parse_args([
+                "--project-dir",
+                tmpdir,
+                "--requirement-name",
+                "需求A",
+                "--reuse-existing-original-requirement",
+            ])
+            request = collect_request(args)
+
+        self.assertEqual(request.requirement_name, "需求A")
+        self.assertTrue(request.reuse_existing_original_requirement)
+        self.assertEqual(request.input_type, "")
+        self.assertEqual(request.input_value, "")
+
+    def test_collect_request_can_back_from_input_type_to_requirement_name(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = parser.parse_args(["--project-dir", tmpdir])
+            with patch("A02_RequirementIntake.prompt_requirement_name", side_effect=["需求A", "需求B"]) as name_prompt, patch(
+                "A02_RequirementIntake.prompt_input_type",
+                side_effect=[PromptBackRequested(), "text"],
+            ):
+                request = collect_request(args)
+        self.assertEqual(request.requirement_name, "需求B")
+        self.assertEqual(request.input_type, "text")
+        self.assertEqual(name_prompt.call_count, 2)
+
+    def test_collect_request_can_bubble_previous_stage_back_from_first_requirement_prompt(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            args = parser.parse_args(["--project-dir", tmpdir, "--allow-previous-stage-back"])
+            with patch("A02_RequirementIntake.prompt_requirement_name", side_effect=PromptBackRequested()):
+                with self.assertRaises(PromptBackRequested):
+                    collect_request(args)
+
+    def test_run_requirement_intake_stage_reuses_existing_requirement_from_args(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            original_path = root / "需求A_原始需求.md"
+            original_path.write_text("正文A\n", encoding="utf-8")
+            result = run_requirement_intake_stage([
+                "--project-dir",
+                tmpdir,
+                "--requirement-name",
+                "需求A",
+                "--reuse-existing-original-requirement",
+            ])
+
+        self.assertEqual(result.requirement_name, "需求A")
+        self.assertEqual(result.original_requirement_path, str(original_path.resolve()))
+
+    def test_run_requirement_intake_stage_reprompts_after_overwrite_declined(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            existing_path = root / "需求A_原始需求.md"
+            existing_path.write_text("旧内容\n", encoding="utf-8")
+            with patch(
+                "builtins.input",
+                side_effect=[
+                    "2",
+                    "需求A",
+                    "1",
+                    "no",
+                    "2",
+                    "需求B",
+                    "1",
+                    "新内容",
+                    "EOF",
+                ],
+            ), patch("sys.stdin", _TTYStringIO("")):
+                result = run_requirement_intake_stage(["--project-dir", tmpdir])
+
+            new_path = root / "需求B_原始需求.md"
+            self.assertEqual(result.requirement_name, "需求B")
+            self.assertEqual(existing_path.read_text(encoding="utf-8"), "旧内容\n")
+            self.assertEqual(new_path.read_text(encoding="utf-8"), "新内容\n")
+
+    def test_run_requirement_intake_stage_overwrite_prompt_allows_back_under_bridge_ui(self):
+        from canopy_core.requirements_scope import CREATE_NEW_REQUIREMENT_SELECTION_VALUE
+        from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, use_terminal_ui
+
+        captured_requests: list[BridgePromptRequest] = []
+        requirement_names = iter(["需求A", "需求B"])
+
+        def emit_event(_event_type: str, _payload: dict[str, object]) -> None:
+            return None
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            prompt_text = str(request.payload.get("prompt_text", ""))
+            if request.prompt_type == "select" and prompt_text == "选择已有需求或创建新需求":
+                return {"value": CREATE_NEW_REQUIREMENT_SELECTION_VALUE}
+            if request.prompt_type == "select" and prompt_text == "选择输入方式":
+                return {"value": "text"}
+            if request.prompt_type == "select" and prompt_text.startswith("文件已存在，是否覆盖"):
+                return {"value": PROMPT_BACK_VALUE}
+            if request.prompt_type == "text" and prompt_text == "输入需求名称":
+                return {"value": next(requirement_names)}
+            if request.prompt_type == "multiline":
+                return {"value": "新内容"}
+            return {"value": str(request.payload.get("default_value", ""))}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "需求A_原始需求.md").write_text("旧内容\n", encoding="utf-8")
+            with use_terminal_ui(BridgeTerminalUI(emit_event=emit_event, request_prompt=request_prompt)):
+                result = run_requirement_intake_stage(["--project-dir", tmpdir])
+
+        overwrite_requests = [
+            request
+            for request in captured_requests
+            if str(request.payload.get("prompt_text", "")).startswith("文件已存在，是否覆盖")
+        ]
+        self.assertEqual(result.requirement_name, "需求B")
+        self.assertEqual(len(overwrite_requests), 1)
+        self.assertTrue(overwrite_requests[0].payload["allow_back"])
+        self.assertEqual(overwrite_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(overwrite_requests[0].payload["stage_step_index"], 5)
 
     def test_clarification_collect_request_clears_existing_human_exchange_file(self):
         from A03_RequirementsClarification import build_parser as build_clarification_parser, collect_request as collect_clarification_request
@@ -338,6 +488,58 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
         self.assertEqual(selection.reasoning_effort, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)
         self.assertEqual(selection.proxy_url, "")
         self.assertEqual(select_calls, 3)
+
+    def test_collect_requirements_analysis_agent_selection_can_bubble_previous_stage_back_from_first_prompt(self):
+        args = type(
+            "Args",
+            (),
+            {
+                "vendor": "",
+                "model": "",
+                "effort": "",
+                "proxy_url": "",
+                "allow_previous_stage_back": True,
+            },
+        )()
+        with patch("A02_RequirementsAnalysis.stdin_is_interactive", return_value=True), patch(
+            "A02_RequirementsAnalysis.prompt_vendor",
+            side_effect=PromptBackRequested(),
+        ):
+            with self.assertRaises(PromptBackRequested):
+                collect_requirements_analysis_agent_selection(args)
+
+    def test_clarification_reuse_prompt_allows_previous_stage_back_under_bridge_ui(self):
+        from A03_RequirementsClarification import run_requirements_clarification_stage
+        from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, use_terminal_ui
+
+        captured_requests: list[BridgePromptRequest] = []
+
+        def emit_event(_event_type: str, _payload: dict[str, object]) -> None:
+            return None
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            return {"value": "__canopy_back__"}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "需求A_原始需求.md").write_text("原始需求\n", encoding="utf-8")
+            (root / "需求A_需求澄清.md").write_text("已有需求澄清\n", encoding="utf-8")
+            with use_terminal_ui(BridgeTerminalUI(emit_event=emit_event, request_prompt=request_prompt)):
+                with self.assertRaises(PromptBackRequested):
+                    run_requirements_clarification_stage(
+                        [
+                            "--project-dir",
+                            tmpdir,
+                            "--requirement-name",
+                            "需求A",
+                            "--allow-previous-stage-back",
+                        ]
+                    )
+
+        self.assertEqual(captured_requests[0].prompt_type, "select")
+        self.assertTrue(captured_requests[0].payload["allow_back"])
+        self.assertEqual(captured_requests[0].payload["prompt_text"], "是否直接复用已有的需求澄清并跳入需求评审阶段")
 
     def test_stdin_is_interactive_reflects_stdin_capability(self):
         with patch("sys.stdin", _TTYStringIO("")):

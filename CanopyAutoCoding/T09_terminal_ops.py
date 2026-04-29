@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import json
 import os
 import subprocess
@@ -23,6 +24,49 @@ from T06_terminal_progress import (
     SingleLineSpinnerMonitor as LegacySingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
 )
+
+
+PROMPT_BACK_VALUE = "__canopy_back__"
+_PROMPT_METADATA: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar("canopy_prompt_metadata", default={})
+
+
+class PromptBackRequested(Exception):
+    """Raised when a bridge client requests returning to the previous setup prompt."""
+
+
+def _current_prompt_metadata() -> dict[str, Any]:
+    return dict(_PROMPT_METADATA.get({}))
+
+
+def _apply_prompt_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = _current_prompt_metadata()
+    for key, value in metadata.items():
+        if key not in payload:
+            payload[key] = value
+    return payload
+
+
+def _raise_if_prompt_back(response_payload: Mapping[str, Any], request_payload: Mapping[str, Any]) -> None:
+    back_value = str(request_payload.get("back_value", PROMPT_BACK_VALUE) or PROMPT_BACK_VALUE)
+    if not bool(request_payload.get("allow_back", False)):
+        return
+    if str(response_payload.get("value", "")) == back_value:
+        raise PromptBackRequested()
+
+
+@contextlib.contextmanager
+def prompt_metadata(**metadata: Any) -> ContextManager[None]:
+    previous = _current_prompt_metadata()
+    next_metadata = {**previous}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        next_metadata[str(key)] = value
+    token = _PROMPT_METADATA.set(next_metadata)
+    try:
+        yield
+    finally:
+        _PROMPT_METADATA.reset(token)
 
 
 class ProgressMonitor(Protocol):
@@ -297,16 +341,20 @@ class BridgeTerminalUI:
 
     def prompt_text(self, prompt_text: str, default: str = "", allow_empty: bool = False) -> str:
         while True:
+            request_payload = _apply_prompt_metadata(
+                {
+                    "prompt_text": prompt_text,
+                    "default": default,
+                    "allow_empty": allow_empty,
+                }
+            )
             payload = self._request_prompt(
                 BridgePromptRequest(
                     prompt_type="text",
-                    payload={
-                        "prompt_text": prompt_text,
-                        "default": default,
-                        "allow_empty": allow_empty,
-                    },
+                    payload=request_payload,
                 )
             )
+            _raise_if_prompt_back(payload, request_payload)
             value = str(payload.get("value", ""))
             if allow_empty or value.strip():
                 return value
@@ -324,14 +372,16 @@ class BridgeTerminalUI:
         is_hitl: bool = False,
         extra_payload: Mapping[str, Any] | None = None,
     ) -> str:
-        request_payload: dict[str, Any] = {
-            "title": title,
-            "options": [{"value": value, "label": label} for value, label in options],
-            "default_value": default_value,
-            "prompt_text": prompt_text,
-            "preview_path": str(Path(preview_path).expanduser().resolve()) if preview_path else "",
-            "preview_title": str(preview_title or "").strip(),
-        }
+        request_payload: dict[str, Any] = _apply_prompt_metadata(
+            {
+                "title": title,
+                "options": [{"value": value, "label": label} for value, label in options],
+                "default_value": default_value,
+                "prompt_text": prompt_text,
+                "preview_path": str(Path(preview_path).expanduser().resolve()) if preview_path else "",
+                "preview_title": str(preview_title or "").strip(),
+            }
+        )
         if extra_payload:
             protected_keys = set(request_payload)
             for key, value in extra_payload.items():
@@ -346,6 +396,7 @@ class BridgeTerminalUI:
                 payload=request_payload,
             )
         )
+        _raise_if_prompt_back(payload, request_payload)
         value = str(payload.get("value", default_value))
         allowed = {item[0] for item in options}
         if value not in allowed:
@@ -362,18 +413,22 @@ class BridgeTerminalUI:
         is_hitl: bool = False,
     ) -> str:
         while True:
+            request_payload = _apply_prompt_metadata(
+                {
+                    "title": title,
+                    "empty_retry_message": empty_retry_message,
+                    "question_path": str(Path(question_path).expanduser().resolve()) if question_path else "",
+                    "answer_path": str(Path(answer_path).expanduser().resolve()) if answer_path else "",
+                    "is_hitl": bool(is_hitl),
+                }
+            )
             payload = self._request_prompt(
                 BridgePromptRequest(
                     prompt_type="multiline",
-                    payload={
-                        "title": title,
-                        "empty_retry_message": empty_retry_message,
-                        "question_path": str(Path(question_path).expanduser().resolve()) if question_path else "",
-                        "answer_path": str(Path(answer_path).expanduser().resolve()) if answer_path else "",
-                        "is_hitl": bool(is_hitl),
-                    },
+                    payload=request_payload,
                 )
             )
+            _raise_if_prompt_back(payload, request_payload)
             value = str(payload.get("value", ""))
             if value.strip():
                 return value
@@ -685,7 +740,9 @@ def maybe_launch_tui(
 __all__ = [
     "BridgePromptRequest",
     "BridgeTerminalUI",
+    "PROMPT_BACK_VALUE",
     "ProgressMonitor",
+    "PromptBackRequested",
     "SingleLineSpinnerMonitor",
     "StdioTerminalUI",
     "TERMINAL_SPINNER_FRAMES",
@@ -702,6 +759,7 @@ __all__ = [
     "tui_package_dir",
     "ensure_tui_dependencies_installed",
     "prompt_command_line",
+    "prompt_metadata",
     "prompt_positive_int",
     "prompt_select_option",
     "prompt_with_default",

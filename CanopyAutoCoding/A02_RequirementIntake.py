@@ -18,6 +18,7 @@ from typing import Iterable, Sequence
 from xml.etree import ElementTree
 
 from canopy_core.runtime.vendor_catalog import get_default_model_for_vendor
+from canopy_core.requirements_scope import CREATE_NEW_REQUIREMENT_SELECTION_VALUE
 from Prompt_02_RequirementIntake import (
     NOTION_STATUS_ERROR,
     NOTION_STATUS_HITL,
@@ -36,11 +37,14 @@ from T02_tmux_agents import (
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop, validate_hitl_status_file
 from T08_pre_development import ensure_pre_development_task_record, mark_requirement_intake_completed
 from T09_terminal_ops import (
+    PROMPT_BACK_VALUE,
+    PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
     collect_multiline_input,
     maybe_launch_tui,
     message,
+    prompt_metadata,
     prompt_select_option,
     prompt_yes_no as terminal_prompt_yes_no,
 )
@@ -50,8 +54,9 @@ from T12_requirements_common import (
     clear_requirements_human_exchange_file,
     cleanup_runtime_paths,
     cleanup_runtime_root_if_empty,
+    list_existing_requirements,
     prompt_project_dir,
-    prompt_requirement_name_selection,
+    prompt_requirement_name,
     prompt_with_default,
     resolve_existing_directory,
     sanitize_requirement_name,
@@ -112,6 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--input-type", choices=INPUT_TYPE_CHOICES, help="输入方式: text|file|notion")
     parser.add_argument("--input-value", default="", help="输入值")
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的原始需求文件")
+    parser.add_argument("--reuse-existing-original-requirement", action="store_true", help="复用已存在的原始需求文件")
+    parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--yes", action="store_true", help="跳过非覆盖类确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
@@ -130,6 +137,15 @@ def prompt_input_type(default: str = "text") -> str:
 
 def prompt_yes_no(prompt_text: str, default: bool = False) -> bool:
     return terminal_prompt_yes_no(prompt_text, default)
+
+
+def _requirement_prompt_step(step_index: int, *, allow_back: bool):
+    return prompt_metadata(
+        allow_back=allow_back,
+        back_value=PROMPT_BACK_VALUE,
+        stage_key="requirement_intake",
+        stage_step_index=step_index,
+    )
 
 
 def normalize_input_type(value: str | None) -> str:
@@ -639,33 +655,109 @@ def write_requirement_file(output_path: str | Path, content: str, *, overwrite: 
     return path
 
 
-def collect_request(args: argparse.Namespace) -> RequirementIntakeRequest:
-    project_dir = (
-        str(resolve_existing_directory(args.project_dir))
-        if args.project_dir
-        else prompt_project_dir("")
+def _prompt_requirement_selection(project_dir: str | Path, default: str = "") -> RequirementNameSelection:
+    existing = list_existing_requirements(project_dir)
+    if not existing:
+        return RequirementNameSelection(
+            requirement_name=prompt_requirement_name(default),
+            reuse_existing_original_requirement=False,
+        )
+    selected = prompt_select_option(
+        title="\n".join(
+            [
+                f"检测项目内已有需求: {', '.join(existing)}",
+                "可选需求:",
+            ]
+        ),
+        options=[*[(item, item) for item in existing], (CREATE_NEW_REQUIREMENT_SELECTION_VALUE, "创建新需求")],
+        default_value=CREATE_NEW_REQUIREMENT_SELECTION_VALUE,
+        prompt_text="选择已有需求或创建新需求",
     )
-    reuse_existing_original_requirement = False
-    if args.requirement_name:
-        requirement_name = str(args.requirement_name).strip()
-    else:
-        selection: RequirementNameSelection = prompt_requirement_name_selection(project_dir, "")
-        requirement_name = selection.requirement_name
-        reuse_existing_original_requirement = selection.reuse_existing_original_requirement
+    if selected == CREATE_NEW_REQUIREMENT_SELECTION_VALUE:
+        return RequirementNameSelection(
+            requirement_name="",
+            reuse_existing_original_requirement=False,
+        )
+    return RequirementNameSelection(
+        requirement_name=selected,
+        reuse_existing_original_requirement=True,
+    )
+
+
+def collect_request(args: argparse.Namespace) -> RequirementIntakeRequest:
+    project_dir = str(args.project_dir or "").strip()
+    requirement_name = str(args.requirement_name or "").strip()
+    reuse_existing_original_requirement = bool(args.reuse_existing_original_requirement and requirement_name)
+    input_type = normalize_input_type(args.input_type) if args.input_type else ""
+    input_value = str(args.input_value or "").strip()
+    requirement_name_step = 1
+    require_new_requirement_name = False
+    allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
+
+    first_prompt_step = 0 if not project_dir else (1 if not requirement_name else 3)
+    step = first_prompt_step
+    while step < 5:
+        try:
+            if step == 0:
+                with _requirement_prompt_step(0, allow_back=False):
+                    project_dir = prompt_project_dir(project_dir)
+                step = 1
+                continue
+            if step == 1:
+                project_dir = str(resolve_existing_directory(project_dir))
+                with _requirement_prompt_step(1, allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back)):
+                    selection = _prompt_requirement_selection(project_dir, requirement_name)
+                reuse_existing_original_requirement = selection.reuse_existing_original_requirement
+                if selection.requirement_name:
+                    requirement_name = selection.requirement_name
+                    require_new_requirement_name = False
+                    requirement_name_step = 1
+                    step = 5 if reuse_existing_original_requirement else 3
+                    continue
+                require_new_requirement_name = True
+                requirement_name_step = 2
+                step = 2
+                continue
+            if step == 2:
+                with _requirement_prompt_step(2, allow_back=step > first_prompt_step):
+                    requirement_name = prompt_requirement_name(requirement_name)
+                reuse_existing_original_requirement = False
+                step = 3
+                continue
+            if step == 3:
+                if reuse_existing_original_requirement:
+                    step = 5
+                    continue
+                if not input_type:
+                    with _requirement_prompt_step(3, allow_back=step > first_prompt_step):
+                        input_type = prompt_input_type("text")
+                else:
+                    input_type = normalize_input_type(input_type)
+                step = 4
+                continue
+            if step == 4:
+                if input_type == "file" and not input_value:
+                    with _requirement_prompt_step(4, allow_back=step > first_prompt_step):
+                        input_value = prompt_with_default("输入本地文件路径", "", allow_empty=False)
+                elif input_type == "notion" and not input_value:
+                    with _requirement_prompt_step(4, allow_back=step > first_prompt_step):
+                        input_value = prompt_with_default("输入 Notion 页面链接", "", allow_empty=False)
+                elif input_type == "text" and input_value:
+                    input_value = str(args.input_value)
+                step = 5
+                continue
+        except PromptBackRequested:
+            if step == first_prompt_step:
+                if allow_previous_stage_back:
+                    raise
+                continue
+            if step == 3:
+                step = requirement_name_step if require_new_requirement_name else 1
+            else:
+                step = max(first_prompt_step, step - 1)
+
+    project_dir = str(resolve_existing_directory(project_dir))
     clear_requirements_human_exchange_file(project_dir, requirement_name)
-
-    input_type = ""
-    input_value = ""
-    if not reuse_existing_original_requirement:
-        input_type = args.input_type or prompt_input_type("text")
-        input_value = str(args.input_value or "").strip()
-        if input_type == "file" and not input_value:
-            input_value = prompt_with_default("输入本地文件路径", "", allow_empty=False)
-        elif input_type == "notion" and not input_value:
-            input_value = prompt_with_default("输入 Notion 页面链接", "", allow_empty=False)
-        elif input_type == "text" and input_value:
-            input_value = str(args.input_value)
-
     return RequirementIntakeRequest(
         project_dir=project_dir,
         requirement_name=requirement_name,
@@ -686,18 +778,44 @@ def maybe_confirm_overwrite(path: str | Path, *, overwrite: bool) -> bool:
     return prompt_yes_no(f"文件已存在，是否覆盖 {target.name}", False)
 
 
+def _reprompt_args_after_overwrite_declined(
+    args: argparse.Namespace,
+    *,
+    project_dir: str | Path,
+) -> argparse.Namespace:
+    next_args = argparse.Namespace(**vars(args))
+    next_args.project_dir = str(project_dir)
+    next_args.requirement_name = ""
+    next_args.reuse_existing_original_requirement = False
+    next_args.input_type = ""
+    next_args.input_value = ""
+    next_args.overwrite = False
+    next_args.yes = False
+    return next_args
+
+
 def run_requirement_intake_stage(argv: Sequence[str] | None = None) -> RequirementIntakeStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
-    request = collect_request(args)
-    ensure_pre_development_task_record(request.project_dir, request.requirement_name)
-    output_path = build_output_path(request.project_dir, request.requirement_name)
+    while True:
+        request = collect_request(args)
+        output_path = build_output_path(request.project_dir, request.requirement_name)
 
-    if not request.reuse_existing_original_requirement and output_path.exists() and not request.overwrite:
-        if request.auto_confirm:
-            raise RuntimeError(f"目标文件已存在，未指定 --overwrite: {output_path}")
-        if not maybe_confirm_overwrite(output_path, overwrite=False):
-            raise RuntimeError("已取消写入。")
+        if not request.reuse_existing_original_requirement and output_path.exists() and not request.overwrite:
+            if request.auto_confirm:
+                raise RuntimeError(f"目标文件已存在，未指定 --overwrite: {output_path}")
+            try:
+                with _requirement_prompt_step(5, allow_back=True):
+                    should_overwrite = maybe_confirm_overwrite(output_path, overwrite=False)
+            except PromptBackRequested:
+                args = _reprompt_args_after_overwrite_declined(args, project_dir=request.project_dir)
+                continue
+            if not should_overwrite:
+                message("已取消覆盖，请重新选择需求名称或复用已有需求。")
+                args = _reprompt_args_after_overwrite_declined(args, project_dir=request.project_dir)
+                continue
+        break
+    ensure_pre_development_task_record(request.project_dir, request.requirement_name)
 
     if request.reuse_existing_original_requirement:
         if not get_markdown_content(output_path).strip():

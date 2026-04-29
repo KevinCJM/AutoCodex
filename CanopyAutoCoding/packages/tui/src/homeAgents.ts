@@ -15,7 +15,8 @@ const SOURCE_RANK: Record<HomeAgentItem['source'], number> = {
 
 export function isRunningWorker(worker: WorkerSnapshot): boolean {
   if (!worker.sessionName.trim()) return false
-  if (String(worker.agentState || '').trim().toUpperCase() === 'DEAD') return true
+  const agentState = String(worker.agentState || '').trim().toUpperCase()
+  if (agentState === 'DEAD' || agentState === 'STARTING') return true
   if (worker.sessionExists !== undefined) return worker.sessionExists
   return LIVE_WORKER_HEALTH_STATUSES.has(worker.healthStatus)
 }

@@ -42,7 +42,6 @@ from canopy_core.runtime.contracts import (
 from canopy_core.runtime.hitl import build_prefixed_sha256
 from canopy_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
-    AgentRunConfig,
     TmuxBatchWorker,
     Vendor,
     build_session_name,
@@ -96,6 +95,7 @@ from canopy_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     collect_review_limit_hitl_response,
     run_review_limit_hitl_cycle,
@@ -116,7 +116,7 @@ from T08_pre_development import (
     mark_task_split_completed,
     update_pre_development_task_status,
 )
-from T09_terminal_ops import maybe_launch_tui, message, prompt_select_option
+from T09_terminal_ops import PROMPT_BACK_VALUE, maybe_launch_tui, message, prompt_metadata, prompt_select_option
 from T12_requirements_common import (
     DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
     DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
@@ -157,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="任务拆分阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
@@ -169,6 +170,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
+
+
+def _consume_stage_back(allow_previous_stage_back: bool, will_prompt: bool) -> tuple[bool, bool]:
+    allow_back = bool(allow_previous_stage_back and will_prompt)
+    if will_prompt:
+        return allow_back, False
+    return False, bool(allow_previous_stage_back)
 
 
 def build_task_split_paths(project_dir: str | Path, requirement_name: str) -> dict[str, Path]:
@@ -223,6 +231,7 @@ def resolve_review_max_rounds(
     args: argparse.Namespace,
     *,
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> int | None:
     explicit = getattr(args, "review_max_rounds", "")
     if str(explicit or "").strip():
@@ -238,6 +247,9 @@ def resolve_review_max_rounds(
     return prompt_review_max_rounds(
         default=MAX_TASK_SPLIT_REVIEW_ROUNDS,
         progress=progress,
+        allow_back=allow_back,
+        stage_key="task_split",
+        stage_step_index=1,
     )
 
 
@@ -525,6 +537,7 @@ def decide_existing_task_split_mode(
     *,
     paths: dict[str, Path],
     progress: ReviewStageProgress | None = None,
+    allow_back: bool = False,
 ) -> ExistingTaskSplitMode:
     if bool(getattr(args, "yes", False)) or not stdin_is_interactive():
         return "rerun"
@@ -536,29 +549,41 @@ def decide_existing_task_split_mode(
         progress.set_phase("任务拆分 / 已有文档处理")
     with progress.suspended() if progress is not None else contextlib.nullcontext():
         if has_valid_task_json:
+            with prompt_metadata(
+                allow_back=allow_back,
+                back_value=PROMPT_BACK_VALUE,
+                stage_key="task_split",
+                stage_step_index=0,
+            ):
+                return prompt_select_option(
+                    title=f"检测到已存在《{paths['task_md_path'].name}》与《{paths['task_json_path'].name}》",
+                    options=(
+                        ("skip", "跳过任务拆分阶段"),
+                        ("review_existing", "直接评审现有任务单"),
+                        ("rerun", "从头重跑并重新生成任务单"),
+                    ),
+                    default_value="rerun",
+                    prompt_text="请选择处理方式",
+                    preview_path=paths["task_md_path"],
+                    preview_title="现有任务单",
+                )
+        with prompt_metadata(
+            allow_back=allow_back,
+            back_value=PROMPT_BACK_VALUE,
+            stage_key="task_split",
+            stage_step_index=0,
+        ):
             return prompt_select_option(
-                title=f"检测到已存在《{paths['task_md_path'].name}》与《{paths['task_json_path'].name}》",
+                title=f"检测到已存在《{paths['task_md_path'].name}》，但《{paths['task_json_path'].name}》缺失或无效",
                 options=(
-                    ("skip", "跳过任务拆分阶段"),
                     ("review_existing", "直接评审现有任务单"),
                     ("rerun", "从头重跑并重新生成任务单"),
                 ),
-                default_value="rerun",
+                default_value="review_existing",
                 prompt_text="请选择处理方式",
                 preview_path=paths["task_md_path"],
                 preview_title="现有任务单",
             )
-        return prompt_select_option(
-            title=f"检测到已存在《{paths['task_md_path'].name}》，但《{paths['task_json_path'].name}》缺失或无效",
-            options=(
-                ("review_existing", "直接评审现有任务单"),
-                ("rerun", "从头重跑并重新生成任务单"),
-            ),
-            default_value="review_existing",
-            prompt_text="请选择处理方式",
-            preview_path=paths["task_md_path"],
-            preview_title="现有任务单",
-        )
 
 
 def create_task_split_ba_handoff(
@@ -568,15 +593,14 @@ def create_task_split_ba_handoff(
     selection: ReviewAgentSelection,
 ) -> RequirementsAnalystHandoff:
     project_root = Path(project_dir).expanduser().resolve()
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=_task_split_ba_display_name(project_dir=project_root),
+    )
     worker = TmuxBatchWorker(
         worker_id="task-split-analyst",
         work_dir=project_root,
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=build_task_split_runtime_root(project_root, requirement_name),
         runtime_metadata={
             "project_dir": str(project_root),
@@ -599,12 +623,18 @@ def prepare_task_split_ba_handoff(
     *,
     project_dir: str | Path,
     ba_handoff: RequirementsAnalystHandoff | None,
+    allow_back_first_prompt: bool = False,
 ) -> tuple[RequirementsAnalystHandoff, bool]:
     if _is_live_ba_handoff(ba_handoff):
         message("复用上一阶段的需求分析师继续生成任务单")
         return ba_handoff, False
     role_label = _task_split_ba_display_name(project_dir=project_dir)
-    selection = collect_ba_agent_selection(args, role_label=role_label)
+    selection = collect_ba_agent_selection(
+        args,
+        role_label=role_label,
+        allow_back_first_step=allow_back_first_prompt,
+        stage_key="task_split_main",
+    )
     message(render_review_agent_selection("进入任务拆分阶段（需求分析师）", selection))
     create_kwargs: dict[str, object] = {"project_dir": project_dir, "selection": selection}
     requirement_name = str(getattr(args, "requirement_name", "") or "").strip()
@@ -1061,15 +1091,18 @@ def create_reviewer_runtime(
 ) -> ReviewerRuntime:
     reviewer_identity = _reviewer_spec_identity(reviewer_spec)
     runtime_root = build_task_split_runtime_root(project_dir, requirement_name)
+    reviewer_display_name = _predict_worker_display_name(
+        project_dir=project_dir,
+        worker_id=build_task_split_reviewer_worker_id(reviewer_spec.role_name),
+    )
+    selection, config = resolve_agent_run_config_with_recovery(
+        selection,
+        role_label=reviewer_display_name,
+    )
     worker = TmuxBatchWorker(
         worker_id=build_task_split_reviewer_worker_id(reviewer_spec.role_name),
         work_dir=Path(project_dir).expanduser().resolve(),
-        config=AgentRunConfig(
-            vendor=selection.vendor,
-            model=selection.model,
-            reasoning_effort=selection.reasoning_effort,
-            proxy_url=selection.proxy_url,
-        ),
+        config=config,
         runtime_root=runtime_root,
         runtime_metadata={
             "project_dir": str(Path(project_dir).expanduser().resolve()),
@@ -1180,6 +1213,7 @@ def resolve_reviewer_specs(
     *,
     reviewer_handoff: Sequence[ReviewAgentHandoff],
     progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
 ) -> list[TaskSplitReviewerSpec]:
     if reviewer_handoff:
         return [
@@ -1190,7 +1224,13 @@ def resolve_reviewer_specs(
             )
             for item in reviewer_handoff
         ]
-    return list(resolve_design_reviewer_specs(args, progress=progress))
+    return list(
+        resolve_design_reviewer_specs(
+            args,
+            progress=progress,
+            allow_back_first_prompt=allow_back_first_prompt,
+        )
+    )
 
 
 def build_reviewer_workers(
@@ -1742,6 +1782,7 @@ def run_task_split_stage(
 ) -> TaskSplitStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     if args.project_dir:
         project_dir = str(Path(args.project_dir).expanduser().resolve())
     else:
@@ -1770,7 +1811,17 @@ def run_task_split_stage(
             ba_handoff=active_ba_handoff,
             reviewer_handoff=active_reviewer_handoff,
         )
-        existing_task_split_mode = decide_existing_task_split_mode(args, paths=paths, progress=progress)
+        existing_task_prompted = stdin_is_interactive() and not bool(getattr(args, "yes", False)) and bool(get_markdown_content(paths["task_md_path"]).strip())
+        existing_task_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            existing_task_prompted,
+        )
+        existing_task_split_mode = decide_existing_task_split_mode(
+            args,
+            paths=paths,
+            progress=progress,
+            allow_back=existing_task_allow_back,
+        )
         initial_task_md_hash = _task_md_content_hash(paths["task_md_path"]) if existing_task_split_mode == "review_existing" else ""
         if existing_task_split_mode == "skip":
             message(f"检测到已存在《{paths['task_md_path'].name}》与《{paths['task_json_path'].name}》")
@@ -1799,12 +1850,24 @@ def run_task_split_stage(
             clear_task_json=existing_task_split_mode == "rerun",
         )
         reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"任务拆分审核智能体 {index}"  # noqa: E731
-        review_round_limit = resolve_review_max_rounds(args, progress=progress)
+        review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not str(getattr(args, "review_max_rounds", "") or "").strip(),
+        )
+        review_round_limit = resolve_review_max_rounds(args, progress=progress, allow_back=review_round_allow_back)
         review_round_policy = ReviewRoundPolicy(review_round_limit)
+        reviewer_specs_prompted = stdin_is_interactive() and not reviewer_handoff and not any(
+            str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
+        ) and not resolve_stage_agent_config(args).reviewer_order
+        reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            reviewer_specs_prompted,
+        )
         reviewer_specs = resolve_reviewer_specs(
             args,
             reviewer_handoff=active_reviewer_handoff,
             progress=progress,
+            allow_back_first_prompt=reviewer_specs_allow_back,
         )
         reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
         live_reviewer_keys = tuple(
@@ -1813,6 +1876,10 @@ def run_task_split_stage(
             if _is_live_reviewer_handoff(item)
         )
         agent_config = resolve_stage_agent_config(args)
+        reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            stdin_is_interactive() and not bool(agent_config.reviewers) and bool(reviewer_specs),
+        )
         reviewer_selections_by_name = agent_config.reviewers or collect_reviewer_agent_selections(
             project_dir=project_dir,
             reviewer_specs=reviewer_specs,
@@ -1823,13 +1890,21 @@ def run_task_split_stage(
             ),
             progress=progress,
             skip_reviewer_keys=live_reviewer_keys,
+            allow_back_first_prompt=reviewer_selection_allow_back,
+            stage_key="task_split_reviewer_selection",
         )
         created_new_ba = False
         if existing_task_split_mode == "rerun":
+            ba_prompted = stdin_is_interactive() and not _is_live_ba_handoff(active_ba_handoff) and not any(
+                str(getattr(args, key, "") or "").strip()
+                for key in ("vendor", "model", "effort", "proxy_url")
+            )
+            ba_allow_back, allow_previous_stage_back = _consume_stage_back(allow_previous_stage_back, ba_prompted)
             active_ba_handoff, created_new_ba = prepare_task_split_ba_handoff(
                 args,
                 project_dir=project_dir,
                 ba_handoff=active_ba_handoff,
+                allow_back_first_prompt=ba_allow_back,
             )
             if created_new_ba:
                 _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(

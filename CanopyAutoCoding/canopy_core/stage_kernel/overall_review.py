@@ -100,6 +100,7 @@ from T12_requirements_common import (
     prompt_project_dir,
     prompt_requirement_name_selection,
     sanitize_requirement_name,
+    stdin_is_interactive,
 )
 
 
@@ -122,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="复核阶段")
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
+    parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode")
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
@@ -134,6 +136,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
+
+
+def _consume_stage_back(allow_previous_stage_back: bool, will_prompt: bool) -> tuple[bool, bool]:
+    allow_back = bool(allow_previous_stage_back and will_prompt)
+    if will_prompt:
+        return allow_back, False
+    return False, bool(allow_previous_stage_back)
 
 
 def build_overall_review_paths(project_dir: str | Path, requirement_name: str) -> dict[str, Path]:
@@ -237,6 +246,8 @@ def ensure_overall_review_inputs(
 def _is_live_developer_handoff(handoff: DevelopmentAgentHandoff | None) -> bool:
     if handoff is None:
         return False
+    if not _worker_reusable_for_handoff(getattr(handoff, "worker", None)):
+        return False
     get_state = getattr(handoff.worker, "get_agent_state", None)
     if callable(get_state):
         with contextlib.suppress(Exception):
@@ -257,6 +268,8 @@ def _is_live_developer_handoff(handoff: DevelopmentAgentHandoff | None) -> bool:
 
 
 def _is_live_reviewer_handoff(handoff: ReviewAgentHandoff) -> bool:
+    if not _worker_reusable_for_handoff(getattr(handoff, "worker", None)):
+        return False
     get_state = getattr(handoff.worker, "get_agent_state", None)
     if callable(get_state):
         with contextlib.suppress(Exception):
@@ -285,6 +298,46 @@ def _load_runtime_state_payload(state_path: str | Path) -> dict[str, object]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _runtime_payload_reusable_for_handoff(payload: dict[str, object]) -> bool:
+    status = str(payload.get("status") or payload.get("result_status") or "").strip().lower()
+    health_status = str(payload.get("health_status", "")).strip().lower()
+    note = str(payload.get("note", "")).strip().lower()
+    agent_state = str(payload.get("agent_state", "")).strip().upper()
+    task_runtime_status = str(payload.get("current_task_runtime_status", "")).strip().lower()
+    active_execution = agent_state == "BUSY" or task_runtime_status == "running"
+    if (note == "awaiting_reconfig" or health_status == "awaiting_reconfig") and not active_execution:
+        return False
+    if status in {"failed", "stale_failed", "error"} and not active_execution:
+        return False
+    if health_status in {"provider_auth_error", "provider_runtime_error", "missing_session", "pane_dead", "dead"}:
+        return False
+    if agent_state == "DEAD" and not active_execution:
+        return False
+    return True
+
+
+def _worker_state_payload(worker) -> dict[str, object]:
+    if worker is None:
+        return {}
+    reader = getattr(worker, "read_state", None)
+    if not callable(reader):
+        return {}
+    with contextlib.suppress(Exception):
+        payload = reader()
+        if isinstance(payload, dict):
+            return dict(payload)
+    return {}
+
+
+def _worker_reusable_for_handoff(worker) -> bool:
+    if worker is None:
+        return False
+    state_payload = _worker_state_payload(worker)
+    if state_payload and not _runtime_payload_reusable_for_handoff(state_payload):
+        return False
+    return True
 
 
 def _selection_from_runtime_state(payload: dict[str, object]) -> ReviewAgentSelection | None:
@@ -352,15 +405,15 @@ def _prefer_handoff(current, candidate, *, current_default_action: str = "stage.
         return candidate
     if candidate is None:
         return current
-    current_key = (
-        _workflow_action_priority(_handoff_workflow_action(current, default=current_default_action)),
-        _handoff_updated_at(current),
-    )
-    candidate_key = (
-        _workflow_action_priority(_handoff_workflow_action(candidate, default=candidate_default_action)),
-        _handoff_updated_at(candidate),
-    )
-    return candidate if candidate_key > current_key else current
+    current_priority = _workflow_action_priority(_handoff_workflow_action(current, default=current_default_action))
+    candidate_priority = _workflow_action_priority(_handoff_workflow_action(candidate, default=candidate_default_action))
+    if candidate_priority != current_priority:
+        return candidate if candidate_priority > current_priority else current
+    current_updated_at = _handoff_updated_at(current)
+    candidate_updated_at = _handoff_updated_at(candidate)
+    if current_updated_at and candidate_updated_at and candidate_updated_at > current_updated_at:
+        return candidate
+    return current
 
 
 def _merge_preferred_reviewer_handoffs(
@@ -427,6 +480,8 @@ def discover_live_development_handoffs(
             pass
         payload = _load_runtime_state_payload(state_path)
         if not payload:
+            continue
+        if not _runtime_payload_reusable_for_handoff(payload):
             continue
         workflow_action = str(payload.get("workflow_action", "")).strip()
         if workflow_action not in {"stage.a07.start", "stage.a08.start"}:
@@ -583,6 +638,7 @@ def resolve_overall_review_reviewer_specs(
     *,
     reviewer_handoff: Sequence[ReviewAgentHandoff],
     progress: ReviewStageProgress | None = None,
+    allow_back_first_prompt: bool = False,
 ) -> list[DevelopmentReviewerSpec]:
     if reviewer_handoff:
         return [
@@ -593,7 +649,13 @@ def resolve_overall_review_reviewer_specs(
             )
             for item in reviewer_handoff
         ]
-    return list(resolve_development_reviewer_specs(args, progress=progress))
+    return list(
+        resolve_development_reviewer_specs(
+            args,
+            progress=progress,
+            allow_back_first_prompt=allow_back_first_prompt,
+        )
+    )
 
 
 def build_reviewer_workers(
@@ -1311,6 +1373,7 @@ def run_overall_review_stage(
 ) -> OverallReviewStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     requirement_name = str(args.requirement_name).strip() if args.requirement_name else prompt_requirement_name_selection(project_dir, "").requirement_name
 
@@ -1362,12 +1425,33 @@ def run_overall_review_stage(
                 handoff=live_developer_handoff,
             )
         else:
-            developer_plan = resolve_developer_plan(args, project_dir=project_dir, progress=progress)
+            developer_plan_prompted = stdin_is_interactive() and (
+                not str(getattr(args, "developer_role_prompt", "") or "").strip()
+                or not any(str(getattr(args, key, "") or "").strip() for key in ("vendor", "model", "effort", "proxy_url"))
+            )
+            developer_plan_allow_back, allow_previous_stage_back = _consume_stage_back(
+                allow_previous_stage_back,
+                developer_plan_prompted,
+            )
+            developer_plan = resolve_developer_plan(
+                args,
+                project_dir=project_dir,
+                progress=progress,
+                allow_back_first_prompt=developer_plan_allow_back,
+            )
 
+        reviewer_specs_prompted = stdin_is_interactive() and not effective_reviewer_handoffs and not any(
+            str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
+        ) and not resolve_stage_agent_config(args).reviewer_order
+        reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
+            allow_previous_stage_back,
+            reviewer_specs_prompted,
+        )
         reviewer_specs = resolve_overall_review_reviewer_specs(
             args,
             reviewer_handoff=effective_reviewer_handoffs,
             progress=progress,
+            allow_back_first_prompt=reviewer_specs_allow_back,
         )
         reviewer_specs_by_name = {str(item.reviewer_key or item.role_name).strip(): item for item in reviewer_specs}
         agent_config = resolve_stage_agent_config(args)
@@ -1380,6 +1464,10 @@ def run_overall_review_stage(
             and str(item.reviewer_key or item.role_name).strip() not in reviewer_selections_by_name
         ]
         if missing_reviewer_specs:
+            reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
+                allow_previous_stage_back,
+                stdin_is_interactive() and not bool(reviewer_selections_by_name),
+            )
             reviewer_selections_by_name.update(
                 collect_reviewer_agent_selections(
                     project_dir=project_dir,
@@ -1394,6 +1482,8 @@ def run_overall_review_stage(
                         _developer_display_name(project_dir=project_dir),
                         *(str(item.worker.session_name or "").strip() for item in live_reviewer_handoffs if str(item.worker.session_name or "").strip()),
                     ),
+                    allow_back_first_prompt=reviewer_selection_allow_back,
+                    stage_key="overall_review_reviewer_selection",
                 )
             )
         reviewers = build_reviewer_workers(
