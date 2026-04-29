@@ -3780,6 +3780,137 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["workers"][0]["health_status"], "dead")
         self.assertEqual(snapshot["workers"][0]["health_note"], "tmux session missing")
 
+    def test_routing_setup_prompt_suppresses_manifest_only_dead_workers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True)
+            runtime_root = build_routing_runtime_root(project_dir)
+            for file_path in required_routing_layer_paths(project_dir):
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text("ok", encoding="utf-8")
+
+            run_root = runtime_root / "run_demo"
+            run_root.mkdir(parents=True)
+            (run_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "manifest_version": 1,
+                        "run_id": "run_demo",
+                        "runtime_dir": str(run_root),
+                        "project_dir": str(project_dir),
+                        "selection": {"project_dir": str(project_dir), "selected_dirs": [], "skipped_dirs": [], "forced_dirs": [], "project_missing_files": []},
+                        "config": {"vendor": "codex", "model": "gpt-5.4", "reasoning_effort": "high", "proxy_url": ""},
+                        "status": "running",
+                        "created_at": "2026-04-16T10:00:00",
+                        "updated_at": "2026-04-16T10:00:00",
+                        "workers": [
+                            {
+                                "work_dir": str(project_dir),
+                                "session_name": "sess-routing-dead",
+                                "workflow_stage": "create_running",
+                                "result_status": "running",
+                                "agent_state": "READY",
+                                "health_status": "alive",
+                                "state_path": "",
+                                "transcript_path": "",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), action="stage.a01.start")  # noqa: SLF001
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda name: False)  # noqa: SLF001
+            server._pending_prompt = PendingPromptState(  # noqa: SLF001
+                prompt_id="prompt-routing",
+                prompt_type="select",
+                payload={
+                    "stage_key": "routing",
+                    "stage_step_index": 1,
+                    "prompt_text": "是否执行 AGENT初始化",
+                    "options": [{"value": "yes", "label": "yes"}, {"value": "no", "label": "no"}],
+                },
+            )
+
+            snapshot = server._build_routing_snapshot()  # noqa: SLF001
+
+        self.assertEqual(snapshot["workers"], [])
+
+    def test_routing_skip_prompt_resolution_clears_manifest_only_workers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            project_dir.mkdir(parents=True)
+            runtime_root = build_routing_runtime_root(project_dir)
+            for file_path in required_routing_layer_paths(project_dir):
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text("ok", encoding="utf-8")
+
+            run_root = runtime_root / "run_demo"
+            run_root.mkdir(parents=True)
+            (run_root / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "manifest_version": 1,
+                        "run_id": "run_demo",
+                        "runtime_dir": str(run_root),
+                        "project_dir": str(project_dir),
+                        "selection": {"project_dir": str(project_dir), "selected_dirs": [], "skipped_dirs": [], "forced_dirs": [], "project_missing_files": []},
+                        "config": {"vendor": "codex", "model": "gpt-5.4", "reasoning_effort": "high", "proxy_url": ""},
+                        "status": "running",
+                        "created_at": "2026-04-16T10:00:00",
+                        "updated_at": "2026-04-16T10:00:00",
+                        "workers": [
+                            {
+                                "work_dir": str(project_dir),
+                                "session_name": "sess-routing-dead",
+                                "workflow_stage": "create_running",
+                                "result_status": "running",
+                                "agent_state": "READY",
+                                "health_status": "alive",
+                                "state_path": "",
+                                "transcript_path": "",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            server._set_context(project_dir=str(project_dir), action="stage.a01.start")  # noqa: SLF001
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda name: False)  # noqa: SLF001
+            server._pending_prompts["prompt-routing"] = PendingPromptState(  # noqa: SLF001
+                prompt_id="prompt-routing",
+                prompt_type="select",
+                payload={
+                    "stage_key": "routing",
+                    "stage_step_index": 1,
+                    "prompt_text": "是否执行 AGENT初始化",
+                    "options": [{"value": "yes", "label": "yes"}, {"value": "no", "label": "no"}],
+                },
+            )
+            server._pending_prompt = server._pending_prompts["prompt-routing"]  # noqa: SLF001
+
+            server._handle_prompt_resolved("prompt-routing", {"value": "no"})  # noqa: SLF001
+            snapshot = server._build_routing_snapshot()  # noqa: SLF001
+            events = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+
+        self.assertEqual(snapshot["workers"], [])
+        self.assertIsNone(server._pending_prompt)  # noqa: SLF001
+        self.assertEqual(server._pending_prompts, {})  # noqa: SLF001
+        self.assertTrue(
+            any(
+                item.get("kind") == "event"
+                and item.get("type") == "snapshot.stage"
+                and item.get("payload", {}).get("route") == "routing"
+                and item.get("payload", {}).get("snapshot", {}).get("workers") == []
+                for item in events
+            )
+        )
+
     def test_bridge_ui_runtime_state_change_notifier_debounces_app_and_current_stage_snapshots(self):
         writer = io.StringIO()
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)

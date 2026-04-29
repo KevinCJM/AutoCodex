@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from A00_main import (
+from A00_main_tui import (
     build_parser,
     build_pre_development_task_record_path,
     build_pre_development_task_record_payload,
@@ -186,29 +186,29 @@ class A00MainTests(unittest.TestCase):
                 self.assertEqual(reviewer_handoff, ())
                 return _RequirementsStageResult(requirement_name="需求A")
 
-            with patch("A00_main.routing_stage_main", side_effect=fake_a01), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", side_effect=fake_a01), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 side_effect=fake_a02,
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 side_effect=fake_a03,
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 side_effect=fake_a04,
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=fake_a05,
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=fake_a06,
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 side_effect=fake_a07,
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 side_effect=fake_a08,
-            ), patch("A00_main.clear_pending_tty_input", side_effect=lambda: lifecycle.append("flush")), patch(
-                "A00_main.notify_stage_action_changed",
+            ), patch("A00_main_tui.clear_pending_tty_input", side_effect=lambda: lifecycle.append("flush")), patch(
+                "A00_main_tui.notify_stage_action_changed",
                 side_effect=stage_notifications.append,
             ), patch("sys.stdout", stdout):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A", "--yes"])
@@ -255,28 +255,28 @@ class A00MainTests(unittest.TestCase):
 
                 return inner
 
-            with patch("A00_main.routing_stage_main", side_effect=remember("a01", 0)), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", side_effect=remember("a01", 0)), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 side_effect=remember("a02", _RequirementsStageResult(requirement_name="需求A")),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 side_effect=remember("a03", _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 side_effect=remember("a04", _RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba")),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=remember("a05", _RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=())),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=remember("a06", _RequirementsStageResult(requirement_name="需求A")),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 side_effect=remember("a07", _RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=())),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 side_effect=remember("a08", _RequirementsStageResult(requirement_name="需求A")),
-            ), patch("A00_main.clear_pending_tty_input"), patch("A00_main.notify_stage_action_changed"):
+            ), patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
                 exit_code = main([
                     "--project-dir",
                     tmpdir,
@@ -307,28 +307,28 @@ class A00MainTests(unittest.TestCase):
                     raise PromptBackRequested()
                 return _RequirementsStageResult(requirement_name="需求A")
 
-            with patch("A00_main.routing_stage_main", side_effect=route), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", side_effect=route), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 side_effect=intake,
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=()),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=()),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
-            ), patch("A00_main.clear_pending_tty_input"), patch("A00_main.notify_stage_action_changed"):
+            ), patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
                 exit_code = main([])
 
         self.assertEqual(exit_code, 0)
@@ -355,30 +355,30 @@ class A00MainTests(unittest.TestCase):
                 return _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")
 
             with patch(
-                "A00_main.routing_stage_main",
+                "A00_main_tui.routing_stage_main",
                 return_value=SimpleNamespace(project_dir=tmpdir, skipped=False, exit_code=0),
             ), patch(
-                "A00_main.run_requirement_intake_stage",
+                "A00_main_tui.run_requirement_intake_stage",
                 side_effect=intake,
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 side_effect=clarification,
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=()),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=()),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
-            ), patch("A00_main.clear_pending_tty_input"), patch("A00_main.notify_stage_action_changed"):
+            ), patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
                 exit_code = main(["--project-dir", tmpdir])
 
         self.assertEqual(exit_code, 0)
@@ -403,30 +403,30 @@ class A00MainTests(unittest.TestCase):
                 return _RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba")
 
             with patch(
-                "A00_main.routing_stage_main",
+                "A00_main_tui.routing_stage_main",
                 return_value=SimpleNamespace(project_dir=tmpdir, skipped=False, exit_code=0),
             ), patch(
-                "A00_main.run_requirement_intake_stage",
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 side_effect=clarification,
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 side_effect=review,
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=()),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=()),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
-            ), patch("A00_main.clear_pending_tty_input"), patch("A00_main.notify_stage_action_changed"):
+            ), patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
                 exit_code = main(["--project-dir", tmpdir])
 
         self.assertEqual(exit_code, 0)
@@ -462,28 +462,28 @@ class A00MainTests(unittest.TestCase):
 
                 return _runner
 
-            with patch("A00_main.routing_stage_main", side_effect=remember("a01", 0)), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", side_effect=remember("a01", 0)), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 side_effect=remember("a02", _RequirementsStageResult(requirement_name="需求A")),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 side_effect=remember("a03", _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 side_effect=remember("a04", _RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba")),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=remember("a05", _RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=())),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=remember("a06", _RequirementsStageResult(requirement_name="需求A")),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 side_effect=remember("a07", _RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=())),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
             ) as a08_mock, patch(
-                "A00_main.notify_stage_action_changed",
+                "A00_main_tui.notify_stage_action_changed",
                 side_effect=stage_notifications.append,
             ):
                 exit_code = main(
@@ -542,28 +542,28 @@ class A00MainTests(unittest.TestCase):
 
                 return _runner
 
-            with patch("A00_main.routing_stage_main", side_effect=remember("a01", 0)), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", side_effect=remember("a01", 0)), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 side_effect=remember("a02", _RequirementsStageResult(requirement_name="需求A")),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 side_effect=remember("a03", _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 side_effect=remember("a04", _RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba")),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=remember("a05", _RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=())),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=remember("a06", _RequirementsStageResult(requirement_name="需求A")),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 side_effect=remember("a07", _RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=())),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 side_effect=remember("a08", _RequirementsStageResult(requirement_name="需求A")),
-            ), patch("A00_main.notify_stage_action_changed"):
+            ), patch("A00_main_tui.notify_stage_action_changed"):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A", "--agent-config", str(config_path)])
 
         self.assertEqual(exit_code, 0)
@@ -576,20 +576,20 @@ class A00MainTests(unittest.TestCase):
 
     def test_main_reraises_stage_exception_in_bridge_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            with patch("A00_main._bridge_terminal_active", return_value=True), patch(
-                "A00_main.routing_stage_main",
+            with patch("A00_main_tui._bridge_terminal_active", return_value=True), patch(
+                "A00_main_tui.routing_stage_main",
                 return_value=0,
             ), patch(
-                "A00_main.run_requirement_intake_stage",
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=RuntimeError("详细设计失败"),
             ):
                 with self.assertRaisesRegex(RuntimeError, "详细设计失败"):
@@ -598,20 +598,20 @@ class A00MainTests(unittest.TestCase):
     def test_main_keeps_return_one_for_stage_exception_in_cli_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             stdout = io.StringIO()
-            with patch("A00_main._bridge_terminal_active", return_value=False), patch(
-                "A00_main.routing_stage_main",
+            with patch("A00_main_tui._bridge_terminal_active", return_value=False), patch(
+                "A00_main_tui.routing_stage_main",
                 return_value=0,
             ), patch(
-                "A00_main.run_requirement_intake_stage",
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=RuntimeError("详细设计失败"),
             ), patch("sys.stdout", stdout):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A"])
@@ -635,26 +635,26 @@ class A00MainTests(unittest.TestCase):
                 observed["a06_reviewer_handoff"] = reviewer_handoff
                 return _RequirementsStageResult(requirement_name="需求A")
 
-            with patch("A00_main.routing_stage_main", return_value=0), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", return_value=0), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=fake_a05,
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=fake_a06,
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff=None, reviewer_handoff=()),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A", "--yes"])
@@ -679,26 +679,26 @@ class A00MainTests(unittest.TestCase):
                 observed["reviewer_handoff"] = reviewer_handoff
                 return _RequirementsStageResult(requirement_name="需求A")
 
-            with patch("A00_main.routing_stage_main", return_value=0), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", return_value=0), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None, reviewer_handoff=()),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=fake_a06,
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff=None, reviewer_handoff=()),
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A", "--yes"])
@@ -729,32 +729,32 @@ class A00MainTests(unittest.TestCase):
                 self.assertEqual(reviewer_handoff, ())
                 return _RequirementsStageResult(requirement_name="需求A")
 
-            with patch("A00_main.routing_stage_main", return_value=0), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", return_value=0), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None, reviewer_handoff=()),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 side_effect=fake_a07,
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 side_effect=fake_a08,
             ), patch(
-                "A00_main.cleanup_stale_development_runtime_state",
+                "A00_main_tui.cleanup_stale_development_runtime_state",
                 side_effect=lambda project_dir, requirement_name: lifecycle.append(f"cleanup:{project_dir}:{requirement_name}") or (),
             ), patch(
-                "A00_main.notify_stage_action_changed",
+                "A00_main_tui.notify_stage_action_changed",
                 side_effect=lambda action: lifecycle.append(f"stage:{action}"),
             ):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A", "--yes"])
@@ -772,20 +772,20 @@ class A00MainTests(unittest.TestCase):
 
     def test_main_stops_when_a01_fails(self):
         stdout = io.StringIO()
-        with patch("A00_main.routing_stage_main", return_value=1), patch(
-            "A00_main.run_requirement_intake_stage",
+        with patch("A00_main_tui.routing_stage_main", return_value=1), patch(
+            "A00_main_tui.run_requirement_intake_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A"),
         ) as mocked_a02, patch(
-            "A00_main.run_requirements_clarification_stage",
+            "A00_main_tui.run_requirements_clarification_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
         ) as mocked_a03, patch(
-            "A00_main.run_requirements_review_stage",
+            "A00_main_tui.run_requirements_review_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
         ) as mocked_a04, patch(
-            "A00_main.run_detailed_design_stage",
+            "A00_main_tui.run_detailed_design_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None),
         ) as mocked_a05, patch(
-            "A00_main.run_task_split_stage",
+            "A00_main_tui.run_task_split_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A"),
         ) as mocked_a06, patch("sys.stdout", stdout):
             exit_code = main(["--project-dir", "/tmp/project"])
@@ -800,23 +800,23 @@ class A00MainTests(unittest.TestCase):
     def test_main_stops_when_a04_fails(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             stdout = io.StringIO()
-            with patch("A00_main.routing_stage_main", return_value=0), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", return_value=0), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 side_effect=RuntimeError("review failed"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff=None, reviewer_handoff=()),
             ), patch("sys.stdout", stdout):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A"])
@@ -827,23 +827,23 @@ class A00MainTests(unittest.TestCase):
     def test_main_stops_when_a05_fails(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             stdout = io.StringIO()
-            with patch("A00_main.routing_stage_main", return_value=0), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", return_value=0), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=RuntimeError("design failed"),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff=None, reviewer_handoff=()),
             ), patch("sys.stdout", stdout):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A"])
@@ -854,23 +854,23 @@ class A00MainTests(unittest.TestCase):
     def test_main_stops_when_a06_fails(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             stdout = io.StringIO()
-            with patch("A00_main.routing_stage_main", return_value=0), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", return_value=0), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A"),
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba"),
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=RuntimeError("task split failed"),
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 return_value=0,
             ), patch("sys.stdout", stdout):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A"])
@@ -880,28 +880,28 @@ class A00MainTests(unittest.TestCase):
 
     def test_main_delegates_missing_project_dir_to_a01(self):
         with patch(
-            "A00_main.routing_stage_main",
+            "A00_main_tui.routing_stage_main",
             return_value=SimpleNamespace(project_dir="/tmp/project", exit_code=0),
         ) as routing_stage, patch(
-            "A00_main.run_requirement_intake_stage",
+            "A00_main_tui.run_requirement_intake_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A"),
         ) as intake_stage, patch(
-            "A00_main.run_requirements_clarification_stage",
+            "A00_main_tui.run_requirements_clarification_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
         ), patch(
-            "A00_main.run_requirements_review_stage",
+            "A00_main_tui.run_requirements_review_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
         ), patch(
-            "A00_main.run_detailed_design_stage",
+            "A00_main_tui.run_detailed_design_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None, reviewer_handoff=None),
         ), patch(
-            "A00_main.run_task_split_stage",
+            "A00_main_tui.run_task_split_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A"),
         ), patch(
-            "A00_main.run_development_stage",
+            "A00_main_tui.run_development_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff=None, reviewer_handoff=()),
         ), patch(
-            "A00_main.run_overall_review_stage",
+            "A00_main_tui.run_overall_review_stage",
             return_value=_RequirementsStageResult(requirement_name="需求A"),
         ):
             exit_code = main([])
@@ -1000,26 +1000,26 @@ class A00MainTests(unittest.TestCase):
                 calls["a08"] = list(argv)
                 return _RequirementsStageResult(requirement_name="需求A")
 
-            with patch("A00_main.routing_stage_main", side_effect=fake_a01), patch(
-                "A00_main.run_requirement_intake_stage",
+            with patch("A00_main_tui.routing_stage_main", side_effect=fake_a01), patch(
+                "A00_main_tui.run_requirement_intake_stage",
                 side_effect=fake_a02,
             ), patch(
-                "A00_main.run_requirements_clarification_stage",
+                "A00_main_tui.run_requirements_clarification_stage",
                 side_effect=fake_a03,
             ), patch(
-                "A00_main.run_requirements_review_stage",
+                "A00_main_tui.run_requirements_review_stage",
                 side_effect=fake_a04,
             ), patch(
-                "A00_main.run_detailed_design_stage",
+                "A00_main_tui.run_detailed_design_stage",
                 side_effect=fake_a05,
             ), patch(
-                "A00_main.run_task_split_stage",
+                "A00_main_tui.run_task_split_stage",
                 side_effect=fake_a06,
             ), patch(
-                "A00_main.run_development_stage",
+                "A00_main_tui.run_development_stage",
                 side_effect=fake_a07,
             ), patch(
-                "A00_main.run_overall_review_stage",
+                "A00_main_tui.run_overall_review_stage",
                 side_effect=fake_a08,
             ):
                 exit_code = main(

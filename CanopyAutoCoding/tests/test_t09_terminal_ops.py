@@ -277,7 +277,7 @@ class T09TerminalOpsTests(unittest.TestCase):
             patch("T09_terminal_ops.sys.stdout.isatty", return_value=True),
             patch("T09_terminal_ops.ensure_tui_dependencies_installed"),
             patch("T09_terminal_ops.attach_external_process", side_effect=RuntimeError("bun missing")),
-            patch("T09_terminal_ops.sys.argv", ["A00_main.py"]),
+            patch("T09_terminal_ops.sys.argv", ["A00_main_tui.py"]),
         ):
             with self.assertRaisesRegex(RuntimeError, "bun missing"):
                 maybe_launch_tui(None, route="home", action="workflow.a00.start")
@@ -288,7 +288,7 @@ class T09TerminalOpsTests(unittest.TestCase):
             patch("T09_terminal_ops.sys.stdout.isatty", return_value=True),
             patch("T09_terminal_ops.ensure_tui_dependencies_installed") as ensure_install,
             patch("T09_terminal_ops.attach_external_process", return_value=0) as attach_process,
-            patch("T09_terminal_ops.sys.argv", ["A00_main.py"]),
+            patch("T09_terminal_ops.sys.argv", ["A00_main_tui.py"]),
         ):
             redirected, payload = maybe_launch_tui(None, route="home", action="workflow.a00.start")
         self.assertTrue(redirected)
