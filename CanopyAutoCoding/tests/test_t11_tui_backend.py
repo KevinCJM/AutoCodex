@@ -2704,6 +2704,31 @@ class T11TuiBackendTests(unittest.TestCase):
                 for worker in list(server._workers.values()):  # noqa: SLF001
                     worker.join(timeout=2.0)
 
+    def test_nonzero_routing_error_includes_failed_target_details(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        result = SimpleNamespace(
+            exit_code=1,
+            batch_result=SimpleNamespace(
+                results=[
+                    SimpleNamespace(work_dir="/tmp/project", status="passed"),
+                    SimpleNamespace(
+                        work_dir="/tmp/project/core",
+                        status="failed",
+                        failure_reason="create_command_failed: prompt timeout",
+                    ),
+                ]
+            ),
+        )
+
+        with self.assertRaises(RuntimeError) as context:
+            server._raise_for_nonzero_exit_code(action="stage.a01.start", stage_seq=1, result=result)  # noqa: SLF001
+
+        message = str(context.exception)
+        self.assertIn("stage.a01.start exited with non-zero code: 1", message)
+        self.assertIn("failed routing targets", message)
+        self.assertIn("/tmp/project/core", message)
+        self.assertIn("create_command_failed: prompt timeout", message)
+
     def test_workflow_status_downgrades_to_awaiting_input_when_runner_leaves_file_driven_hitl(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)

@@ -3032,6 +3032,44 @@ class BridgeCore:
         except Exception:
             return 0
 
+    @staticmethod
+    def _get_mapping_or_attr(source: Any, key: str, default: Any = None) -> Any:
+        if isinstance(source, Mapping):
+            return source.get(key, default)
+        return getattr(source, key, default)
+
+    @classmethod
+    def _result_failure_summary(cls, result: Any) -> str:
+        batch_result = cls._get_mapping_or_attr(result, "batch_result")
+        if not batch_result:
+            return ""
+        results = cls._get_mapping_or_attr(batch_result, "results", ())
+        if not isinstance(results, Sequence) or isinstance(results, (str, bytes)):
+            return ""
+        lines: list[str] = []
+        for item in results:
+            status = str(
+                cls._get_mapping_or_attr(item, "status", "")
+                or cls._get_mapping_or_attr(item, "result_status", "")
+            ).strip()
+            if status != "failed":
+                continue
+            work_dir = str(cls._get_mapping_or_attr(item, "work_dir", "")).strip() or "(unknown)"
+            reason = str(
+                cls._get_mapping_or_attr(item, "failure_reason", "")
+                or cls._get_mapping_or_attr(item, "note", "")
+                or status
+            ).strip()
+            if len(reason) > 500:
+                reason = f"{reason[:497]}..."
+            lines.append(f"- {work_dir}: {reason}")
+        if not lines:
+            return ""
+        if len(lines) > 5:
+            remaining = len(lines) - 5
+            lines = lines[:5] + [f"- ... and {remaining} more failed target(s)"]
+        return "failed routing targets:\n" + "\n".join(lines)
+
     def _resolve_terminal_stage_target(
         self,
         *,
@@ -3058,7 +3096,11 @@ class BridgeCore:
             fallback_action=action,
             fallback_stage_seq=stage_seq,
         )
-        raise RuntimeError(f"{final_action or action} exited with non-zero code: {exit_code}")
+        message = f"{final_action or action} exited with non-zero code: {exit_code}"
+        failure_summary = self._result_failure_summary(result)
+        if failure_summary:
+            message = f"{message}\n{failure_summary}"
+        raise RuntimeError(message)
 
     def _build_requirement_intake_argv(
         self,

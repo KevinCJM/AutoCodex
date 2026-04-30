@@ -669,6 +669,36 @@ def determine_exit_code(batch_result: BatchInitResult) -> int:
     return 1 if any(item.status == "failed" for item in batch_result.results) else 0
 
 
+def failed_batch_results(batch_result: BatchInitResult) -> list[DirectoryInitResult]:
+    return [item for item in batch_result.results if item.status == "failed"]
+
+
+def render_routing_failure_summary(
+    batch_result: BatchInitResult,
+    killed_sessions: Sequence[str],
+    cleanup_result: RoutingCleanupResult | None = None,
+) -> str:
+    cleanup_result = cleanup_result or RoutingCleanupResult()
+    lines = ["路由层初始化未完全通过"]
+    failures = failed_batch_results(batch_result)
+    if failures:
+        lines.append("失败目录:")
+        for item in failures:
+            reason = item.failure_reason or item.last_audit_summary or item.status
+            line = f"- {item.work_dir}: {reason}"
+            lines.append(line)
+    if killed_sessions:
+        lines.append(f"已清理路由层 tmux 会话: {len(killed_sessions)}")
+    else:
+        lines.append("路由层 tmux 会话已清理")
+    if cleanup_result.removed_intermediate_count:
+        lines.append(f"已清理阶段中间文件: {cleanup_result.removed_intermediate_count}")
+    if cleanup_result.removed_runtime_count:
+        lines.append(f"已清理阶段运行目录: {cleanup_result.removed_runtime_count}")
+    lines.append("请修复失败目录后重新发起路由初始化。")
+    return "\n".join(lines)
+
+
 def render_requirements_stage_placeholder(
     killed_sessions: Sequence[str],
     cleanup_result: RoutingCleanupResult | None = None,
@@ -938,11 +968,15 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
     )
     killed_sessions = kill_run_tmux_sessions(run_store=run_store)
     cleanup_result = cleanup_routing_stage_artifacts(batch_result=batch_result)
-    message(render_requirements_stage_placeholder(killed_sessions, cleanup_result))
+    exit_code = determine_exit_code(batch_result)
+    if exit_code == 0:
+        message(render_requirements_stage_placeholder(killed_sessions, cleanup_result))
+    else:
+        message(render_routing_failure_summary(batch_result, killed_sessions, cleanup_result))
     return RoutingStageResult(
         project_dir=request.project_dir,
         skipped=False,
-        exit_code=determine_exit_code(batch_result),
+        exit_code=exit_code,
         batch_result=batch_result,
         killed_sessions=tuple(killed_sessions),
         cleanup_result=cleanup_result,

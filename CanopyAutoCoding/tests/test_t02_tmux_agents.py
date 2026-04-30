@@ -1443,6 +1443,111 @@ workspace (/directory)                                                     branc
         self.assertEqual(worker.wait_calls, 2)
         self.assertTrue(any(note.startswith("still_running:") for _, note, _ in worker.state_notes))
 
+    def test_run_turn_keeps_waiting_when_prompt_confirmation_times_out_but_codex_is_busy(self):
+        class BusyAfterPromptTimeoutWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+                self.wait_calls = 0
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "AutoCodex"
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "• Planning scan and write actions (20s • esc to interrupt)"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="• Planning scan and write actions (20s • esc to interrupt)\n\n› Explain this codebase",
+                    raw_log_delta="",
+                    raw_log_tail="• Planning scan and write actions (20s • esc to interrupt)",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-30T10:32:39",
+                    pane_title="⠋ AutoCodex",
+                )
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):
+                raise TimeoutError("等待智能体确认收到 prompt 超时")
+
+            def wait_for_turn_artifacts(self, *, contract, task_status_path=None, timeout_sec):
+                self.wait_calls += 1
+                artifact_path.write_text("", encoding="utf-8")
+                contract.status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "turn_id": contract.turn_id,
+                            "phase": contract.phase,
+                            "status": "done",
+                            "written_at": "2026-04-30T10:33:00+08:00",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                if task_status_path is not None:
+                    write_task_status(task_status_path, status="done")
+                self.current_task_runtime_status = "done"
+                return contract.validator(contract.status_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            contract_path = root / "routing_status.json"
+            artifact_path = root / "AGENTS.md"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"agents": str(artifact_path)},
+                    artifact_hashes={"agents": "sha256:agents"},
+                    validated_at="2026-04-30T10:33:01",
+                )
+
+            worker = BusyAfterPromptTimeoutWorker(
+                worker_id="busy-after-prompt-timeout-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=root / "runtime",
+            )
+            result = worker.run_turn(
+                label="create_routing_layer",
+                prompt="write routing files only",
+                completion_contract=TurnFileContract(
+                    turn_id="create_routing_layer_1",
+                    phase="routing_layer_create",
+                    status_path=contract_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                ),
+                timeout_sec=1.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertEqual(worker.wait_calls, 1)
+
     def test_run_turn_marks_wrapper_ready_after_success(self):
         class SubmitStateWorker(TmuxBatchWorker):
             def _append_transcript(self, title, body):

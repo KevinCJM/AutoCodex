@@ -3334,6 +3334,17 @@ class TmuxBatchWorker:
                 if task_result is not None:
                     return task_result
 
+    def _infer_prompt_submission_from_busy_agent_after_timeout(self) -> bool:
+        observation = self._busy_agent_observation_after_turn_timeout()
+        if observation is None:
+            return False
+        self._log_event(
+            "prompt_submission_inferred_from_busy_agent",
+            current_command=observation.current_command,
+            pane_title=observation.pane_title,
+        )
+        return True
+
     def _turn_failure_runtime_state_extra(self, clean_output: str) -> dict[str, object]:
         if is_provider_runtime_error(clean_output):
             self.agent_ready = False
@@ -4981,6 +4992,11 @@ class TmuxBatchWorker:
                 )
                 return result
             except TimeoutError as error:
+                if (
+                        not prompt_submission_observed
+                        and (completion_contract is not None or result_contract is not None)
+                ):
+                    prompt_submission_observed = self._infer_prompt_submission_from_busy_agent_after_timeout()
                 if completion_contract is not None:
                     file_result = self._try_finalize_turn_artifacts_after_timeout(
                         contract=completion_contract,
