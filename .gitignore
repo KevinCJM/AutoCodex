@@ -179,6 +179,9 @@ cython_debug/
 # Node
 node_modules/
 
+# Local generated media output
+codex-disk-incident/
+
 # Abstra
 # Abstra is an AI-powered process automation framework.
 # Ignore directories containing user credentials, local state, and settings.

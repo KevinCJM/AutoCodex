@@ -4085,7 +4085,7 @@ class TmuxBatchWorker:
         return _agent_command_running(current_command, self.config.expected_current_commands())
 
     def _codex_title_candidates(self) -> tuple[str, ...]:
-        candidates = ["AutoCodex"]
+        candidates = ["TmuxCodingTeam"]
         work_dir_name = self.work_dir.name.strip()
         if work_dir_name and work_dir_name not in candidates:
             candidates.append(work_dir_name)

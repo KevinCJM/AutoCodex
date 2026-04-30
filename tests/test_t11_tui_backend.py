@@ -243,7 +243,7 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertTrue(snapshot["pending"])
         self.assertEqual(snapshot["reason"], "hitl")
-        self.assertIn(("TmuxAutoCodingTeam 需要人工介入", "任务拆分", "请选择 reviewer 模型"), notifications)
+        self.assertIn(("TmuxCodingTeam 需要人工介入", "任务拆分", "请选择 reviewer 模型"), notifications)
 
     def test_human_attention_manager_initial_notify_is_async(self):
         manager = HumanAttentionManager(

@@ -58,7 +58,7 @@ class TmuxAgentsTests(unittest.TestCase):
             health_status=health_status,
             health_note=health_status,
             agent_state=agent_state,
-            pane_title="AutoCodex",
+            pane_title="TmuxCodingTeam",
             last_heartbeat_at="2026-04-24T00:00:00",
             last_log_offset=0,
             current_command="codex",
@@ -330,8 +330,8 @@ s
                 "codex",
                 "gpt-5.4-mini",
                 "",
-                {"visible_text": "› Continue", "raw_log_tail": "› Continue", "current_command": "codex", "pane_title": "AutoCodex"},
-                {"visible_text": "› Continue", "raw_log_tail": "› Continue", "current_command": "codex", "pane_title": "⠋ AutoCodex"},
+                {"visible_text": "› Continue", "raw_log_tail": "› Continue", "current_command": "codex", "pane_title": "TmuxCodingTeam"},
+                {"visible_text": "› Continue", "raw_log_tail": "› Continue", "current_command": "codex", "pane_title": "⠋ TmuxCodingTeam"},
             ),
             (
                 "claude",
@@ -539,7 +539,7 @@ s
             worker.agent_state = AgentRuntimeState.READY
             worker.agent_ready = True
             worker.agent_started = True
-            worker.last_pane_title = "AutoCodex"
+            worker.last_pane_title = "TmuxCodingTeam"
             self.assertEqual(
                 worker._infer_wrapper_state(
                     current_command="codex",
@@ -1205,7 +1205,7 @@ workspace (/directory)                                                     branc
                 self.agent_ready = True
                 self.agent_state = AgentRuntimeState.READY
                 self.wrapper_state = WrapperState.READY
-                self.last_pane_title = "AutoCodex"
+                self.last_pane_title = "TmuxCodingTeam"
 
             def observe(self, *, tail_lines=500, tail_bytes=24000):
                 if not self.agent_ready:
@@ -1219,7 +1219,7 @@ workspace (/directory)                                                     branc
                         session_exists=True,
                         log_mtime=0.0,
                         observed_at="2026-04-28T17:23:00",
-                        pane_title="⠋ AutoCodex",
+                        pane_title="⠋ TmuxCodingTeam",
                     )
                 return WorkerObservation(
                     visible_text="›",
@@ -1231,7 +1231,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-28T17:24:00",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def target_exists(self, target=None):
@@ -1289,7 +1289,7 @@ workspace (/directory)                                                     branc
                 self.agent_ready = True
                 self.agent_state = AgentRuntimeState.READY
                 self.wrapper_state = WrapperState.READY
-                self.last_pane_title = "AutoCodex"
+                self.last_pane_title = "TmuxCodingTeam"
 
             def observe(self, *, tail_lines=500, tail_bytes=24000):
                 return WorkerObservation(
@@ -1302,7 +1302,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-28T17:23:00",
-                    pane_title="⠋ AutoCodex" if not self.agent_ready else "AutoCodex",
+                    pane_title="⠋ TmuxCodingTeam" if not self.agent_ready else "TmuxCodingTeam",
                 )
 
             def target_exists(self, target=None):
@@ -1353,7 +1353,7 @@ workspace (/directory)                                                     branc
                 self.wrapper_state = WrapperState.READY
                 self.current_command = "node"
                 self.current_path = str(self.work_dir)
-                self.last_pane_title = "AutoCodex"
+                self.last_pane_title = "TmuxCodingTeam"
 
             def target_exists(self, target=None):
                 return True
@@ -1372,7 +1372,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-28T19:16:56",
-                    pane_title="⠋ AutoCodex",
+                    pane_title="⠋ TmuxCodingTeam",
                 )
 
             def _send_text(self, text, enter_count=None):
@@ -1461,7 +1461,7 @@ workspace (/directory)                                                     branc
                 self.wrapper_state = WrapperState.READY
                 self.current_command = "node"
                 self.current_path = str(self.work_dir)
-                self.last_pane_title = "AutoCodex"
+                self.last_pane_title = "TmuxCodingTeam"
 
             def target_exists(self, target=None):
                 return True
@@ -1480,7 +1480,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-30T10:32:39",
-                    pane_title="⠋ AutoCodex",
+                    pane_title="⠋ TmuxCodingTeam",
                 )
 
             def _send_text(self, text, enter_count=None):
@@ -1558,7 +1558,7 @@ workspace (/directory)                                                     branc
                 self.agent_ready = True
                 self.agent_started = True
                 self.agent_state = AgentRuntimeState.READY
-                self.last_pane_title = "AutoCodex"
+                self.last_pane_title = "TmuxCodingTeam"
                 self.current_command = "codex"
                 self.current_path = str(self.work_dir)
 
@@ -1580,7 +1580,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-15T00:00:00",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def _send_text(self, text, enter_count=None):
@@ -1805,7 +1805,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-17T00:00:00",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def capture_visible(self, tail_lines=500):
@@ -1969,7 +1969,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-25T00:00:00",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2078,7 +2078,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-20T00:00:00",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def _can_finalize_turn_artifacts_without_helper(self, observation):
@@ -2678,7 +2678,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-25T00:00:00",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2738,7 +2738,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:00",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2819,7 +2819,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2873,7 +2873,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2931,7 +2931,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="⠋ AutoCodex",
+                    pane_title="⠋ TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2994,7 +2994,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3052,7 +3052,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3107,7 +3107,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="⠋ AutoCodex",
+                    pane_title="⠋ TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3162,7 +3162,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3213,7 +3213,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3269,7 +3269,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-24T00:00:00",
-                    pane_title="⠋ AutoCodex",
+                    pane_title="⠋ TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -3433,7 +3433,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-16T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def _maybe_send_task_completion_nudge(self, **kwargs):
@@ -3574,7 +3574,7 @@ workspace (/directory)                                                     branc
                 self.wrapper_state = WrapperState.READY
                 self.current_command = "codex"
                 self.current_path = str(self.work_dir)
-                self.last_pane_title = "AutoCodex"
+                self.last_pane_title = "TmuxCodingTeam"
 
             def _send_text(self, text, enter_count=None):
                 self.sent_text = text
@@ -3585,14 +3585,14 @@ workspace (/directory)                                                     branc
             def observe(self, *, tail_lines=500, tail_bytes=24000):
                 prompt_sent = bool(getattr(self, "sent_text", ""))
                 if not prompt_sent:
-                    pane_title = "AutoCodex"
+                    pane_title = "TmuxCodingTeam"
                     surface = "› Continue"
                 elif self.after_submit_observes == 0:
                     self.after_submit_observes += 1
-                    pane_title = "⠋ AutoCodex"
+                    pane_title = "⠋ TmuxCodingTeam"
                     surface = "working"
                 else:
-                    pane_title = "AutoCodex"
+                    pane_title = "TmuxCodingTeam"
                     surface = "› Continue"
                 return WorkerObservation(
                     visible_text=surface,
@@ -3648,7 +3648,7 @@ workspace (/directory)                                                     branc
                 self.wrapper_state = WrapperState.READY
                 self.current_command = "codex"
                 self.current_path = str(self.work_dir)
-                self.last_pane_title = "AutoCodex"
+                self.last_pane_title = "TmuxCodingTeam"
 
             def _send_text(self, text, enter_count=None):
                 self.sent_text = text
@@ -3667,7 +3667,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-24T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def capture_visible(self, tail_lines=500):
@@ -3823,7 +3823,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-20T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def _maybe_send_task_completion_nudge(self, **kwargs):
@@ -3896,7 +3896,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-20T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def _maybe_send_task_completion_nudge(self, **kwargs):
@@ -3971,7 +3971,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-20T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
             def _maybe_send_task_completion_nudge(self, **kwargs):
@@ -4434,7 +4434,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-25T00:00:03",
-                    pane_title="AutoCodex",
+                    pane_title="TmuxCodingTeam",
                 )
 
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -5941,7 +5941,7 @@ Do you trust the files in this folder?
                 return str(self.work_dir)
 
             def pane_title(self):
-                return "AutoCodex"
+                return "TmuxCodingTeam"
 
             def pane_dead(self):
                 return False
@@ -6034,12 +6034,12 @@ Do you trust the files in this folder?
             display.pane_id = "%1"
             display.current_command = "codex"
             display.current_path = tmp_dir
-            display.last_pane_title = "AutoCodex"
+            display.last_pane_title = "TmuxCodingTeam"
             self.assertEqual(
                 display._capture_pane_liveness_snapshot(),  # noqa: SLF001
-                (True, "codex", tmp_dir, "AutoCodex", False),
+                (True, "codex", tmp_dir, "TmuxCodingTeam", False),
             )
-            self.assertEqual(display._capture_passive_observation().pane_title, "AutoCodex")  # noqa: SLF001
+            self.assertEqual(display._capture_passive_observation().pane_title, "TmuxCodingTeam")  # noqa: SLF001
 
     def test_file_wait_liveness_probe_skips_until_probe_interval(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -6113,7 +6113,7 @@ Do you trust the files in this folder?
                 return str(self.work_dir)
 
             def pane_title(self):
-                return "AutoCodex"
+                return "TmuxCodingTeam"
 
             def pane_dead(self):
                 return False
@@ -6265,7 +6265,7 @@ Do you trust the files in this folder?
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-24T00:00:00",
-                    pane_title="⠋ AutoCodex",
+                    pane_title="⠋ TmuxCodingTeam",
                 )
             )
             self.assertEqual(busy.agent_state, AgentRuntimeState.BUSY.value)

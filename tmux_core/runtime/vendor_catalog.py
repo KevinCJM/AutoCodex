@@ -232,12 +232,12 @@ def _now_iso() -> str:
 def _cache_root() -> Path:
     xdg_cache_home = str(os.environ.get("XDG_CACHE_HOME", "")).strip()
     if xdg_cache_home:
-        return Path(xdg_cache_home).expanduser().resolve() / "tmux_auto_coding_team"
+        return Path(xdg_cache_home).expanduser().resolve() / "tmux_coding_team"
     if os.name == "nt":
         local_app_data = str(os.environ.get("LOCALAPPDATA", "")).strip()
         if local_app_data:
-            return Path(local_app_data).expanduser().resolve() / "tmux_auto_coding_team"
-    return Path.home().expanduser().resolve() / ".cache" / "tmux_auto_coding_team"
+            return Path(local_app_data).expanduser().resolve() / "tmux_coding_team"
+    return Path.home().expanduser().resolve() / ".cache" / "tmux_coding_team"
 
 
 def catalog_cache_path() -> Path:

@@ -518,7 +518,7 @@ class HumanAttentionManager:
             state=AttentionState(
                 prompt_id=prompt_id_text,
                 reason=_prompt_attention_reason(prompt_type, payload),
-                title="TmuxAutoCodingTeam 需要人工介入",
+                title="TmuxCodingTeam 需要人工介入",
                 subtitle=stage_label_text,
                 body=_build_attention_body(prompt_type, payload),
                 started_at=_iso_now(),
