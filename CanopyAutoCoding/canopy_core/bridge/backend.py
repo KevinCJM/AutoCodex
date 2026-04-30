@@ -1201,6 +1201,7 @@ class BridgeCore:
         self._artifact_index_scope: tuple[str, str] = ("", "")
         self._artifact_index_items: list[dict[str, Any]] = []
         self._pending_prompt_display_state: dict[str, Any] | None = None
+        self._routing_manifest_worker_suppressed_projects: set[str] = set()
         self._active_control_id = ""
         self._tmux_runtime = TmuxRuntimeController()
         self._attention_manager = HumanAttentionManager(
@@ -1299,13 +1300,21 @@ class BridgeCore:
         if current is None and self._pending_prompt is not None and self._pending_prompt.prompt_id == prompt_id_text:
             current = self._pending_prompt
             self._pending_prompt = None
+        elif current is not None and self._pending_prompt is not None and self._pending_prompt.prompt_id == prompt_id_text:
+            self._pending_prompt = None
+        routing_snapshot_changed = False
         if current is not None:
             self._update_context_from_prompt_response(current, payload or {})
+            routing_snapshot_changed = self._update_routing_manifest_suppression_from_prompt(current, payload or {})
             self._remember_resolved_hitl_prompt(current)
         latest_pending = self._latest_pending_prompt()
         self._pending_prompt = latest_pending
         self._attention_manager.resolve_prompt(prompt_id)
-        self._emit_snapshot_update(include_app=True, include_hitl=True)
+        self._emit_snapshot_update(
+            include_app=True,
+            include_hitl=True,
+            stage_routes=("routing",) if routing_snapshot_changed else (),
+        )
 
     def record_tui_presence(self, reason: str, shell_focus: str) -> dict[str, Any]:
         if str(self._adapter_name or "").strip().lower() != "tui":
@@ -1370,6 +1379,70 @@ class BridgeCore:
             question_path=question_path,
             question_summary=question_summary,
         )
+
+    @staticmethod
+    def _prompt_stage_step_index(prompt: PendingPromptState) -> int:
+        try:
+            return int(prompt.payload.get("stage_step_index", -1))
+        except Exception:
+            return -1
+
+    @staticmethod
+    def _routing_setup_prompt(prompt: PendingPromptState) -> bool:
+        payload = prompt.payload
+        if str(payload.get("stage_key", "")).strip() == "routing":
+            return True
+        prompt_text = str(payload.get("prompt_text", "") or payload.get("title", "")).strip()
+        return "AGENT初始化" in prompt_text or "routing" in prompt_text.lower()
+
+    def _routing_manifest_workers_suppressed(self, project_dir: str) -> bool:
+        project_text = str(project_dir or "").strip()
+        if not project_text:
+            return False
+        normalized_project_dir = str(Path(project_text).expanduser().resolve())
+        if normalized_project_dir in self._routing_manifest_worker_suppressed_projects:
+            return True
+        return any(self._routing_setup_prompt(prompt) for prompt in self._iter_pending_prompts())
+
+    def _set_routing_manifest_worker_suppression(self, project_dir: str, *, suppressed: bool) -> None:
+        project_text = str(project_dir or "").strip()
+        if not project_text:
+            return
+        normalized_project_dir = str(Path(project_text).expanduser().resolve())
+        if suppressed:
+            self._routing_manifest_worker_suppressed_projects.add(normalized_project_dir)
+        else:
+            self._routing_manifest_worker_suppressed_projects.discard(normalized_project_dir)
+
+    def _update_routing_manifest_suppression_from_prompt(
+        self,
+        prompt: PendingPromptState,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        if not self._routing_setup_prompt(prompt):
+            return False
+        step_index = self._prompt_stage_step_index(prompt)
+        prompt_text = str(prompt.payload.get("prompt_text", "") or prompt.payload.get("title", "")).strip()
+        if step_index not in {1, 7} and "AGENT初始化" not in prompt_text:
+            return False
+        value = str(payload.get("value", "")).strip().lower()
+        if value not in {"yes", "no"}:
+            return False
+        project_dir = self._resolve_project_dir()
+        if not project_dir:
+            return False
+        normalized_project_dir = str(Path(project_dir).expanduser().resolve())
+        before = normalized_project_dir in self._routing_manifest_worker_suppressed_projects
+        self._set_routing_manifest_worker_suppression(project_dir, suppressed=value == "no")
+        after = normalized_project_dir in self._routing_manifest_worker_suppressed_projects
+        return value == "no" or before != after
+
+    def _update_routing_manifest_suppression_from_result(self, result: Any) -> None:
+        skipped = bool(getattr(result, "skipped", False))
+        project_dir = str(getattr(result, "project_dir", "") or "").strip()
+        if not project_dir:
+            return
+        self._set_routing_manifest_worker_suppression(project_dir, suppressed=skipped)
 
     def _handle_runtime_stage_change(self, action: str) -> None:
         normalized = str(action or "").strip()
@@ -1872,7 +1945,7 @@ class BridgeCore:
         workers = list(control_snapshot.get("workers", []))
         status_text = str(control_snapshot.get("status_text", "")).strip()
         done = bool(control_snapshot.get("done", False))
-        if not workers:
+        if not workers and not self._routing_manifest_workers_suppressed(project_dir):
             store = self._latest_run_store(project_dir=project_dir)
             if store is not None:
                 workers = [self._manifest_worker_snapshot(entry) for entry in store.manifest.workers]
@@ -2959,6 +3032,44 @@ class BridgeCore:
         except Exception:
             return 0
 
+    @staticmethod
+    def _get_mapping_or_attr(source: Any, key: str, default: Any = None) -> Any:
+        if isinstance(source, Mapping):
+            return source.get(key, default)
+        return getattr(source, key, default)
+
+    @classmethod
+    def _result_failure_summary(cls, result: Any) -> str:
+        batch_result = cls._get_mapping_or_attr(result, "batch_result")
+        if not batch_result:
+            return ""
+        results = cls._get_mapping_or_attr(batch_result, "results", ())
+        if not isinstance(results, Sequence) or isinstance(results, (str, bytes)):
+            return ""
+        lines: list[str] = []
+        for item in results:
+            status = str(
+                cls._get_mapping_or_attr(item, "status", "")
+                or cls._get_mapping_or_attr(item, "result_status", "")
+            ).strip()
+            if status != "failed":
+                continue
+            work_dir = str(cls._get_mapping_or_attr(item, "work_dir", "")).strip() or "(unknown)"
+            reason = str(
+                cls._get_mapping_or_attr(item, "failure_reason", "")
+                or cls._get_mapping_or_attr(item, "note", "")
+                or status
+            ).strip()
+            if len(reason) > 500:
+                reason = f"{reason[:497]}..."
+            lines.append(f"- {work_dir}: {reason}")
+        if not lines:
+            return ""
+        if len(lines) > 5:
+            remaining = len(lines) - 5
+            lines = lines[:5] + [f"- ... and {remaining} more failed target(s)"]
+        return "failed routing targets:\n" + "\n".join(lines)
+
     def _resolve_terminal_stage_target(
         self,
         *,
@@ -2985,7 +3096,11 @@ class BridgeCore:
             fallback_action=action,
             fallback_stage_seq=stage_seq,
         )
-        raise RuntimeError(f"{final_action or action} exited with non-zero code: {exit_code}")
+        message = f"{final_action or action} exited with non-zero code: {exit_code}"
+        failure_summary = self._result_failure_summary(result)
+        if failure_summary:
+            message = f"{message}\n{failure_summary}"
+        raise RuntimeError(message)
 
     def _build_requirement_intake_argv(
         self,
@@ -3137,6 +3252,8 @@ class BridgeCore:
                     )
                     result = runner()
                 self._update_context_from_result(result, action=action)
+                if action == "stage.a01.start":
+                    self._update_routing_manifest_suppression_from_result(result)
                 self._raise_for_nonzero_exit_code(action=action, stage_seq=stage_seq, result=result)
                 self._validate_stage_success_before_completed(action=action, result=result)
                 if respond and request_id:

@@ -30,6 +30,7 @@ from A01_Routing_LayerPlanning import (
     prompt_vendor,
     render_live_progress_frame,
     render_live_progress_line,
+    render_routing_failure_summary,
     render_runtime_start_summary,
     render_requirements_stage_placeholder,
     summarize_live_result_counts,
@@ -267,6 +268,45 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertIn("已清理阶段运行目录: 1", text)
         self.assertIn("进入需求录入阶段（占位）", text)
         self.assertIn("A02_RequirementIntake.py", text)
+
+    def test_render_routing_failure_summary_lists_failed_targets_without_next_stage(self):
+        batch = BatchInitResult(
+            run_id="run_demo",
+            runtime_dir="/tmp/runtime/run_demo",
+            selection=TargetSelection(
+                project_dir="/tmp/project",
+                selected_dirs=("/tmp/project", "/tmp/project/core"),
+                skipped_dirs=(),
+                forced_dirs=(),
+                project_missing_files=(),
+            ),
+            config={
+                "vendor": "codex",
+                "model": "gpt-5.4",
+                "reasoning_effort": "high",
+                "proxy_url": "",
+                "reasoning_note": "reasoning_effort=high",
+            },
+            results=[
+                DirectoryInitResult(work_dir="/tmp/project", forced=False, status="passed", rounds_used=1),
+                DirectoryInitResult(
+                    work_dir="/tmp/project/core",
+                    forced=False,
+                    status="failed",
+                    rounds_used=1,
+                    failure_reason="create_command_failed: prompt timeout",
+                ),
+            ],
+        )
+
+        text = render_routing_failure_summary(batch, ["aginit-core"])
+
+        self.assertIn("路由层初始化未完全通过", text)
+        self.assertIn("/tmp/project/core", text)
+        self.assertIn("create_command_failed: prompt timeout", text)
+        self.assertIn("已清理路由层 tmux 会话: 1", text)
+        self.assertNotIn("进入需求录入阶段（占位）", text)
+        self.assertNotIn("A02_RequirementIntake.py", text)
 
     def test_render_runtime_start_summary_includes_tmux_sessions_and_attach_commands(self):
         run_store = type(

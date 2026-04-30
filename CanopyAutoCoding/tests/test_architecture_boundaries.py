@@ -23,7 +23,7 @@ def _collect_imports(relative_path: str) -> set[str]:
 
 class ArchitectureBoundaryTests(unittest.TestCase):
     def test_top_level_entrypoints_are_real_module_aliases(self):
-        import A00_main
+        import A00_main_tui
         import A04_RequirementsReview
         import A05_DetailedDesign
         import A08_OverallReview
@@ -35,7 +35,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         from canopy_core.stage_kernel import detailed_design, overall_review, requirements_review
         from canopy_core.workflow import entry
 
-        self.assertIs(A00_main, entry)
+        self.assertIs(A00_main_tui, entry)
         self.assertIs(A04_RequirementsReview, requirements_review)
         self.assertIs(A05_DetailedDesign, detailed_design)
         self.assertIs(A08_OverallReview, overall_review)
@@ -81,7 +81,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         self.assertIn("canopy_core.stage_kernel.detailed_design", bridge_imports)
         self.assertIn("canopy_core.stage_kernel.overall_review", bridge_imports)
         self.assertIn("canopy_core.runtime.tmux_runtime", bridge_imports)
-        self.assertNotIn("A00_main", bridge_imports)
+        self.assertNotIn("A00_main_tui", bridge_imports)
         self.assertNotIn("A04_RequirementsReview", bridge_imports)
         self.assertNotIn("A05_DetailedDesign", bridge_imports)
         self.assertNotIn("A08_OverallReview", bridge_imports)
