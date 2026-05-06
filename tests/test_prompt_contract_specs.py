@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tmux_core.prompt_contracts.spec import (
     CHANGE_MUST_CHANGE,
@@ -489,7 +490,10 @@ class PromptContractSpecTests(unittest.TestCase):
                     review_md.write_text("stale bug\n", encoding="utf-8")
                     return SimpleNamespace(ok=True, clean_output="")
 
-            with self.assertRaisesRegex(RuntimeError, "review_md|forbidden"):
+            with patch(
+                "tmux_core.stage_kernel.turn_output_goals.request_file_noncompliance_intervention",
+                side_effect=RuntimeError("review_md must be empty on pass"),
+            ), self.assertRaisesRegex(RuntimeError, "review_md|forbidden"):
                 run_prompt_completion_turn(
                     worker=StalePassWorker(),
                     prompt_fn=reviewer_review_code,
@@ -516,7 +520,10 @@ class PromptContractSpecTests(unittest.TestCase):
                     review_md.write_text("old bug\n", encoding="utf-8")
                     return SimpleNamespace(ok=True, clean_output="")
 
-            with self.assertRaisesRegex(RuntimeError, "未变化"):
+            with patch(
+                "tmux_core.stage_kernel.turn_output_goals.request_file_noncompliance_intervention",
+                side_effect=RuntimeError("artifact 未变化: review_md"),
+            ), self.assertRaisesRegex(RuntimeError, "未变化"):
                 run_prompt_completion_turn(
                     worker=StaleFailWorker(),
                     prompt_fn=reviewer_review_code,

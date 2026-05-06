@@ -9,16 +9,14 @@ export function TaskSplitRoute(props: Props) {
   return (
     <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} flexGrow={1}>
       <text>任务拆分</text>
-      <text fg="#888888">项目目录: {props.snapshot.projectDir || '(unset)'}</text>
-      <text fg="#888888">需求名称: {props.snapshot.requirementName || '(unset)'}</text>
+      <text fg="#888888">{`项目目录: ${props.snapshot.projectDir || '(unset)'}`}</text>
+      <text fg="#888888">{`需求名称: ${props.snapshot.requirementName || '(unset)'}`}</text>
       <box borderStyle="single" paddingLeft={1} paddingRight={1} flexDirection="column">
         <text>阶段文档</text>
         <Show when={props.snapshot.files.length > 0} fallback={<text fg="#888888">尚未发现任务拆分产物。</text>}>
           <For each={props.snapshot.files}>
             {(item) => (
-              <text fg={item.exists ? '#00d2ff' : '#888888'}>
-                {item.label}: {item.exists ? 'ready' : 'missing'}
-              </text>
+              <text fg={item.exists ? '#00d2ff' : '#888888'}>{`${item.label}: ${item.exists ? 'ready' : 'missing'}`}</text>
             )}
           </For>
         </Show>
@@ -27,7 +25,7 @@ export function TaskSplitRoute(props: Props) {
         <text>Workers</text>
         <Show when={props.snapshot.workers.length > 0} fallback={<text fg="#888888">当前没有任务拆分 workers。</text>}>
           <For each={props.snapshot.workers}>
-            {(worker) => <text>{worker.sessionName} | {worker.workflowStage}/{worker.agentState} | {worker.healthStatus}</text>}
+            {(worker) => <text>{`${worker.sessionName} | ${worker.workflowStage}/${worker.agentState} | ${worker.healthStatus}`}</text>}
           </For>
         </Show>
       </box>

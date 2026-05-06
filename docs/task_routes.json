@@ -1,653 +1,308 @@
 {
-  "schema_version": "1.2",
+  "schema_version": "1.1",
   "scope_mode": "subtree_only",
+  "allowed_unresolved_sentinels": ["unknown", "out_of_scope", "needs_code_confirmation"],
   "selector_contract": {
-    "selector_fields": [
-      "first_read_selectors",
-      "then_check_selectors",
-      "read_before_edit_selectors"
-    ],
-    "selector_types": [
-      {
-        "id": "literal_path",
-        "required_fields": [
-          "path"
-        ]
+    "selector_types": {
+      "literal": {
+        "required": ["type", "path"],
+        "output": "exact_path",
+        "path_policy": "relative_to_scope_root_no_parent_segments"
       },
-      {
-        "id": "owned_paths_role",
-        "required_fields": [
-          "role"
-        ]
+      "subtree": {
+        "required": ["type", "path"],
+        "output": "subtree_anchor",
+        "enumeration_policy": "do_not_auto_enumerate_descendants"
       },
-      {
-        "id": "field_ref",
-        "required_fields": [
-          "field"
-        ],
+      "token": {
+        "required": ["type", "token"],
+        "output": "resolver_defined"
+      },
+      "field_ref": {
+        "required": ["type", "field"],
         "allowed_fields": [
+          "entry_selectors",
           "first_read_selectors",
-          "then_check_selectors"
-        ]
-      }
-    ],
-    "selector_contexts": {
-      "module_selector_fields": {
-        "container_paths": [
-          "modules[].first_read_selectors",
-          "modules[].then_check_selectors",
-          "modules[].read_before_edit_selectors"
+          "then_check_selectors",
+          "related_test_selectors",
+          "related_config_selectors",
+          "minimum_regression_selectors",
+          "read_before_edit_selectors"
         ],
-        "binding_module_policy": "current_module"
+        "output": "inline_same_module_field"
       },
-      "route_selector_fields": {
-        "container_paths": [
-          "routes[].route_selector_appends",
-          "routes[].route_then_check_appends",
-          "routes[].route_overrides.first_read_selectors",
-          "routes[].route_overrides.then_check_selectors"
-        ],
-        "literal_path_binding": "none",
-        "non_literal_binding_required_for": [
-          "owned_paths_role",
-          "field_ref"
-        ],
-        "non_literal_binding_field": "module_id",
-        "non_literal_binding_validation": "selector.module_id must reference one module id listed in route.first_read_modules",
-        "bound_module_usage": {
-          "owned_paths_role": "scan only the bound module owned_paths",
-          "field_ref": "inline only the bound module selector field"
-        },
-        "omitted_non_literal_binding_policy": "invalid"
+      "owned_paths_role": {
+        "required": ["type", "role"],
+        "output": "owned_paths_filtered_by_role"
       }
     },
-    "resolution_output": {
-      "kind": "ordered_path_anchor_list",
-      "anchor_fields": [
-        "path",
-        "match",
-        "role",
-        "origin_field"
-      ],
-      "origin_field_semantics": "the selector field currently being materialized into output anchors",
-      "origin_field_allowed_values": [
-        "first_read_selectors",
-        "then_check_selectors",
-        "read_before_edit_selectors"
-      ],
-      "origin_field_assignment_scope": "set from the active output selector field before expansion and preserved unchanged through recursion and materialization",
-      "directory_anchor_policy": "if a materialized anchor has match=subtree, the directory root path itself is the read target",
-      "enumeration_policy": "never auto-enumerate descendants from subtree anchors",
-      "dedupe_basis": [
-        "path",
-        "match",
-        "role",
-        "origin_field"
-      ]
-    },
-    "expansion_algorithm": [
-      {
-        "step": 0,
-        "op": "enter_selector_field_frame",
-        "input": "one selector field listed in selector_fields",
-        "set_active_origin_field_from": "input.selector_field",
-        "active_origin_field_constraints": "must remain one of resolution_output.origin_field_allowed_values for the full expansion frame"
+    "token_registry": {
+      "matched_stage_entry": {
+        "resolver_inputs": ["task_text", "route_id", "M03_stage_family.owned_paths[role=stage_entry]"],
+        "output_type": "literal",
+        "fallback": "needs_code_confirmation"
       },
+      "matched_prompt_file": {
+        "resolver_inputs": ["task_text", "route_id", "M04_prompt_contracts.owned_paths[role=business_prompt]"],
+        "output_type": "literal",
+        "fallback": "needs_code_confirmation"
+      },
+      "matched_shared_file": {
+        "resolver_inputs": ["task_text", "M08_shared_support.owned_paths"],
+        "output_type": "literal",
+        "fallback": "needs_code_confirmation"
+      },
+      "matched_failing_test": {
+        "resolver_inputs": ["test_failure_identifier", "task_text"],
+        "output_type": "literal",
+        "fallback": "needs_code_confirmation"
+      },
+      "nearest_tested_module": {
+        "resolver_inputs": ["matched_failing_test", "repo_map.relations"],
+        "output_type": "module_id_or_selector",
+        "fallback": "needs_code_confirmation"
+      },
+      "implementation_under_test": {
+        "resolver_inputs": ["matched_failing_test", "import_trace_inside_scope"],
+        "output_type": "literal_or_subtree",
+        "fallback": "needs_code_confirmation"
+      },
+      "direct_callers": {
+        "resolver_inputs": ["selected_path", "visible_import_or_call_trace"],
+        "output_type": "literal_list",
+        "fallback": "needs_code_confirmation"
+      },
+      "specific_requested_generated_path": {
+        "resolver_inputs": ["task_text", "M10_generated_artifacts.owned_paths"],
+        "output_type": "literal_or_subtree",
+        "fallback": "needs_code_confirmation"
+      },
+      "generator_or_test_for_artifact": {
+        "resolver_inputs": ["specific_requested_generated_path", "repo_map.relations", "related_test_selectors"],
+        "output_type": "literal_or_module_ref",
+        "fallback": "needs_code_confirmation"
+      }
+    }
+  },
+  "resolution_model": {
+    "module_source": "docs/repo_map.json modules[]",
+    "route_source": "docs/task_routes.json routes[]",
+    "operations": [
       {
         "step": 1,
-        "op": "literal_path_passthrough",
-        "selector_type": "literal_path",
-        "ordering": "preserve_selector_order",
-        "materialize_as": {
-          "path_source": "selector.path",
-          "match": "exact",
-          "role": null,
-          "origin_field_source": "active_origin_field"
-        },
-        "route_level_binding": "not_applicable"
+        "op": "match_routes",
+        "input_fields": ["routes[].match_keywords", "routes[].negative_keywords", "routes[].route_priority"],
+        "output_field": "matched_routes",
+        "dedupe_key": ["route_id"]
       },
       {
         "step": 2,
-        "op": "field_ref_inline",
-        "selector_type": "field_ref",
-        "lookup_scope": "same_module_only",
-        "ordering": "depth_first_preserve_referenced_order",
-        "cycle_policy": "invalid",
-        "origin_field_policy": "preserve_active_origin_field",
-        "route_level_binding_policy": "when selector is stored in a route selector field, resolve lookup_scope against selector.module_id and reject if selector.module_id is missing or invalid"
+        "op": "collect_module_defaults",
+        "input_fields": ["routes[].first_read_modules"],
+        "module_fields": [
+          "first_read_selectors",
+          "then_check_selectors",
+          "related_test_selectors",
+          "related_config_selectors",
+          "minimum_regression_selectors"
+        ],
+        "output_fields": [
+          "first_read_selectors",
+          "then_check_selectors",
+          "related_test_selectors",
+          "related_config_selectors",
+          "minimum_regression_selectors"
+        ],
+        "dedupe_key": ["type", "path", "token", "field", "role"]
       },
       {
         "step": 3,
-        "op": "owned_paths_role_scan",
-        "selector_type": "owned_paths_role",
-        "source": "modules[].owned_paths",
-        "lookup_scope": "same_module_only",
-        "ordering": "preserve_owned_paths_declaration_order",
-        "filter": "owned_path.role == selector.role",
-        "route_level_binding_policy": "when selector is stored in a route selector field, scan only the module identified by selector.module_id and reject if selector.module_id is missing or invalid"
+        "op": "apply_route_deltas",
+        "input_fields": ["routes[].selector_deltas"],
+        "merge": "append",
+        "dedupe_key": ["type", "path", "token", "field", "role"]
       },
       {
         "step": 4,
-        "op": "owned_path_materialize",
-        "source": "matched_owned_path",
-        "exact_match_output": "emit_exact_path_anchor",
-        "subtree_match_output": "emit_subtree_root_anchor_only",
-        "materialized_anchor_fields": {
-          "path_source": "matched_owned_path.path",
-          "match_source": "matched_owned_path.match",
-          "role_source": "matched_owned_path.role",
-          "origin_field_source": "active_origin_field"
-        }
+        "op": "apply_route_overrides",
+        "input_fields": ["routes[].selector_overrides"],
+        "merge": "replace_named_output_field",
+        "dedupe_key": ["type", "path", "token", "field", "role"]
       },
       {
         "step": 5,
-        "op": "dedupe",
-        "strategy": "stable_first_seen_exact_tuple",
-        "tuple_fields": [
-          "path",
-          "match",
-          "role",
-          "origin_field"
-        ]
+        "op": "materialize_selectors",
+        "input_fields": [
+          "first_read_selectors",
+          "then_check_selectors",
+          "related_test_selectors",
+          "related_config_selectors",
+          "minimum_regression_selectors"
+        ],
+        "selector_contract_ref": "#/selector_contract",
+        "fallback_policy": "emit_allowed_unresolved_sentinel"
       }
     ]
   },
-  "resolution_model": {
-    "module_owned_fields": [
-      "first_read_selectors",
-      "then_check_selectors",
-      "related_tests",
-      "related_configs",
-      "minimum_regression"
-    ],
-    "module_order_source": "first_read_modules",
-    "route_delta_fields": {
-      "route_selector_appends": "append_to_first_read_selectors",
-      "route_then_check_appends": "append_to_then_check_selectors",
-      "route_test_appends": "append_to_related_tests",
-      "route_config_appends": "append_to_related_configs",
-      "route_regression_appends": "append_to_minimum_regression"
-    },
-    "route_override_fields": [
-      "first_read_selectors",
-      "then_check_selectors",
-      "related_tests",
-      "related_configs",
-      "minimum_regression"
-    ],
-    "selector_contract_ref": "#/selector_contract",
-    "delta_application_order": [
-      "route_selector_appends",
-      "route_then_check_appends",
-      "route_test_appends",
-      "route_config_appends",
-      "route_regression_appends"
-    ],
-    "merge_steps": [
-      "1_collect_module_owned_fields_from_first_read_modules_in_listed_order",
-      "2_apply_route_delta_fields_in_delta_application_order",
-      "3_apply_route_overrides_as_exact_replacement_for_named_fields",
-      "4_dedupe_each_result_field_using_dedupe_strategy"
-    ],
-    "override_precedence": "route_overrides replace module-derived and route-appended values for the named field exactly",
-    "missing_field_semantics": "omitted route delta or override fields mean no route-level modification for that field",
-    "dedupe_strategy": "stable_first_seen_exact_value"
+  "cross_file_validation": {
+    "module_ids": "routes[].first_read_modules and pitfalls[].affected_modules must exist in repo_map.modules[].id",
+    "pitfall_ids": "modules[].pitfall_ids and routes[].pitfall_ids must exist in pitfalls.pitfalls[].id",
+    "relation_targets": "repo_map.modules[].relations[].target must exist in repo_map.modules[].id",
+    "selector_tokens": "every selector type=token must exist in selector_contract.token_registry",
+    "selector_fields": "every selector type=field_ref must use selector_contract.selector_types.field_ref.allowed_fields",
+    "literal_path_policy": "literal/subtree paths must stay inside scope root and must not contain parent traversal",
+    "allowed_unresolved_sentinels_ref": "#/allowed_unresolved_sentinels"
   },
   "condition_code_registry": {
-    "module_expand_search_codes": {
-      "MX01": "workflow_stage_surface_changed",
-      "MX02": "workflow_flag_or_requirement_handoff_changed",
-      "MX03": "wrapper_target_mapping_unclear",
-      "MX04": "shared_review_or_runtime_artifact_surface_changed",
-      "MX05": "runtime_resume_status_or_provider_surface_changed",
-      "MX06": "prompt_permission_or_prompt_runtime_boundary_unclear",
-      "MX07": "bridge_protocol_or_python_tui_boundary_changed",
-      "MX08": "frontend_route_family_or_protocol_consumer_changed",
-      "MX09": "shared_support_fanout_or_scope_handling_changed",
-      "MX10": "routing_reference_or_id_mismatch"
+    "expand_search_codes": {
+      "TX01": "module_reference_ambiguous",
+      "TX02": "wrapper_target_unconfirmed",
+      "TX03": "cross_module_contract_touched",
+      "TX04": "external_runtime_implicated",
+      "TX05": "frontend_backend_protocol_touched",
+      "TX06": "prompt_contract_boundary_touched",
+      "TX07": "generated_artifact_boundary_touched"
     },
-    "route_expand_search_codes": {
-      "TX01": "route_reference_not_visible_or_id_mismatch",
-      "TX02": "multi_stage_or_wrapper_surface_touched",
-      "TX03": "requirement_handoff_or_launch_path_involved",
-      "TX04": "stage_family_target_ambiguous",
-      "TX05": "shared_review_or_completion_contract_touched",
-      "TX06": "external_runtime_dependency_implicated",
-      "TX07": "prompt_boundary_or_authorization_unclear",
-      "TX08": "protocol_surface_crosses_python_and_tui",
-      "TX09": "frontend_route_family_expansion_needed",
-      "TX10": "shared_helper_fanout_high",
-      "TX11": "failing_boundary_test_points_to_wrapper_only"
-    },
-    "stop_and_verify_codes": {
-      "SV01": "wrapper_target_not_traced",
-      "SV02": "multi_handoff_surface_change",
-      "SV03": "runtime_companion_not_read",
-      "SV04": "prompt_companion_not_read",
-      "SV05": "external_behavior_assumed_without_visible_artifact",
-      "SV06": "prompt_permission_missing",
-      "SV07": "cross_boundary_side_missing",
-      "SV08": "vendor_tree_targeted",
-      "SV09": "shared_helper_callers_not_checked",
-      "SV10": "boundary_claim_without_visible_reference",
-      "SV11": "routing_docs_drifting_into_prose"
-    },
-    "fact_check_codes": {
-      "FC01": "confirm_wrapper_target",
-      "FC02": "confirm_direct_call_chain",
-      "FC03": "confirm_runtime_and_prompt_boundary",
-      "FC04": "confirm_visible_vs_external_boundary",
-      "FC05": "confirm_prompt_protection_rule",
-      "FC06": "confirm_python_and_tui_protocol_boundary",
-      "FC07": "confirm_package_entry_and_owned_surface",
-      "FC08": "confirm_shared_helper_callers",
-      "FC09": "trace_from_test_to_active_target",
-      "FC10": "confirm_doc_reference_integrity"
+    "stop_codes": {
+      "SV01": "out_of_scope_path",
+      "SV02": "pitfall_gate_triggered",
+      "SV03": "routing_conflict_with_visible_truth"
     }
   },
   "routes": [
     {
-      "id": "R01_routing_docs",
-      "task_type": "routing_layer_docs",
-      "match_keywords": [
-        "agents.md",
-        "repo_map",
-        "task_routes",
-        "pitfalls",
-        "routing layer",
-        "machine-first"
-      ],
-      "negative_keywords": [
-        "business prompt rewrite",
-        "feature implementation"
-      ],
-      "route_priority": 120,
-      "first_read_modules": [
-        "M08_routing_docs"
-      ],
-      "pitfall_ids": [
-        "P07"
-      ],
-      "expand_search_codes": [
-        "TX01"
-      ],
-      "stop_and_verify_codes": [
-        "SV11"
-      ],
-      "fact_check_codes": [
-        "FC10"
-      ],
-      "scope_notes": [
-        "routing artifacts are protocol surfaces, not implementation truth"
-      ]
+      "id": "R01_routing_layer",
+      "task_type": "routing_layer_creation_or_validation",
+      "match_keywords": ["routing_layer", "agents_md", "repo_map", "task_routes", "pitfalls", "machine_first", "audit"],
+      "negative_keywords": ["human_docs", "architecture_overview"],
+      "route_priority": 100,
+      "first_read_modules": ["M09_routing_init_layer", "M04_prompt_contracts", "M11_tests"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P02", "P06", "P08"],
+      "expand_search_codes": ["TX03", "TX06", "TX07"],
+      "stop_codes": ["SV01", "SV02", "SV03"]
     },
     {
       "id": "R02_workflow_entry",
-      "task_type": "workflow_entry_and_stage_chaining",
-      "match_keywords": [
-        "a00",
-        "workflow",
-        "entry",
-        "cli",
-        "stage order",
-        "build_stage_args",
-        "pre development"
-      ],
-      "negative_keywords": [
-        "prompt text",
-        "frontend route"
-      ],
-      "route_priority": 110,
-      "first_read_modules": [
-        "M01_workflow_entry",
-        "M07_shared_support"
-      ],
-      "pitfall_ids": [
-        "P01",
-        "P04"
-      ],
-      "expand_search_codes": [
-        "TX02",
-        "TX03"
-      ],
-      "stop_and_verify_codes": [
-        "SV01",
-        "SV02"
-      ],
-      "fact_check_codes": [
-        "FC01",
-        "FC02"
-      ],
-      "scope_notes": [
-        "do not infer workflow behavior outside this subtree"
-      ]
+      "task_type": "main_workflow_or_stage_chain",
+      "match_keywords": ["a00_main_tui", "workflow", "stage_chain", "legacy_cli", "skip_overall_review", "project_dir"],
+      "negative_keywords": ["web_console", "vite"],
+      "route_priority": 90,
+      "first_read_modules": ["M01_workflow_entry", "M03_stage_family", "M05_tmux_runtime_hitl", "M08_shared_support"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P01", "P04", "P07"],
+      "expand_search_codes": ["TX01", "TX02", "TX03", "TX04"],
+      "stop_codes": ["SV01", "SV03"]
     },
     {
-      "id": "R03_stage_kernel",
-      "task_type": "stage_logic_and_shared_review",
-      "match_keywords": [
-        "a01",
-        "a02",
-        "a03",
-        "a04",
-        "a05",
-        "a06",
-        "a07",
-        "a08",
-        "routing init",
-        "requirement intake",
-        "clarification",
-        "review",
-        "design",
-        "task split",
-        "development",
-        "overall review",
-        "shared review",
-        "role orchestration"
-      ],
-      "negative_keywords": [
-        "prompt source only",
-        "tui frontend only"
-      ],
-      "route_priority": 105,
-      "first_read_modules": [
-        "M02_stage_kernel_family",
-        "M03_runtime_family",
-        "M04_prompt_contract_family"
-      ],
-      "pitfall_ids": [
-        "P01",
-        "P04"
-      ],
-      "expand_search_codes": [
-        "TX04",
-        "TX05"
-      ],
-      "stop_and_verify_codes": [
-        "SV03",
-        "SV04"
-      ],
-      "fact_check_codes": [
-        "FC01",
-        "FC03"
-      ],
-      "scope_notes": [
-        "module family narrowing happens through module selectors, not prose placeholders"
-      ]
+      "id": "R03_stage_behavior",
+      "task_type": "stage_logic_or_artifact_contract",
+      "match_keywords": ["requirement", "clarification", "review", "detailed_design", "task_split", "development", "overall_review", "artifact"],
+      "negative_keywords": [],
+      "route_priority": 85,
+      "first_read_modules": ["M03_stage_family", "M04_prompt_contracts", "M05_tmux_runtime_hitl", "M08_shared_support"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P01", "P02", "P04", "P06"],
+      "expand_search_codes": ["TX02", "TX03", "TX06"],
+      "stop_codes": ["SV02", "SV03"]
     },
     {
-      "id": "R04_runtime_family",
-      "task_type": "runtime_hitl_tmux_and_contracts",
-      "match_keywords": [
-        "tmux",
-        "runtime",
-        "hitl",
-        "resume",
-        "status",
-        "contract",
-        "vendor catalog"
-      ],
-      "negative_keywords": [
-        "ui route only",
-        "prompt wording"
-      ],
-      "route_priority": 104,
-      "first_read_modules": [
-        "M03_runtime_family",
-        "M07_shared_support"
-      ],
-      "pitfall_ids": [
-        "P04",
-        "P06"
-      ],
-      "expand_search_codes": [
-        "TX06"
-      ],
-      "stop_and_verify_codes": [
-        "SV05"
-      ],
-      "fact_check_codes": [
-        "FC04"
-      ],
-      "scope_notes": [
-        "external tmux or provider behavior remains out_of_scope unless visible here"
-      ]
+      "id": "R04_tmux_runtime_hitl",
+      "task_type": "tmux_agent_runtime_or_hitl",
+      "match_keywords": ["tmux", "worker", "hitl", "human_input", "resume", "terminal", "agent_config", "provider", "model", "proxy"],
+      "negative_keywords": [],
+      "route_priority": 80,
+      "first_read_modules": ["M05_tmux_runtime_hitl", "M08_shared_support", "M03_stage_family"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P01", "P04", "P07"],
+      "expand_search_codes": ["TX02", "TX03", "TX04"],
+      "stop_codes": ["SV01", "SV03"]
     },
     {
-      "id": "R05_prompt_contracts",
-      "task_type": "prompt_contracts_and_prompt_boundaries",
-      "match_keywords": [
-        "prompt",
-        "prompt contract",
-        "prompt spec",
-        "system prompt",
-        "review prompt",
-        "development prompt"
-      ],
-      "negative_keywords": [
-        "non-prompt runtime fix",
-        "frontend route only"
-      ],
-      "route_priority": 103,
-      "first_read_modules": [
-        "M04_prompt_contract_family",
-        "M02_stage_kernel_family"
-      ],
-      "route_selector_appends": [
-        {
-          "type": "literal_path",
-          "path": "AGENTS.md"
-        }
-      ],
-      "pitfall_ids": [
-        "P02",
-        "P07"
-      ],
-      "expand_search_codes": [
-        "TX07"
-      ],
-      "stop_and_verify_codes": [
-        "SV06"
-      ],
-      "fact_check_codes": [
-        "FC05"
-      ],
-      "scope_notes": [
-        "prompt routing can identify protected files without authorizing edits"
-      ]
+      "id": "R05_tui_bridge_protocol",
+      "task_type": "opentui_backend_or_protocol",
+      "match_keywords": ["opentui", "tui", "protocol", "ndjson", "t11_tui_backend", "stage_registry", "client_ts"],
+      "negative_keywords": ["web_only"],
+      "route_priority": 80,
+      "first_read_modules": ["M06_bridge_protocol_backends", "M07_frontend_packages", "M05_tmux_runtime_hitl"],
+      "selector_deltas": {
+        "then_check_selectors": [
+          {"type": "literal", "path": "scripts/tmux-tui"}
+        ]
+      },
+      "selector_overrides": {},
+      "pitfall_ids": ["P03", "P05", "P07"],
+      "expand_search_codes": ["TX02", "TX05"],
+      "stop_codes": ["SV02", "SV03"]
     },
     {
-      "id": "R06_bridge_backend",
-      "task_type": "python_bridge_backend_and_protocol",
-      "match_keywords": [
-        "t11",
-        "bridge",
-        "backend",
-        "web backend",
-        "tui backend",
-        "protocol"
-      ],
-      "negative_keywords": [
-        "pure frontend styling",
-        "prompt source only"
-      ],
-      "route_priority": 102,
-      "first_read_modules": [
-        "M05_bridge_backend",
-        "M06_tui_package",
-        "M03_runtime_family"
-      ],
-      "pitfall_ids": [
-        "P01",
-        "P05"
-      ],
-      "expand_search_codes": [
-        "TX08"
-      ],
-      "stop_and_verify_codes": [
-        "SV01",
-        "SV07"
-      ],
-      "fact_check_codes": [
-        "FC01",
-        "FC06"
-      ],
-      "scope_notes": [
-        "backend protocol tasks usually require both python and tui boundary reads"
-      ]
+      "id": "R06_web_console",
+      "task_type": "web_console_or_web_backend",
+      "match_keywords": ["web_console", "a00_main_web", "vite", "webbackend", "healthz", "backend_port"],
+      "negative_keywords": ["opentui_only"],
+      "route_priority": 78,
+      "first_read_modules": ["M02_web_launcher", "M06_bridge_protocol_backends", "M07_frontend_packages"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P05", "P07", "P09"],
+      "expand_search_codes": ["TX05"],
+      "stop_codes": ["SV03"]
     },
     {
-      "id": "R07_tui_frontend",
-      "task_type": "packages_tui_frontend",
-      "match_keywords": [
-        "packages/tui",
-        "solid",
-        "bun",
-        "route component",
-        "ui smoke",
-        "stage registry",
-        "stage status"
-      ],
-      "negative_keywords": [
-        "python runtime only",
-        "prompt source only"
-      ],
-      "route_priority": 101,
-      "first_read_modules": [
-        "M06_tui_package"
-      ],
-      "pitfall_ids": [
-        "P03",
-        "P05"
-      ],
-      "expand_search_codes": [
-        "TX08",
-        "TX09"
-      ],
-      "stop_and_verify_codes": [
-        "SV07",
-        "SV08"
-      ],
-      "fact_check_codes": [
-        "FC06",
-        "FC07"
-      ],
-      "scope_notes": [
-        "node_modules is visible but never an owned edit surface"
-      ]
+      "id": "R07_prompt_contract",
+      "task_type": "prompt_or_output_contract",
+      "match_keywords": ["prompt", "business_prompt", "contract", "output_schema", "reviewer_instruction", "agent_instruction"],
+      "negative_keywords": [],
+      "route_priority": 75,
+      "first_read_modules": ["M04_prompt_contracts", "M03_stage_family"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P02", "P06"],
+      "expand_search_codes": ["TX03", "TX06"],
+      "stop_codes": ["SV02", "SV03"]
     },
     {
       "id": "R08_shared_support",
-      "task_type": "shared_support_config_and_aliases",
-      "match_keywords": [
-        "compat",
-        "alias",
-        "common config",
-        "system python path",
-        "requirements scope",
-        "terminal ops",
-        "pre development"
-      ],
-      "negative_keywords": [
-        "stage business logic only",
-        "frontend only"
-      ],
-      "route_priority": 100,
-      "first_read_modules": [
-        "M07_shared_support",
-        "M01_workflow_entry"
-      ],
-      "pitfall_ids": [
-        "P01",
-        "P04"
-      ],
-      "expand_search_codes": [
-        "TX10"
-      ],
-      "stop_and_verify_codes": [
-        "SV01",
-        "SV09"
-      ],
-      "fact_check_codes": [
-        "FC01",
-        "FC08"
-      ],
-      "scope_notes": [
-        "shared support may require widening into direct callers before edit"
-      ]
+      "task_type": "shared_config_or_helper",
+      "match_keywords": ["t01", "t08", "t12", "u01", "config", "helper", "pre_development", "requirements_common"],
+      "negative_keywords": [],
+      "route_priority": 60,
+      "first_read_modules": ["M08_shared_support", "M01_workflow_entry", "M03_stage_family"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P04", "P06"],
+      "expand_search_codes": ["TX03"],
+      "stop_codes": ["SV03"]
     },
     {
-      "id": "R09_boundary_tests",
-      "task_type": "architecture_boundary_and_contract_regression",
-      "match_keywords": [
-        "architecture boundary",
-        "contract compat",
-        "protocol regression",
-        "compatibility test",
-        "boundary test"
-      ],
-      "negative_keywords": [
-        "new feature only"
-      ],
-      "route_priority": 99,
-      "first_read_modules": [
-        "M01_workflow_entry",
-        "M03_runtime_family",
-        "M04_prompt_contract_family",
-        "M05_bridge_backend",
-        "M08_routing_docs"
-      ],
-      "route_overrides": {
-        "first_read_selectors": [
-          {
-            "type": "literal_path",
-            "path": "tests/test_architecture_boundaries.py"
-          },
-          {
-            "type": "literal_path",
-            "path": "tests/test_runtime_contract_compat.py"
-          },
-          {
-            "type": "literal_path",
-            "path": "tests/test_prompt_contract_specs.py"
-          },
-          {
-            "type": "literal_path",
-            "path": "tests/test_t10_tui_protocol.py"
-          }
-        ],
-        "related_tests": [
-          "tests/test_architecture_boundaries.py",
-          "tests/test_runtime_contract_compat.py",
-          "tests/test_prompt_contract_specs.py",
-          "tests/test_t10_tui_protocol.py"
-        ],
-        "minimum_regression": [
-          "tests/test_architecture_boundaries.py",
-          "tests/test_runtime_contract_compat.py",
-          "tests/test_prompt_contract_specs.py",
-          "tests/test_t10_tui_protocol.py"
-        ]
-      },
-      "pitfall_ids": [
-        "P01",
-        "P02",
-        "P05",
-        "P07"
-      ],
-      "expand_search_codes": [
-        "TX11"
-      ],
-      "stop_and_verify_codes": [
-        "SV10"
-      ],
-      "fact_check_codes": [
-        "FC09",
-        "FC10"
-      ],
-      "scope_notes": [
-        "boundary regression routes start from visible tests, then widen into matched code"
-      ]
+      "id": "R09_tests_regression",
+      "task_type": "test_failure_or_regression_routing",
+      "match_keywords": ["pytest", "test_failure", "regression", "tests", "boundary_test", "failing_test"],
+      "negative_keywords": [],
+      "route_priority": 70,
+      "first_read_modules": ["M11_tests"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P01", "P06"],
+      "expand_search_codes": ["TX01", "TX02"],
+      "stop_codes": ["SV03"]
+    },
+    {
+      "id": "R10_generated_artifacts",
+      "task_type": "generated_fixture_or_e2e_output",
+      "match_keywords": ["_tui_e2e_projects", ".tmp", "fixture", "generated", "sample_project", "space_path"],
+      "negative_keywords": [],
+      "route_priority": 40,
+      "first_read_modules": ["M10_generated_artifacts", "M09_routing_init_layer"],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": ["P08"],
+      "expand_search_codes": ["TX07"],
+      "stop_codes": ["SV01", "SV03"]
     }
   ]
 }

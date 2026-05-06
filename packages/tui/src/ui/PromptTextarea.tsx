@@ -17,12 +17,14 @@ type Props = {
   height?: number
   minHeight?: number
   maxHeight?: number
+  rememberHistory?: boolean
   onSubmit: (value: string) => void
 }
 
 export function PromptTextarea(props: Props) {
   let textarea: ScrollableTextareaRenderable | undefined
-  const resolveInitialValue = () => readPromptDraft(props.draftKey) || props.initialValue || latestPromptHistory(props.draftKey) || ''
+  const resolveInitialValue = () =>
+    readPromptDraft(props.draftKey) || props.initialValue || (props.rememberHistory === false ? '' : latestPromptHistory(props.draftKey)) || ''
   const [value, setValue] = createSignal(resolveInitialValue())
   const minHeight = () => props.minHeight ?? (props.multiline ? 3 : 1)
   const maxHeight = () => props.maxHeight ?? (props.multiline ? 6 : 1)
@@ -145,13 +147,16 @@ export function PromptTextarea(props: Props) {
           }}
           keyBindings={[
             { name: 'return', shift: true, action: 'newline' },
+            { name: 'linefeed', shift: true, action: 'newline' },
             { name: 'return', meta: true, action: 'newline' },
+            { name: 'linefeed', meta: true, action: 'newline' },
             { name: 'j', ctrl: true, action: 'newline' },
             { name: 'return', action: 'submit' },
+            { name: 'linefeed', action: 'submit' },
           ]}
           onSubmit={() => {
             const submittedValue = textarea?.plainText ?? value()
-            rememberPromptValue(props.draftKey, submittedValue)
+            if (props.rememberHistory !== false) rememberPromptValue(props.draftKey, submittedValue)
             clearPromptDraft(props.draftKey)
             props.onSubmit(submittedValue)
           }}

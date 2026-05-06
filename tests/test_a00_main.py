@@ -22,7 +22,7 @@ from A00_main_tui import (
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from tmux_core.stage_kernel.shared_review import ReviewAgentSelection
-from T09_terminal_ops import PromptBackRequested
+from T09_terminal_ops import BridgeTerminalUI, PROMPT_BACK_VALUE, PromptBackRequested, use_terminal_ui
 
 
 @dataclass
@@ -31,6 +31,7 @@ class _RequirementsStageResult:
     ba_handoff: object | None = None
     reviewer_handoff: object | None = None
     developer_handoff: object | None = None
+    reuse_existing_original_requirement: bool = False
 
 
 def _hold_requirement_lock(
@@ -387,6 +388,60 @@ class A00MainTests(unittest.TestCase):
         self.assertIn("--allow-previous-stage-back", clarification_calls[0])
         self.assertIn("--allow-previous-stage-back", clarification_calls[1])
 
+    def test_main_back_from_clarification_after_reuse_reopens_requirement_selection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            intake_calls: list[list[str]] = []
+            clarification_calls: list[list[str]] = []
+
+            def intake(argv):  # noqa: ANN001
+                intake_calls.append(list(argv))
+                if len(intake_calls) == 1:
+                    return _RequirementsStageResult(
+                        requirement_name="需求A",
+                        reuse_existing_original_requirement=True,
+                    )
+                return _RequirementsStageResult(requirement_name="需求A")
+
+            def clarification(argv, preserve_ba_worker=False):  # noqa: ANN001, ARG001
+                clarification_calls.append(list(argv))
+                if len(clarification_calls) == 1:
+                    raise PromptBackRequested()
+                return _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")
+
+            with patch(
+                "A00_main_tui.routing_stage_main",
+                return_value=SimpleNamespace(project_dir=tmpdir, skipped=True, exit_code=0),
+            ), patch(
+                "A00_main_tui.run_requirement_intake_stage",
+                side_effect=intake,
+            ), patch(
+                "A00_main_tui.run_requirements_clarification_stage",
+                side_effect=clarification,
+            ), patch(
+                "A00_main_tui.run_requirements_review_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
+            ), patch(
+                "A00_main_tui.run_detailed_design_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=()),
+            ), patch(
+                "A00_main_tui.run_task_split_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ), patch(
+                "A00_main_tui.run_development_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=()),
+            ), patch(
+                "A00_main_tui.run_overall_review_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ), patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
+                exit_code = main(["--project-dir", tmpdir])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(intake_calls), 2)
+        self.assertEqual(len(clarification_calls), 2)
+        self.assertNotIn("--requirement-name", intake_calls[1])
+        self.assertNotIn("--reuse-existing-original-requirement", intake_calls[1])
+        self.assertIn("--allow-previous-stage-back", intake_calls[1])
+
     def test_main_allows_back_from_requirements_review_first_prompt_to_clarification_stage(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             clarification_calls: list[list[str]] = []
@@ -434,6 +489,176 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(len(review_calls), 2)
         self.assertIn("--allow-previous-stage-back", review_calls[0])
         self.assertIn("--allow-previous-stage-back", clarification_calls[1])
+
+    def test_main_allows_back_across_later_stage_boundaries(self):
+        stage_results = {
+            "a02": _RequirementsStageResult(requirement_name="需求A"),
+            "a03": _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
+            "a04": _RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
+            "a05": _RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=()),
+            "a06": _RequirementsStageResult(requirement_name="需求A"),
+            "a07": _RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=()),
+            "a08": _RequirementsStageResult(requirement_name="需求A"),
+        }
+        cases = (
+            ("a05", "a04"),
+            ("a06", "a05"),
+            ("a07", "a06"),
+            ("a08", "a07"),
+        )
+
+        for back_stage, previous_stage in cases:
+            with self.subTest(back_stage=back_stage):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    calls: dict[str, list[list[str]]] = {stage: [] for stage in stage_results}
+
+                    def runner(stage: str):  # noqa: ANN001
+                        def _run(argv, *args, **kwargs):  # noqa: ANN001
+                            _ = args, kwargs
+                            calls[stage].append(list(argv))
+                            if stage == back_stage and len(calls[stage]) == 1:
+                                raise PromptBackRequested()
+                            return stage_results[stage]
+
+                        return _run
+
+                    with patch(
+                        "A00_main_tui.routing_stage_main",
+                        return_value=SimpleNamespace(project_dir=tmpdir, skipped=False, exit_code=0),
+                    ), patch(
+                        "A00_main_tui.run_requirement_intake_stage",
+                        side_effect=runner("a02"),
+                    ), patch(
+                        "A00_main_tui.run_requirements_clarification_stage",
+                        side_effect=runner("a03"),
+                    ), patch(
+                        "A00_main_tui.run_requirements_review_stage",
+                        side_effect=runner("a04"),
+                    ), patch(
+                        "A00_main_tui.run_detailed_design_stage",
+                        side_effect=runner("a05"),
+                    ), patch(
+                        "A00_main_tui.run_task_split_stage",
+                        side_effect=runner("a06"),
+                    ), patch(
+                        "A00_main_tui.run_development_stage",
+                        side_effect=runner("a07"),
+                    ), patch(
+                        "A00_main_tui.run_overall_review_stage",
+                        side_effect=runner("a08"),
+                    ), patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
+                        exit_code = main(["--project-dir", tmpdir])
+
+                self.assertEqual(exit_code, 0)
+                self.assertEqual(len(calls[back_stage]), 2)
+                self.assertEqual(len(calls[previous_stage]), 2)
+                self.assertIn("--allow-previous-stage-back", calls[back_stage][0])
+                self.assertIn("--allow-previous-stage-back", calls[previous_stage][1])
+
+    def test_main_overall_review_entry_prompt_allows_back_to_development_under_bridge_ui(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            development_calls: list[list[str]] = []
+            overall_review_calls: list[list[str]] = []
+            prompts: list[object] = []
+            prompt_values = [PROMPT_BACK_VALUE, "yes"]
+
+            def request_prompt(request):  # noqa: ANN001
+                prompts.append(request)
+                return {"value": prompt_values.pop(0)}
+
+            ui = BridgeTerminalUI(
+                emit_event=lambda *_args, **_kwargs: None,
+                request_prompt=request_prompt,
+            )
+
+            def fake_a07(argv, preserve_workers=False):  # noqa: ANN001, ARG001
+                development_calls.append(list(argv))
+                return _RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=())
+
+            def fake_a08(argv, developer_handoff=None, reviewer_handoff=None):  # noqa: ANN001, ARG001
+                overall_review_calls.append(list(argv))
+                return _RequirementsStageResult(requirement_name="需求A")
+
+            with use_terminal_ui(ui), patch(
+                "A00_main_tui.routing_stage_main",
+                return_value=SimpleNamespace(project_dir=tmpdir, skipped=False, exit_code=0),
+            ), patch(
+                "A00_main_tui.run_requirement_intake_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ), patch(
+                "A00_main_tui.run_requirements_clarification_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
+            ), patch(
+                "A00_main_tui.run_requirements_review_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
+            ), patch(
+                "A00_main_tui.run_detailed_design_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=()),
+            ), patch(
+                "A00_main_tui.run_task_split_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ), patch(
+                "A00_main_tui.run_development_stage",
+                side_effect=fake_a07,
+            ), patch(
+                "A00_main_tui.run_overall_review_stage",
+                side_effect=fake_a08,
+            ), patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
+                exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(len(development_calls), 2)
+        self.assertEqual(len(overall_review_calls), 1)
+        self.assertEqual(len(prompts), 2)
+        self.assertEqual(prompts[0].prompt_type, "select")
+        self.assertEqual(prompts[0].payload["prompt_text"], "是否执行全面复核")
+        self.assertEqual(prompts[0].payload["options"], [{"value": "yes", "label": "是"}, {"value": "skip", "label": "跳过"}])
+        self.assertTrue(prompts[0].payload["allow_back"])
+        self.assertEqual(prompts[0].payload["back_value"], PROMPT_BACK_VALUE)
+
+    def test_main_overall_review_entry_prompt_can_skip_under_bridge_ui(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prompts: list[object] = []
+
+            def request_prompt(request):  # noqa: ANN001
+                prompts.append(request)
+                return {"value": "skip"}
+
+            ui = BridgeTerminalUI(
+                emit_event=lambda *_args, **_kwargs: None,
+                request_prompt=request_prompt,
+            )
+
+            with use_terminal_ui(ui), patch(
+                "A00_main_tui.routing_stage_main",
+                return_value=SimpleNamespace(project_dir=tmpdir, skipped=False, exit_code=0),
+            ), patch(
+                "A00_main_tui.run_requirement_intake_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ), patch(
+                "A00_main_tui.run_requirements_clarification_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
+            ), patch(
+                "A00_main_tui.run_requirements_review_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
+            ), patch(
+                "A00_main_tui.run_detailed_design_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="design-ba", reviewer_handoff=()),
+            ), patch(
+                "A00_main_tui.run_task_split_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ), patch(
+                "A00_main_tui.run_development_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff="live-dev", reviewer_handoff=()),
+            ), patch(
+                "A00_main_tui.run_overall_review_stage",
+            ) as a08_mock, patch("A00_main_tui.clear_pending_tty_input"), patch("A00_main_tui.notify_stage_action_changed"):
+                exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A"])
+
+        self.assertEqual(exit_code, 0)
+        a08_mock.assert_not_called()
+        self.assertEqual(len(prompts), 1)
+        self.assertTrue(prompts[0].payload["allow_back"])
 
     def test_main_forwards_agent_config_and_can_skip_overall_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -751,8 +976,11 @@ class A00MainTests(unittest.TestCase):
                 "A00_main_tui.run_overall_review_stage",
                 side_effect=fake_a08,
             ), patch(
+                "A00_main_tui.cleanup_stale_task_split_runtime_state",
+                side_effect=lambda project_dir, requirement_name: lifecycle.append(f"task_split_cleanup:{project_dir}:{requirement_name}") or (),
+            ), patch(
                 "A00_main_tui.cleanup_stale_development_runtime_state",
-                side_effect=lambda project_dir, requirement_name: lifecycle.append(f"cleanup:{project_dir}:{requirement_name}") or (),
+                side_effect=lambda project_dir, requirement_name: lifecycle.append(f"development_cleanup:{project_dir}:{requirement_name}") or (),
             ), patch(
                 "A00_main_tui.notify_stage_action_changed",
                 side_effect=lambda action: lifecycle.append(f"stage:{action}"),
@@ -767,7 +995,11 @@ class A00MainTests(unittest.TestCase):
                 ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
             ],
         )
-        self.assertLess(lifecycle.index(f"cleanup:{tmpdir}:需求A"), lifecycle.index("stage:stage.a07.start"))
+        self.assertLess(
+            lifecycle.index(f"task_split_cleanup:{tmpdir}:需求A"),
+            lifecycle.index(f"development_cleanup:{tmpdir}:需求A"),
+        )
+        self.assertLess(lifecycle.index(f"development_cleanup:{tmpdir}:需求A"), lifecycle.index("stage:stage.a07.start"))
         self.assertLess(lifecycle.index("stage:stage.a07.start"), lifecycle.index("a07"))
 
     def test_main_stops_when_a01_fails(self):

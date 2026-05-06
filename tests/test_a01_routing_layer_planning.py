@@ -442,6 +442,111 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertIn("project:create_running/BUSY", text)
         self.assertIn("create_routing_layer", text)
 
+    def test_render_live_progress_displays_prelaunch_dead_state_as_starting(self):
+        run_store = type(
+            "RunStoreStub",
+            (),
+            {
+                "manifest": RunManifest(
+                    manifest_version=1,
+                    run_id="run_demo",
+                    runtime_dir="/tmp/runtime/run_demo",
+                    project_dir="/tmp/project",
+                    selection={},
+                    config={},
+                    status="running",
+                    created_at="2026-04-13T12:00:00",
+                    updated_at="2026-04-13T12:00:00",
+                    workers=[
+                        WorkerManifestEntry(
+                            work_dir="/tmp/project",
+                            session_name="aginit-demo-1",
+                            workflow_stage="create_running",
+                            result_status="running",
+                            agent_state="DEAD",
+                            agent_started=False,
+                            pane_id="",
+                            health_status="missing_session",
+                            note="create_routing_layer",
+                        )
+                    ],
+                )
+            },
+        )()
+        selection = TargetSelection(
+            project_dir="/tmp/project",
+            selected_dirs=("/tmp/project",),
+            skipped_dirs=(),
+            forced_dirs=(),
+            project_missing_files=(),
+        )
+
+        frame = render_live_progress_frame(run_store=run_store, selection=selection, tick=1)
+        line = render_live_progress_line(run_store=run_store, selection=selection, tick=1)
+
+        self.assertIn("state=STARTING", frame)
+        self.assertIn("project:create_running/STARTING", line)
+
+    def test_render_live_progress_line_refreshes_worker_state_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "agent_state": "BUSY",
+                        "agent_started": True,
+                        "agent_alive": True,
+                        "health_status": "alive",
+                        "note": "turn:create_routing_layer",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entry = WorkerManifestEntry(
+                work_dir="/tmp/project",
+                session_name="aginit-demo-1",
+                workflow_stage="create_running",
+                result_status="running",
+                agent_state="STARTING",
+                health_status="unknown",
+                note="create_routing_layer",
+                state_path=str(state_path),
+            )
+
+            class _RunStoreStub:
+                def __init__(self) -> None:
+                    self.manifest = RunManifest(
+                        manifest_version=1,
+                        run_id="run_demo",
+                        runtime_dir="/tmp/runtime/run_demo",
+                        project_dir="/tmp/project",
+                        selection={},
+                        config={},
+                        status="running",
+                        created_at="2026-04-13T12:00:00",
+                        updated_at="2026-04-13T12:00:00",
+                        workers=[entry],
+                    )
+
+                def update_worker_state_from_file(self, work_dir, state_path, *, preserve_workflow_fields=False):  # noqa: ANN001
+                    payload = json.loads(Path(state_path).read_text(encoding="utf-8"))
+                    self.manifest.workers[0].agent_state = str(payload["agent_state"])
+                    self.manifest.workers[0].health_status = str(payload["health_status"])
+                    self.manifest.workers[0].note = str(payload["note"])
+                    return self.manifest.workers[0]
+
+            selection = TargetSelection(
+                project_dir="/tmp/project",
+                selected_dirs=("/tmp/project",),
+                skipped_dirs=(),
+                forced_dirs=(),
+                project_missing_files=(),
+            )
+            text = render_live_progress_line(run_store=_RunStoreStub(), selection=selection, tick=0)
+
+        self.assertIn("project:create_running/BUSY", text)
+        self.assertIn("turn:create_routing_layer", text)
+
     def test_collect_cli_request_uses_project_arg_without_prompting_for_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             parser = build_parser()

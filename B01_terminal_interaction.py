@@ -68,6 +68,10 @@ from T03_agent_init_workflow import (
 )
 
 
+ACTIVE_ROUTING_WORKFLOW_STAGES = {"create_running", "audit_running", "refine_running"}
+PRELAUNCH_AGENT_STATES = {"", "STARTING", "DEAD"}
+
+
 @dataclass(frozen=True)
 class ControlCommand:
     action: str
@@ -95,6 +99,21 @@ class WorkerTarget:
     session_name: str
     transcript_path: str
     live_handle: LiveWorkerHandle | None
+
+
+def _is_prelaunch_active_worker(entry: object) -> bool:
+    workflow_stage = str(getattr(entry, "workflow_stage", "") or "").strip()
+    result_status = str(getattr(entry, "result_status", "") or "").strip()
+    agent_state = str(getattr(entry, "agent_state", "") or "").strip().upper()
+    agent_started = bool(getattr(entry, "agent_started", False))
+    pane_id = str(getattr(entry, "pane_id", "") or "").strip()
+    return (
+        workflow_stage in ACTIVE_ROUTING_WORKFLOW_STAGES
+        and result_status in {"pending", "ready", "running"}
+        and agent_state in PRELAUNCH_AGENT_STATES
+        and not agent_started
+        and not pane_id
+    )
 
 
 def _collect_snapshot_paths(node: object) -> list[str]:
@@ -261,7 +280,7 @@ def render_control_help() -> str:
             "  attach <编号|session_name>       attach 到指定 tmux 会话",
             "  transcript <编号|session_name>   查看指定会话 transcript 尾部",
             "  detach <编号|session_name>       从 B01 侧 detach 指定会话上的 client",
-            "  restart <编号|session_name>      杀掉当前 tmux 会话并允许自动恢复",
+            "  restart <编号|session_name>      人工请求重启当前 tmux 会话",
             "  kill <编号|session_name>         杀掉当前 tmux 会话并关闭自动恢复",
             "  retry <编号|session_name>        对 failed/stale_failed 目录重新创建 worker 并重跑",
             "  wait                             阻塞等待全部目录执行完成",
@@ -436,6 +455,21 @@ class AgentInitControlCenter:
     def _entry_by_dir(self, work_dir: str):
         return self.run_store.ensure_worker(work_dir=work_dir)
 
+    def _refresh_entry_from_state_file(self, work_dir: str):
+        entry = self._entry_by_dir(work_dir)
+        state_path = str(getattr(entry, "state_path", "") or "").strip()
+        if not state_path:
+            return entry
+        try:
+            updated = self.run_store.update_worker_state_from_file(
+                work_dir,
+                state_path,
+                preserve_workflow_fields=True,
+            )
+        except Exception:
+            return entry
+        return updated or entry
+
     def _resolve_work_dir(self, argument: str) -> str:
         if not argument:
             raise ValueError("请提供会话编号或 session_name")
@@ -479,16 +513,22 @@ class AgentInitControlCenter:
             if handle.work_dir in self.results_by_dir:
                 continue
             entry = self._entry_by_dir(handle.work_dir)
+            if _is_prelaunch_active_worker(entry):
+                self.run_store.sync_worker_snapshot(
+                    handle.work_dir,
+                    preserve_workflow_fields=True,
+                    agent_state="STARTING",
+                    health_status="unknown",
+                    health_note="launch pending",
+                    session_name=entry.session_name or handle.worker.session_name,
+                    runtime_dir=entry.runtime_dir or str(handle.worker.runtime_dir),
+                    pane_id=entry.pane_id,
+                )
+                continue
             snapshot = handle.worker.refresh_health(
-                auto_relaunch=(
-                        entry.recoverable
-                        and entry.workflow_stage not in {"create_running", "audit_running", "refine_running"}
-                ),
+                auto_relaunch=False,
                 relaunch_timeout_sec=30.0,
             )
-            if snapshot.health_status == "auto_relaunched":
-                self.run_store.append_event("auto_relaunch", work_dir=handle.work_dir,
-                                            session_name=handle.worker.session_name)
 
             self.run_store.sync_worker_snapshot(
                 handle.work_dir,
@@ -511,7 +551,7 @@ class AgentInitControlCenter:
         rows: list[SessionStatusRow] = []
         for index, work_dir in enumerate(self.selection.selected_dirs, start=1):
             finished = self.results_by_dir.get(work_dir)
-            entry = self._entry_by_dir(work_dir)
+            entry = self._refresh_entry_from_state_file(work_dir)
             handle = self.handle_by_dir.get(work_dir)
             if finished is not None:
                 status_value = entry.result_status if entry.result_status else display_status_label(finished)

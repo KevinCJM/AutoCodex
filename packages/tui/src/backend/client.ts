@@ -53,6 +53,19 @@ export class BackendClient {
     this.consumeStderr(this.process.stderr)
   }
 
+  stop() {
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const waiter of pending) {
+      waiter.reject(new Error('backend stopped'))
+    }
+    this.listeners.clear()
+    const child = this.process
+    this.process = undefined
+    if (!child) return
+    child.kill()
+  }
+
   private async consumeStderr(stream: ReadableStream<Uint8Array>) {
     const reader = stream.getReader()
     const decoder = new TextDecoder()

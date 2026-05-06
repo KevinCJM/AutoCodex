@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -509,6 +510,133 @@ class B01TerminalInteractionTests(unittest.TestCase):
         control_center.selection = SimpleNamespace(selected_dirs=("/tmp/project",))
         control_center.results_by_dir = {}
         self.assertEqual(control_center.pending_work_count(), 1)
+
+    def test_build_worker_snapshots_refreshes_latest_worker_state_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = str((Path(tmpdir) / "project").resolve())
+            state_path = Path(tmpdir) / "runtime" / "worker.state.json"
+            state_path.parent.mkdir(parents=True)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "sess-routing",
+                        "runtime_dir": str(state_path.parent),
+                        "workflow_stage": "pending",
+                        "result_status": "pending",
+                        "agent_state": "BUSY",
+                        "agent_started": True,
+                        "agent_alive": True,
+                        "health_status": "alive",
+                        "retry_count": 1,
+                        "last_heartbeat_at": "2026-05-03T13:00:00",
+                        "state_path": str(state_path),
+                        "transcript_path": str(state_path.parent / "transcript.md"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            entry = SimpleNamespace(
+                work_dir=project_dir,
+                session_name="sess-routing",
+                transcript_path="",
+                state_path=str(state_path),
+                result_status="running",
+                workflow_stage="create_running",
+                agent_state="STARTING",
+                health_status="unknown",
+                health_note="",
+                retry_count=0,
+                note="create_routing_layer",
+                forced=True,
+                current_turn_status_path="",
+            )
+
+            def update_worker_state_from_file(work_dir, path, preserve_workflow_fields=False):  # noqa: ANN001
+                self.assertTrue(preserve_workflow_fields)
+                self.assertEqual(work_dir, project_dir)
+                payload = json.loads(Path(path).read_text(encoding="utf-8"))
+                entry.session_name = payload["session_name"]
+                entry.agent_state = payload["agent_state"]
+                entry.health_status = payload["health_status"]
+                entry.retry_count = payload["retry_count"]
+                entry.transcript_path = payload["transcript_path"]
+                return entry
+
+            control_center = AgentInitControlCenter.__new__(AgentInitControlCenter)
+            control_center.selection = SimpleNamespace(selected_dirs=(project_dir,))
+            control_center.results_by_dir = {}
+            control_center.futures = {}
+            control_center.handle_by_dir = {}
+            control_center.tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-routing")
+            control_center.run_store = SimpleNamespace(
+                ensure_worker=lambda work_dir: entry,
+                update_worker_state_from_file=update_worker_state_from_file,
+            )
+
+            snapshots = control_center.build_worker_snapshots()
+
+        self.assertEqual(snapshots[0]["agent_state"], "BUSY")
+        self.assertEqual(snapshots[0]["health_status"], "alive")
+        self.assertEqual(snapshots[0]["retry_count"], 1)
+
+    def test_refresh_worker_health_keeps_prelaunch_active_worker_starting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = str((Path(tmpdir) / "project").resolve())
+            runtime_dir = Path(tmpdir) / "runtime"
+            entry = SimpleNamespace(
+                work_dir=project_dir,
+                session_name="sess-routing",
+                runtime_dir=str(runtime_dir),
+                pane_id="",
+                result_status="running",
+                workflow_stage="create_running",
+                agent_state="DEAD",
+                agent_started=False,
+                health_status="dead",
+                health_note="missing_session",
+                retry_count=0,
+                note="create_routing_layer",
+                recoverable=True,
+                forced=True,
+                state_path="",
+                transcript_path="",
+                current_turn_status_path="",
+            )
+
+            def ensure_worker(*, work_dir):  # noqa: ANN001
+                self.assertEqual(work_dir, project_dir)
+                return entry
+
+            def sync_worker_snapshot(work_dir, **fields):  # noqa: ANN001
+                self.assertEqual(work_dir, project_dir)
+                for key, value in fields.items():
+                    if hasattr(entry, key):
+                        setattr(entry, key, value)
+                return entry
+
+            def refresh_health(**_kwargs):  # noqa: ANN001
+                raise AssertionError("prelaunch worker should not be probed as dead")
+
+            worker = SimpleNamespace(
+                session_name="sess-routing",
+                runtime_dir=runtime_dir,
+                state_path=runtime_dir / "worker.state.json",
+                refresh_health=refresh_health,
+            )
+            handle = SimpleNamespace(work_dir=project_dir, worker=worker, forced=True)
+            control_center = AgentInitControlCenter.__new__(AgentInitControlCenter)
+            control_center.live_workers = [handle]
+            control_center.results_by_dir = {}
+            control_center.run_store = SimpleNamespace(
+                ensure_worker=ensure_worker,
+                sync_worker_snapshot=sync_worker_snapshot,
+            )
+
+            control_center.refresh_worker_health()
+
+        self.assertEqual(entry.agent_state, "STARTING")
+        self.assertEqual(entry.health_status, "unknown")
+        self.assertEqual(entry.health_note, "launch pending")
 
     def test_run_terminal_control_loop_announces_stage_transition_and_cleans_tmux(self):
         batch_result = SimpleNamespace(run_id="run_demo")

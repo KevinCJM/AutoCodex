@@ -29,6 +29,8 @@ function isBusyWorker(worker: WorkerSnapshot): boolean {
   const agentState = String(worker.agentState || '').trim().toUpperCase()
   const status = String(worker.status || '').trim().toLowerCase()
   const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
+  if (['done', 'succeeded', 'completed'].includes(runtimeStatus)) return false
+  if (['done', 'succeeded', 'completed', 'ready', 'idle'].includes(status)) return false
   if (agentState === 'BUSY') return true
   if (agentState === 'READY' || agentState === 'STARTING' || agentState === 'DEAD') return false
   return status === 'running' || runtimeStatus === 'running'

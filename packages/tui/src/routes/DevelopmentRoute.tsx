@@ -9,16 +9,14 @@ export function DevelopmentRoute(props: Props) {
   return (
     <box flexDirection="column" gap={1} paddingLeft={1} paddingRight={1} flexGrow={1}>
       <text>任务开发</text>
-      <text fg="#888888">项目目录: {props.snapshot.projectDir || '(unset)'}</text>
-      <text fg="#888888">需求名称: {props.snapshot.requirementName || '(unset)'}</text>
+      <text fg="#888888">{`项目目录: ${props.snapshot.projectDir || '(unset)'}`}</text>
+      <text fg="#888888">{`需求名称: ${props.snapshot.requirementName || '(unset)'}`}</text>
       <box borderStyle="single" paddingLeft={1} paddingRight={1} flexDirection="column">
         <text>阶段文档</text>
         <Show when={props.snapshot.files.length > 0} fallback={<text fg="#888888">尚未发现任务开发产物。</text>}>
           <For each={props.snapshot.files}>
             {(item) => (
-              <text fg={item.exists ? '#00d2ff' : '#888888'}>
-                {item.label}: {item.exists ? 'ready' : 'missing'}
-              </text>
+              <text fg={item.exists ? '#00d2ff' : '#888888'}>{`${item.label}: ${item.exists ? 'ready' : 'missing'}`}</text>
             )}
           </For>
         </Show>
@@ -31,14 +29,10 @@ export function DevelopmentRoute(props: Props) {
               const isCurrent = () => milestone.key === props.snapshot.currentMilestoneKey && Boolean(props.snapshot.currentMilestoneKey)
               return (
                 <box flexDirection="column">
-                  <text fg={isCurrent() ? '#7be495' : '#00d2ff'}>
-                    {milestone.completed ? '☑' : '☐'} {milestone.key}{isCurrent() ? ' (当前)' : ''}
-                  </text>
+                  <text fg={isCurrent() ? '#7be495' : '#00d2ff'}>{`${milestone.completed ? '☑' : '☐'} ${milestone.key}${isCurrent() ? ' (当前)' : ''}`}</text>
                   <For each={milestone.tasks}>
                     {(task) => (
-                      <text fg={task.completed ? '#7be495' : '#f7c948'}>
-                        {'  '}{task.completed ? '☑' : '☐'} {task.key}
-                      </text>
+                      <text fg={task.completed ? '#7be495' : '#f7c948'}>{`  ${task.completed ? '☑' : '☐'} ${task.key}`}</text>
                     )}
                   </For>
                 </box>
@@ -51,7 +45,7 @@ export function DevelopmentRoute(props: Props) {
         <text>Workers</text>
         <Show when={props.snapshot.workers.length > 0} fallback={<text fg="#888888">当前没有任务开发 workers。</text>}>
           <For each={props.snapshot.workers}>
-            {(worker) => <text>{worker.sessionName} | {worker.workflowStage}/{worker.agentState} | {worker.healthStatus}</text>}
+            {(worker) => <text>{`${worker.sessionName} | ${worker.workflowStage}/${worker.agentState} | ${worker.healthStatus}`}</text>}
           </For>
         </Show>
       </box>

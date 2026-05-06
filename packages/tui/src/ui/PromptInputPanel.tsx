@@ -1,5 +1,6 @@
 import { useKeyboard } from '@opentui/solid'
-import { For, Show, createMemo } from 'solid-js'
+import { For, Show, createEffect, createMemo } from 'solid-js'
+import { clearPromptDraft, readPromptDraft, rememberPromptValue } from '../promptMemory'
 import { PromptTextarea } from './PromptTextarea'
 
 type Props = {
@@ -10,6 +11,8 @@ type Props = {
   focused?: boolean
   mode?: 'singleline' | 'multiline'
   hintLines?: string[]
+  textareaHeight?: number
+  rememberHistory?: boolean
   showSubmitHelper?: boolean
   onBack?: () => void
   onSubmit: (value: string) => void
@@ -17,15 +20,54 @@ type Props = {
 
 export function PromptInputPanel(props: Props) {
   const multiline = createMemo(() => props.mode !== 'singleline')
+  const textareaHeight = createMemo(() => Math.max(1, props.textareaHeight ?? (multiline() ? 5 : 1)))
   const helperText = createMemo(() =>
     props.showSubmitHelper && multiline() ? 'Enter 提交，Shift+Enter / Meta+Enter / Ctrl+J 换行' : ''
   )
+  const promptToken = createMemo(() => `${props.focusToken ?? ''}:${props.draftKey ?? ''}:${props.title}`)
+  let submittedPromptToken = ''
+
+  createEffect(() => {
+    promptToken()
+    submittedPromptToken = ''
+  })
+
+  const submitValue = (value: string) => {
+    const token = promptToken()
+    if (submittedPromptToken === token) return false
+    submittedPromptToken = token
+    props.onSubmit(value)
+    return true
+  }
+
+  const submitCurrentDraft = () => {
+    const value = readPromptDraft(props.draftKey) || props.defaultValue || ''
+    if (!submitValue(value)) return
+    if (props.rememberHistory !== false) {
+      rememberPromptValue(props.draftKey, value)
+    } else {
+      clearPromptDraft(props.draftKey)
+    }
+  }
 
   useKeyboard((event) => {
-    if (!props.focused || !props.onBack) return
-    if (event.name !== 'escape') return
+    if (props.focused && props.onBack && event.name === 'escape') {
+      event.preventDefault()
+      props.onBack()
+      return
+    }
+    const isSubmitKey =
+      ['return', 'linefeed', 'enter'].includes(event.name) ||
+      event.raw === '\r' ||
+      event.raw === '\n' ||
+      event.sequence === '\r' ||
+      event.sequence === '\n'
+    if (!isSubmitKey) return
+    if (event.shift || event.meta || event.ctrl) return
+    if (props.focused === false && !readPromptDraft(props.draftKey).trim()) return
     event.preventDefault()
-    props.onBack()
+    event.stopPropagation()
+    submitCurrentDraft()
   })
 
   return (
@@ -55,11 +97,12 @@ export function PromptInputPanel(props: Props) {
         focusToken={props.focusToken}
         focused={props.focused}
         multiline={multiline()}
-        height={multiline() ? 5 : 1}
-        minHeight={multiline() ? 5 : 1}
-        maxHeight={multiline() ? 5 : 1}
+        height={textareaHeight()}
+        minHeight={textareaHeight()}
+        maxHeight={textareaHeight()}
+        rememberHistory={props.rememberHistory}
         placeholder=""
-        onSubmit={props.onSubmit}
+        onSubmit={submitValue}
       />
     </box>
   )

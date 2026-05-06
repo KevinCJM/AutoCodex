@@ -1,1008 +1,673 @@
 {
-  "schema_version": "1.2",
+  "schema_version": "1.1",
   "scope": {
     "root": ".",
     "mode": "subtree_only",
     "parent_inspection_allowed": false,
-    "path_ownership_model": {
-      "authoritative_field": "owned_paths",
-      "path_field_role": "canonical_anchor_only"
-    },
     "notes": [
-      "treat current working directory as the full visible project boundary"
+      "current working directory is the full visible boundary",
+      "routing facts are navigation only"
     ]
+  },
+  "module_contract": {
+    "path_anchor_policy": "modules[].path is a canonical anchor string; multi-target fields use selector objects",
+    "selector_fields": [
+      "entry_selectors",
+      "first_read_selectors",
+      "then_check_selectors",
+      "related_test_selectors",
+      "related_config_selectors",
+      "minimum_regression_selectors",
+      "read_before_edit_selectors"
+    ],
+    "risk_policy": "modules reference pitfall_ids only; risk semantics are owned by docs/pitfalls.json"
   },
   "modules": [
     {
       "id": "M01_workflow_entry",
       "name": "workflow_entry",
-      "path": "tmux_core/workflow",
+      "path": "A00_main_tui.py",
+      "kind": "python_entry_orchestrator",
+      "purpose": "launch and chain A01-A08 workflow",
+      "task_keywords": ["main", "workflow", "stage_chain", "legacy_cli", "tui_launch", "project_dir"],
       "owned_paths": [
-        {
-          "path": "A00_main.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "tmux_core/workflow",
-          "match": "subtree",
-          "role": "implementation_tree"
-        }
+        {"type": "literal", "path": "A00_main_tui.py", "match": "exact", "role": "wrapper_entry"},
+        {"type": "subtree", "path": "tmux_core/workflow", "match": "subtree", "role": "implementation_tree"}
       ],
-      "kind": "orchestrator",
-      "purpose": "top-level CLI workflow entry and stage chaining",
-      "entry_files": [
-        "A00_main.py",
-        "tmux_core/workflow/entry.py"
+      "entry_selectors": [
+        {"type": "literal", "path": "A00_main_tui.py"},
+        {"type": "literal", "path": "tmux_core/workflow/entry.py"}
       ],
-      "key_symbols": [
-        "main",
-        "build_parser",
-        "build_stage_args",
-        "ensure_pre_development_task_record",
-        "render_remaining_stage_placeholders"
-      ],
+      "key_symbols": ["main", "build_parser"],
       "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "A00_main.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/workflow/entry.py"
-        }
+        {"type": "literal", "path": "A00_main_tui.py"},
+        {"type": "literal", "path": "tmux_core/workflow/entry.py"}
       ],
       "then_check_selectors": [
-        {
-          "type": "literal_path",
-          "path": "T08_pre_development.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "T09_terminal_ops.py"
-        }
+        {"type": "literal", "path": "T08_pre_development.py"},
+        {"type": "literal", "path": "T09_terminal_ops.py"},
+        {"type": "literal", "path": "U01_common_config.py"}
       ],
       "relations": [
-        {
-          "type": "depends_on",
-          "target": "M02_stage_kernel_family"
-        },
-        {
-          "type": "depends_on",
-          "target": "M07_shared_support"
-        },
-        {
-          "type": "dispatches_to",
-          "target": "M05_bridge_backend"
-        }
+        {"type": "depends_on", "target": "M03_stage_family"},
+        {"type": "depends_on", "target": "M05_tmux_runtime_hitl"},
+        {"type": "depends_on", "target": "M08_shared_support"}
       ],
-      "out_of_scope_dependencies": [
-        "shell environment outside current subtree",
-        "external agent providers"
+      "out_of_scope_dependencies": ["external_agent_cli", "shell_environment", "target_project_paths"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_a00_main.py"},
+        {"type": "literal", "path": "tests/test_architecture_boundaries.py"}
       ],
-      "related_tests": [
-        "tests/test_a00_main.py",
-        "tests/test_architecture_boundaries.py"
-      ],
-      "related_configs": [],
-      "risk_flags": [
-        "wrapper_alias",
-        "stage_chain",
-        "pre_development_record"
-      ],
+      "related_config_selectors": [],
       "edit_risk": "high",
       "blast_radius": "whole_python_workflow",
-      "pitfall_ids": [
-        "P01",
-        "P04"
-      ],
-      "minimum_regression": [
-        "tests/test_a00_main.py",
-        "tests/test_architecture_boundaries.py"
+      "pitfall_ids": ["P01", "P04", "P07"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_a00_main.py"},
+        {"type": "literal", "path": "tests/test_architecture_boundaries.py"}
       ],
       "read_before_edit_selectors": [
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        },
-        {
-          "type": "literal_path",
-          "path": "tests/test_a00_main.py"
-        }
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
       ],
       "routing_confidence": "medium",
-      "expand_search_codes": [
-        "MX01",
-        "MX02"
-      ],
-      "scope_notes": [
-        "wrapper file is visible; implementation target must still be confirmed before edit"
-      ]
+      "expand_search_codes": ["TX02", "TX03", "TX04"],
+      "scope_notes": ["needs_code_confirmation"]
     },
     {
-      "id": "M02_stage_kernel_family",
-      "name": "stage_kernel_family",
-      "path": "tmux_core/stage_kernel",
+      "id": "M02_web_launcher",
+      "name": "web_launcher",
+      "path": "A00_main_web.py",
+      "kind": "python_web_launcher",
+      "purpose": "start WebBackend and Vite web console",
+      "task_keywords": ["web", "vite", "backend_port", "web_port", "healthz", "skip_install"],
       "owned_paths": [
-        {
-          "path": "A01_Routing_LayerPlanning.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A02_RequirementIntake.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A02_RequirementsAnalysis.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A03_RequirementsClarification.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A03_RequirementsReview.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A04_RequirementsReview.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A05_DetailedDesign.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A06_TaskSplit.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A07_Development.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "A08_OverallReview.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "tmux_core/stage_kernel",
-          "match": "subtree",
-          "role": "implementation_tree"
-        }
+        {"type": "literal", "path": "A00_main_web.py", "match": "exact", "role": "entry_file"}
       ],
-      "kind": "stage_family",
-      "purpose": "stage implementations plus shared review and orchestration helpers",
-      "entry_files": [
-        "A01_Routing_LayerPlanning.py",
-        "A02_RequirementIntake.py",
-        "A02_RequirementsAnalysis.py",
-        "A03_RequirementsClarification.py",
-        "A03_RequirementsReview.py",
-        "A04_RequirementsReview.py",
-        "A05_DetailedDesign.py",
-        "A06_TaskSplit.py",
-        "A07_Development.py",
-        "A08_OverallReview.py",
-        "tmux_core/stage_kernel/routing_init.py",
-        "tmux_core/stage_kernel/requirement_intake.py",
-        "tmux_core/stage_kernel/requirements_clarification.py",
-        "tmux_core/stage_kernel/requirements_review.py",
-        "tmux_core/stage_kernel/detailed_design.py",
-        "tmux_core/stage_kernel/task_split.py",
-        "tmux_core/stage_kernel/development.py",
-        "tmux_core/stage_kernel/overall_review.py"
+      "entry_selectors": [
+        {"type": "literal", "path": "A00_main_web.py"}
       ],
-      "key_symbols": [],
+      "key_symbols": ["main", "build_parser", "ensure_web_dependencies_installed", "build_backend_command"],
       "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "A01_Routing_LayerPlanning.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/stage_kernel/routing_init.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/stage_kernel/requirements_clarification.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/stage_kernel/shared_review.py"
-        }
+        {"type": "literal", "path": "A00_main_web.py"}
       ],
       "then_check_selectors": [
-        {
-          "type": "literal_path",
-          "path": "tmux_core/stage_kernel/reviewer_orchestration.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/stage_kernel/role_orchestration.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/stage_kernel/turn_output_goals.py"
-        }
+        {"type": "literal", "path": "T11_web_backend.py"},
+        {"type": "literal", "path": "packages/web/package.json"},
+        {"type": "literal", "path": "packages/web/vite.config.ts"}
       ],
       "relations": [
-        {
-          "type": "depends_on",
-          "target": "M03_runtime_family"
-        },
-        {
-          "type": "depends_on",
-          "target": "M04_prompt_contract_family"
-        },
-        {
-          "type": "depends_on",
-          "target": "M07_shared_support"
-        }
+        {"type": "depends_on", "target": "M06_bridge_protocol_backends"},
+        {"type": "depends_on", "target": "M07_frontend_packages"}
       ],
-      "out_of_scope_dependencies": [],
-      "related_tests": [
-        "tests/test_a01_routing_layer_planning.py",
-        "tests/test_a02_requirements_analysis.py",
-        "tests/test_a03_requirements_review.py",
-        "tests/test_a05_detailed_design.py",
-        "tests/test_a06_task_split.py",
-        "tests/test_a07_development.py",
-        "tests/test_a08_overall_review.py",
-        "tests/test_role_orchestration.py",
-        "tests/test_stage_kernel_review_design_shared.py",
-        "tests/test_stage_kernel_turn_output_goals.py"
+      "out_of_scope_dependencies": ["browser_process", "bun_runtime", "network_port_availability"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_a00_main_web.py"},
+        {"type": "literal", "path": "tests/test_t11_web_backend.py"}
       ],
-      "related_configs": [],
-      "risk_flags": [
-        "multi_stage_handoff",
-        "shared_review_flow",
-        "runtime_artifacts"
-      ],
-      "edit_risk": "high",
-      "blast_radius": "multi_stage_python_flow",
-      "pitfall_ids": [
-        "P01",
-        "P04"
-      ],
-      "minimum_regression": [
-        "tests/test_stage_kernel_review_design_shared.py",
-        "tests/test_stage_kernel_turn_output_goals.py",
-        "tests/test_role_orchestration.py"
-      ],
-      "read_before_edit_selectors": [
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        },
-        {
-          "type": "field_ref",
-          "field": "then_check_selectors"
-        },
-        {
-          "type": "owned_paths_role",
-          "role": "wrapper_file"
-        },
-        {
-          "type": "owned_paths_role",
-          "role": "implementation_tree"
-        }
-      ],
-      "routing_confidence": "medium",
-      "expand_search_codes": [
-        "MX03",
-        "MX04"
-      ],
-      "scope_notes": [
-        "family routing is intentionally coarse; wrapper and implementation surfaces are both owned"
-      ]
-    },
-    {
-      "id": "M03_runtime_family",
-      "name": "runtime_family",
-      "path": "tmux_core/runtime",
-      "owned_paths": [
-        {
-          "path": "T02_tmux_agents.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "T05_hitl_runtime.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "tmux_core/runtime",
-          "match": "subtree",
-          "role": "implementation_tree"
-        }
-      ],
-      "kind": "runtime_family",
-      "purpose": "runtime contracts, hitl state, tmux runtime, and vendor catalog",
-      "entry_files": [
-        "T02_tmux_agents.py",
-        "T05_hitl_runtime.py",
-        "tmux_core/runtime/contracts.py",
-        "tmux_core/runtime/hitl.py",
-        "tmux_core/runtime/tmux_runtime.py",
-        "tmux_core/runtime/vendor_catalog.py"
-      ],
-      "key_symbols": [],
-      "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "tmux_core/runtime/contracts.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/runtime/hitl.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/runtime/tmux_runtime.py"
-        }
-      ],
-      "then_check_selectors": [
-        {
-          "type": "literal_path",
-          "path": "tmux_core/runtime/vendor_catalog.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "T02_tmux_agents.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "T05_hitl_runtime.py"
-        }
-      ],
-      "relations": [
-        {
-          "type": "depends_on",
-          "target": "M07_shared_support"
-        }
-      ],
-      "out_of_scope_dependencies": [
-        "tmux binary",
-        "provider credentials or services outside current subtree"
-      ],
-      "related_tests": [
-        "tests/test_t02_tmux_agents.py",
-        "tests/test_t03_agent_init_workflow.py",
-        "tests/test_t05_hitl_runtime.py",
-        "tests/test_runtime_contract_compat.py",
-        "tests/test_vendor_catalog.py"
-      ],
-      "related_configs": [],
-      "risk_flags": [
-        "resume_behavior",
-        "status_schema",
-        "external_runtime_dependency"
-      ],
-      "edit_risk": "high",
-      "blast_radius": "resume_and_agent_lifecycle",
-      "pitfall_ids": [
-        "P04",
-        "P06"
-      ],
-      "minimum_regression": [
-        "tests/test_t02_tmux_agents.py",
-        "tests/test_t05_hitl_runtime.py",
-        "tests/test_runtime_contract_compat.py"
-      ],
-      "read_before_edit_selectors": [
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        },
-        {
-          "type": "field_ref",
-          "field": "then_check_selectors"
-        }
-      ],
-      "routing_confidence": "medium",
-      "expand_search_codes": [
-        "MX05"
-      ],
-      "scope_notes": [
-        "external process behavior stays partly out_of_scope even when wrapper files are visible"
-      ]
-    },
-    {
-      "id": "M04_prompt_contract_family",
-      "name": "prompt_contract_family",
-      "path": "tmux_core/prompt_contracts",
-      "owned_paths": [
-        {
-          "path": "T04_common_prompt.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_01_RoutingLayerPlanning.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_02_RequirementIntake.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_03_RequirementsClarification.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_04_RequirementsReview.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_05_DetailedDesign.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_06_TaskSplit.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_07_Development.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "Prompt_08_OverallReview.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "tmux_core/prompt_contracts",
-          "match": "subtree",
-          "role": "implementation_tree"
-        }
-      ],
-      "kind": "prompt_family",
-      "purpose": "prompt-contract wrappers and prompt spec modules for stage agents",
-      "entry_files": [
-        "T04_common_prompt.py",
-        "Prompt_01_RoutingLayerPlanning.py",
-        "Prompt_02_RequirementIntake.py",
-        "Prompt_03_RequirementsClarification.py",
-        "Prompt_04_RequirementsReview.py",
-        "Prompt_05_DetailedDesign.py",
-        "Prompt_06_TaskSplit.py",
-        "Prompt_07_Development.py",
-        "Prompt_08_OverallReview.py",
-        "tmux_core/prompt_contracts/common.py",
-        "tmux_core/prompt_contracts/requirements_clarification.py",
-        "tmux_core/prompt_contracts/requirements_review.py",
-        "tmux_core/prompt_contracts/detailed_design.py",
-        "tmux_core/prompt_contracts/task_split.py",
-        "tmux_core/prompt_contracts/development.py",
-        "tmux_core/prompt_contracts/overall_review.py",
-        "tmux_core/prompt_contracts/spec.py"
-      ],
-      "key_symbols": [],
-      "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "T04_common_prompt.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/prompt_contracts/common.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/prompt_contracts/spec.py"
-        }
-      ],
-      "then_check_selectors": [
-        {
-          "type": "owned_paths_role",
-          "role": "wrapper_file"
-        },
-        {
-          "type": "owned_paths_role",
-          "role": "implementation_tree"
-        }
-      ],
-      "relations": [],
-      "out_of_scope_dependencies": [],
-      "related_tests": [
-        "tests/test_prompt_contract_specs.py",
-        "tests/test_architecture_boundaries.py"
-      ],
-      "related_configs": [],
-      "risk_flags": [
-        "protected_prompt_source",
-        "prompt_boundary"
-      ],
-      "edit_risk": "high",
-      "blast_radius": "multi_stage_agent_behavior",
-      "pitfall_ids": [
-        "P02",
-        "P07"
-      ],
-      "minimum_regression": [
-        "tests/test_prompt_contract_specs.py",
-        "tests/test_architecture_boundaries.py"
-      ],
-      "read_before_edit_selectors": [
-        {
-          "type": "literal_path",
-          "path": "AGENTS.md"
-        },
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        },
-        {
-          "type": "field_ref",
-          "field": "then_check_selectors"
-        }
-      ],
-      "routing_confidence": "medium",
-      "expand_search_codes": [
-        "MX06"
-      ],
-      "scope_notes": [
-        "prompt surfaces are protected; routing may identify them without authorizing edits"
-      ]
-    },
-    {
-      "id": "M05_bridge_backend",
-      "name": "bridge_backend",
-      "path": "tmux_core/bridge",
-      "owned_paths": [
-        {
-          "path": "T11_tui_backend.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "T11_web_backend.py",
-          "match": "exact",
-          "role": "wrapper_file"
-        },
-        {
-          "path": "tmux_core/bridge",
-          "match": "subtree",
-          "role": "implementation_tree"
-        }
-      ],
-      "kind": "bridge",
-      "purpose": "python-side bridge and backend surfaces for tui or web control",
-      "entry_files": [
-        "T11_tui_backend.py",
-        "T11_web_backend.py",
-        "tmux_core/bridge/backend.py",
-        "tmux_core/bridge/web_backend.py"
-      ],
-      "key_symbols": [],
-      "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "T11_tui_backend.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "T11_web_backend.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/bridge/backend.py"
-        }
-      ],
-      "then_check_selectors": [
-        {
-          "type": "literal_path",
-          "path": "tmux_core/bridge/web_backend.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/backend/client.ts"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/stageRegistry.ts"
-        }
-      ],
-      "relations": [
-        {
-          "type": "dispatches_to",
-          "target": "M06_tui_package"
-        },
-        {
-          "type": "depends_on",
-          "target": "M03_runtime_family"
-        }
-      ],
-      "out_of_scope_dependencies": [
-        "browser or terminal host behavior outside current subtree"
-      ],
-      "related_tests": [
-        "tests/test_t10_tui_protocol.py",
-        "tests/test_t11_tui_backend.py",
-        "tests/test_t11_web_backend.py"
-      ],
-      "related_configs": [],
-      "risk_flags": [
-        "python_frontend_boundary",
-        "protocol_shape"
-      ],
-      "edit_risk": "high",
-      "blast_radius": "bridge_protocol_and_launch_path",
-      "pitfall_ids": [
-        "P01",
-        "P05"
-      ],
-      "minimum_regression": [
-        "tests/test_t10_tui_protocol.py",
-        "tests/test_t11_tui_backend.py",
-        "tests/test_t11_web_backend.py"
-      ],
-      "read_before_edit_selectors": [
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        },
-        {
-          "type": "field_ref",
-          "field": "then_check_selectors"
-        }
-      ],
-      "routing_confidence": "medium",
-      "expand_search_codes": [
-        "MX07"
-      ],
-      "scope_notes": [
-        "protocol work usually crosses python bridge and tui client surfaces"
-      ]
-    },
-    {
-      "id": "M06_tui_package",
-      "name": "tui_package",
-      "path": "packages/tui/src",
-      "owned_paths": [
-        {
-          "path": "packages/tui/package.json",
-          "match": "exact",
-          "role": "package_config"
-        },
-        {
-          "path": "packages/tui/tsconfig.json",
-          "match": "exact",
-          "role": "package_config"
-        },
-        {
-          "path": "packages/tui/bunfig.toml",
-          "match": "exact",
-          "role": "package_config"
-        },
-        {
-          "path": "packages/tui/src",
-          "match": "subtree",
-          "role": "src_tree"
-        }
-      ],
-      "kind": "frontend",
-      "purpose": "bun/solid terminal UI package and tests",
-      "entry_files": [
-        "packages/tui/package.json",
-        "packages/tui/tsconfig.json",
-        "packages/tui/bunfig.toml",
-        "packages/tui/src/index.tsx",
-        "packages/tui/src/app.tsx",
-        "packages/tui/src/backend/client.ts"
-      ],
-      "key_symbols": [],
-      "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "packages/tui/package.json"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/index.tsx"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/app.tsx"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/backend/client.ts"
-        }
-      ],
-      "then_check_selectors": [
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/stageRegistry.ts"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/routes/RoutingRoute.tsx"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/routes/RequirementsRoute.tsx"
-        },
-        {
-          "type": "literal_path",
-          "path": "packages/tui/src/routes/DevelopmentRoute.tsx"
-        }
-      ],
-      "relations": [],
-      "out_of_scope_dependencies": [],
-      "related_tests": [
-        "packages/tui/src/backend/client.test.ts",
-        "packages/tui/src/routes_smoke.test.ts",
-        "packages/tui/src/stageStatus.test.ts",
-        "packages/tui/src/ui_smoke.test.ts"
-      ],
-      "related_configs": [
-        "packages/tui/package.json",
-        "packages/tui/tsconfig.json",
-        "packages/tui/bunfig.toml"
-      ],
-      "risk_flags": [
-        "frontend_package_boundary",
-        "vendor_tree_present"
+      "related_config_selectors": [
+        {"type": "literal", "path": "packages/web/package.json"},
+        {"type": "literal", "path": "packages/web/vite.config.ts"}
       ],
       "edit_risk": "medium",
-      "blast_radius": "tui_package",
-      "pitfall_ids": [
-        "P03",
-        "P05"
-      ],
-      "minimum_regression": [
-        "packages/tui/src/backend/client.test.ts",
-        "packages/tui/src/routes_smoke.test.ts",
-        "packages/tui/src/ui_smoke.test.ts"
+      "blast_radius": "web_console_launch",
+      "pitfall_ids": ["P05", "P07", "P09"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_a00_main_web.py"},
+        {"type": "literal", "path": "tests/test_t11_web_backend.py"}
       ],
       "read_before_edit_selectors": [
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        },
-        {
-          "type": "field_ref",
-          "field": "then_check_selectors"
-        },
-        {
-          "type": "owned_paths_role",
-          "role": "package_config"
-        }
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
       ],
       "routing_confidence": "high",
-      "expand_search_codes": [
-        "MX08"
-      ],
-      "scope_notes": [
-        "owned surface is packages/tui/src plus package configs; node_modules remains read-only"
-      ]
+      "expand_search_codes": ["TX05"],
+      "scope_notes": []
     },
     {
-      "id": "M07_shared_support",
-      "name": "shared_support",
-      "path": "tmux_core/compat.py",
+      "id": "M03_stage_family",
+      "name": "stage_family",
+      "path": "A02_RequirementIntake.py",
+      "kind": "python_stage_family",
+      "purpose": "stage entry family and shared stage implementation surface",
+      "task_keywords": ["requirement", "clarification", "review", "design", "task_split", "development", "overall_review"],
       "owned_paths": [
-        {
-          "path": "U01_common_config.py",
-          "match": "exact",
-          "role": "support_file"
-        },
-        {
-          "path": "T08_pre_development.py",
-          "match": "exact",
-          "role": "support_file"
-        },
-        {
-          "path": "T09_terminal_ops.py",
-          "match": "exact",
-          "role": "support_file"
-        },
-        {
-          "path": "T12_requirements_common.py",
-          "match": "exact",
-          "role": "support_file"
-        },
-        {
-          "path": "tmux_core/compat.py",
-          "match": "exact",
-          "role": "support_file"
-        },
-        {
-          "path": "tmux_core/requirements_scope.py",
-          "match": "exact",
-          "role": "support_file"
-        }
+        {"type": "literal", "path": "A02_RequirementIntake.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A02_RequirementsAnalysis.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A03_RequirementsClarification.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A03_RequirementsReview.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A04_RequirementsReview.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A05_DetailedDesign.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A06_TaskSplit.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A07_Development.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "A08_OverallReview.py", "match": "exact", "role": "stage_entry"},
+        {"type": "subtree", "path": "tmux_core/stage_kernel", "match": "subtree", "role": "implementation_tree"}
       ],
-      "kind": "support",
-      "purpose": "compat aliases, scope helpers, common config, pre-development, and terminal support",
-      "entry_files": [
-        "U01_common_config.py",
-        "T08_pre_development.py",
-        "T09_terminal_ops.py",
-        "T12_requirements_common.py",
-        "tmux_core/compat.py",
-        "tmux_core/requirements_scope.py"
+      "entry_selectors": [
+        {"type": "owned_paths_role", "role": "stage_entry"},
+        {"type": "subtree", "path": "tmux_core/stage_kernel"}
       ],
-      "key_symbols": [
-        "SYSTEM_PYTHON_PATH",
-        "alias_module"
-      ],
+      "key_symbols": ["main", "needs_code_confirmation"],
       "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "U01_common_config.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/compat.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "T08_pre_development.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "T09_terminal_ops.py"
-        }
+        {"type": "token", "token": "matched_stage_entry"},
+        {"type": "subtree", "path": "tmux_core/stage_kernel"}
       ],
       "then_check_selectors": [
-        {
-          "type": "literal_path",
-          "path": "T12_requirements_common.py"
-        },
-        {
-          "type": "literal_path",
-          "path": "tmux_core/requirements_scope.py"
-        }
+        {"type": "token", "token": "matched_prompt_file"},
+        {"type": "literal", "path": "T05_hitl_runtime.py"},
+        {"type": "literal", "path": "T08_pre_development.py"},
+        {"type": "literal", "path": "T12_requirements_common.py"}
       ],
-      "relations": [],
-      "out_of_scope_dependencies": [],
-      "related_tests": [
-        "tests/test_t03_agent_init_workflow.py",
-        "tests/test_t09_terminal_ops.py",
-        "tests/test_t12_requirements_common.py"
+      "relations": [
+        {"type": "used_by", "target": "M01_workflow_entry"},
+        {"type": "depends_on", "target": "M04_prompt_contracts"},
+        {"type": "depends_on", "target": "M05_tmux_runtime_hitl"},
+        {"type": "depends_on", "target": "M08_shared_support"}
       ],
-      "related_configs": [],
-      "risk_flags": [
-        "alias_indirection",
-        "shared_helper_surface"
+      "out_of_scope_dependencies": ["agent_model_behavior", "target_project_contents"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_a02_requirements_analysis.py"},
+        {"type": "literal", "path": "tests/test_a03_requirements_clarification.py"},
+        {"type": "literal", "path": "tests/test_a03_requirements_review.py"},
+        {"type": "literal", "path": "tests/test_a05_detailed_design.py"},
+        {"type": "literal", "path": "tests/test_a06_task_split.py"},
+        {"type": "literal", "path": "tests/test_a07_development.py"},
+        {"type": "literal", "path": "tests/test_a08_overall_review.py"},
+        {"type": "literal", "path": "tests/test_stage_kernel_review_design_shared.py"},
+        {"type": "literal", "path": "tests/test_stage_kernel_turn_output_goals.py"}
       ],
-      "edit_risk": "medium",
-      "blast_radius": "shared_python_support",
-      "pitfall_ids": [
-        "P01",
-        "P04"
+      "related_config_selectors": [
+        {"type": "literal", "path": "U01_common_config.py"}
       ],
-      "minimum_regression": [
-        "tests/test_t03_agent_init_workflow.py",
-        "tests/test_t09_terminal_ops.py",
-        "tests/test_t12_requirements_common.py"
+      "edit_risk": "high",
+      "blast_radius": "multi_stage_outputs",
+      "pitfall_ids": ["P01", "P02", "P04", "P06"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_stage_kernel_review_design_shared.py"},
+        {"type": "literal", "path": "tests/test_stage_kernel_turn_output_goals.py"}
       ],
       "read_before_edit_selectors": [
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        },
-        {
-          "type": "field_ref",
-          "field": "then_check_selectors"
-        }
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
       ],
       "routing_confidence": "medium",
-      "expand_search_codes": [
-        "MX03",
-        "MX09"
-      ],
-      "scope_notes": [
-        "support files fan out into workflow, runtime, and stage modules"
-      ]
+      "expand_search_codes": ["TX02", "TX03", "TX06"],
+      "scope_notes": ["needs_code_confirmation"]
     },
     {
-      "id": "M08_routing_docs",
-      "name": "routing_docs",
-      "path": "docs",
+      "id": "M04_prompt_contracts",
+      "name": "prompt_contracts",
+      "path": "Prompt_01_RoutingLayerPlanning.py",
+      "kind": "prompt_and_contract_family",
+      "purpose": "business prompt files and output contract helpers",
+      "task_keywords": ["prompt", "contract", "schema", "agent_wording", "output_format"],
       "owned_paths": [
-        {
-          "path": "AGENTS.md",
-          "match": "exact",
-          "role": "protocol_file"
-        },
-        {
-          "path": "docs/repo_map.json",
-          "match": "exact",
-          "role": "routing_doc"
-        },
-        {
-          "path": "docs/task_routes.json",
-          "match": "exact",
-          "role": "routing_doc"
-        },
-        {
-          "path": "docs/pitfalls.json",
-          "match": "exact",
-          "role": "routing_doc"
-        }
+        {"type": "literal", "path": "T04_common_prompt.py", "match": "exact", "role": "shared_prompt_helper"},
+        {"type": "literal", "path": "Prompt_01_RoutingLayerPlanning.py", "match": "exact", "role": "business_prompt"},
+        {"type": "literal", "path": "Prompt_02_RequirementIntake.py", "match": "exact", "role": "business_prompt"},
+        {"type": "literal", "path": "Prompt_03_RequirementsClarification.py", "match": "exact", "role": "business_prompt"},
+        {"type": "literal", "path": "Prompt_04_RequirementsReview.py", "match": "exact", "role": "business_prompt"},
+        {"type": "literal", "path": "Prompt_05_DetailedDesign.py", "match": "exact", "role": "business_prompt"},
+        {"type": "literal", "path": "Prompt_06_TaskSplit.py", "match": "exact", "role": "business_prompt"},
+        {"type": "literal", "path": "Prompt_07_Development.py", "match": "exact", "role": "business_prompt"},
+        {"type": "literal", "path": "Prompt_08_OverallReview.py", "match": "exact", "role": "business_prompt"},
+        {"type": "subtree", "path": "tmux_core/prompt_contracts", "match": "subtree", "role": "contract_tree"}
       ],
-      "kind": "routing_docs",
-      "purpose": "machine-first agent protocol, module map, task routes, and pitfalls",
-      "entry_files": [
-        "AGENTS.md",
-        "docs/repo_map.json",
-        "docs/task_routes.json",
-        "docs/pitfalls.json"
+      "entry_selectors": [
+        {"type": "literal", "path": "T04_common_prompt.py"},
+        {"type": "owned_paths_role", "role": "business_prompt"},
+        {"type": "subtree", "path": "tmux_core/prompt_contracts"}
       ],
-      "key_symbols": [],
+      "key_symbols": ["build_create_prompt", "build_refine_prompt", "build_audit_prompt", "needs_code_confirmation"],
       "first_read_selectors": [
-        {
-          "type": "literal_path",
-          "path": "AGENTS.md"
-        },
-        {
-          "type": "literal_path",
-          "path": "docs/repo_map.json"
-        },
-        {
-          "type": "literal_path",
-          "path": "docs/task_routes.json"
-        },
-        {
-          "type": "literal_path",
-          "path": "docs/pitfalls.json"
-        }
+        {"type": "token", "token": "matched_prompt_file"},
+        {"type": "literal", "path": "T04_common_prompt.py"},
+        {"type": "subtree", "path": "tmux_core/prompt_contracts"}
       ],
-      "then_check_selectors": [],
-      "relations": [],
+      "then_check_selectors": [
+        {"type": "token", "token": "matched_stage_entry"},
+        {"type": "literal", "path": "tests/test_prompt_contract_specs.py"}
+      ],
+      "relations": [
+        {"type": "used_by", "target": "M03_stage_family"},
+        {"type": "used_by", "target": "M09_routing_init_layer"}
+      ],
+      "out_of_scope_dependencies": ["model_compliance_with_prompt_text"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_prompt_contract_specs.py"},
+        {"type": "literal", "path": "tests/test_stage_kernel_turn_output_goals.py"}
+      ],
+      "related_config_selectors": [],
+      "edit_risk": "high",
+      "blast_radius": "multi_agent_behavior",
+      "pitfall_ids": ["P02", "P06"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_prompt_contract_specs.py"},
+        {"type": "literal", "path": "tests/test_stage_kernel_turn_output_goals.py"}
+      ],
+      "read_before_edit_selectors": [
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
+      ],
+      "routing_confidence": "medium",
+      "expand_search_codes": ["TX03", "TX06"],
+      "scope_notes": []
+    },
+    {
+      "id": "M05_tmux_runtime_hitl",
+      "name": "tmux_runtime_hitl",
+      "path": "T02_tmux_agents.py",
+      "kind": "runtime_and_terminal_protocol",
+      "purpose": "tmux worker control, HITL files, terminal input/output, provider runtime",
+      "task_keywords": ["tmux", "worker", "agent", "runtime", "hitl", "resume", "terminal", "provider", "model"],
+      "owned_paths": [
+        {"type": "literal", "path": "B01_terminal_interaction.py", "match": "exact", "role": "terminal_interaction"},
+        {"type": "literal", "path": "T02_tmux_agents.py", "match": "exact", "role": "runtime_controller"},
+        {"type": "literal", "path": "T05_hitl_runtime.py", "match": "exact", "role": "wrapper_alias"},
+        {"type": "literal", "path": "T06_terminal_progress.py", "match": "exact", "role": "terminal_status"},
+        {"type": "literal", "path": "T07_terminal_input.py", "match": "exact", "role": "terminal_input"},
+        {"type": "literal", "path": "T09_terminal_ops.py", "match": "exact", "role": "terminal_ops"},
+        {"type": "subtree", "path": "tmux_core/runtime", "match": "subtree", "role": "implementation_tree"}
+      ],
+      "entry_selectors": [
+        {"type": "literal", "path": "T02_tmux_agents.py"},
+        {"type": "literal", "path": "T05_hitl_runtime.py"},
+        {"type": "subtree", "path": "tmux_core/runtime"}
+      ],
+      "key_symbols": ["TmuxRuntimeController", "TmuxBatchWorker", "AgentRunConfig", "TurnFileContract", "TurnFileResult"],
+      "first_read_selectors": [
+        {"type": "literal", "path": "T02_tmux_agents.py"},
+        {"type": "literal", "path": "T05_hitl_runtime.py"},
+        {"type": "subtree", "path": "tmux_core/runtime"}
+      ],
+      "then_check_selectors": [
+        {"type": "literal", "path": "B01_terminal_interaction.py"},
+        {"type": "literal", "path": "T07_terminal_input.py"},
+        {"type": "literal", "path": "T09_terminal_ops.py"}
+      ],
+      "relations": [
+        {"type": "used_by", "target": "M01_workflow_entry"},
+        {"type": "used_by", "target": "M03_stage_family"},
+        {"type": "used_by", "target": "M06_bridge_protocol_backends"},
+        {"type": "depends_on", "target": "M08_shared_support"}
+      ],
+      "out_of_scope_dependencies": ["tmux_binary", "agent_cli_binaries", "auth_state", "network_proxy"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_t02_tmux_agents.py"},
+        {"type": "literal", "path": "tests/test_t05_hitl_runtime.py"},
+        {"type": "literal", "path": "tests/test_t07_terminal_input.py"},
+        {"type": "literal", "path": "tests/test_t09_terminal_ops.py"},
+        {"type": "literal", "path": "tests/test_runtime_contract_compat.py"},
+        {"type": "literal", "path": "tests/test_role_orchestration.py"}
+      ],
+      "related_config_selectors": [
+        {"type": "literal", "path": "U01_common_config.py"}
+      ],
+      "edit_risk": "high",
+      "blast_radius": "runtime_and_stage_execution",
+      "pitfall_ids": ["P01", "P04", "P07"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_t02_tmux_agents.py"},
+        {"type": "literal", "path": "tests/test_runtime_contract_compat.py"}
+      ],
+      "read_before_edit_selectors": [
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
+      ],
+      "routing_confidence": "medium",
+      "expand_search_codes": ["TX03", "TX04"],
+      "scope_notes": []
+    },
+    {
+      "id": "M06_bridge_protocol_backends",
+      "name": "bridge_protocol_backends",
+      "path": "T10_tui_protocol.py",
+      "kind": "python_bridge_protocol",
+      "purpose": "NDJSON protocol and Python backends for TUI/Web clients",
+      "task_keywords": ["protocol", "backend", "ndjson", "opentui", "web_backend", "api", "healthz"],
+      "owned_paths": [
+        {"type": "literal", "path": "T10_tui_protocol.py", "match": "exact", "role": "protocol_file"},
+        {"type": "literal", "path": "T11_tui_backend.py", "match": "exact", "role": "wrapper_backend"},
+        {"type": "literal", "path": "T11_web_backend.py", "match": "exact", "role": "wrapper_backend"},
+        {"type": "subtree", "path": "tmux_core/bridge", "match": "subtree", "role": "implementation_tree"}
+      ],
+      "entry_selectors": [
+        {"type": "literal", "path": "T10_tui_protocol.py"},
+        {"type": "literal", "path": "T11_tui_backend.py"},
+        {"type": "literal", "path": "T11_web_backend.py"},
+        {"type": "subtree", "path": "tmux_core/bridge"}
+      ],
+      "key_symbols": ["PROTOCOL_VERSION", "build_request", "build_response", "build_event", "encode_message", "decode_message"],
+      "first_read_selectors": [
+        {"type": "literal", "path": "T10_tui_protocol.py"},
+        {"type": "literal", "path": "T11_tui_backend.py"},
+        {"type": "literal", "path": "T11_web_backend.py"},
+        {"type": "subtree", "path": "tmux_core/bridge"}
+      ],
+      "then_check_selectors": [
+        {"type": "subtree", "path": "packages/tui/src"},
+        {"type": "subtree", "path": "packages/web/src"},
+        {"type": "literal", "path": "A00_main_web.py"}
+      ],
+      "relations": [
+        {"type": "depends_on", "target": "M05_tmux_runtime_hitl"},
+        {"type": "depends_on", "target": "M07_frontend_packages"},
+        {"type": "used_by", "target": "M02_web_launcher"}
+      ],
+      "out_of_scope_dependencies": ["browser_runtime", "terminal_renderer_internals"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_t10_tui_protocol.py"},
+        {"type": "literal", "path": "tests/test_t11_tui_backend.py"},
+        {"type": "literal", "path": "tests/test_t11_web_backend.py"}
+      ],
+      "related_config_selectors": [
+        {"type": "literal", "path": "packages/tui/package.json"},
+        {"type": "literal", "path": "packages/web/package.json"}
+      ],
+      "edit_risk": "high",
+      "blast_radius": "python_frontend_bridge",
+      "pitfall_ids": ["P01", "P05", "P07"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_t10_tui_protocol.py"},
+        {"type": "literal", "path": "tests/test_t11_tui_backend.py"},
+        {"type": "literal", "path": "tests/test_t11_web_backend.py"}
+      ],
+      "read_before_edit_selectors": [
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
+      ],
+      "routing_confidence": "medium",
+      "expand_search_codes": ["TX02", "TX05"],
+      "scope_notes": []
+    },
+    {
+      "id": "M07_frontend_packages",
+      "name": "frontend_packages",
+      "path": "packages",
+      "kind": "bun_solid_frontend_family",
+      "purpose": "OpenTUI terminal UI and Solid Web console",
+      "task_keywords": ["frontend", "opentui", "solid", "bun", "vite", "client", "stage_registry"],
+      "owned_paths": [
+        {"type": "literal", "path": "packages/tui/package.json", "match": "exact", "role": "tui_package_config"},
+        {"type": "subtree", "path": "packages/tui/src", "match": "subtree", "role": "tui_source_tree"},
+        {"type": "literal", "path": "packages/web/package.json", "match": "exact", "role": "web_package_config"},
+        {"type": "subtree", "path": "packages/web/src", "match": "subtree", "role": "web_source_tree"},
+        {"type": "literal", "path": "packages/web/vite.config.ts", "match": "exact", "role": "web_vite_config"},
+        {"type": "literal", "path": "scripts/tmux-tui", "match": "exact", "role": "tui_launcher_script"}
+      ],
+      "entry_selectors": [
+        {"type": "literal", "path": "packages/tui/package.json"},
+        {"type": "literal", "path": "packages/web/package.json"},
+        {"type": "subtree", "path": "packages/tui/src"},
+        {"type": "subtree", "path": "packages/web/src"}
+      ],
+      "key_symbols": ["needs_code_confirmation"],
+      "first_read_selectors": [
+        {"type": "literal", "path": "packages/tui/package.json"},
+        {"type": "literal", "path": "packages/web/package.json"},
+        {"type": "subtree", "path": "packages/tui/src"},
+        {"type": "subtree", "path": "packages/web/src"}
+      ],
+      "then_check_selectors": [
+        {"type": "literal", "path": "T10_tui_protocol.py"},
+        {"type": "literal", "path": "T11_tui_backend.py"},
+        {"type": "literal", "path": "T11_web_backend.py"}
+      ],
+      "relations": [
+        {"type": "depends_on", "target": "M06_bridge_protocol_backends"},
+        {"type": "used_by", "target": "M02_web_launcher"}
+      ],
+      "out_of_scope_dependencies": ["npm_registry", "bun_runtime_behavior", "browser_rendering_outside_visible_code"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_vendor_catalog.py"},
+        {"type": "literal", "path": "tests/test_t10_tui_protocol.py"},
+        {"type": "literal", "path": "tests/test_t11_tui_backend.py"},
+        {"type": "literal", "path": "tests/test_t11_web_backend.py"}
+      ],
+      "related_config_selectors": [
+        {"type": "literal", "path": "packages/tui/package.json"},
+        {"type": "literal", "path": "packages/web/package.json"},
+        {"type": "literal", "path": "packages/web/vite.config.ts"}
+      ],
+      "edit_risk": "medium",
+      "blast_radius": "frontend_clients_and_bridge",
+      "pitfall_ids": ["P03", "P05", "P09"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_t10_tui_protocol.py"},
+        {"type": "literal", "path": "tests/test_t11_tui_backend.py"},
+        {"type": "literal", "path": "tests/test_t11_web_backend.py"}
+      ],
+      "read_before_edit_selectors": [
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
+      ],
+      "routing_confidence": "medium",
+      "expand_search_codes": ["TX05"],
+      "scope_notes": []
+    },
+    {
+      "id": "M08_shared_support",
+      "name": "shared_support",
+      "path": "T01_tools.py",
+      "kind": "shared_python_support",
+      "purpose": "common tools, config, requirement helpers, pre-development state",
+      "task_keywords": ["config", "tools", "pre_development", "requirements_common", "path", "json", "helper"],
+      "owned_paths": [
+        {"type": "literal", "path": "T01_tools.py", "match": "exact", "role": "shared_tools"},
+        {"type": "literal", "path": "T08_pre_development.py", "match": "exact", "role": "pre_development_state"},
+        {"type": "literal", "path": "T12_requirements_common.py", "match": "exact", "role": "requirements_common"},
+        {"type": "literal", "path": "U01_common_config.py", "match": "exact", "role": "shared_config"}
+      ],
+      "entry_selectors": [
+        {"type": "owned_paths_role", "role": "shared_tools"},
+        {"type": "owned_paths_role", "role": "pre_development_state"},
+        {"type": "owned_paths_role", "role": "requirements_common"},
+        {"type": "owned_paths_role", "role": "shared_config"}
+      ],
+      "key_symbols": ["needs_code_confirmation"],
+      "first_read_selectors": [
+        {"type": "token", "token": "matched_shared_file"}
+      ],
+      "then_check_selectors": [
+        {"type": "token", "token": "direct_callers"},
+        {"type": "field_ref", "field": "related_test_selectors"}
+      ],
+      "relations": [
+        {"type": "used_by", "target": "M01_workflow_entry"},
+        {"type": "used_by", "target": "M03_stage_family"},
+        {"type": "used_by", "target": "M05_tmux_runtime_hitl"}
+      ],
       "out_of_scope_dependencies": [],
-      "related_tests": [
-        "tests/test_a01_routing_layer_planning.py",
-        "tests/test_architecture_boundaries.py"
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_t01_tools.py"},
+        {"type": "literal", "path": "tests/test_t12_requirements_common.py"},
+        {"type": "literal", "path": "tests/test_architecture_boundaries.py"}
       ],
-      "related_configs": [],
-      "risk_flags": [
-        "navigation_only",
-        "scope_boundary"
+      "related_config_selectors": [
+        {"type": "literal", "path": "U01_common_config.py"}
       ],
+      "edit_risk": "medium",
+      "blast_radius": "shared_python_flow",
+      "pitfall_ids": ["P04", "P06"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_t01_tools.py"},
+        {"type": "literal", "path": "tests/test_t12_requirements_common.py"},
+        {"type": "literal", "path": "tests/test_architecture_boundaries.py"}
+      ],
+      "read_before_edit_selectors": [
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
+      ],
+      "routing_confidence": "medium",
+      "expand_search_codes": ["TX03"],
+      "scope_notes": []
+    },
+    {
+      "id": "M09_routing_init_layer",
+      "name": "routing_init_layer",
+      "path": "docs/repo_map.json",
+      "kind": "machine_routing_layer_and_initializer",
+      "purpose": "create, validate, audit, and store routing artifacts",
+      "task_keywords": ["agents_md", "repo_map", "task_routes", "pitfalls", "routing_layer", "audit", "machine_first"],
+      "owned_paths": [
+        {"type": "literal", "path": "AGENTS.md", "match": "exact", "role": "agent_protocol"},
+        {"type": "literal", "path": "docs/repo_map.json", "match": "exact", "role": "module_facts"},
+        {"type": "literal", "path": "docs/task_routes.json", "match": "exact", "role": "task_routes"},
+        {"type": "literal", "path": "docs/pitfalls.json", "match": "exact", "role": "pitfalls"},
+        {"type": "literal", "path": "A01_Routing_LayerPlanning.py", "match": "exact", "role": "stage_entry"},
+        {"type": "literal", "path": "T03_agent_init_workflow.py", "match": "exact", "role": "routing_runtime"}
+      ],
+      "entry_selectors": [
+        {"type": "literal", "path": "A01_Routing_LayerPlanning.py"},
+        {"type": "literal", "path": "T03_agent_init_workflow.py"},
+        {"type": "literal", "path": "AGENTS.md"},
+        {"type": "literal", "path": "docs/repo_map.json"},
+        {"type": "literal", "path": "docs/task_routes.json"},
+        {"type": "literal", "path": "docs/pitfalls.json"}
+      ],
+      "key_symbols": ["ROUTING_LAYER_REQUIRED_FILES", "routing_layer_artifact_errors", "validate_routing_layer_artifacts"],
+      "first_read_selectors": [
+        {"type": "literal", "path": "AGENTS.md"},
+        {"type": "literal", "path": "docs/repo_map.json"},
+        {"type": "literal", "path": "docs/task_routes.json"},
+        {"type": "literal", "path": "docs/pitfalls.json"},
+        {"type": "literal", "path": "A01_Routing_LayerPlanning.py"},
+        {"type": "literal", "path": "T03_agent_init_workflow.py"}
+      ],
+      "then_check_selectors": [
+        {"type": "literal", "path": "Prompt_01_RoutingLayerPlanning.py"},
+        {"type": "literal", "path": "tests/test_a01_routing_layer_planning.py"},
+        {"type": "literal", "path": "tests/test_t03_agent_init_workflow.py"}
+      ],
+      "relations": [
+        {"type": "depends_on", "target": "M04_prompt_contracts"},
+        {"type": "depends_on", "target": "M05_tmux_runtime_hitl"},
+        {"type": "writes", "target": "M10_generated_artifacts"}
+      ],
+      "out_of_scope_dependencies": ["selected_target_directories_outside_visible_subtree"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "tests/test_a01_routing_layer_planning.py"},
+        {"type": "literal", "path": "tests/test_t03_agent_init_workflow.py"}
+      ],
+      "related_config_selectors": [],
       "edit_risk": "medium",
       "blast_radius": "downstream_agent_routing",
-      "pitfall_ids": [
-        "P07"
-      ],
-      "minimum_regression": [
-        "tests/test_a01_routing_layer_planning.py",
-        "tests/test_architecture_boundaries.py"
+      "pitfall_ids": ["P02", "P06", "P08"],
+      "minimum_regression_selectors": [
+        {"type": "literal", "path": "tests/test_a01_routing_layer_planning.py"},
+        {"type": "literal", "path": "tests/test_t03_agent_init_workflow.py"}
       ],
       "read_before_edit_selectors": [
-        {
-          "type": "field_ref",
-          "field": "first_read_selectors"
-        }
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"},
+        {"type": "field_ref", "field": "related_test_selectors"}
       ],
       "routing_confidence": "high",
-      "expand_search_codes": [
-        "MX10"
+      "expand_search_codes": ["TX03", "TX07"],
+      "scope_notes": []
+    },
+    {
+      "id": "M10_generated_artifacts",
+      "name": "generated_artifacts",
+      "path": "_tui_e2e_projects",
+      "kind": "generated_output_and_fixture_family",
+      "purpose": "sample generated projects, e2e outputs, runtime scratch data",
+      "task_keywords": ["e2e", "fixture", "generated", "sample_project", "_tui_e2e_projects", ".tmp"],
+      "owned_paths": [
+        {"type": "subtree", "path": "_tui_e2e_projects", "match": "subtree", "role": "generated_e2e_tree"},
+        {"type": "subtree", "path": ".tmp", "match": "subtree", "role": "scratch_tree"}
       ],
-      "scope_notes": [
-        "routing docs narrow search but never replace code as truth"
-      ]
+      "entry_selectors": [
+        {"type": "subtree", "path": "_tui_e2e_projects"},
+        {"type": "subtree", "path": ".tmp"}
+      ],
+      "key_symbols": [],
+      "first_read_selectors": [
+        {"type": "token", "token": "specific_requested_generated_path"}
+      ],
+      "then_check_selectors": [
+        {"type": "token", "token": "generator_or_test_for_artifact"}
+      ],
+      "relations": [
+        {"type": "written_by", "target": "M09_routing_init_layer"},
+        {"type": "observed_by", "target": "M11_tests"}
+      ],
+      "out_of_scope_dependencies": ["generated_target_project_contents_beyond_visible_files"],
+      "related_test_selectors": [
+        {"type": "literal", "path": "_tui_e2e_projects/live full flow 20260504/test_url_status.py"}
+      ],
+      "related_config_selectors": [
+        {"type": "literal", "path": ".tmp/tui_full_flow_project/pyproject.toml"}
+      ],
+      "edit_risk": "low",
+      "blast_radius": "fixtures_and_e2e_outputs",
+      "pitfall_ids": ["P08"],
+      "minimum_regression_selectors": [],
+      "read_before_edit_selectors": [
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"}
+      ],
+      "routing_confidence": "medium",
+      "expand_search_codes": ["TX07"],
+      "scope_notes": []
+    },
+    {
+      "id": "M11_tests",
+      "name": "tests",
+      "path": "tests",
+      "kind": "pytest_regression_suite",
+      "purpose": "visible Python regression and boundary tests",
+      "task_keywords": ["test", "pytest", "regression", "boundary", "failing_test", "coverage"],
+      "owned_paths": [
+        {"type": "subtree", "path": "tests", "match": "subtree", "role": "pytest_tree"},
+        {"type": "literal", "path": "test_models.py", "match": "exact", "role": "top_level_test"}
+      ],
+      "entry_selectors": [
+        {"type": "subtree", "path": "tests"},
+        {"type": "literal", "path": "test_models.py"}
+      ],
+      "key_symbols": [],
+      "first_read_selectors": [
+        {"type": "token", "token": "matched_failing_test"},
+        {"type": "token", "token": "nearest_tested_module"}
+      ],
+      "then_check_selectors": [
+        {"type": "token", "token": "implementation_under_test"},
+        {"type": "field_ref", "field": "related_config_selectors"}
+      ],
+      "relations": [
+        {"type": "verifies", "target": "M01_workflow_entry"},
+        {"type": "verifies", "target": "M03_stage_family"},
+        {"type": "verifies", "target": "M05_tmux_runtime_hitl"},
+        {"type": "verifies", "target": "M06_bridge_protocol_backends"}
+      ],
+      "out_of_scope_dependencies": [],
+      "related_test_selectors": [
+        {"type": "subtree", "path": "tests"},
+        {"type": "literal", "path": "test_models.py"}
+      ],
+      "related_config_selectors": [],
+      "edit_risk": "medium",
+      "blast_radius": "regression_confidence",
+      "pitfall_ids": ["P01", "P06"],
+      "minimum_regression_selectors": [
+        {"type": "token", "token": "matched_failing_test"}
+      ],
+      "read_before_edit_selectors": [
+        {"type": "field_ref", "field": "first_read_selectors"},
+        {"type": "field_ref", "field": "then_check_selectors"}
+      ],
+      "routing_confidence": "high",
+      "expand_search_codes": ["TX01", "TX02", "TX07"],
+      "scope_notes": []
     }
   ]
 }

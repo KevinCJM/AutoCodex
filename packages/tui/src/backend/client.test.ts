@@ -25,3 +25,29 @@ test('BackendClient treats non-JSON stdout lines as log events instead of crashi
   expect(events[0]?.type).toBe('log.append')
   expect(String(events[0]?.payload.text ?? '')).toContain('警告：文件不存在')
 })
+
+test('BackendClient stop tears down child process and pending requests', () => {
+  const client = new BackendClient() as any
+  let killed = false
+  let rejected = false
+  client.process = {
+    kill: () => {
+      killed = true
+    },
+  }
+  client.pending.set('req_1', {
+    resolve: () => undefined,
+    reject: () => {
+      rejected = true
+    },
+  })
+  client.subscribe(() => undefined)
+
+  client.stop()
+
+  expect(killed).toBe(true)
+  expect(rejected).toBe(true)
+  expect(client.process).toBeUndefined()
+  expect(client.pending.size).toBe(0)
+  expect(client.listeners.size).toBe(0)
+})

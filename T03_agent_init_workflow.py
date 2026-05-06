@@ -34,6 +34,7 @@ from T02_tmux_agents import (
     TmuxRuntimeController,
     clean_ansi,
     is_runtime_noise_line,
+    worker_state_is_prelaunch_active,
 )
 
 
@@ -57,6 +58,8 @@ PHASE_ROUTING_LAYER_REFINE = "routing_layer_refine"
 ROUTING_RUNTIME_ROOT_NAME = ".routing_init_runtime"
 RUN_MANIFEST_VERSION = 1
 FINAL_RESULT_STATUSES = {"passed", "failed", "skipped", "stale_failed"}
+ACTIVE_ROUTING_WORKFLOW_STAGES = {"create_running", "audit_running", "refine_running"}
+PRELAUNCH_AGENT_STATES = {"", AgentRuntimeState.STARTING.value, AgentRuntimeState.DEAD.value}
 
 
 def _now_iso() -> str:
@@ -457,6 +460,8 @@ def _validate_turn_status_file(
             raise ValueError(f"artifact_hash mismatch: {relative_path} -> {expected_hash!r} != {actual_hash!r}")
         validated_paths[relative_path] = str(file_path)
         validated_hashes[relative_path] = actual_hash
+    if required_set == set(ROUTING_LAYER_REQUIRED_FILES):
+        validate_routing_layer_artifacts(root)
     return TurnStatusDecision(
         turn_id=turn_id,
         phase=phase,
@@ -619,6 +624,7 @@ def build_turn_file_contract(
         status_path=status_path,
         validator=validator,
         quiet_window_sec=quiet_window_sec,
+        kind="routing_file_contract",
     )
 
 
@@ -852,6 +858,8 @@ class DirectoryInitResult:
 
 
 def _normalize_agent_state_from_runtime_state(state: dict[str, object], fallback: str = AgentRuntimeState.DEAD.value) -> str:
+    if worker_state_is_prelaunch_active(state):
+        return AgentRuntimeState.STARTING.value
     candidate = str(state.get("agent_state", "")).strip().upper()
     if candidate in {item.value for item in AgentRuntimeState}:
         return candidate
@@ -871,6 +879,27 @@ def _normalize_agent_state_from_runtime_state(state: dict[str, object], fallback
     if wrapper_state == AgentRuntimeState.READY.value or provider_phase in {"waiting_input", "idle_ready", "completed_response"}:
         return AgentRuntimeState.READY.value
     return AgentRuntimeState.BUSY.value
+
+
+def _is_active_prelaunch_state_update(
+    entry: "WorkerManifestEntry",
+    state: dict[str, object],
+    normalized_agent_state: str,
+) -> bool:
+    workflow_stage = str(entry.workflow_stage or "").strip()
+    result_status = str(entry.result_status or "").strip()
+    payload = dict(state)
+    payload.setdefault("agent_state", normalized_agent_state)
+    payload.setdefault("workflow_stage", workflow_stage)
+    payload.setdefault("result_status", result_status)
+    payload.setdefault("status", result_status)
+    payload.setdefault("pane_id", entry.pane_id)
+    payload.setdefault("agent_started", entry.agent_started)
+    return (
+        workflow_stage in ACTIVE_ROUTING_WORKFLOW_STAGES | {"pending"}
+        and normalized_agent_state in PRELAUNCH_AGENT_STATES
+        and worker_state_is_prelaunch_active(payload)
+    )
 
 
 @dataclass
@@ -1154,7 +1183,17 @@ class RunStore:
             entry.workflow_stage = str(state.get("workflow_stage", entry.workflow_stage))
             entry.workflow_round = int(state.get("workflow_round", entry.workflow_round))
             entry.result_status = str(state.get("result_status", entry.result_status))
-        entry.agent_state = _normalize_agent_state_from_runtime_state(state, entry.agent_state)
+        normalized_agent_state = _normalize_agent_state_from_runtime_state(state, entry.agent_state)
+        active_prelaunch_update = preserve_workflow_fields and _is_active_prelaunch_state_update(
+            entry,
+            state,
+            normalized_agent_state,
+        )
+        entry.agent_state = (
+            AgentRuntimeState.STARTING.value
+            if active_prelaunch_update
+            else normalized_agent_state
+        )
         entry.agent_alive = bool(state.get("agent_alive", entry.agent_alive))
         entry.agent_started = bool(state.get("agent_started", state.get("agent_ready", entry.agent_started)))
         entry.retry_count = int(state.get("retry_count", entry.retry_count))
@@ -1175,6 +1214,10 @@ class RunStore:
         entry.recoverable = bool(state.get("recoverable", entry.recoverable))
         entry.health_status = str(state.get("health_status", entry.health_status))
         entry.health_note = str(state.get("health_note", entry.health_note))
+        if active_prelaunch_update:
+            entry.health_status = "unknown"
+            if entry.health_note in {"", "missing_session", "pane_dead", "tmux session missing"}:
+                entry.health_note = "launch pending"
         if not preserve_workflow_fields:
             entry.note = str(state.get("note", entry.note))
         entry.log_path = str(state.get("log_path", entry.log_path))

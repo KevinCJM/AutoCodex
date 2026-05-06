@@ -336,6 +336,77 @@ class TurnOutputGoalsTests(unittest.TestCase):
             self.assertIn("评审输出未通过协议校验", worker.prompts[1])
             self.assertIn(str(review_md), worker.prompts[1])
 
+    def test_run_completion_turn_with_repair_skips_repair_when_artifacts_become_valid_after_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            review_json = root / "review.json"
+            review_md = root / "review.md"
+            review_md.write_text("", encoding="utf-8")
+            validator_calls = 0
+
+            def validator(status_path: Path) -> TurnFileResult:
+                nonlocal validator_calls
+                validator_calls += 1
+                if validator_calls == 1:
+                    review_json.write_text(
+                        json.dumps([{"task_name": "M1-T1", "review_pass": True}], ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    review_md.write_text("", encoding="utf-8")
+                    raise ValueError("review_json 尚未稳定")
+                payload = json.loads(status_path.read_text(encoding="utf-8"))
+                matched = payload[0]
+                review_pass = matched["review_pass"]
+                review_md_empty = not review_md.read_text(encoding="utf-8").strip()
+                if review_pass and not review_md_empty:
+                    raise ValueError("通过时 review_md 必须为空")
+                if (not review_pass) and review_md_empty:
+                    raise ValueError("未通过时 review_md 不能为空")
+                return TurnFileResult(
+                    status_path=str(status_path),
+                    payload={"review_pass": review_pass},
+                    artifact_paths={"review_json": str(review_json), "review_md": str(review_md)},
+                    artifact_hashes={},
+                    validated_at="0",
+                )
+
+            contract = TurnFileContract(
+                turn_id="reviewer-turn",
+                phase="任务开发",
+                status_path=review_json,
+                validator=validator,
+                kind="review_round",
+                tracked_artifacts={"review_json": review_json, "review_md": review_md},
+            )
+
+            def first_response(*, result_contract=None, completion_contract=None):  # noqa: ANN001, ARG001
+                return SimpleNamespace(
+                    ok=False,
+                    clean_output=f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: runtime_stalled",
+                )
+
+            def unexpected_repair(*, result_contract=None, completion_contract=None):  # noqa: ANN001, ARG001
+                raise AssertionError("repair prompt should not be sent once artifacts are already valid")
+
+            worker = _FakeTaskWorker([first_response, unexpected_repair])
+            run_completion_turn_with_repair(
+                worker=worker,
+                label="reviewer_turn",
+                prompt="评审 prompt",
+                completion_contract=contract,
+                turn_goal=CompletionTurnGoal(
+                    goal_id="reviewer_round",
+                    outcomes={
+                        "review_pass": OutcomeGoal(status="review_pass", required_aliases=("review_json",), forbidden_aliases=("review_md",)),
+                        "review_fail": OutcomeGoal(status="review_fail", required_aliases=("review_json", "review_md")),
+                    },
+                ),
+                stage_label="任务开发",
+                role_label="审核员",
+            )
+
+            self.assertEqual(worker.prompts, ["评审 prompt"])
+
 
 if __name__ == "__main__":
     unittest.main()

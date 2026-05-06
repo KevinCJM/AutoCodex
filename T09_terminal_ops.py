@@ -239,7 +239,10 @@ class StdioTerminalUI:
     ) -> int:
         merged_env = dict(os.environ)
         merged_env.update(dict(env or {}))
-        completed = subprocess.run(list(command), cwd=cwd, env=merged_env, check=False)
+        try:
+            completed = subprocess.run(list(command), cwd=cwd, env=merged_env, check=False)
+        except KeyboardInterrupt:
+            return 130
         return int(completed.returncode)
 
 
@@ -722,7 +725,7 @@ def maybe_launch_tui(
     no_tui, filtered = split_legacy_cli_flag(argv)
     if any(item in {"-h", "--help"} for item in filtered):
         return False, filtered
-    if argv is None and not filtered and not no_tui and sys.stdin.isatty() and sys.stdout.isatty():
+    if not no_tui and sys.stdin.isatty() and sys.stdout.isatty():
         ensure_tui_dependencies_installed()
         command = [
             str(repo_root() / "scripts" / "tmux-tui"),

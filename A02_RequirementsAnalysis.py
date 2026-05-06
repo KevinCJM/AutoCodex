@@ -123,7 +123,6 @@ from T12_requirements_common import (
     sanitize_requirement_name,
 )
 
-
 REQUIREMENTS_ANALYSIS_STAGE_NAME = REQUIREMENTS_CLARIFICATION_STAGE_NAME
 REQUIREMENTS_ANALYSIS_TURN_PHASE = REQUIREMENTS_CLARIFICATION_TURN_PHASE
 collect_requirements_analysis_agent_selection = collect_requirements_clarification_agent_selection
@@ -132,7 +131,6 @@ render_requirements_analysis_tmux_start_summary = render_requirements_clarificat
 cleanup_stage_runtime_paths = cleanup_runtime_paths
 collect_request = collect_intake_request
 build_parser = build_intake_parser
-
 
 _INTAKE_BOOLEAN_FLAGS = {
     "--overwrite",
@@ -355,7 +353,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     preserve_ba_worker=False,
                 )
         else:
-            message("执行摘要: 未检测到可复用的需求澄清，需要启动需求分析师智能体执行需求澄清；请为需求分析师选择厂商、模型、推理强度、代理端口。")
+            message(
+                "执行摘要: 未检测到可复用的需求澄清，需要启动需求分析师智能体执行需求澄清；请为需求分析师选择厂商、模型、推理强度、代理端口。")
             selection = collect_requirements_analysis_agent_selection(selection_args)
             message(render_requirements_clarification_stage_start(selection))
             result = run_requirements_analysis(

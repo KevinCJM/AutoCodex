@@ -246,6 +246,13 @@ function LogEntryCard(props: { entry: LogEntry }) {
 
 function buildPromptDraftKey(promptType: string, payload: Record<string, unknown>) {
   const title = String(payload.title ?? payload.prompt_text ?? 'prompt').trim()
+  const hitlFingerprint = [
+    String(payload.id ?? '').trim(),
+    resolveHitlQuestionPath(payload),
+    resolveHitlAnswerPath(payload),
+  ].find(Boolean)
+  const looksLikeHitl = resolvePromptIsHitl(payload) || `${promptType} ${title}`.toLowerCase().includes('hitl')
+  if (looksLikeHitl && hitlFingerprint) return `${promptType}:hitl:${hitlFingerprint}`
   return `${promptType}:${title}`
 }
 
@@ -285,6 +292,14 @@ function resolvePreviewTitle(payload: Record<string, unknown> | null | undefined
   return String(payload?.preview_title ?? payload?.previewTitle ?? '').trim()
 }
 
+function resolvePromptDocumentPath(payload: Record<string, unknown> | null | undefined) {
+  return resolvePreviewPath(payload) || resolveHitlQuestionPath(payload)
+}
+
+function resolvePromptDocumentTitle(payload: Record<string, unknown> | null | undefined) {
+  return resolvePreviewTitle(payload) || String(payload?.title ?? payload?.prompt_text ?? '文档预览').trim() || '文档预览'
+}
+
 function isHitlPrompt(active: PromptState | null): boolean {
   if (!active) return false
   if (resolvePromptIsHitl(active.payload)) return true
@@ -319,12 +334,20 @@ function buildPromptBackedHitlSnapshot(active: PromptState | null, fallback: Hit
   }
 }
 
+function buildVisibleHitlSnapshot(active: PromptState | null, fallback: HitlSnapshot, appStatus: string): HitlSnapshot {
+  const promptBacked = buildPromptBackedHitlSnapshot(active, fallback)
+  if (isHitlPrompt(active)) return promptBacked
+  if (!fallback.pending) return fallback
+  if (String(appStatus || '').trim().toLowerCase() === 'awaiting-input') return fallback
+  return EMPTY_HITL_SNAPSHOT
+}
+
 function allocateShellHeights(totalHeight: number, footerIsPrompt: boolean, logOpen: boolean): ShellHeights {
   const shellGapRows = logOpen ? 2 : 1
   const available = Math.max(1, totalHeight - shellGapRows)
   const topMin = 8
   const logMin = 8
-  const footerMin = footerIsPrompt ? 10 : 6
+  const footerMin = footerIsPrompt ? 13 : 6
 
   if (!logOpen) {
     const preferredTop = Math.floor(available * 0.6)
@@ -369,6 +392,24 @@ function FooterPromptHost(props: FooterPromptHostProps) {
   const title = createMemo(() => String(props.active.payload.title ?? props.active.payload.prompt_text ?? '请输入'))
   const allowBack = createMemo(() => promptAllowsBack(props.active.payload))
   const backValue = createMemo(() => resolvePromptBackValue(props.active.payload))
+  const hitlHints = createMemo(() => {
+    if (!isHitlPrompt(props.active)) return []
+    const questionPath = resolveHitlQuestionPath(props.active.payload)
+    const lines: string[] = []
+    if (questionPath) lines.push(`问题文件: ${questionPath.split('/').pop() || questionPath}`)
+    lines.push('Ctrl+K 查看完整问题')
+    if (!questionPath) return lines
+    try {
+      const previewLines = normalizeLogLines(readFileSync(questionPath, 'utf8'))
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 2)
+      lines.push(...previewLines.map((line) => `> ${line.slice(0, 88)}`))
+    } catch {
+      lines.push('> 问题文件读取失败，请查看日志')
+    }
+    return lines
+  })
   return (
     <box
       borderStyle="single"
@@ -385,6 +426,9 @@ function FooterPromptHost(props: FooterPromptHostProps) {
         focusToken={props.focusToken}
         focused={props.focused}
         mode={props.active.promptType === 'multiline' ? 'multiline' : 'singleline'}
+        hintLines={hitlHints()}
+        textareaHeight={isHitlPrompt(props.active) ? 4 : undefined}
+        rememberHistory={!isHitlPrompt(props.active)}
         showSubmitHelper={false}
         onBack={allowBack() ? () => void props.onSubmit(backValue()) : undefined}
         onSubmit={(value) => void props.onSubmit(value)}
@@ -408,7 +452,7 @@ function DialogOverlay(props: DialogOverlayProps) {
       height={dimensions().height}
       alignItems="center"
       paddingTop={topPadding()}
-      backgroundColor={RGBA.fromInts(0, 0, 0, 150)}
+      backgroundColor={RGBA.fromInts(0, 0, 0, 255)}
     >
       <box width={dialogWidth()} maxWidth={dimensions().width - 2} borderStyle="single" flexDirection="column" paddingTop={1} paddingBottom={1}>
         <Show when={props.helperText}>
@@ -506,25 +550,31 @@ function DocumentPreviewLayer(props: { preview: DocumentPreviewState; onScrollbo
 }
 
 function FooterStatusHost(props: FooterStatusHostProps) {
+  const normalizedStatus = createMemo(() => String(props.status || '').trim().toLowerCase())
   const isError = createMemo(() => props.status === 'error' || props.status === 'failed')
+  const isCompleted = createMemo(() => ['completed', 'succeeded', 'done'].includes(normalizedStatus()))
   const isWaitingForHitl = createMemo(() => props.pendingHitl && !isError())
-  const isRunning = createMemo(() => !isError() && (props.status === 'running' || Boolean(props.progressLine.trim())))
-  const isBooting = createMemo(() => !isError() && props.status === 'running' && !props.progressLine.trim())
+  const isRunning = createMemo(() => !isError() && !isCompleted() && (props.status === 'running' || Boolean(props.progressLine.trim())))
+  const isBooting = createMemo(() => !isError() && !isCompleted() && props.status === 'booting')
   const title = createMemo(() => {
     if (isWaitingForHitl()) return '等待人工输入'
     if (isError()) return '运行失败'
+    if (isCompleted()) return '已完成'
     return isRunning() ? '运行中' : '等待中'
   })
   const primaryLine = createMemo(() => {
     if (isWaitingForHitl()) return '存在待处理 HITL，请回复问题。'
     if (isError()) return '当前阶段发生错误，请查看上方日志。'
+    if (isCompleted()) return '流程已完成，可退出界面。'
     if (props.progressLine.trim()) return props.progressLine
     if (isBooting()) return '⠦ 智能体启动中...'
+    if (isRunning()) return '阶段调度中，等待下一个智能体任务。'
     return '当前没有待处理的人类输入，系统空闲。'
   })
   const secondaryLine = createMemo(() => {
     if (isWaitingForHitl()) return '请根据右侧问题文件或日志内容继续回复。'
     if (isError()) return '请查看失败日志，修正配置后重新发起当前阶段。'
+    if (isCompleted()) return '所有阶段已收尾，结果文件已写入项目目录。'
     return isRunning() ? '系统执行智能体任务中，输入框会在需要人类交互时自动恢复。' : '等待下一次人类输入或阶段调度。'
   })
 
@@ -819,12 +869,13 @@ export function App(props: StartupOptions) {
   const [controlSelectedIndex, setControlSelectedIndex] = createSignal(0)
   const [hitlSnapshot, setHitlSnapshot] = createSignal<HitlSnapshot>(EMPTY_HITL_SNAPSHOT)
   const [artifactsSnapshot, setArtifactsSnapshot] = createSignal<ArtifactsSnapshot>(EMPTY_ARTIFACTS_SNAPSHOT)
-  const displayHitlSnapshot = createMemo(() => buildPromptBackedHitlSnapshot(prompt(), hitlSnapshot()))
+  const displayHitlSnapshot = createMemo(() => buildVisibleHitlSnapshot(prompt(), hitlSnapshot(), status()))
   const displayAppSnapshot = createMemo<AppSnapshot>(() => {
     const base = appSnapshot()
+    const visibleHitl = displayHitlSnapshot()
     return {
       ...base,
-      pendingHitl: base.pendingHitl || displayHitlSnapshot().pending,
+      pendingHitl: visibleHitl.pending || (base.pendingHitl && status() === 'awaiting-input'),
     }
   })
   const homeAgents = createMemo<HomeAgentItem[]>(() =>
@@ -864,17 +915,17 @@ export function App(props: StartupOptions) {
   let logScrollbox: ScrollBoxRenderable | undefined
   let documentPreviewScrollbox: ScrollBoxRenderable | undefined
   let controlPollInFlight = false
-  const dialogPreview = createMemo<DocumentPreviewState | null>(() => {
-    const active = dialogPrompt()
+  const promptPreview = createMemo<DocumentPreviewState | null>(() => {
+    const active = dialogPrompt() ?? footerPrompt()
     if (!active) return null
-    const path = resolvePreviewPath(active.payload)
+    const path = resolvePromptDocumentPath(active.payload)
     if (!path) return null
     return {
       path,
-      title: resolvePreviewTitle(active.payload) || String(active.payload.title ?? active.payload.prompt_text ?? '文档预览'),
+      title: resolvePromptDocumentTitle(active.payload),
     }
   })
-  const activeDocumentPreview = createMemo<DocumentPreviewState | null>(() => (documentPreviewOpen() ? dialogPreview() : null))
+  const activeDocumentPreview = createMemo<DocumentPreviewState | null>(() => (documentPreviewOpen() ? promptPreview() : null))
 
   const currentProgress = createMemo(() => Object.values(progress()).join(' | '))
   const footerProgressLine = createMemo(() =>
@@ -904,11 +955,16 @@ export function App(props: StartupOptions) {
   })
   const statusLines = createMemo(() => {
     const lines = ['运行状态', `status: ${status()}`]
+    const snapshot = displayAppSnapshot()
     if (footerProgressLine()) lines.push(footerProgressLine())
     if (Object.keys(bootstrap()).length > 0) lines.push(`python: ${String(bootstrap().python_path ?? '')}`)
-    lines.push(`active_run: ${displayAppSnapshot().activeRunId || '(none)'}`)
-    lines.push(`pending_hitl: ${displayAppSnapshot().pendingHitl ? 'yes' : 'no'}`)
-    lines.push(`pending_attention: ${displayAppSnapshot().pendingAttention ? 'yes' : 'no'}`)
+    if (snapshot.currentAction) lines.push(`action: ${snapshot.currentAction}`)
+    if (snapshot.activeStage || snapshot.activeStageLabel) {
+      lines.push(`stage: ${snapshot.activeStageLabel || snapshot.activeStage}${snapshot.activeStage ? ` (${snapshot.activeStage})` : ''}`)
+    }
+    lines.push(`active_run: ${snapshot.activeRunId || '(none)'}`)
+    lines.push(`pending_hitl: ${snapshot.pendingHitl ? 'yes' : 'no'}`)
+    lines.push(`pending_attention: ${snapshot.pendingAttention ? 'yes' : 'no'}`)
     lines.push(...developmentStatusLines())
     if (showLogs()) lines.push('log_open: yes')
     return lines
@@ -1155,7 +1211,8 @@ export function App(props: StartupOptions) {
       if (stageRoute === 'development') setDevelopmentSnapshot(normalizeDevelopmentSnapshot(stageSnapshot))
       if (stageRoute === 'overall-review') setOverallReviewSnapshot(normalizeOverallReviewSnapshot(stageSnapshot))
       const activeStage = displayAppSnapshot().activeStage !== 'idle' ? displayAppSnapshot().activeStage : stageCursor().activeAction
-      if (shouldRecoverRunningFromStageSnapshot(status(), activeStage, stageRoute, stageSnapshot)) {
+      const hasPendingInput = Boolean(prompt()) || Boolean(hitlSnapshot().pending)
+      if (shouldRecoverRunningFromStageSnapshot(status(), activeStage, stageRoute, stageSnapshot, hasPendingInput)) {
         setStatus('running')
       }
       return
@@ -1225,10 +1282,15 @@ export function App(props: StartupOptions) {
     const spinnerTimer = setInterval(() => {
       setFooterSpinnerTick((prev) => prev + 1)
     }, 500)
+    let unsubscribeBackend: (() => void) | undefined
     onCleanup(() => clearInterval(spinnerTimer))
+    onCleanup(() => {
+      unsubscribeBackend?.()
+      client.stop()
+    })
     try {
       await client.start()
-      client.subscribe(handleEvent)
+      unsubscribeBackend = client.subscribe(handleEvent)
       const result = (await client.bootstrap()) as Record<string, unknown>
       setBootstrap(result)
       applyBootstrapSnapshots(result)
@@ -1279,7 +1341,7 @@ export function App(props: StartupOptions) {
   })
 
   createEffect(() => {
-    if (!dialogPreview()) setDocumentPreviewOpen(false)
+    if (!promptPreview()) setDocumentPreviewOpen(false)
   })
 
   createEffect(() => {
@@ -1403,7 +1465,7 @@ export function App(props: StartupOptions) {
       return
     }
     if (event.name === 'k' && event.ctrl) {
-      const preview = dialogPreview()
+      const preview = promptPreview()
       if (preview) {
         event.preventDefault()
         setDocumentPreviewOpen(true)
@@ -1507,9 +1569,7 @@ export function App(props: StartupOptions) {
                             ? '#7be495'
                             : '#888888'
                     }
-                  >
-                    {line}
-                  </text>
+                  >{line}</text>
                 )}
               </For>
             </box>

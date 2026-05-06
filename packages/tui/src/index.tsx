@@ -61,6 +61,8 @@ const renderer = await createCliRenderer({
   autoFocus: true,
   screenMode: 'alternate-screen',
   externalOutputMode: 'passthrough',
+  consoleMode: 'disabled',
+  openConsoleOnError: false,
   consoleOptions: {
     keyBindings: [{ name: 'y', ctrl: true, action: 'copy-selection' }],
     onCopySelection: (text) => {

@@ -48,6 +48,12 @@ from T02_tmux_agents import (
     _session_name_lease_lock,
 )
 from tmux_core.runtime.contracts import finalize_task_result, write_task_status
+from tmux_core.runtime.tmux_runtime import (
+    is_worker_death_error,
+    worker_state_has_launch_evidence,
+    worker_state_is_prelaunch_active,
+)
+from tmux_core.stage_kernel.role_orchestration import ensure_reviewers_ready
 
 
 class TmuxAgentsTests(unittest.TestCase):
@@ -106,6 +112,28 @@ class TmuxAgentsTests(unittest.TestCase):
         self.assertGreaterEqual(len(calls), 2)
         self.assertTrue(supervisor.stopped())
         supervisor.stop()
+
+    def test_task_runtime_paths_do_not_collide_when_labels_share_truncated_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="runtime-path-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+
+            original_path = worker._build_task_result_path(  # noqa: SLF001
+                label="detailed_design_review_limit_human_reply",
+                attempt=1,
+            )
+            repair_path = worker._build_task_result_path(  # noqa: SLF001
+                label="detailed_design_review_limit_human_reply_repair_1",
+                attempt=1,
+            )
+
+            self.assertNotEqual(original_path, repair_path)
+            self.assertEqual(original_path.name.count("_attempt_1_result.json"), 1)
+            self.assertEqual(repair_path.name.count("_attempt_1_result.json"), 1)
 
     def test_health_supervisor_can_restart_after_self_stop(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -211,7 +239,13 @@ YOLO Ctrl+Y
 *   Type your message or @path/to/file
 workspace (/directory)
 """
+            busy_visible = """
+Thinking... (esc to cancel, 43s)
+*   Type your message or @path/to/file
+workspace (/directory)
+"""
             self.assertFalse(worker._visible_indicates_agent_ready(not_ready_visible))
+            self.assertFalse(worker._visible_indicates_agent_ready(busy_visible))
             self.assertTrue(worker._visible_indicates_agent_ready(ready_visible))
 
     def test_codex_ready_detection_rejects_prompt_marker_during_mcp_boot(self):
@@ -252,6 +286,47 @@ workspace (/directory)
 """
             self.assertFalse(worker._visible_indicates_agent_starting(visible))
             self.assertTrue(worker._visible_indicates_agent_ready(visible))
+
+    def test_codex_ready_detection_ignores_stale_boot_prompts_after_input_box(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="codex-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.3-codex"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            visible = """
+Do you trust the contents of this directory?
+› 1. Yes, continue
+  Press enter to continue
+
+╭─────────────────────────────────────────────────╮
+│ ✨ Update available! 0.125.0 -> 0.128.0         │
+╰─────────────────────────────────────────────────╯
+
+⚠ MCP startup incomplete (failed: notion)
+
+› Find and fix a bug in @filename
+
+  gpt-5.3-codex high · ~/Desktop/tmux_tui_simple_20260503_172545
+"""
+            observation = WorkerObservation(
+                visible_text=visible,
+                raw_log_delta="",
+                raw_log_tail=visible,
+                current_command="node",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-05-03T17:36:00",
+                pane_title="tmux_tui_simple_20260...",
+            )
+
+            self.assertFalse(worker._visible_indicates_agent_starting(visible))
+            self.assertTrue(worker._visible_indicates_agent_ready(visible))
+            self.assertTrue(worker._visible_ready_signature(observation))
+            self.assertFalse(worker._maybe_handle_codex_boot_prompt(visible))
 
     def test_gemini_ready_detection_rejects_trust_prompt(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -723,6 +798,21 @@ workspace (/directory)                                                     branc
         )
         self.assertEqual(gemini_processing_over_stale_auth_phase, AgentRuntimeState.BUSY)
 
+        gemini_thinking_with_input_box_phase = GeminiOutputDetector().classify_agent_state(
+            WorkerObservation(
+                visible_text="Thinking... (esc to cancel, 43s)\n*   Type your message or @path/to/file",
+                raw_log_delta="",
+                raw_log_tail="Thinking... (esc to cancel, 43s)\n*   Type your message or @path/to/file",
+                current_command="gemini",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-12T00:00:00",
+            )
+        )
+        self.assertEqual(gemini_thinking_with_input_box_phase, AgentRuntimeState.BUSY)
+
         codex_phase = CodexOutputDetector().classify_agent_state(
             WorkerObservation(
                 visible_text="Update available!\nUpdate now\nSkip until next version\nPress enter to continue",
@@ -831,6 +921,7 @@ workspace (/directory)                                                     branc
         opencode_default_cmd = AgentRunConfig(vendor=Vendor.OPENCODE, model="default").build_launch_command(work_dir)
         self.assertIn("opencode /tmp/project --pure", opencode_default_cmd)
         self.assertIn(f"--model {get_default_model_for_vendor('opencode')}", opencode_default_cmd)
+        self.assertNotIn("--dangerously-skip-permissions", opencode_default_cmd)
 
         mapped_opencode_model = next(
             item.model_id
@@ -843,7 +934,8 @@ workspace (/directory)                                                     branc
             reasoning_effort="max",
         ).build_launch_command(work_dir)
         self.assertIn(f"opencode /tmp/project --pure --model {mapped_opencode_model}", opencode_model_cmd)
-        self.assertIn("--variant", opencode_model_cmd)
+        self.assertNotIn("--variant", opencode_model_cmd)
+        self.assertNotIn("--dangerously-skip-permissions", opencode_model_cmd)
 
     def test_build_session_name_is_stable_and_bounded(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1001,6 +1093,41 @@ workspace (/directory)                                                     branc
             with mock.patch("T02_tmux_agents._notify_runtime_state_changed_best_effort") as notifier:
                 worker._write_state(WorkerStatus.RUNNING, note="test")  # noqa: SLF001
         notifier.assert_called_once_with()
+
+    def test_write_ready_state_clears_stale_running_runtime_fields(self):
+        class ReadyStateWorker(TmuxBatchWorker):
+            def is_agent_alive(self, observation=None):  # noqa: ANN001, ARG002
+                return True
+
+            def get_agent_state(self, observation=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.READY
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = ReadyStateWorker(
+                worker_id="reviewer-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="gemini", model="flash"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            worker._write_state(  # noqa: SLF001
+                WorkerStatus.RUNNING,
+                note="turn:review",
+                extra={
+                    "result_status": "running",
+                    "current_task_runtime_status": "running",
+                },
+            )
+
+            worker.current_task_runtime_status = "running"
+            worker._write_state(WorkerStatus.READY, note="agent_ready")  # noqa: SLF001
+            state = worker.read_state()
+
+        self.assertEqual(state["status"], WorkerStatus.READY.value)
+        self.assertEqual(state["result_status"], WorkerStatus.READY.value)
+        self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
+        self.assertEqual(state["current_task_runtime_status"], "")
 
     def test_read_state_recovers_from_trailing_json_garbage(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1331,6 +1458,331 @@ workspace (/directory)                                                     branc
         self.assertEqual(len(worker.sent_prompts), 1)
         self.assertEqual(worker.ensure_timeouts[:3], [60.0, 2.0, 2.0])
 
+    def test_run_turn_relaunches_stale_busy_agent_after_completed_contract_turn(self):
+        class StaleBusyAfterDoneWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.ensure_timeouts = []
+                self.sent_prompts = []
+                self.restart_count = 0
+                self.state_notes = []
+
+            def _write_state(self, status, *, note, extra=None):
+                self.state_notes.append((status.value, note, extra or {}))
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.ensure_timeouts.append(timeout_sec)
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                if self.restart_count == 0:
+                    self.agent_ready = False
+                    self.agent_state = AgentRuntimeState.BUSY
+                    self.wrapper_state = WrapperState.NOT_READY
+                    raise RuntimeError("Timed out waiting for agent ready.\nBuild · Big Pickle")
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def request_restart(self):
+                self.restart_count += 1
+                self.agent_ready = False
+                self.agent_started = False
+                self.agent_state = AgentRuntimeState.STARTING
+                self.wrapper_state = WrapperState.NOT_READY
+                return self.session_name
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="Build · Big Pickle" if self.restart_count == 0 else "›",
+                    raw_log_delta="",
+                    raw_log_tail="Build · Big Pickle\nesc interrupt" if self.restart_count == 0 else "›",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-04T06:24:00",
+                    pane_title="OC | 需求文档一致性审计" if self.restart_count == 0 else "TmuxCodingTeam",
+                )
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "Build · Big Pickle"
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+                write_task_status(self.current_task_status_path, status="done")
+
+            def _wait_for_turn_reply(self, **kwargs):
+                return "ok\n[[DONE]]"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = StaleBusyAfterDoneWorker(
+                worker_id="stale-busy-after-done-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.current_task_runtime_status = "done"
+            result = worker.run_turn(label="stale_busy_after_done", prompt="hello", required_tokens=["[[DONE]]"], timeout_sec=2.0)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(worker.restart_count, 0)
+        self.assertEqual(len(worker.sent_prompts), 0)
+        self.assertEqual(worker.ensure_timeouts, [60.0])
+        self.assertIn("系统不会自动重启该智能体", result.clean_output)
+        self.assertIn(f"tmux attach -t {worker.session_name}", result.clean_output)
+
+    def test_run_turn_relaunches_stale_busy_agent_before_repair_after_failed_turn(self):
+        class StaleBusyAfterFailedWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.ensure_timeouts = []
+                self.sent_prompts = []
+                self.restart_count = 0
+
+            def read_state(self):
+                return {"status": "failed"}
+
+            def _write_state(self, status, *, note, extra=None):
+                return None
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.ensure_timeouts.append(timeout_sec)
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                if self.restart_count == 0:
+                    self.agent_ready = False
+                    self.agent_state = AgentRuntimeState.BUSY
+                    self.wrapper_state = WrapperState.NOT_READY
+                    raise RuntimeError("Timed out waiting for agent ready.\nBuild · Big Pickle")
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+
+            def request_restart(self):
+                self.restart_count += 1
+                self.agent_ready = False
+                self.agent_started = False
+                self.agent_state = AgentRuntimeState.STARTING
+                self.wrapper_state = WrapperState.NOT_READY
+                return self.session_name
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="Build · Big Pickle" if self.restart_count == 0 else "›",
+                    raw_log_delta="",
+                    raw_log_tail="Build · Big Pickle\nesc interrupt" if self.restart_count == 0 else "›",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-04T07:20:00",
+                    pane_title="OC | Review Repair" if self.restart_count == 0 else "TmuxCodingTeam",
+                )
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "Build · Big Pickle"
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+                write_task_status(self.current_task_status_path, status="done")
+
+            def _wait_for_turn_reply(self, **kwargs):
+                return "ok\n[[DONE]]"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = StaleBusyAfterFailedWorker(
+                worker_id="stale-busy-after-failed-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            result = worker.run_turn(label="repair_turn", prompt="repair", required_tokens=["[[DONE]]"], timeout_sec=2.0)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(worker.restart_count, 0)
+        self.assertEqual(len(worker.sent_prompts), 0)
+        self.assertEqual(worker.ensure_timeouts, [60.0])
+        self.assertIn("系统不会自动重启该智能体", result.clean_output)
+        self.assertIn(f"tmux attach -t {worker.session_name}", result.clean_output)
+
+    def test_run_turn_waits_for_active_busy_agent_after_failed_turn(self):
+        class ActiveBusyAfterFailedWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.ensure_timeouts = []
+                self.sent_prompts = []
+                self.state_notes = []
+
+            def read_state(self):
+                return {"status": "failed"}
+
+            def _write_state(self, status, *, note, extra=None):
+                self.state_notes.append((status.value, note, extra or {}))
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.ensure_timeouts.append(timeout_sec)
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                if len(self.ensure_timeouts) == 1:
+                    self.agent_ready = False
+                    self.agent_state = AgentRuntimeState.BUSY
+                    self.wrapper_state = WrapperState.NOT_READY
+                    raise RuntimeError("Timed out waiting for agent ready.\nBuild · Big Pickle")
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                self.last_terminal_signature = "active-progress"
+                self.last_terminal_changed_at = "2026-05-06T11:28:40"
+                self._last_terminal_change_monotonic = time.monotonic()
+                self.terminal_recently_changed = True
+                return WorkerObservation(
+                    visible_text="Build · Big Pickle",
+                    raw_log_delta="",
+                    raw_log_tail="Build · Big Pickle\nesc interrupt",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-06T11:28:40",
+                    pane_title="OC | Review Repair",
+                )
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "Build · Big Pickle"
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+
+            def _wait_for_turn_reply(self, **kwargs):
+                return "ok\n[[DONE]]"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = ActiveBusyAfterFailedWorker(
+                worker_id="active-busy-after-failed-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            result = worker.run_turn(label="repair_turn", prompt="repair", required_tokens=["[[DONE]]"], timeout_sec=2.0)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(worker.ensure_timeouts, [60.0, 2.0])
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertNotIn("系统不会自动重启该智能体", result.clean_output)
+
+    def test_run_turn_failure_does_not_leave_runtime_status_running(self):
+        class FailingTurnWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.state_updates = []
+
+            def _write_state(self, status, *, note, extra=None):
+                self.state_updates.append((status.value, note, extra or {}))
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+
+            def target_exists(self, target=None):
+                return False
+
+            def _send_text(self, text, enter_count=None):
+                return None
+
+            def _wait_for_turn_reply(self, **kwargs):
+                raise RuntimeError("reply contract failed")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = FailingTurnWorker(
+                worker_id="failed-turn-runtime-status-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            result = worker.run_turn(label="bad_turn", prompt="hello", required_tokens=["[[DONE]]"], timeout_sec=2.0)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(worker.state_updates[-1][0], "failed")
+        self.assertEqual(worker.state_updates[-1][2]["current_task_runtime_status"], "")
+
+    def test_ensure_reviewers_ready_blocks_failed_busy_worker_without_restart(self):
+        class FailedBusyWorker:
+            def __init__(self):
+                self.restart_count = 0
+                self.ensure_timeouts = []
+
+            def read_state(self):
+                return {
+                    "status": "failed" if self.restart_count == 0 else "ready",
+                    "result_status": "failed" if self.restart_count == 0 else "pending",
+                    "current_task_runtime_status": "running",
+                }
+
+            def get_agent_state(self, observation=None):
+                return AgentRuntimeState.BUSY if self.restart_count == 0 else AgentRuntimeState.READY
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.ensure_timeouts.append(timeout_sec)
+
+            def _restart_stale_busy_agent_for_turn_start(self, *, timeout_sec, reason):
+                self.restart_count += 1
+                self.restart_reason = reason
+                self.restart_timeout = timeout_sec
+
+        worker = FailedBusyWorker()
+
+        with self.assertRaises(RuntimeError) as raised:
+            ensure_reviewers_ready(None, [worker], timeout_sec=3.0, allow_completed_nonready=True)
+
+        self.assertEqual(worker.restart_count, 0)
+        self.assertIn("需要人工介入", str(raised.exception))
+        self.assertIn("系统不会自动重启该智能体", str(raised.exception))
+        self.assertEqual(worker.ensure_timeouts, [])
+
     def test_run_turn_keeps_waiting_for_same_completion_turn_when_timeout_agent_still_busy(self):
         class SlowBusyCompletionWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -1547,6 +1999,127 @@ workspace (/directory)                                                     branc
         self.assertTrue(result.ok)
         self.assertEqual(len(worker.sent_prompts), 1)
         self.assertEqual(worker.wait_calls, 1)
+
+    def test_run_turn_does_not_retry_when_agent_becomes_busy_after_prompt_timeout(self):
+        class DelayedBusyAfterPromptTimeoutWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+                self.wait_calls = 0
+                self.post_timeout_observes = 0
+                self.prompt_timeout_seen = False
+
+            def _append_transcript(self, title, body):
+                return None
+
+            def ensure_agent_ready(self, timeout_sec=60.0):
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "◇  Ready"
+
+            def target_exists(self, target=None):
+                return True
+
+            def capture_visible(self, tail_lines=500):
+                return "fake-visible"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                if self.prompt_timeout_seen:
+                    self.post_timeout_observes += 1
+                busy = self.prompt_timeout_seen and self.post_timeout_observes >= 2
+                visible_text = (
+                    "⠋ Thinking... (esc to cancel)\n *   Type your message or @path/to/file"
+                    if busy
+                    else "*   Type your message or @path/to/file"
+                )
+                pane_title = "✦  Working..." if busy else "◇  Ready"
+                return WorkerObservation(
+                    visible_text=visible_text,
+                    raw_log_delta=visible_text,
+                    raw_log_tail=visible_text,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-02T21:10:49",
+                    pane_title=pane_title,
+                )
+
+            def _send_text(self, text, enter_count=None):
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):
+                self.prompt_timeout_seen = True
+                raise TimeoutError("等待智能体确认收到 prompt 超时")
+
+            def wait_for_turn_artifacts(self, *, contract, task_status_path=None, timeout_sec):
+                self.wait_calls += 1
+                artifact_path.write_text("", encoding="utf-8")
+                contract.status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "turn_id": contract.turn_id,
+                            "phase": contract.phase,
+                            "status": "done",
+                            "written_at": "2026-05-02T21:11:47+08:00",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                if task_status_path is not None:
+                    write_task_status(task_status_path, status="done")
+                self.current_task_runtime_status = "done"
+                return contract.validator(contract.status_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "tmux_core.runtime.tmux_runtime.time.sleep",
+            return_value=None,
+        ):
+            root = Path(tmp_dir)
+            contract_path = root / "requirements_status.json"
+            artifact_path = root / "requirements.md"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"requirements": str(artifact_path)},
+                    artifact_hashes={"requirements": "sha256:req"},
+                    validated_at="2026-05-02T21:11:48",
+                )
+
+            worker = DelayedBusyAfterPromptTimeoutWorker(
+                worker_id="delayed-busy-after-prompt-timeout-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="gemini", model="flash"),
+                runtime_root=root / "runtime",
+            )
+            result = worker.run_turn(
+                label="requirements_clarification_round_1",
+                prompt="write requirements files only",
+                completion_contract=TurnFileContract(
+                    turn_id="requirements_clarification_1",
+                    phase="requirements_clarification",
+                    status_path=contract_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                ),
+                timeout_sec=1.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertEqual(worker.wait_calls, 1)
+        self.assertGreaterEqual(worker.post_timeout_observes, 2)
 
     def test_run_turn_marks_wrapper_ready_after_success(self):
         class SubmitStateWorker(TmuxBatchWorker):
@@ -1858,6 +2431,154 @@ workspace (/directory)                                                     branc
             self.assertEqual(worker.current_task_runtime_status, "done")
             self.assertGreaterEqual(worker.observe_count, 2)
 
+    def test_wait_for_turn_artifacts_finishes_stable_routing_contract_even_when_agent_busy(self):
+        class BusyFileContractWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="Thinking... (esc to cancel, 43s)\n*   Type your message or @path/to/file",
+                    raw_log_delta="",
+                    raw_log_tail="Thinking... (esc to cancel, 43s)\n*   Type your message or @path/to/file",
+                    current_command="gemini",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-02T20:53:00",
+                )
+
+            def capture_visible(self, tail_lines=500):
+                return "Thinking... (esc to cancel, 43s)"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            artifact_path = root / "AGENTS.md"
+            artifact_path.write_text("routing protocol", encoding="utf-8")
+            status_path = root / "turn_status.json"
+            task_status_path = root / "task_runtime.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                if not path.exists():
+                    path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"agents": str(artifact_path)},
+                    artifact_hashes={"agents": "sha256:agents"},
+                    validated_at="2026-05-02T20:53:01",
+                )
+
+            worker = BusyFileContractWorker(
+                worker_id="stable-routing-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="gemini", model="flash"),
+                runtime_root=root / "runtime",
+            )
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            result = worker.wait_for_turn_artifacts(
+                contract=TurnFileContract(
+                    turn_id="create_routing_layer_1",
+                    phase="routing_layer_create",
+                    status_path=status_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                    kind="routing_file_contract",
+                ),
+                task_status_path=task_status_path,
+                timeout_sec=1.0,
+            )
+
+            self.assertEqual(Path(result.status_path).resolve(), status_path.resolve())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertEqual(worker.current_task_runtime_status, "done")
+
+    def test_wait_for_turn_artifacts_finishes_stable_review_contract_even_when_agent_busy(self):
+        class BusyReviewContractWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="Build · Big Pickle\nesc interrupt",
+                    raw_log_delta="",
+                    raw_log_tail="Build · Big Pickle\nesc interrupt",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-03T21:38:00",
+                )
+
+            def get_agent_state(self, observation=None):
+                return AgentRuntimeState.BUSY
+
+            def capture_visible(self, tail_lines=500):
+                return "Build · Big Pickle"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            review_md_path = root / "需求A_代码评审记录_测试工程师.md"
+            review_json_path = root / "需求A_评审记录_测试工程师.json"
+            task_status_path = root / "task_runtime.json"
+            review_md_path.write_text("", encoding="utf-8")
+            review_json_path.write_text(
+                json.dumps([{"task_name": "M1-T1", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                matched = payload[0]
+                if matched["task_name"] != "M1-T1" or matched["review_pass"] is not True:
+                    raise ValueError("review payload mismatch")
+                if review_md_path.read_text(encoding="utf-8").strip():
+                    raise ValueError("review md must be empty on pass")
+                return TurnFileResult(
+                    status_path=str(path.resolve()),
+                    payload={"task_name": "M1-T1", "review_pass": True},
+                    artifact_paths={
+                        "review_md": str(review_md_path.resolve()),
+                        "review_json": str(review_json_path.resolve()),
+                    },
+                    artifact_hashes={
+                        "review_md": "sha256:empty",
+                        "review_json": "sha256:pass",
+                    },
+                    validated_at="2026-05-03T21:38:00",
+                )
+
+            worker = BusyReviewContractWorker(
+                worker_id="stable-review-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=root / "runtime",
+            )
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            result = worker.wait_for_turn_artifacts(
+                contract=TurnFileContract(
+                    turn_id="development_review_M1-T1_R2",
+                    phase="任务开发",
+                    status_path=review_json_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                    kind="review_round",
+                ),
+                task_status_path=task_status_path,
+                timeout_sec=1.0,
+            )
+
+            self.assertEqual(Path(result.status_path).resolve(), review_json_path.resolve())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertEqual(worker.current_task_runtime_status, "done")
+
     def test_wait_for_turn_artifacts_raises_contract_violation_after_done_with_invalid_files(self):
         class InvalidFileContractWorker(TmuxBatchWorker):
             def target_exists(self, target=None):
@@ -1999,6 +2720,123 @@ workspace (/directory)                                                     branc
                         contract=TurnFileContract(
                             turn_id="requirements_review_stalled",
                             phase="需求评审",
+                            status_path=status_path,
+                            validator=validator,
+                            quiet_window_sec=0.0,
+                        ),
+                        task_status_path=task_status_path,
+                        timeout_sec=1.0,
+                    )
+
+    def test_wait_for_turn_artifacts_raises_contract_violation_when_invalid_file_stalls_running_task(self):
+        class StalledInvalidArtifactWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text="审核通过\nAsk anything...",
+                    raw_log_delta="",
+                    raw_log_tail="审核通过\nAsk anything...",
+                    current_command="opencode",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-03T09:35:00",
+                    pane_title="TmuxCodingTeam",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            status_path = root / "review.json"
+            status_path.write_text("[]", encoding="utf-8")
+            task_status_path = root / "task_runtime.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                raise ValueError("review payload must include task_name")
+
+            worker = StalledInvalidArtifactWorker(
+                worker_id="stalled-invalid-artifact-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/minimax-m2.5-free"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            worker._last_terminal_change_monotonic = time.monotonic() - 60.0
+            worker.terminal_recently_changed = False
+
+            with mock.patch("T02_tmux_agents.TASK_CONTRACT_STALL_IDLE_SEC", 0.0):
+                with self.assertRaisesRegex(RuntimeError, r"runtime_stalled"):
+                    worker.wait_for_turn_artifacts(
+                        contract=TurnFileContract(
+                            turn_id="task_split_review_stalled_invalid",
+                            phase="任务拆分评审",
+                            status_path=status_path,
+                            validator=validator,
+                            quiet_window_sec=0.0,
+                        ),
+                        task_status_path=task_status_path,
+                        timeout_sec=1.0,
+                    )
+
+    def test_wait_for_turn_artifacts_stalls_on_stable_invalid_file_even_when_terminal_changes(self):
+        class BusyInvalidArtifactWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_count = 0
+
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                self.observe_count += 1
+                self.agent_state = AgentRuntimeState.BUSY
+                now = time.monotonic()
+                self._last_terminal_change_monotonic = now
+                self.terminal_recently_changed = True
+                return WorkerObservation(
+                    visible_text=f"Build · Big Pickle {self.observe_count}",
+                    raw_log_delta="",
+                    raw_log_tail=f"Build · Big Pickle {self.observe_count}",
+                    current_command="opencode",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-03T22:20:00",
+                    pane_title="OC | review",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            status_path = root / "review.json"
+            status_path.write_text("[]", encoding="utf-8")
+            task_status_path = root / "task_runtime.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                raise ValueError("review payload must include task_name")
+
+            worker = BusyInvalidArtifactWorker(
+                worker_id="busy-invalid-artifact-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+
+            with mock.patch("T02_tmux_agents.TASK_CONTRACT_STALL_IDLE_SEC", 0.0):
+                with self.assertRaisesRegex(RuntimeError, r"runtime_stalled"):
+                    worker.wait_for_turn_artifacts(
+                        contract=TurnFileContract(
+                            turn_id="development_review_stalled_invalid",
+                            phase="任务开发",
                             status_path=status_path,
                             validator=validator,
                             quiet_window_sec=0.0,
@@ -4262,6 +5100,42 @@ workspace (/directory)                                                     branc
 
         self.assertGreaterEqual(worker.observe_calls, 1)
 
+    def test_source_mentions_prompt_accepts_multiple_wrapped_fragments(self):
+        prompt = "\n".join(
+            [
+                "## 任务上下文",
+                "你已进入代码实现预研阶段，需要交叉验证需求文档和现有代码。",
+                "## 核心预研任务",
+                "链路追踪、兼容性评估和物理环境对齐必须在准备就绪前完成。",
+                "## 约束事项",
+                "严禁在预研阶段修改任何源代码或配置文件。",
+            ]
+        )
+        source = "\n".join(
+            [
+                "你已进入代码实现预研阶段，需要交叉验证需求文档和现有代码。",
+                "链路追踪、兼容性评估和物理环境对齐必须在准备就绪前完成。",
+                "严禁在预研阶段修改任何源代码或配置文件。",
+            ]
+        )
+
+        self.assertTrue(TmuxBatchWorker._source_mentions_prompt(source, prompt))  # noqa: SLF001
+
+    def test_source_mentions_prompt_rejects_single_fragment_match(self):
+        prompt = "\n".join(
+            [
+                "## 任务上下文",
+                "你已进入代码实现预研阶段，需要交叉验证需求文档和现有代码。",
+                "## 核心预研任务",
+                "链路追踪、兼容性评估和物理环境对齐必须在准备就绪前完成。",
+                "## 约束事项",
+                "严禁在预研阶段修改任何源代码或配置文件。",
+            ]
+        )
+        source = "你已进入代码实现预研阶段，需要交叉验证需求文档和现有代码。"
+
+        self.assertFalse(TmuxBatchWorker._source_mentions_prompt(source, prompt))  # noqa: SLF001
+
     def test_wait_for_prompt_submission_accepts_opencode_opaque_tui_delta_as_processing(self):
         class OpaqueTuiPromptWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -4416,6 +5290,63 @@ workspace (/directory)                                                     branc
 
         self.assertEqual([call.kwargs.get("tail_bytes") for call in observe.call_args_list], [12000, 12000])
 
+    def test_loaded_opencode_ready_state_stays_ready_on_lightweight_health_refresh(self):
+        class LoadedOpenCodeReadyWorker(TmuxBatchWorker):
+            def observe(self, *, tail_lines=320, tail_bytes=24000):
+                raise AssertionError("READY OpenCode passive health should not require full raw-log observe")
+
+            def _capture_lightweight_observation(self):
+                return WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-06T12:24:53",
+                    pane_title="OC | 代码评审测试工程师角色初始化",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            runtime_root = root / "runtime"
+            runtime_dir = runtime_root / "development-review-08fdcab4"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "development-review-测试工程师",
+                        "session_name": "测试工程师-天寿星",
+                        "pane_id": "%24",
+                        "work_dir": str(root),
+                        "config": {"vendor": "opencode", "model": "opencode/minimax-m2.5-free", "reasoning_effort": "high"},
+                        "agent_state": "READY",
+                        "agent_started": True,
+                        "agent_ready": True,
+                        "health_status": "alive",
+                        "health_note": "alive",
+                        "current_command": "node",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            worker = LoadedOpenCodeReadyWorker(
+                worker_id="development-review-测试工程师",
+                work_dir=root,
+                config=AgentRunConfig(vendor="opencode", model="opencode/minimax-m2.5-free"),
+                runtime_root=runtime_root,
+                existing_runtime_dir=runtime_dir,
+                existing_session_name="测试工程师-天寿星",
+                existing_pane_id="%24",
+            )
+            snapshot = worker.refresh_health(notify_on_change=False)
+
+        self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
+        self.assertEqual(snapshot.agent_state, AgentRuntimeState.READY.value)
+
     def test_running_task_probe_uses_full_observe_for_vendor_state_patterns(self):
         class RunningTaskProbeWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -4502,6 +5433,93 @@ workspace (/directory)                                                     branc
             worker.agent_state = AgentRuntimeState.BUSY
             worker.ensure_agent_ready(timeout_sec=0.1)
             self.assertEqual(worker.wait_called, 1)
+
+    def test_has_ever_launched_ignores_metadata_only_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="metadata-only-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.state_path.parent.mkdir(parents=True, exist_ok=True)
+            worker.state_path.write_text("{}", encoding="utf-8")
+
+            self.assertFalse(worker.has_ever_launched())
+
+    def test_runtime_prelaunch_helper_treats_active_no_pane_state_as_starting_candidate(self):
+        payload = {
+            "status": "running",
+            "result_status": "running",
+            "agent_state": "DEAD",
+            "agent_started": False,
+            "pane_id": "",
+            "health_status": "missing_session",
+            "workflow_stage": "pending",
+        }
+
+        self.assertFalse(worker_state_has_launch_evidence(payload))
+        self.assertTrue(worker_state_is_prelaunch_active(payload))
+
+    def test_runtime_prelaunch_helper_keeps_launched_missing_session_as_not_prelaunch(self):
+        self.assertFalse(
+            worker_state_is_prelaunch_active(
+                {
+                    "status": "running",
+                    "result_status": "running",
+                    "agent_state": "DEAD",
+                    "agent_started": True,
+                    "pane_id": "",
+                    "health_status": "missing_session",
+                }
+            )
+        )
+        self.assertFalse(
+            worker_state_is_prelaunch_active(
+                {
+                    "status": "failed",
+                    "result_status": "failed",
+                    "agent_state": "DEAD",
+                    "agent_started": False,
+                    "pane_id": "",
+                    "health_status": "missing_session",
+                }
+            )
+        )
+
+    def test_ensure_agent_ready_launches_metadata_only_worker_without_pane(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="metadata-only-launch-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.state_path.parent.mkdir(parents=True, exist_ok=True)
+            worker.state_path.write_text("{}", encoding="utf-8")
+
+            with mock.patch.object(worker, "launch_agent") as launch_agent:
+                worker.ensure_agent_ready(timeout_sec=0.1)
+
+        launch_agent.assert_called_once_with(timeout_sec=0.1)
+        self.assertEqual(worker.agent_state, AgentRuntimeState.STARTING)
+
+    def test_ensure_agent_ready_blocks_launched_worker_when_pane_missing(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="launched-missing-pane-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.agent_started = True
+            worker.state_path.parent.mkdir(parents=True, exist_ok=True)
+            worker.state_path.write_text("{}", encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "tmux pane missing"):
+                worker.ensure_agent_ready(timeout_sec=0.1)
+
+        self.assertTrue(is_worker_death_error("原因: tmux pane missing"))
 
     def test_wait_for_agent_ready_accepts_codex_work_dir_title(self):
         class ReadyTitleWorker(TmuxBatchWorker):
@@ -5567,7 +6585,7 @@ Do you trust the files in this folder?
             self.assertFalse(worker_a.recoverable)
             self.assertFalse(worker_b.recoverable)
 
-    def test_refresh_health_can_auto_relaunch(self):
+    def test_refresh_health_auto_relaunch_is_blocked(self):
         class RelaunchWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -5591,11 +6609,11 @@ Do you trust the files in this folder?
             )
             snapshot = worker.refresh_health(auto_relaunch=True, relaunch_timeout_sec=0.1)
             self.assertIsInstance(snapshot, WorkerHealthSnapshot)
-            self.assertEqual(snapshot.health_status, "auto_relaunched")
-            self.assertEqual(snapshot.agent_state, AgentRuntimeState.READY.value)
-            self.assertEqual(worker.ready_calls, 1)
+            self.assertEqual(snapshot.health_status, "unknown")
+            self.assertEqual(snapshot.agent_state, AgentRuntimeState.STARTING.value)
+            self.assertEqual(worker.ready_calls, 0)
 
-    def test_refresh_health_auto_relaunch_keeps_opencode_supported(self):
+    def test_refresh_health_auto_relaunch_keeps_opencode_blocked(self):
         class RelaunchWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -5619,9 +6637,9 @@ Do you trust the files in this folder?
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             snapshot = worker.refresh_health(auto_relaunch=True, relaunch_timeout_sec=0.1)
-            self.assertEqual(snapshot.health_status, "auto_relaunched")
-            self.assertEqual(snapshot.agent_state, AgentRuntimeState.READY.value)
-            self.assertEqual(worker.ready_calls, 1)
+            self.assertEqual(snapshot.health_status, "unknown")
+            self.assertEqual(snapshot.agent_state, AgentRuntimeState.STARTING.value)
+            self.assertEqual(worker.ready_calls, 0)
 
     def test_opencode_output_detector_classifies_starting_ready_and_busy_surfaces(self):
         detector = OpenCodeOutputDetector()
@@ -5974,6 +6992,61 @@ Do you trust the files in this folder?
             self.assertEqual(str(state.get("updated_at", "")), str(state.get("last_heartbeat_at", "")))
             self.assertTrue(str(state.get("updated_at", "")))
             self.assertEqual(worker.last_log_offset, 123)
+
+    def test_prelaunch_worker_without_session_stays_starting_during_turn_start(self):
+        class PendingSessionWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = PendingSessionWorker(
+                worker_id="pending-session-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.current_task_runtime_status = "running"
+
+            self.assertEqual(worker.get_agent_state(), AgentRuntimeState.STARTING)
+            worker._write_state(  # noqa: SLF001
+                WorkerStatus.RUNNING,
+                note="turn:review",
+                extra={
+                    "result_status": "running",
+                    "current_task_runtime_status": "running",
+                },
+            )
+            snapshot = worker.refresh_health()
+            state = worker.read_state()
+
+        self.assertEqual(snapshot.agent_state, AgentRuntimeState.STARTING.value)
+        self.assertEqual(snapshot.health_status, "unknown")
+        self.assertEqual(snapshot.health_note, "launch pending")
+        self.assertEqual(state["agent_state"], AgentRuntimeState.STARTING.value)
+        self.assertEqual(state["health_status"], "unknown")
+        self.assertEqual(state["health_note"], "launch pending")
+
+    def test_missing_session_after_launch_still_reports_dead(self):
+        class MissingLaunchedSessionWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = MissingLaunchedSessionWorker(
+                worker_id="missing-launched-session-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            snapshot = worker.refresh_health()
+            state = worker.read_state()
+
+        self.assertEqual(snapshot.agent_state, AgentRuntimeState.DEAD.value)
+        self.assertEqual(snapshot.health_status, "missing_session")
+        self.assertEqual(state["agent_state"], AgentRuntimeState.DEAD.value)
+        self.assertEqual(state["health_status"], "missing_session")
 
     def test_lightweight_liveness_probe_handles_missing_target_and_display_failures(self):
         class MissingSessionWorker(TmuxBatchWorker):

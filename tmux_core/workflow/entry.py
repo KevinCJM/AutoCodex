@@ -22,14 +22,15 @@ from tmux_core.stage_kernel.requirements_review import run_requirements_review_s
 from tmux_core.stage_kernel.routing_init import run_routing_stage as routing_stage_main
 from tmux_core.stage_kernel.development import cleanup_stale_development_runtime_state, run_development_stage
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
-from tmux_core.stage_kernel.task_split import run_task_split_stage
+from tmux_core.stage_kernel.task_split import cleanup_stale_task_split_runtime_state, run_task_split_stage
 from T08_pre_development import (
     build_pre_development_task_record_path as shared_build_pre_development_task_record_path,
     build_pre_development_task_record_payload as shared_build_pre_development_task_record_payload,
     ensure_pre_development_task_record as shared_ensure_pre_development_task_record,
 )
-from T09_terminal_ops import PromptBackRequested, clear_pending_tty_input
+from T09_terminal_ops import PROMPT_BACK_VALUE, PromptBackRequested, clear_pending_tty_input
 from T09_terminal_ops import BridgeTerminalUI, get_terminal_ui, maybe_launch_tui, message, notify_stage_action_changed
+from T09_terminal_ops import prompt_metadata, prompt_select_option
 
 
 UNIMPLEMENTED_STAGES = (
@@ -66,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--detailed-design-review-max-rounds", default="", help="详细设计评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--task-split-review-max-rounds", default="", help="任务拆分评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--development-review-max-rounds", default="", help="任务开发评审最多重试几轮；传 infinite 表示不设上限")
+    parser.add_argument("--overall-review-max-rounds", default="", help="整体复核最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--main-agent", default="", help="主工作智能体配置: vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体配置，可重复: name=<key>,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--agent-config", default="", help="模型配置 JSON；命令行 --main-agent/--reviewer-agent 优先")
@@ -161,6 +163,25 @@ def _bridge_terminal_active() -> bool:
     return isinstance(get_terminal_ui(), BridgeTerminalUI)
 
 
+def _resolve_overall_review_entry_decision(args: argparse.Namespace) -> str:
+    if bool(args.skip_overall_review):
+        return "skip"
+    if bool(args.yes) or not _bridge_terminal_active():
+        return "yes"
+    with prompt_metadata(
+        allow_back=True,
+        back_value=PROMPT_BACK_VALUE,
+        stage_key="overall_review_entry_decision",
+        stage_step_index=0,
+    ):
+        return prompt_select_option(
+            title="是否执行全面复核",
+            options=(("yes", "是"), ("skip", "跳过")),
+            default_value="yes",
+            prompt_text="是否执行全面复核",
+        )
+
+
 def _release_workflow_lock(lock_context) -> None:
     if lock_context is None:
         return
@@ -187,6 +208,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     stage = "routing"
     routing_result = None
     intake_result = None
+    revisit_intake_requirement_selection = False
     requirements_result = None
     review_result = None
     design_result = None
@@ -228,16 +250,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 continue
 
             if stage == "intake":
+                intake_requirement_name = "" if revisit_intake_requirement_selection else requirement_name
+                intake_reuse_existing_original_requirement = (
+                    False
+                    if revisit_intake_requirement_selection
+                    else bool(args.reuse_existing_original_requirement)
+                )
                 intake_stage_args = build_stage_args(
                     project_dir,
                     auto_confirm=bool(args.yes),
-                    requirement_name=requirement_name,
-                    reuse_existing_original_requirement=bool(args.reuse_existing_original_requirement),
+                    requirement_name=intake_requirement_name,
+                    reuse_existing_original_requirement=intake_reuse_existing_original_requirement,
                     allow_previous_stage_back=bool(getattr(routing_result, "skipped", False)) and not bool(args.yes),
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                 )
+                revisit_intake_requirement_selection = False
                 clear_pending_tty_input()
                 message("\n===== 需求录入阶段 =====")
                 notify_stage_action_changed("stage.a02.start")
@@ -297,6 +326,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     _release_workflow_lock(workflow_lock_context)
                     workflow_lock_context = None
                     workflow_lock_key = ("", "")
+                    revisit_intake_requirement_selection = bool(
+                        getattr(intake_result, "reuse_existing_original_requirement", False)
+                    )
                     stage = "intake"
                     continue
                 except Exception as error:  # noqa: BLE001
@@ -420,6 +452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     legacy_cli=bool(args.legacy_cli),
                 )
                 message("\n===== 任务开发阶段 =====")
+                cleanup_stale_task_split_runtime_state(project_dir, task_split_result.requirement_name)
                 cleanup_stale_development_runtime_state(project_dir, task_split_result.requirement_name)
                 notify_stage_action_changed("stage.a07.start")
                 try:
@@ -435,7 +468,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                         raise
                     message(error)
                     return 1
-                if bool(args.skip_overall_review):
+                try:
+                    overall_review_decision = _resolve_overall_review_entry_decision(args)
+                except PromptBackRequested:
+                    stage = "development"
+                    continue
+                if overall_review_decision == "skip":
                     message()
                     message(render_remaining_stage_placeholders())
                     return 0
@@ -448,6 +486,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     project_dir,
                     auto_confirm=bool(args.yes),
                     requirement_name=task_split_result.requirement_name,
+                    review_max_rounds=str(args.overall_review_max_rounds or "").strip(),
                     main_agent=overall_review_agent_config.main,
                     reviewer_agents=_workflow_reviewer_agent_args(overall_review_agent_config),
                     allow_previous_stage_back=True,

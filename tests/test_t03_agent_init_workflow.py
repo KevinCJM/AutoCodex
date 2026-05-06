@@ -443,10 +443,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
     def test_build_turn_file_contract_materializes_turn_status_for_routing_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir).resolve()
-            for relative in ROUTING_LAYER_REQUIRED_FILES:
-                path = project_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"{relative}\n", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             runtime_dir = project_dir / "runtime"
             contract = build_turn_file_contract(
                 runtime_dir=runtime_dir,
@@ -455,6 +452,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
                 phase=PHASE_ROUTING_LAYER_CREATE,
                 required_artifacts=ROUTING_LAYER_REQUIRED_FILES,
             )
+            self.assertEqual(contract.kind, "routing_file_contract")
             result = contract.validator(contract.status_path)
             payload = json.loads(Path(result.status_path).read_text(encoding="utf-8"))
             self.assertEqual(payload["turn_id"], "create_routing_layer_1")
@@ -464,6 +462,24 @@ class AgentInitWorkflowTests(unittest.TestCase):
                 payload["artifact_hashes"]["AGENTS.md"],
                 build_prefixed_sha256(project_dir / "AGENTS.md"),
             )
+
+    def test_build_turn_file_contract_rejects_empty_routing_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            for relative in ROUTING_LAYER_REQUIRED_FILES:
+                path = project_dir / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            runtime_dir = project_dir / "runtime"
+            contract = build_turn_file_contract(
+                runtime_dir=runtime_dir,
+                work_dir=project_dir,
+                turn_id="create_routing_layer_1",
+                phase=PHASE_ROUTING_LAYER_CREATE,
+                required_artifacts=ROUTING_LAYER_REQUIRED_FILES,
+            )
+            with self.assertRaisesRegex(ValueError, "缺少路由层文件"):
+                contract.validator(contract.status_path)
 
     def test_build_turn_file_contract_materializes_turn_status_for_audit_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -503,10 +519,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
     def test_build_turn_file_contract_rematerializes_when_artifact_hash_changes(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir).resolve()
-            for relative in ROUTING_LAYER_REQUIRED_FILES:
-                path = project_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"{relative}:v1\n", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             runtime_dir = project_dir / "runtime"
             contract = build_turn_file_contract(
                 runtime_dir=runtime_dir,
@@ -532,10 +545,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
     def test_build_turn_file_contract_requires_refine_change_from_baseline(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir).resolve()
-            for relative in ROUTING_LAYER_REQUIRED_FILES:
-                path = project_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"{relative}:v1\n", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             runtime_dir = project_dir / "runtime"
             baseline_hashes = {
                 relative: build_prefixed_sha256(project_dir / relative)
@@ -994,10 +1004,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = (Path(tmpdir) / "project").resolve()
             project_dir.mkdir(parents=True)
-            for relative in ROUTING_LAYER_REQUIRED_FILES:
-                path = project_dir / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(f"existing:{relative}\n", encoding="utf-8")
+            _write_valid_routing_layer(project_dir)
             FakeWorker.scripts = {
                 str(project_dir): [
                     {
@@ -1140,6 +1147,113 @@ class AgentInitWorkflowTests(unittest.TestCase):
             self.assertEqual(manifest["workers"][0]["result_status"], "pending")
             self.assertEqual(manifest["workers"][0]["agent_state"], AgentRuntimeState.STARTING.value)
 
+    def test_run_store_preserves_active_prelaunch_starting_from_dead_state_file(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            store = RunStore.create(
+                selection=selection,
+                config=config,
+                runtime_root=Path(tmpdir) / "runtime",
+                run_id="run_demo",
+            )
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "sess-launching",
+                        "pane_id": "",
+                        "runtime_dir": str(state_path.parent),
+                        "result_status": "running",
+                        "agent_state": "DEAD",
+                        "agent_alive": False,
+                        "agent_started": False,
+                        "health_status": "missing_session",
+                        "health_note": "missing_session",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            store.update_worker_binding(
+                str(project_dir),
+                session_name="sess-launching",
+                pane_id="",
+                workflow_stage="create_running",
+                result_status="running",
+                agent_state=AgentRuntimeState.STARTING.value,
+                agent_started=False,
+                health_status="unknown",
+                note="create_routing_layer",
+                state_path=str(state_path),
+            )
+
+            entry = store.update_worker_state_from_file(
+                str(project_dir),
+                state_path,
+                preserve_workflow_fields=True,
+            )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.agent_state, AgentRuntimeState.STARTING.value)
+        self.assertEqual(entry.health_status, "unknown")
+        self.assertEqual(entry.health_note, "launch pending")
+
+    def test_run_store_keeps_dead_state_for_launched_active_worker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            store = RunStore.create(
+                selection=selection,
+                config=config,
+                runtime_root=Path(tmpdir) / "runtime",
+                run_id="run_demo",
+            )
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "sess-launched",
+                        "pane_id": "%1",
+                        "runtime_dir": str(state_path.parent),
+                        "result_status": "running",
+                        "agent_state": "DEAD",
+                        "agent_alive": False,
+                        "agent_started": True,
+                        "health_status": "missing_session",
+                        "health_note": "missing_session",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            store.update_worker_binding(
+                str(project_dir),
+                session_name="sess-launched",
+                pane_id="%1",
+                workflow_stage="create_running",
+                result_status="running",
+                agent_state=AgentRuntimeState.READY.value,
+                agent_started=True,
+                health_status="alive",
+                note="create_routing_layer",
+                state_path=str(state_path),
+            )
+
+            entry = store.update_worker_state_from_file(
+                str(project_dir),
+                state_path,
+                preserve_workflow_fields=True,
+            )
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry.agent_state, AgentRuntimeState.DEAD.value)
+        self.assertEqual(entry.health_status, "missing_session")
+
     def test_run_store_load_maps_legacy_worker_manifest_phase_to_agent_state(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = (Path(tmpdir) / "project").resolve()
@@ -1165,6 +1279,40 @@ class AgentInitWorkflowTests(unittest.TestCase):
 
         self.assertEqual(loaded.manifest.workers[0].agent_state, "READY")
         self.assertTrue(loaded.manifest.workers[0].agent_started)
+
+    def test_run_store_load_maps_prelaunch_dead_manifest_worker_to_starting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            store = RunStore.create(
+                selection=selection,
+                config=config,
+                runtime_root=Path(tmpdir) / "runtime",
+                run_id="run_demo",
+            )
+            payload = json.loads((store.run_root / "manifest.json").read_text(encoding="utf-8"))
+            payload["workers"] = [
+                {
+                    "work_dir": str(project_dir),
+                    "session_name": "sess-prelaunch",
+                    "pane_id": "",
+                    "workflow_stage": "create_running",
+                    "result_status": "running",
+                    "agent_state": "DEAD",
+                    "agent_started": False,
+                    "agent_alive": False,
+                    "health_status": "missing_session",
+                    "health_note": "missing_session",
+                }
+            ]
+            (store.run_root / "manifest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            loaded = RunStore.load(run_id=store.manifest.run_id, runtime_root=Path(tmpdir) / "runtime")
+
+        self.assertEqual(loaded.manifest.workers[0].agent_state, "STARTING")
+        self.assertFalse(loaded.manifest.workers[0].agent_started)
 
     def test_run_store_defaults_to_project_local_routing_runtime_root(self):
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -266,6 +266,11 @@ class T09TerminalOpsTests(unittest.TestCase):
         with use_terminal_ui(ui):
             self.assertTrue(terminal_ui_is_interactive())
 
+    def test_stdio_attach_external_process_returns_130_on_keyboard_interrupt(self):
+        ui = StdioTerminalUI()
+        with patch("T09_terminal_ops.subprocess.run", side_effect=KeyboardInterrupt):
+            self.assertEqual(ui.attach_external_process(["bun", "run"]), 130)
+
     def test_maybe_launch_tui_falls_back_to_legacy_when_help_requested(self):
         redirected, payload = maybe_launch_tui(["--help"], route="home", action="workflow.a00.start")
         self.assertFalse(redirected)
@@ -296,19 +301,21 @@ class T09TerminalOpsTests(unittest.TestCase):
         ensure_install.assert_called_once_with()
         attach_process.assert_called_once()
 
-    def test_maybe_launch_tui_keeps_explicit_cli_args_in_legacy_path(self):
+    def test_maybe_launch_tui_forwards_explicit_cli_args_to_tui(self):
         with (
             patch("T09_terminal_ops.sys.stdin.isatty", return_value=True),
             patch("T09_terminal_ops.sys.stdout.isatty", return_value=True),
             patch("T09_terminal_ops.ensure_tui_dependencies_installed") as ensure_install,
-            patch("T09_terminal_ops.attach_external_process") as attach_process,
+            patch("T09_terminal_ops.attach_external_process", return_value=0) as attach_process,
             patch("T09_terminal_ops.sys.argv", ["A06_TaskSplit.py", "--project-dir", "/tmp/project"]),
         ):
             redirected, payload = maybe_launch_tui(None, route="task-split", action="stage.a06.start")
-        self.assertFalse(redirected)
-        self.assertEqual(payload, ["--project-dir", "/tmp/project"])
-        ensure_install.assert_not_called()
-        attach_process.assert_not_called()
+        self.assertTrue(redirected)
+        self.assertEqual(payload, 0)
+        ensure_install.assert_called_once_with()
+        command = attach_process.call_args.args[0]
+        self.assertIn("--argv-json", command)
+        self.assertEqual(command[command.index("--argv-json") + 1], '["--project-dir", "/tmp/project"]')
 
     def test_maybe_launch_tui_preserves_legacy_cli_escape_hatch(self):
         redirected, payload = maybe_launch_tui(["--legacy-cli", "--help"], route="home", action="workflow.a00.start")

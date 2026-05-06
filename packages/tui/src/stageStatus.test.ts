@@ -190,6 +190,136 @@ test('failed status recovers when current routing snapshot still has live worker
   ).toBe(true)
 })
 
+test('failed status does not recover from idle READY sessions after a stage runner failed', () => {
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'failed',
+      'stage.a05.start',
+      'design',
+      {
+        workers: [
+          {
+            session_name: '架构师-奎木狼',
+            status: 'failed',
+            agent_state: 'READY',
+            health_status: 'alive',
+            current_task_runtime_status: '',
+            session_exists: true,
+          },
+          {
+            session_name: '开发工程师-地魁星',
+            status: 'succeeded',
+            agent_state: 'READY',
+            health_status: 'alive',
+            current_task_runtime_status: 'done',
+            session_exists: true,
+          },
+        ],
+      },
+    ),
+  ).toBe(false)
+})
+
+test('bootstrap does not infer running from completed READY sessions', () => {
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a05.start',
+          pending_hitl: false,
+        },
+        stages: {
+          design: {
+            workers: [
+              {
+                session_name: '开发工程师-地魁星',
+                status: 'succeeded',
+                agent_state: 'READY',
+                health_status: 'alive',
+                current_task_runtime_status: 'done',
+                session_exists: true,
+              },
+            ],
+          },
+        },
+      },
+    }),
+  ).toBe('ready')
+})
+
+test('bootstrap ignores stale running runtime status on READY workers', () => {
+  expect(
+    inferBootstrapStatus({
+      snapshots: {
+        app: {
+          active_stage: 'stage.a07.start',
+          pending_hitl: false,
+        },
+        stages: {
+          development: {
+            workers: [
+              {
+                session_name: '测试工程师-天寿星',
+                status: 'ready',
+                agent_state: 'READY',
+                health_status: 'alive',
+                current_task_runtime_status: 'running',
+                session_exists: true,
+              },
+            ],
+          },
+        },
+      },
+    }),
+  ).toBe('ready')
+})
+
+test('awaiting-input recovers when no prompt is pending and current snapshot has live workers', () => {
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'awaiting-input',
+      'stage.a04.start',
+      'review',
+      {
+        workers: [
+          {
+            session_name: '审核器-地奇星',
+            status: 'running',
+            agent_state: 'BUSY',
+            health_status: 'alive',
+            current_task_runtime_status: 'running',
+            session_exists: true,
+          },
+        ],
+      },
+      false,
+    ),
+  ).toBe(true)
+})
+
+test('awaiting-input stays sticky while a real prompt is pending', () => {
+  expect(
+    shouldRecoverRunningFromStageSnapshot(
+      'awaiting-input',
+      'stage.a04.start',
+      'review',
+      {
+        workers: [
+          {
+            session_name: '审核器-地奇星',
+            status: 'running',
+            agent_state: 'BUSY',
+            health_status: 'alive',
+            current_task_runtime_status: 'running',
+            session_exists: true,
+          },
+        ],
+      },
+      true,
+    ),
+  ).toBe(false)
+})
+
 test('failed status is not recovered from unrelated stage snapshots', () => {
   expect(
     shouldRecoverRunningFromStageSnapshot(

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from tmux_core.stage_kernel.death_orchestration import (
     drop_dead_reviewers,
     replace_dead_main,
+    run_main_phase_with_death_handling,
     run_reviewer_phase_with_death_handling,
 )
 from tmux_core.stage_kernel.role_orchestration import ensure_main_ready, run_main_phase, run_reviewer_phase
@@ -57,6 +58,36 @@ class _CompletedBusyWorker(_FakeWorker):
         self.state = "READY"
 
 
+class _PrelaunchMissingSessionWorker(_FakeWorker):
+    def __init__(self) -> None:
+        super().__init__("STARTING")
+
+    def read_state(self):
+        return {
+            "status": "running",
+            "result_status": "running",
+            "agent_state": "DEAD",
+            "agent_started": False,
+            "pane_id": "",
+            "health_status": "missing_session",
+            "workflow_stage": "pending",
+        }
+
+
+class _ActiveFailedBusyWorker(_FakeWorker):
+    def __init__(self) -> None:
+        super().__init__("BUSY")
+
+    def read_state(self):
+        return {
+            "status": "failed",
+            "result_status": "failed",
+            "agent_state": self.state,
+            "health_status": "alive",
+            "terminal_recently_changed": True,
+        }
+
+
 class _DeathAwareFakeWorker:
     def __init__(self, state: str, *, launched: bool) -> None:
         self.state = state
@@ -79,6 +110,20 @@ class _DeathAwareFakeWorker:
         self.agent_started = True
         self.pane_id = "pane_1"
         self.state = "READY"
+
+
+class _ReadyDeathWorker(_DeathAwareFakeWorker):
+    def __init__(self, *, session_name: str) -> None:
+        super().__init__("STARTING", launched=True)
+        self.session_name = session_name
+
+    def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
+        _ = timeout_sec
+        self.ensure_calls += 1
+        raise RuntimeError(
+            f"检测到 {self.session_name} 需要重新启动或重建，但系统不会自动执行。\n"
+            f"原因: tmux pane missing"
+        )
 
 
 class RoleOrchestrationTests(unittest.TestCase):
@@ -106,6 +151,24 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(main.worker.ensure_calls, 1)
         self.assertEqual([item.worker.state for item in reviewers], ["READY", "READY"])
         self.assertEqual([item.worker.ensure_calls for item in reviewers], [1, 1])
+
+    def test_ensure_main_ready_allows_prelaunch_missing_session_to_start(self):
+        worker = _PrelaunchMissingSessionWorker()
+        main = SimpleNamespace(worker=worker)
+
+        ensure_main_ready(main)
+
+        self.assertEqual(worker.ensure_calls, 1)
+        self.assertEqual(worker.state, "READY")
+
+    def test_ensure_main_ready_waits_for_active_failed_busy_worker(self):
+        worker = _ActiveFailedBusyWorker()
+        main = SimpleNamespace(worker=worker)
+
+        ensure_main_ready(main, timeout_sec=3.0)
+
+        self.assertEqual(worker.ensure_calls, 1)
+        self.assertEqual(worker.state, "READY")
 
     def test_run_main_phase_waits_before_and_after_owner_turn(self):
         main = SimpleNamespace(worker=_FakeWorker("READY"))
@@ -223,6 +286,46 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(replace_calls, [])
         self.assertIs(replace_dead_main(launched_main, replace_owner=_replace), replacement)
         self.assertEqual(replace_calls, ["called"])
+
+    def test_run_main_phase_with_death_handling_replaces_main_when_ready_detects_missing_pane(self):
+        main = SimpleNamespace(worker=_ReadyDeathWorker(session_name="开发工程师-柳土獐"))
+        replacement = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        replace_calls: list[object] = []
+
+        def _replace(owner):  # noqa: ANN001
+            replace_calls.append(owner)
+            return replacement
+
+        result, reviewers, current_main = run_main_phase_with_death_handling(
+            main,
+            reviewers=(),
+            run_phase=lambda owner: owner,
+            replace_dead_main_owner=_replace,
+            main_label="开发工程师",
+        )
+
+        self.assertIs(result, replacement)
+        self.assertEqual(reviewers, [])
+        self.assertIs(current_main, replacement)
+        self.assertEqual(replace_calls, [main])
+        self.assertEqual(main.worker.ensure_calls, 1)
+
+    def test_run_main_phase_with_death_handling_does_not_replace_main_for_reviewer_ready_death(self):
+        main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        reviewer = SimpleNamespace(worker=_ReadyDeathWorker(session_name="审核员-地巧星"), reviewer_name="审核员-地巧星")
+        replace_calls: list[object] = []
+
+        with self.assertRaisesRegex(RuntimeError, "审核员-地巧星"):
+            run_main_phase_with_death_handling(
+                main,
+                reviewers=[reviewer],
+                run_phase=lambda owner: owner,
+                replace_dead_main_owner=lambda owner: replace_calls.append(owner) or owner,
+                main_label="开发工程师",
+                reviewer_label_getter=lambda item, _index: item.reviewer_name,
+            )
+
+        self.assertEqual(replace_calls, [])
 
     def test_run_reviewer_phase_with_death_handling_replaces_dead_reviewer(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))

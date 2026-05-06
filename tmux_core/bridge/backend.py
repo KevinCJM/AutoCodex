@@ -32,7 +32,9 @@ from tmux_core.runtime.tmux_runtime import (
     TmuxRuntimeController,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
+    is_worker_death_error,
     load_worker_from_state_path,
+    worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.detailed_design import (
     DETAILED_DESIGN_RUNTIME_ROOT_NAME,
@@ -44,6 +46,7 @@ from tmux_core.stage_kernel.development import (
     DEVELOPMENT_RUNTIME_ROOT_NAME,
     build_development_paths,
     build_parser as build_a07_parser,
+    build_reviewer_artifact_paths,
     run_development_stage,
 )
 from tmux_core.stage_kernel.overall_review import (
@@ -100,7 +103,7 @@ from T08_pre_development import (
     build_pre_development_task_record_path,
     load_pre_development_task_record,
 )
-from T01_tools import get_first_false_task, get_markdown_content, is_task_progress_json
+from T01_tools import get_first_false_task, get_markdown_content, is_task_progress_json, normalize_review_status_payload
 from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, use_terminal_ui
 from T12_requirements_common import (
     build_requirements_clarification_paths,
@@ -257,6 +260,23 @@ STAGE_ROUTE_BY_ACTION = {
     "stage.a06.start": "task-split",
     "stage.a07.start": "development",
     "stage.a08.start": "overall-review",
+}
+
+WORKFLOW_STAGE_ACTION_ORDER = {
+    action: index
+    for index, action in enumerate(
+        (
+            "stage.a01.start",
+            "stage.a02.start",
+            "stage.a03.start",
+            "stage.a04.start",
+            "stage.a05.start",
+            "stage.a06.start",
+            "stage.a07.start",
+            "stage.a08.start",
+        ),
+        start=1,
+    )
 }
 
 LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME = ".requirements_analysis_runtime"
@@ -447,6 +467,10 @@ def _write_project_stage_state_record(
         safe_requirement = sanitize_requirement_name(requirement_name or "_global")
         record_dir = project_root / WORKFLOW_RECORD_ROOT_NAME / safe_requirement / "stages"
         record_dir.mkdir(parents=True, exist_ok=True)
+        if action_text == "workflow.a00.start" and normalized_source == "runner_start":
+            for stale_state_path in record_dir.glob("*.state.json"):
+                with contextlib.suppress(Exception):
+                    stale_state_path.unlink()
         payload = {
             "action": action_text,
             "status": str(status or "").strip() or "ready",
@@ -463,6 +487,10 @@ def _write_project_stage_state_record(
         return state_path
     except Exception:
         return None
+
+
+def _workflow_stage_order(action: str) -> int:
+    return WORKFLOW_STAGE_ACTION_ORDER.get(str(action or "").strip(), 0)
 
 
 def _osascript_quote(value: str) -> str:
@@ -922,7 +950,6 @@ _WORKER_AGENT_STATE_VALUES = {
 }
 _RECOVERABLE_RECONFIG_HEALTH_STATUSES = {"awaiting_reconfig", "recoverable_startup_failure"}
 
-
 def _is_recoverable_reconfig_snapshot(snapshot: Mapping[str, Any]) -> bool:
     health_status = str(snapshot.get("health_status", "")).strip().lower()
     note = str(snapshot.get("note", "")).strip().lower()
@@ -943,6 +970,7 @@ def _normalize_worker_session_state(
     status: str,
     agent_state: str,
     agent_started: bool = False,
+    pane_id: str = "",
     workflow_stage: str = "",
     note: str = "",
     health_status: str,
@@ -954,21 +982,32 @@ def _normalize_worker_session_state(
     normalized_status = str(status or "").strip()
     normalized_workflow_stage = str(workflow_stage or "").strip()
     normalized_note = str(note or "").strip()
-    is_prelaunch_starting_worker = (
-        normalized_agent_state == "STARTING"
-        and not bool(agent_started)
-        and normalized_status in {"ready", "pending"}
-        and normalized_workflow_stage == "pending"
-        and normalized_note in {"", "worker_prepared", "session_created"}
-    )
     if (
         session_name
         and not session_exists
         and normalized_status in {"ready", "running", "pending"}
-        and not is_prelaunch_starting_worker
     ):
+        if worker_state_is_prelaunch_active(
+            {
+                "agent_state": normalized_agent_state,
+                "agent_started": agent_started,
+                "health_note": normalized_health_note,
+                "health_status": normalized_health_status,
+                "note": normalized_note,
+                "pane_id": pane_id,
+                "result_status": normalized_status,
+                "status": normalized_status,
+                "workflow_stage": normalized_workflow_stage,
+            }
+        ):
+            normalized_agent_state = "STARTING"
+            if normalized_health_status in {"", "alive", "dead", "missing_session", "pane_dead"}:
+                normalized_health_status = "unknown"
+            if not normalized_health_note or normalized_health_note in {"tmux session missing", "missing_session", "pane_dead"}:
+                normalized_health_note = "launch pending"
+            return normalized_agent_state, normalized_health_status, normalized_health_note
         normalized_agent_state = "DEAD"
-        if normalized_health_status in {"", "unknown", "alive", "auto_relaunched"}:
+        if normalized_health_status in {"", "unknown", "alive"}:
             normalized_health_status = "dead"
         if not normalized_health_note:
             normalized_health_note = "tmux session missing"
@@ -1005,6 +1044,22 @@ def _worker_snapshot_sort_key(snapshot: Mapping[str, Any]) -> tuple[float, float
         updated_ts,
         _worker_status_sort_rank(snapshot.get("status")),
     )
+
+
+def _worker_snapshot_latest_timestamp(snapshot: Mapping[str, Any]) -> float | None:
+    timestamps: list[float] = []
+    for field in ("last_heartbeat_at", "updated_at"):
+        parsed = _parse_iso_datetime(str(snapshot.get(field, "")).strip())
+        if parsed is not None:
+            timestamps.append(parsed.timestamp())
+    if not timestamps:
+        return None
+    return max(timestamps)
+
+
+def _worker_snapshot_before_timestamp(snapshot: Mapping[str, Any], started_at: float) -> bool:
+    latest_timestamp = _worker_snapshot_latest_timestamp(snapshot)
+    return latest_timestamp is not None and latest_timestamp < started_at
 
 
 def _merge_worker_snapshots(*collections: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1105,7 +1160,9 @@ def _read_worker_state_snapshot(
     elif session_name and session_exists_resolver is not None:
         with contextlib.suppress(Exception):
             session_exists = bool(session_exists_resolver(session_name))
-    status = str(state.get("result_status") or state.get("status") or "pending").strip()
+    raw_status = str(state.get("status") or "").strip()
+    raw_result_status = str(state.get("result_status") or "").strip()
+    status = str(raw_result_status or raw_status or "pending").strip()
     health_status = str(state.get("health_status", "unknown")).strip()
     health_note = str(state.get("health_note", "")).strip()
     note = str(state.get("note", "")).strip()
@@ -1117,11 +1174,22 @@ def _read_worker_state_snapshot(
         status=status,
         agent_state=agent_state,
         agent_started=agent_started,
-        workflow_stage=str(state.get("workflow_stage", "pending")).strip(),
+        pane_id=str(state.get("pane_id", "")).strip(),
+        workflow_stage=str(state.get("workflow_stage", "")).strip(),
         note=note,
         health_status=health_status,
         health_note=health_note,
     )
+    current_task_runtime_status = str(state.get("current_task_runtime_status", "")).strip()
+    if (
+        agent_state == "READY"
+        and raw_status == "ready"
+        and status in {"running", "pending"}
+        and current_task_runtime_status == "running"
+        and note == "agent_ready"
+    ):
+        status = raw_status
+        current_task_runtime_status = ""
     return {
         "worker_id": str(state.get("worker_id") or state.get("raw_worker_id") or "").strip(),
         "session_name": session_name,
@@ -1136,7 +1204,7 @@ def _read_worker_state_snapshot(
         "transcript_path": str(state.get("transcript_path", "")).strip(),
         "turn_status_path": str(state.get("current_turn_status_path", "")).strip(),
         "current_turn_phase": str(state.get("current_turn_phase", "")).strip(),
-        "current_task_runtime_status": str(state.get("current_task_runtime_status", "")).strip(),
+        "current_task_runtime_status": current_task_runtime_status,
         "question_path": str(turn_bundle.get("question_path") or "").strip(),
         "answer_path": str(turn_bundle.get("answer_path") or "").strip(),
         "artifact_paths": artifact_paths,
@@ -1444,11 +1512,34 @@ class BridgeCore:
             return
         self._set_routing_manifest_worker_suppression(project_dir, suppressed=skipped)
 
+    def _persist_previous_runtime_stage_exit(self, next_action: str) -> None:
+        previous_action = str(self._display_action or self._context.current_action or "").strip()
+        if not previous_action or previous_action == next_action:
+            return
+        previous_index = _workflow_stage_order(previous_action)
+        next_index = _workflow_stage_order(next_action)
+        if previous_index <= 0 or next_index <= 0:
+            return
+        previous_status = str(self._display_status or "").strip().lower()
+        if previous_status in {"completed", "failed", "error"}:
+            return
+        exit_status = "completed" if next_index > previous_index else "superseded"
+        _write_project_stage_state_record(
+            project_dir=self._resolve_project_dir(),
+            requirement_name=str(self._context.requirement_name or "").strip(),
+            action=previous_action,
+            status=exit_status,
+            stage_seq=int(self._display_stage_seq or 0),
+            source="runtime_inference",
+            message=f"stage switched to {next_action}",
+        )
+
     def _handle_runtime_stage_change(self, action: str) -> None:
         normalized = str(action or "").strip()
         if not normalized:
             return
         stage_seq = self._allocate_stage_seq()
+        self._persist_previous_runtime_stage_exit(normalized)
         self._set_context(action=normalized)
         self._emit_display_stage_state(
             preferred_status="running",
@@ -1467,6 +1558,18 @@ class BridgeCore:
             sections={"app", "control", "hitl"},
             stage_routes=self._stage_routes_for_action(self._display_action or self._context.current_action),
         )
+
+    def _active_stage_runner_alive(self, action: str) -> bool:
+        normalized = str(action or "").strip()
+        if not normalized:
+            return False
+        for thread in list(self._workers.values()):
+            try:
+                if normalized in str(getattr(thread, "name", "")) and thread.is_alive():
+                    return True
+            except Exception:
+                continue
+        return False
 
     def _allocate_stage_seq(self) -> int:
         with self._stage_seq_lock:
@@ -1611,6 +1714,7 @@ class BridgeCore:
             status=status,
             agent_state=agent_state,
             agent_started=agent_started,
+            pane_id=str(snapshot.get("pane_id") or getattr(entry, "pane_id", "") or "").strip(),
             workflow_stage=str(snapshot.get("workflow_stage") or getattr(entry, "workflow_stage", "") or "pending").strip(),
             note=note,
             health_status=health_status,
@@ -2004,6 +2108,31 @@ class BridgeCore:
             self._scan_runtime_workers(Path(project_dir) / LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
         )
 
+    def _scan_review_handoff_analyst_workers(self, project_dir: str | Path, requirement_name: str) -> list[dict[str, Any]]:
+        project_root = Path(project_dir).expanduser().resolve()
+        requirement_text = str(requirement_name or "").strip()
+        handoff_workers: list[dict[str, Any]] = []
+        for worker in self._scan_requirement_clarification_workers(project_root):
+            worker_id = str(worker.get("worker_id", "")).strip().lower()
+            session_name = str(worker.get("session_name", "")).strip()
+            if worker_id != "requirements-analyst" and not (
+                session_name.startswith("需求分析师-") or session_name.startswith("分析师-")
+            ):
+                continue
+            worker_requirement = str(worker.get("requirement_name", "")).strip()
+            if worker_requirement and requirement_text and worker_requirement != requirement_text:
+                continue
+            worker_project = str(worker.get("project_dir", "") or worker.get("work_dir", "")).strip()
+            if worker_project:
+                with contextlib.suppress(Exception):
+                    worker_project = str(Path(worker_project).expanduser().resolve())
+                if worker_project != str(project_root):
+                    continue
+            if not self._worker_snapshot_has_live_session(worker):
+                continue
+            handoff_workers.append(dict(worker))
+        return handoff_workers
+
     def _scan_current_design_workers(self, project_dir: str | Path) -> list[dict[str, Any]]:
         workers = _merge_worker_snapshots(
             self._scan_runtime_workers(Path(project_dir) / DETAILED_DESIGN_RUNTIME_ROOT_NAME),
@@ -2050,6 +2179,49 @@ class BridgeCore:
                 "审核员-",
             ),
         )
+
+    def _scan_design_handoff_analyst_workers(self, project_dir: str | Path, requirement_name: str) -> list[dict[str, Any]]:
+        project_root = Path(project_dir).expanduser().resolve()
+        requirement_text = str(requirement_name or "").strip()
+        workers = _merge_worker_snapshots(
+            self._scan_runtime_workers(project_root / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME),
+            self._scan_runtime_workers(project_root / REQUIREMENTS_RUNTIME_ROOT_NAME),
+            self._scan_runtime_workers(project_root / LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
+        )
+        handoff_workers: list[dict[str, Any]] = []
+        for worker in workers:
+            worker_id = str(worker.get("worker_id", "")).strip().lower()
+            session_name = str(worker.get("session_name", "")).strip()
+            if worker_id not in {"requirements-analyst", "requirements-review-analyst"} and not (
+                session_name.startswith("需求分析师-") or session_name.startswith("分析师-")
+            ):
+                continue
+            worker_requirement = str(worker.get("requirement_name", "")).strip()
+            if worker_requirement and requirement_text and worker_requirement != requirement_text:
+                continue
+            worker_project = str(worker.get("project_dir", "") or worker.get("work_dir", "")).strip()
+            if worker_project:
+                with contextlib.suppress(Exception):
+                    worker_project = str(Path(worker_project).expanduser().resolve())
+                if worker_project != str(project_root):
+                    continue
+            design_markers = " ".join(
+                str(worker.get(key, "")).strip()
+                for key in (
+                    "note",
+                    "current_turn_phase",
+                    "turn_status_path",
+                    "current_task_runtime_status",
+                )
+            )
+            artifact_markers = " ".join(str(item) for item in worker.get("artifact_paths", []))
+            marker_text = f"{design_markers} {artifact_markers}".lower()
+            if "detailed_design" not in marker_text and "detailed-design" not in marker_text and "详细设计" not in marker_text:
+                continue
+            if not self._worker_snapshot_has_live_session(worker):
+                continue
+            handoff_workers.append(dict(worker))
+        return handoff_workers
 
     def _scan_current_task_split_workers(self, project_dir: str | Path) -> list[dict[str, Any]]:
         workers = _merge_worker_snapshots(
@@ -2120,6 +2292,10 @@ class BridgeCore:
                 self._scan_runtime_workers(Path(project_dir) / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME),
                 "stage.a04.start",
             )
+            workers = _merge_worker_snapshots(
+                workers,
+                self._scan_review_handoff_analyst_workers(project_dir, requirement_name),
+            )
         return {
             "project_dir": project_dir,
             "requirement_name": requirement_name,
@@ -2155,7 +2331,10 @@ class BridgeCore:
                 self._scan_runtime_workers(Path(project_dir) / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME),
                 self._scan_runtime_workers(Path(project_dir) / REQUIREMENTS_RUNTIME_ROOT_NAME),
             )
-            workers = self._filter_workers_for_current_context(_merge_worker_snapshots(*worker_collections), "stage.a05.start")
+            workers = _merge_worker_snapshots(
+                self._filter_workers_for_current_context(_merge_worker_snapshots(*worker_collections), "stage.a05.start"),
+                self._scan_design_handoff_analyst_workers(project_dir, requirement_name),
+            )
         return {
             "project_dir": project_dir,
             "requirement_name": requirement_name,
@@ -2316,7 +2495,8 @@ class BridgeCore:
         prompt_snapshot = self._build_pending_prompt_hitl_snapshot()
         if prompt_snapshot.get("pending", False):
             return prompt_snapshot
-        runtime_snapshot = self._build_runtime_worker_hitl_snapshot(self._display_action or self._context.current_action)
+        active_action = str(self._display_action or self._context.current_action or "").strip()
+        runtime_snapshot = self._build_runtime_worker_hitl_snapshot(active_action)
         if runtime_snapshot.get("pending", False):
             return runtime_snapshot
         project_dir = self._resolve_project_dir()
@@ -2329,17 +2509,30 @@ class BridgeCore:
         except Exception:
             return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
         try:
-            development_question_path = build_development_paths(project_dir, requirement_name)["ask_human_path"]
+            development_paths = build_development_paths(project_dir, requirement_name)
+            development_question_path = development_paths["ask_human_path"]
+            development_answer_path = development_paths["hitl_record_path"]
         except Exception:
             development_question_path = ""
+            development_answer_path = ""
         active_question = ""
-        if development_question_path and Path(development_question_path).exists() and _preview_text(development_question_path):
-            active_question = Path(development_question_path)
-        if not active_question and ask_human_path.exists() and _preview_text(ask_human_path):
-            active_question = ask_human_path
-        if not active_question:
-            active_question = notion_question_path if notion_question_path.exists() and _preview_text(notion_question_path) else ""
-        answer_path = hitl_record_path if hitl_record_path.exists() else notion_record_path
+        answer_path = ""
+        for kind in self._file_hitl_candidate_kinds_for_action(active_action):
+            if kind == "development":
+                question_path = Path(development_question_path) if development_question_path else None
+                candidate_answer_path = Path(development_answer_path) if development_answer_path else None
+            elif kind == "requirements":
+                question_path = ask_human_path
+                candidate_answer_path = hitl_record_path
+            elif kind == "notion":
+                question_path = notion_question_path
+                candidate_answer_path = notion_record_path
+            else:
+                continue
+            if question_path and question_path.exists() and _preview_text(question_path):
+                active_question = question_path
+                answer_path = candidate_answer_path or ""
+                break
         question_summary = _preview_text(active_question) if active_question else ""
         if active_question:
             last_resolved = self._last_resolved_hitl
@@ -2355,6 +2548,21 @@ class BridgeCore:
             "answer_path": str(answer_path) if answer_path and Path(answer_path).exists() else "",
             "summary": question_summary,
         }
+
+    @staticmethod
+    def _file_hitl_candidate_kinds_for_action(action: str) -> tuple[str, ...]:
+        normalized = str(action or "").strip()
+        if not normalized or normalized == "idle":
+            return ("development", "requirements", "notion")
+        if normalized in {"workflow.a00.start", "control.b01.open", "stage.a01.start"}:
+            return ()
+        if normalized == "stage.a02.start":
+            return ("notion",)
+        if normalized in {"stage.a03.start", "stage.a04.start", "stage.a05.start", "stage.a06.start"}:
+            return ("requirements", "notion")
+        if normalized in {"stage.a07.start", "stage.a08.start"}:
+            return ("development", "requirements", "notion")
+        return ("development", "requirements", "notion")
 
     @staticmethod
     def _stage_routes_for_action(action: str) -> tuple[str, ...]:
@@ -2598,7 +2806,37 @@ class BridgeCore:
                 filtered = matched
             elif any(str(worker.get("workflow_action", "")).strip() for worker in filtered):
                 filtered = []
+        workflow_started_at = self._current_workflow_started_at()
+        if workflow_started_at is not None:
+            filtered = [
+                worker
+                for worker in filtered
+                if not _worker_snapshot_before_timestamp(worker, workflow_started_at)
+            ]
         return filtered
+
+    def _current_workflow_started_at(self) -> float | None:
+        project_dir = str(self._resolve_project_dir() or "").strip()
+        requirement_name = str(self._context.requirement_name or "").strip()
+        if not project_dir or not requirement_name:
+            return None
+        try:
+            project_root = Path(project_dir).expanduser().resolve()
+            safe_requirement = sanitize_requirement_name(requirement_name)
+            state_path = (
+                project_root
+                / WORKFLOW_RECORD_ROOT_NAME
+                / safe_requirement
+                / "stages"
+                / "workflow_a00_start.state.json"
+            )
+            payload = _safe_json_read(state_path)
+            if str(payload.get("source", "")).strip() != "runner_start":
+                return None
+            started_at = _parse_iso_datetime(str(payload.get("updated_at", "")).strip())
+            return started_at.timestamp() if started_at is not None else None
+        except Exception:
+            return None
 
     def _build_runtime_worker_hitl_snapshot(self, action: str) -> dict[str, Any]:
         workers = self._filter_workers_for_current_context(self._current_stage_workers(action), action)
@@ -2625,14 +2863,75 @@ class BridgeCore:
         return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
 
     @staticmethod
-    def _worker_snapshot_has_failed_status(worker: Mapping[str, Any]) -> bool:
+    def _review_json_has_task_result(path_value: str | Path, *, task_name: str) -> bool:
+        path_text = str(path_value or "").strip()
+        task_name_text = str(task_name or "").strip()
+        if not path_text or not task_name_text:
+            return False
+        path = Path(path_text).expanduser()
+        if not path.exists() or not path.is_file() or path.suffix.lower() != ".json":
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            normalize_review_status_payload(payload, task_name=task_name_text, source=str(path))
+            return True
+        except Exception:
+            return False
+
+    def _stage_a07_failed_reviewer_has_current_task_output(self, worker: Mapping[str, Any]) -> bool:
+        worker_id = str(worker.get("worker_id", "")).strip()
+        if not worker_id.startswith("development-review-"):
+            return False
+        if not self._worker_snapshot_has_live_session(worker):
+            return False
+        project_dir = self._resolve_project_dir()
+        requirement_name = str(self._context.requirement_name or "").strip()
+        if not project_dir or not requirement_name:
+            return False
+        try:
+            paths = build_development_paths(project_dir, requirement_name)
+            task_json_path = paths["task_json_path"]
+            if not is_task_progress_json(task_json_path):
+                return False
+            task_name = str(get_first_false_task(task_json_path) or "").strip()
+        except Exception:
+            return False
+        if not task_name:
+            return False
+        candidates: list[str] = []
+        turn_status_path = str(worker.get("turn_status_path", "")).strip()
+        if turn_status_path:
+            candidates.append(turn_status_path)
+        artifact_paths = worker.get("artifact_paths", [])
+        if isinstance(artifact_paths, Sequence) and not isinstance(artifact_paths, (str, bytes)):
+            candidates.extend(str(path).strip() for path in artifact_paths if str(path).strip())
+        session_name = str(worker.get("session_name", "")).strip()
+        if session_name:
+            with contextlib.suppress(Exception):
+                _review_md_path, review_json_path = build_reviewer_artifact_paths(project_dir, requirement_name, session_name)
+                candidates.append(str(review_json_path))
+        seen: set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            if self._review_json_has_task_result(candidate, task_name=task_name):
+                return True
+        return False
+
+    def _worker_snapshot_has_failed_status(self, worker: Mapping[str, Any], *, action: str = "") -> bool:
         if _is_recoverable_reconfig_snapshot(worker):
+            return False
+        normalized_action = str(action or self._context.current_action or self._display_action or "").strip()
+        if normalized_action == "stage.a07.start" and self._stage_a07_failed_reviewer_has_current_task_output(worker):
             return False
         return str(worker.get("status", "")).strip() in {"failed", "stale_failed", "error"}
 
     @staticmethod
     def _worker_snapshot_is_dead(worker: Mapping[str, Any]) -> bool:
         if _is_recoverable_reconfig_snapshot(worker):
+            return False
+        if worker_state_is_prelaunch_active(worker):
             return False
         return (
             str(worker.get("agent_state", "")).strip().upper() == "DEAD"
@@ -2664,6 +2963,15 @@ class BridgeCore:
         except Exception:
             return False
         return False
+
+    def _routing_contract_is_ready(self) -> bool:
+        project_dir = self._resolve_project_dir()
+        if not project_dir:
+            return False
+        try:
+            return all(path.exists() and path.is_file() and path.stat().st_size > 0 for path in required_routing_layer_paths(project_dir))
+        except Exception:
+            return False
 
     def _infer_runtime_stage_status(self, action: str) -> str:
         normalized_action = str(action or "").strip()
@@ -2700,7 +3008,7 @@ class BridgeCore:
             return "running"
         if allow_worker_running_inference and alive_workers:
             return "running"
-        has_failed_workers = any(self._worker_snapshot_has_failed_status(worker) for worker in workers)
+        has_failed_workers = any(self._worker_snapshot_has_failed_status(worker, action=normalized_action) for worker in workers)
         has_dead_workers = any(self._worker_snapshot_is_dead(worker) for worker in workers)
         has_live_session = any(self._worker_snapshot_has_live_session(worker) for worker in workers)
         if (
@@ -2713,6 +3021,8 @@ class BridgeCore:
         if has_failed_workers:
             return "failed"
         if has_dead_workers:
+            if normalized_action == "stage.a01.start" and self._routing_contract_is_ready():
+                return ""
             return "failed"
         return ""
 
@@ -2722,6 +3032,7 @@ class BridgeCore:
             for worker in self._filter_workers_for_current_context(self._current_stage_workers(action), action)
             if str(worker.get("status", "")).strip() in {"failed", "stale_failed", "error"}
             and not _is_recoverable_reconfig_snapshot(worker)
+            and self._worker_snapshot_has_failed_status(worker, action=action)
         ]
         summaries: list[str] = []
         for worker in sorted(failed_workers, key=_worker_snapshot_sort_key, reverse=True):
@@ -2779,12 +3090,19 @@ class BridgeCore:
         preferred_status: str | None = None,
         preferred_action: str | None = None,
         preferred_stage_seq: int | None = None,
+        source: str | None = None,
     ) -> tuple[str, str, int]:
         action = str(preferred_action or self._context.current_action or self._display_action or "").strip()
         explicit_status = str(preferred_status or self._display_status or "ready").strip() or "ready"
         stage_seq = max(int(preferred_stage_seq or 0), 0) or int(self._display_stage_seq or 0)
         runtime_status = self._infer_runtime_stage_status(action) if action else ""
-        if runtime_status == "failed":
+        source_text = str(source or "").strip()
+        suppress_recoverable_worker_failure = (
+            runtime_status == "failed"
+            and self._active_stage_runner_alive(action)
+            and source_text not in {"runner_failure", "runner_complete"}
+        )
+        if runtime_status == "failed" and not suppress_recoverable_worker_failure:
             return action, runtime_status, stage_seq
         live_runtime_hitl_pending = bool(self._iter_pending_prompts())
         if not live_runtime_hitl_pending and action:
@@ -2803,6 +3121,8 @@ class BridgeCore:
             return action, "awaiting-input", stage_seq
         if runtime_status == "running":
             return action, runtime_status, stage_seq
+        if suppress_recoverable_worker_failure:
+            return action, "running", stage_seq
         return action, explicit_status, stage_seq
 
     def _emit_display_stage_state(
@@ -2823,6 +3143,7 @@ class BridgeCore:
             preferred_status=preferred_status,
             preferred_action=preferred_action,
             preferred_stage_seq=preferred_stage_seq,
+            source=source,
         )
         if (
             action
@@ -3228,6 +3549,65 @@ class BridgeCore:
                 },
             )
 
+    def _manual_reconfiguration_error_pending(self, *, action: str, error: BaseException) -> bool:
+        message = str(error or "").strip()
+        lowered = message.lower()
+        if not (
+            is_worker_death_error(error)
+            or "需要重新启动或重建" in message
+            or "重新选择" in message
+            or "awaiting_reconfig" in lowered
+        ):
+            return False
+        if self._iter_pending_prompts():
+            return True
+        if self._build_runtime_worker_hitl_snapshot(action).get("pending", False):
+            return True
+        workers = self._filter_workers_for_current_context(self._current_stage_workers(action), action)
+        return any(_is_recoverable_reconfig_snapshot(worker) for worker in workers)
+
+    def _await_manual_reconfiguration_recovery(
+        self,
+        *,
+        request_id: str,
+        action: str,
+        stage_seq: int,
+        error: BaseException,
+        respond: bool,
+    ) -> None:
+        message_text = str(error or "").strip()
+        self.emit_event(
+            "log.append",
+            {
+                "text": "检测到智能体需要人工重配，已转为等待人类输入，系统不会标记为失败。\n",
+                "log_kind": "warning",
+                "log_title": "manual reconfiguration required",
+            },
+        )
+        self._emit_display_stage_state(
+            preferred_status="awaiting-input",
+            preferred_action=action,
+            preferred_stage_seq=stage_seq,
+            source="runtime_inference",
+            message=message_text,
+            force=True,
+        )
+        if respond and request_id:
+            self.emit_response(
+                request_id,
+                ok=True,
+                payload={
+                    "awaiting_input": True,
+                    "recovery_kind": "manual_reconfiguration",
+                    "message": message_text,
+                },
+            )
+        self._emit_snapshot_update(
+            include_app=True,
+            include_artifacts=True,
+            stage_routes=self._stage_routes_for_action(action),
+        )
+
     def _run_in_thread(
         self,
         request_id: str,
@@ -3284,6 +3664,15 @@ class BridgeCore:
                 )
                 if is_agent_ready_timeout_error(error):
                     self._await_agent_ready_timeout_recovery(
+                        request_id=request_id,
+                        action=final_action or action,
+                        stage_seq=final_stage_seq,
+                        error=error,
+                        respond=respond,
+                    )
+                    return
+                if self._manual_reconfiguration_error_pending(action=final_action or action, error=error):
+                    self._await_manual_reconfiguration_recovery(
                         request_id=request_id,
                         action=final_action or action,
                         stage_seq=final_stage_seq,
@@ -3365,6 +3754,30 @@ class BridgeCore:
         if session is not None:
             session.center.close()
 
+    def _cleanup_visible_tmux_workers(self, *, reason: str) -> list[str]:
+        cleaned_sessions: list[str] = []
+        seen_sessions: set[str] = set()
+        actions = ("control.b01.open", *WORKFLOW_STAGE_ACTION_ORDER.keys())
+        for action in actions:
+            try:
+                workers = self._filter_workers_for_current_context(self._current_stage_workers(action), action)
+            except Exception:
+                continue
+            for worker in workers:
+                session_name = str(worker.get("session_name", "")).strip()
+                if not session_name or session_name in seen_sessions:
+                    continue
+                seen_sessions.add(session_name)
+                if not self._worker_snapshot_has_live_session(worker):
+                    continue
+                try:
+                    cleaned_session = self._tmux_runtime.kill_session(session_name, missing_ok=True)
+                except Exception:
+                    continue
+                if cleaned_session:
+                    cleaned_sessions.append(cleaned_session)
+        return sorted(set(cleaned_sessions))
+
     def shutdown(self, *, cleanup_tmux: bool) -> list[str]:
         with self._shutdown_lock:
             if self._shutdown_started:
@@ -3388,7 +3801,12 @@ class BridgeCore:
                 continue
         cleaned_sessions: list[str] = []
         if cleanup_tmux:
-            cleaned_sessions = cleanup_registered_tmux_workers(reason="tui_backend_shutdown")
+            cleaned_sessions = sorted(
+                set(
+                    cleanup_registered_tmux_workers(reason="tui_backend_shutdown")
+                    + self._cleanup_visible_tmux_workers(reason="tui_backend_shutdown")
+                )
+            )
             if cleaned_sessions:
                 self.emit_event(
                     "log.append",
@@ -3943,7 +4361,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     finally:
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
-        server.shutdown(cleanup_tmux=False)
+        server.shutdown(cleanup_tmux=True)
 
 
 if __name__ == "__main__":

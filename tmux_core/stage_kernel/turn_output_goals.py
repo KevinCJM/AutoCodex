@@ -21,6 +21,10 @@ from tmux_core.runtime.tmux_runtime import (
     is_task_result_contract_error,
     is_turn_artifact_contract_error,
 )
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_WORKER_DEAD,
+    request_file_noncompliance_intervention,
+)
 
 DEFAULT_TURN_REPAIR_ATTEMPTS = 2
 
@@ -372,7 +376,42 @@ def run_task_result_turn_with_repair(
         ):
             raise current_error
         if repair_attempt >= repair_budget:
-            raise current_error or _build_task_goal_error(turn_label=current_label, observation=observation, validation=validation)
+            terminal_error = current_error or _build_task_goal_error(
+                turn_label=current_label,
+                observation=observation,
+                validation=validation,
+            )
+            while True:
+                target_paths = tuple(observation.artifact_paths.values()) or (str(result_path),)
+                decision = request_file_noncompliance_intervention(
+                    stage_label=stage_label or active_result_contract.stage_name or active_result_contract.phase,
+                    role_label=role_label,
+                    worker=worker,
+                    reason_text=str(terminal_error),
+                    attempts_used=repair_budget,
+                    target_paths=target_paths,
+                )
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    raise RuntimeError(f"tmux pane died after manual file intervention: {terminal_error}") from terminal_error
+                observation = observe_task_result_state(active_result_contract, result_path)
+                validation = (
+                    _validate_observation(
+                        outcomes=turn_goal.outcomes,
+                        observed_status=observation.observed_status,
+                        present_aliases=observation.present_aliases,
+                        last_validation_error=observation.last_validation_error,
+                    )
+                    if turn_goal is not None
+                    else GoalValidation(valid=True, expected_status="", missing_aliases=(), forbidden_aliases=(), message="")
+                )
+                internal_result_error = _is_internal_task_result_error(observation.last_validation_error or "")
+                if validation.valid and not internal_result_error:
+                    return read_task_result_payload(result_path)
+                terminal_error = _build_task_goal_error(
+                    turn_label=current_label,
+                    observation=observation,
+                    validation=validation,
+                )
         context = _build_repair_context(
             turn_label=current_label,
             stage_label=stage_label or active_result_contract.stage_name or active_result_contract.phase,
@@ -411,6 +450,16 @@ def run_completion_turn_with_repair(
     current_prompt = prompt
     for repair_attempt in range(0, repair_budget + 1):
         current_label = label if repair_attempt == 0 else f"{label}_repair_{repair_attempt}"
+        if repair_attempt > 0 and turn_goal is not None:
+            observation = observe_completion_state(completion_contract)
+            validation = _validate_observation(
+                outcomes=turn_goal.outcomes,
+                observed_status=observation.observed_status,
+                present_aliases=observation.present_aliases,
+                last_validation_error=observation.last_validation_error,
+            )
+            if validation.valid and not observation.last_validation_error:
+                return
         result = worker.run_turn(
             label=current_label,
             prompt=current_prompt,
@@ -450,11 +499,40 @@ def run_completion_turn_with_repair(
         if current_error is not None and not is_turn_artifact_contract_error(current_error):
             raise current_error
         if repair_attempt >= repair_budget:
-            raise current_error or _build_completion_goal_error(
+            terminal_error = current_error or _build_completion_goal_error(
                 turn_label=current_label,
                 observation=observation,
                 validation=validation,
             )
+            while True:
+                decision = request_file_noncompliance_intervention(
+                    stage_label=stage_label or completion_contract.phase,
+                    role_label=role_label,
+                    worker=worker,
+                    reason_text=str(terminal_error),
+                    attempts_used=repair_budget,
+                    target_paths=tuple(observation.artifact_paths.values()),
+                )
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    raise RuntimeError(f"tmux pane died after manual file intervention: {terminal_error}") from terminal_error
+                observation = observe_completion_state(completion_contract)
+                validation = (
+                    _validate_observation(
+                        outcomes=turn_goal.outcomes,
+                        observed_status=observation.observed_status,
+                        present_aliases=observation.present_aliases,
+                        last_validation_error=observation.last_validation_error,
+                    )
+                    if turn_goal is not None
+                    else GoalValidation(valid=True, expected_status="", missing_aliases=(), forbidden_aliases=(), message="")
+                )
+                if validation.valid and not observation.last_validation_error:
+                    return
+                terminal_error = _build_completion_goal_error(
+                    turn_label=current_label,
+                    observation=observation,
+                    validation=validation,
+                )
         context = _build_repair_context(
             turn_label=current_label,
             stage_label=stage_label or completion_contract.phase,

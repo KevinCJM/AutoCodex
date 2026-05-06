@@ -93,12 +93,8 @@ export function DialogSelect(props: Props) {
         paddingRight={1}
         backgroundColor={active() ? '#07141c' : undefined}
       >
-        <text flexShrink={0} fg={active() ? '#00d2ff' : '#666666'}>
-          {active() ? '›' : ' '}
-        </text>
-        <text fg={active() ? '#00d2ff' : '#ffffff'} flexGrow={1} overflow="hidden" wrapMode="none">
-          {item.label}
-        </text>
+        <text flexShrink={0} fg={active() ? '#00d2ff' : '#666666'}>{active() ? '›' : ' '}</text>
+        <text fg={active() ? '#00d2ff' : '#ffffff'} flexGrow={1} overflow="hidden" wrapMode="none">{item.label}</text>
       </box>
     )
   }

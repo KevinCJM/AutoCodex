@@ -29,6 +29,7 @@ from T02_tmux_agents import (
     build_session_name,
     cleanup_registered_tmux_workers,
     list_registered_tmux_workers,
+    worker_state_is_prelaunch_active,
 )
 from T03_agent_init_workflow import (
     BatchInitResult,
@@ -797,7 +798,7 @@ def render_live_progress_frame(
         if status == "stale_failed":
             status = "failed"
         workflow_stage = entry.workflow_stage or "pending"
-        agent_state = entry.agent_state or "DEAD"
+        agent_state = "STARTING" if worker_state_is_prelaunch_active(entry) else entry.agent_state or "DEAD"
         health_status = entry.health_status or "unknown"
         note = entry.note or workflow_stage or "pending"
         session_name = entry.session_name or "(preparing)"
@@ -818,6 +819,18 @@ def render_live_progress_line(
     selection,
     tick: int = 0,
 ) -> str:
+    for entry in run_store.manifest.workers:
+        state_path = str(getattr(entry, "state_path", "") or "").strip()
+        if not state_path:
+            continue
+        try:
+            run_store.update_worker_state_from_file(
+                entry.work_dir,
+                state_path,
+                preserve_workflow_fields=True,
+            )
+        except Exception:
+            continue
     counts = summarize_live_result_counts(run_store)
     spinner = TERMINAL_SPINNER_FRAMES[tick % len(TERMINAL_SPINNER_FRAMES)]
     entry_by_dir = {item.work_dir: item for item in run_store.manifest.workers}
@@ -829,7 +842,7 @@ def render_live_progress_line(
         note = "pending"
     else:
         workflow_stage = entry.workflow_stage or "pending"
-        agent_state = entry.agent_state or "DEAD"
+        agent_state = "STARTING" if worker_state_is_prelaunch_active(entry) else entry.agent_state or "DEAD"
         focus_label = f"{Path(focus_dir).name}:{workflow_stage}/{agent_state}"
         note = entry.note or workflow_stage
     return (

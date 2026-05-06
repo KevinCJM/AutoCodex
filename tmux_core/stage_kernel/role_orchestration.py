@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import Callable, Sequence, TypeVar
 
-from tmux_core.runtime.tmux_runtime import DEFAULT_COMMAND_TIMEOUT_SEC
+from tmux_core.runtime.tmux_runtime import DEFAULT_COMMAND_TIMEOUT_SEC, worker_state_is_prelaunch_active
+from tmux_core.stage_kernel.agent_intervention import render_worker_intervention_summary
 
 TMain = TypeVar("TMain")
 TReviewer = TypeVar("TReviewer")
@@ -64,6 +65,37 @@ def _current_turn_completed(worker: object) -> bool:
     return status == "succeeded" and result_status == "succeeded" and runtime_status == "done"
 
 
+def _worker_failed_or_stale(worker: object) -> bool:
+    state = _read_worker_state(worker)
+    if worker_state_is_prelaunch_active(state or worker):
+        return False
+    status = str(state.get("status", getattr(worker, "status", "")) or "").strip().lower()
+    result_status = str(state.get("result_status", getattr(worker, "result_status", "")) or "").strip().lower()
+    health_status = str(state.get("health_status", getattr(worker, "health_status", "")) or "").strip().lower()
+    return status in {"failed", "stale_failed", "error"} or result_status in {"failed", "error"} or health_status in {
+        "provider_runtime_error",
+        "dead",
+        "missing_session",
+    }
+
+
+def _failed_worker_is_still_active(worker: object, state_name: str) -> bool:
+    if str(state_name or "").strip().upper() not in {"BUSY", "STARTING"}:
+        return False
+    state = _read_worker_state(worker)
+    health_status = str(state.get("health_status", getattr(worker, "health_status", "")) or "").strip().lower()
+    if health_status in {"dead", "missing_session", "pane_dead", "provider_runtime_error"}:
+        return False
+    if hasattr(worker, "terminal_recently_changed"):
+        return bool(getattr(worker, "terminal_recently_changed", False))
+    return bool(state.get("terminal_recently_changed", False))
+
+
+def _restart_failed_worker_before_ready_wait(worker: object, *, timeout_sec: float) -> bool:
+    _ = timeout_sec
+    return False
+
+
 def _ensure_worker_ready(
     worker: object | None,
     *,
@@ -78,7 +110,17 @@ def _ensure_worker_ready(
         return
     if allow_completed_nonready and _current_turn_completed(worker):
         return
-    if _state_name(worker) != "READY":
+    state_name = _state_name(worker)
+    if _worker_failed_or_stale(worker) and state_name != "READY" and not _failed_worker_is_still_active(worker, state_name):
+        raise RuntimeError(
+            render_worker_intervention_summary(
+                stage_label="阶段调度",
+                role_label=role_label,
+                worker=worker,
+                reason_text="上一轮执行失败或状态异常，系统不会自动重启该智能体。请人工进入 tmux 检查后再继续。",
+            )
+        )
+    if state_name != "READY":
         ensure_ready(timeout_sec=timeout_sec)
     if allow_completed_nonready and _current_turn_completed(worker):
         return

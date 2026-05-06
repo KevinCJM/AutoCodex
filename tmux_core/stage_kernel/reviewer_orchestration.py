@@ -5,8 +5,51 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
+from tmux_core.runtime.tmux_runtime import (
+    worker_state_has_launch_evidence,
+    worker_state_is_prelaunch_active,
+)
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_WORKER_DEAD,
+    request_file_noncompliance_intervention,
+)
 
 TReviewer = TypeVar("TReviewer")
+
+
+def _resolve_worker(owner: object | None):
+    if owner is None:
+        return None
+    worker = getattr(owner, "worker", None)
+    return worker if worker is not None else owner
+
+
+def _owner_is_dead(owner: object | None) -> bool:
+    worker = _resolve_worker(owner)
+    if worker is None:
+        return False
+    if worker_state_is_prelaunch_active(worker) or not worker_state_has_launch_evidence(worker):
+        return False
+    get_agent_state = getattr(worker, "get_agent_state", None)
+    if callable(get_agent_state):
+        try:
+            state = get_agent_state()
+            if str(getattr(state, "value", state) or "").strip().upper() == "DEAD":
+                return True
+        except Exception:
+            pass
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        try:
+            payload = read_state()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            return (
+                str(payload.get("agent_state", "") or "").strip().upper() == "DEAD"
+                or str(payload.get("health_status", "") or "").strip().lower() in {"dead", "missing_session", "pane_dead"}
+            )
+    return False
 
 
 def run_parallel_reviewer_round(
@@ -52,6 +95,8 @@ def repair_reviewer_round_outputs(
     max_attempts: int,
     error_prefix: str,
     final_error: str,
+    stage_label: str = "",
+    progress: object | None = None,
 ) -> list[TReviewer]:
     reviewer_list = list(reviewers)
     if not reviewer_list:
@@ -87,8 +132,37 @@ def repair_reviewer_round_outputs(
                 reviewer_index = {key_func(item): index for index, item in enumerate(reviewer_list)}
                 if not reviewer_list:
                     return reviewer_list
-    if check_job([artifact_name_func(item) for item in reviewer_list]):
-        raise RuntimeError(final_error)
+    prompts = check_job([artifact_name_func(item) for item in reviewer_list])
+    while prompts:
+        affected_reviewers = [
+            item for item in reviewer_list
+            if artifact_name_func(item) in prompts
+        ]
+        target_paths: list[str] = []
+        for reviewer in affected_reviewers:
+            for attr in ("review_md_path", "review_json_path"):
+                path = getattr(reviewer, attr, "")
+                if str(path or "").strip():
+                    target_paths.append(str(Path(path).expanduser().resolve()))
+        reason_text = "\n\n".join(
+            f"[{name}]\n{prompt}" for name, prompt in prompts.items()
+        ) or final_error
+        representative = affected_reviewers[0] if affected_reviewers else (reviewer_list[0] if reviewer_list else None)
+        decision = request_file_noncompliance_intervention(
+            stage_label=stage_label or "审核阶段",
+            role_label=artifact_name_func(representative) if representative is not None else "审核智能体",
+            worker=_resolve_worker(representative),
+            reason_text=reason_text,
+            attempts_used=max_attempts,
+            target_paths=target_paths,
+            progress=progress,
+        )
+        if decision == AGENT_INTERVENTION_WORKER_DEAD:
+            survivors = [item for item in reviewer_list if not _owner_is_dead(item)]
+            if len(survivors) != len(reviewer_list):
+                return survivors
+            raise RuntimeError(f"tmux pane died after manual reviewer repair intervention: {final_error}")
+        prompts = check_job([artifact_name_func(item) for item in reviewer_list])
     return reviewer_list
 
 

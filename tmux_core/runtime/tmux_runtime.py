@@ -67,9 +67,22 @@ POST_DONE_AGENT_PROBE_INTERVAL_SEC = 5.0
 READY_HEALTH_INTERVAL_SEC = 15.0
 IDLE_HEALTH_INTERVAL_SEC = 30.0
 IDLE_HEALTH_AFTER_SEC = 60.0
+PRELAUNCH_ACTIVE_RESULT_STATUSES = {"pending", "ready", "running"}
+PRELAUNCH_WORKFLOW_STAGES = {"audit_running", "create_running", "pending", "refine_running", "starting"}
+TERMINAL_WORKER_RESULT_STATUSES = {
+    "completed",
+    "done",
+    "error",
+    "failed",
+    "passed",
+    "skipped",
+    "stale_failed",
+    "succeeded",
+}
 WORKER_DEATH_ERROR_MARKERS = (
     "tmux pane died",
     "tmux pane exited",
+    "tmux pane missing",
     "agent exited back to shell",
     "missing_session",
     "pane_dead",
@@ -113,6 +126,84 @@ PROXY_ENV_KEYS = (
 )
 SHELL_COMMANDS = {"bash", "fish", "sh", "zsh"}
 BRAILLE_SPINNER_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _truthy_runtime_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    text = str(value).strip().lower()
+    if not text:
+        return False
+    if text in {"0", "false", "no", "none", "null", "off"}:
+        return False
+    return True
+
+
+def _worker_state_payload(source: Mapping[str, object] | object | None) -> dict[str, object]:
+    if source is None:
+        return {}
+    if isinstance(source, Mapping):
+        return dict(source)
+    payload: dict[str, object] = {}
+    read_state = getattr(source, "read_state", None)
+    if callable(read_state):
+        try:
+            state = read_state()
+            if isinstance(state, Mapping):
+                payload.update(dict(state))
+        except Exception:
+            pass
+    for field_name in (
+        "agent_ready",
+        "agent_started",
+        "agent_state",
+        "current_task_runtime_status",
+        "health_status",
+        "pane_id",
+        "result_status",
+        "status",
+        "workflow_stage",
+    ):
+        if field_name not in payload and hasattr(source, field_name):
+            payload[field_name] = getattr(source, field_name)
+    return payload
+
+
+def worker_state_has_launch_evidence(source: Mapping[str, object] | object | None) -> bool:
+    payload = _worker_state_payload(source)
+    if _truthy_runtime_flag(payload.get("agent_started")) or _truthy_runtime_flag(payload.get("agent_ready")):
+        return True
+    return bool(str(payload.get("pane_id", "") or "").strip())
+
+
+def worker_state_is_prelaunch_active(source: Mapping[str, object] | object | None) -> bool:
+    payload = _worker_state_payload(source)
+    if not payload or worker_state_has_launch_evidence(payload):
+        return False
+    agent_state = str(payload.get("agent_state", "") or "").strip().upper()
+    if agent_state not in {"", "STARTING", "DEAD"}:
+        return False
+    workflow_stage = str(payload.get("workflow_stage", "") or "").strip().lower()
+    note = str(payload.get("note", "") or "").strip().lower()
+    health_note = str(payload.get("health_note", "") or "").strip().lower()
+    if workflow_stage and workflow_stage not in PRELAUNCH_WORKFLOW_STAGES:
+        return False
+    if not workflow_stage and (not note or note in {"missing_session", "pane_dead", "tmux session missing"}):
+        return False
+    if workflow_stage == "pending" and not note and health_note in {"missing_session", "pane_dead", "tmux session missing"}:
+        return False
+    statuses = {
+        str(payload.get(field_name, "") or "").strip().lower()
+        for field_name in ("status", "result_status")
+    }
+    statuses.discard("")
+    if not statuses:
+        return False
+    if statuses & TERMINAL_WORKER_RESULT_STATUSES:
+        return False
+    return bool(statuses & PRELAUNCH_ACTIVE_RESULT_STATUSES)
 BRAILLE_SPINNER_PREFIX_RE = re.compile(rf"^[{BRAILLE_SPINNER_CHARS}]\s+")
 CODEX_TRUST_PROMPT_PATTERNS = (
     r"allow Codex to work in this folder",
@@ -123,6 +214,9 @@ CODEX_READY_PATTERNS = (
     r"^\s*[›❯]\s+\S.*$",
     r"^\s*[›❯]\s+.*@filename.*$",
     r"^\s*[›❯]\s+.*@path/to/file.*$",
+)
+CODEX_READY_FOOTER_PATTERNS = (
+    r"^\s*\S[^\n]*\s+·\s+(?:~|/|\.)",
 )
 CODEX_MODEL_SELECTION_PROMPT_PATTERNS = (
     r"Introducing GPT-5\.4",
@@ -200,6 +294,25 @@ OPENCODE_FOOTER_PATTERNS = (
     r"Build\s+·",
     r"^[╹▀]+$",
 )
+
+
+def _codex_effective_recent_surface(text: str, *, max_lines: int = 120) -> str:
+    lines = str(text or "").splitlines()[-max_lines:]
+    if not lines:
+        return ""
+    footer_index = -1
+    for index, line in enumerate(lines):
+        if any(re.search(pattern, line, re.IGNORECASE) for pattern in CODEX_READY_FOOTER_PATTERNS):
+            footer_index = index
+    if footer_index < 0:
+        return "\n".join(lines)
+    prompt_index = -1
+    for index in range(footer_index, -1, -1):
+        if any(re.search(pattern, lines[index], re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS):
+            prompt_index = index
+            break
+    start_index = prompt_index if prompt_index >= 0 else max(0, footer_index - 20)
+    return "\n".join(lines[start_index:])
 GEMINI_FOOTER_PATTERNS = (
     r"^\?\s+for shortcuts$",
     r"^YOLO\b",
@@ -944,12 +1057,9 @@ def is_task_result_contract_error(error: BaseException | str) -> bool:
 
 
 def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -> bool:
-    try:
-        worker.request_restart()
-        worker.ensure_agent_ready(timeout_sec=timeout_sec)
-        return True
-    except Exception:
-        return False
+    _ = worker
+    _ = timeout_sec
+    return False
 
 
 def load_worker_from_state_path(
@@ -1022,9 +1132,15 @@ def _sanitize_session_fragment(text: str, *, fallback: str) -> str:
 
 
 def _sanitize_task_runtime_fragment(text: str, *, fallback: str, max_len: int) -> str:
-    value = _sanitize_session_fragment(text, fallback=fallback)
-    value = value[:max_len].strip("-")
-    return value or fallback
+    raw = str(text or "").strip()
+    value = _sanitize_session_fragment(raw, fallback=fallback)
+    if len(value) <= max_len:
+        return value or fallback
+    digest = hashlib.sha1((raw or value).encode("utf-8")).hexdigest()[:8]
+    suffix = f"-{digest}"
+    head_len = max(max_len - len(suffix), 1)
+    head = value[:head_len].strip("-")
+    return f"{head}{suffix}" if head else digest[:max_len]
 
 
 def _worker_role_key(worker_id: str, work_dir: str | Path) -> str:
@@ -1655,18 +1771,20 @@ class CodexOutputDetector(BaseOutputDetector):
         base_state = super().classify_agent_state(observation)
         if base_state != AgentRuntimeState.BUSY:
             return base_state
-        ready_visible = self._contains_any(visible_text or text, CODEX_READY_PATTERNS)
-        busy_visible = self._contains_any(visible_text or recent_log or text, CODEX_BUSY_PATTERNS)
-        if self._contains_any(visible_text or text, CODEX_TRUST_PROMPT_PATTERNS):
+        visible_surface = _codex_effective_recent_surface(visible_text or text)
+        busy_surface = _codex_effective_recent_surface(visible_text or recent_log or text)
+        ready_visible = self._contains_any(visible_surface, CODEX_READY_PATTERNS)
+        busy_visible = self._contains_any(busy_surface, CODEX_BUSY_PATTERNS)
+        if self._contains_any(visible_surface, CODEX_TRUST_PROMPT_PATTERNS):
             return AgentRuntimeState.STARTING
-        if ready_visible and not busy_visible and not self._contains_any(visible_text or text, CODEX_STARTING_PATTERNS):
+        if ready_visible and not busy_visible and not self._contains_any(visible_surface, CODEX_STARTING_PATTERNS):
             return AgentRuntimeState.READY
-        if self._contains_any(visible_text or text, CODEX_UPDATE_NOTICE_PATTERNS) or self._contains_any(
-            visible_text or text,
+        if self._contains_any(visible_surface, CODEX_UPDATE_NOTICE_PATTERNS) or self._contains_any(
+            visible_surface,
             CODEX_MODEL_SELECTION_PROMPT_PATTERNS,
         ):
             return AgentRuntimeState.STARTING
-        if self._contains_any(visible_text or text, CODEX_STARTING_PATTERNS):
+        if self._contains_any(visible_surface, CODEX_STARTING_PATTERNS):
             return AgentRuntimeState.STARTING if observation.current_command else AgentRuntimeState.DEAD
         if busy_visible:
             return AgentRuntimeState.BUSY
@@ -1722,28 +1840,28 @@ class GeminiOutputDetector(BaseOutputDetector):
         base_state = super().classify_agent_state(observation)
         if base_state != AgentRuntimeState.BUSY:
             return base_state
+        if self._contains_any(visible_text, GEMINI_TRUST_PROMPT_PATTERNS):
+            return AgentRuntimeState.STARTING
+        if self._contains_any(visible_text, GEMINI_NOT_READY_PATTERNS):
+            return AgentRuntimeState.STARTING
+        if self._contains_any(visible_text, GEMINI_BUSY_PATTERNS):
+            return AgentRuntimeState.BUSY
         if self._contains_any(visible_text, GEMINI_INPUT_BOX_PATTERNS) or self._contains_any(
             visible_text,
             GEMINI_READY_PATTERNS,
         ):
             return AgentRuntimeState.READY
-        if self._contains_any(visible_text, GEMINI_BUSY_PATTERNS):
-            return AgentRuntimeState.BUSY
-        if self._contains_any(visible_text, GEMINI_TRUST_PROMPT_PATTERNS):
-            return AgentRuntimeState.STARTING
-        if self._contains_any(visible_text, GEMINI_NOT_READY_PATTERNS):
-            return AgentRuntimeState.STARTING
         if self._contains_any(recent_log or text, GEMINI_TRUST_PROMPT_PATTERNS):
             return AgentRuntimeState.STARTING
         if self._contains_any(recent_log or text, GEMINI_NOT_READY_PATTERNS):
             return AgentRuntimeState.STARTING
+        if self._contains_any(recent_log or text, GEMINI_BUSY_PATTERNS):
+            return AgentRuntimeState.BUSY
         if self._contains_any(recent_log or text, GEMINI_INPUT_BOX_PATTERNS) or self._contains_any(
             recent_log or text,
             GEMINI_READY_PATTERNS,
         ):
             return AgentRuntimeState.READY
-        if self._contains_any(recent_log or text, GEMINI_BUSY_PATTERNS):
-            return AgentRuntimeState.BUSY
         return AgentRuntimeState.STARTING if observation.current_command else AgentRuntimeState.DEAD
 
     def extract_last_message(self, output: str) -> str:
@@ -1962,8 +2080,6 @@ class AgentRunConfig:
                 "--model",
                 resolution.resolved_model,
             ]
-            if resolution.resolved_variant:
-                args.extend(["--variant", resolution.resolved_variant])
         else:
             raise ValueError(f"不支持的厂商: {self.vendor}")
 
@@ -2106,7 +2222,11 @@ class TmuxBatchWorker:
             self.last_terminal_changed_at = str(existing_state.get("last_terminal_changed_at", ""))
             self.terminal_recently_changed = bool(existing_state.get("terminal_recently_changed", False))
             self.agent_started = bool(existing_state.get("agent_started", existing_state.get("agent_ready", False)))
-            self.agent_ready = str(existing_state.get("agent_state", "")).strip().upper() == AgentRuntimeState.READY.value
+            existing_agent_state = str(existing_state.get("agent_state", "")).strip().upper()
+            if existing_agent_state in {state.value for state in AgentRuntimeState}:
+                self.agent_state = AgentRuntimeState(existing_agent_state)
+            self.agent_ready = self.agent_state == AgentRuntimeState.READY
+            self.wrapper_state = WrapperState.READY if self.agent_ready else WrapperState.NOT_READY
             for key in ("project_dir", "requirement_name", "workflow_action", "stage_seq", "run_id"):
                 if key in existing_state and key not in self._runtime_metadata:
                     self._runtime_metadata[key] = existing_state.get(key)
@@ -2576,6 +2696,15 @@ class TmuxBatchWorker:
             previous = self.read_state()
             agent_alive = self.is_agent_alive()
             agent_state = self.get_agent_state().value
+            extra_payload = dict(extra or {})
+            result_status = str(previous.get("result_status", "pending"))
+            current_task_runtime_status = self.current_task_runtime_status or str(previous.get("current_task_runtime_status", ""))
+            if status == WorkerStatus.READY and agent_state == AgentRuntimeState.READY.value:
+                if "result_status" not in extra_payload and result_status in {"running", "pending"}:
+                    result_status = WorkerStatus.READY.value
+                if "current_task_runtime_status" not in extra_payload and current_task_runtime_status == TASK_STATUS_RUNNING:
+                    current_task_runtime_status = ""
+                    self.current_task_runtime_status = ""
             payload: dict[str, object] = {
                 "worker_id": self.worker_id,
                 "runtime_worker_id": self.runtime_worker_id,
@@ -2604,7 +2733,7 @@ class TmuxBatchWorker:
                 "last_log_offset": self.last_log_offset,
                 "auto_recovery_mode": str(previous.get("auto_recovery_mode", "standard")),
                 "recoverable": self.recoverable,
-                "result_status": str(previous.get("result_status", "pending")),
+                "result_status": result_status,
                 "pane_title": self.last_pane_title,
                 "current_command": self.current_command or str(previous.get("current_command", "")),
                 "current_path": self.current_path or str(previous.get("current_path", "")),
@@ -2616,7 +2745,7 @@ class TmuxBatchWorker:
                 "current_turn_status_path": str(previous.get("current_turn_status_path", "")),
                 "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
                 "current_task_result_path": self.current_task_result_path or str(previous.get("current_task_result_path", "")),
-                "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
+                "current_task_runtime_status": current_task_runtime_status,
                 "last_terminal_signature": self.last_terminal_signature,
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
@@ -2625,8 +2754,8 @@ class TmuxBatchWorker:
                 if key in previous and key not in self._runtime_metadata:
                     self._runtime_metadata[key] = previous.get(key)
             payload.update(self._runtime_metadata)
-            if extra:
-                payload.update(extra)
+            if extra_payload:
+                payload.update(extra_payload)
             _atomic_write_json(self.state_path, payload)
         self._log_event("state_changed", status=status.value, note=note)
         _notify_runtime_state_changed_best_effort()
@@ -2661,6 +2790,21 @@ class TmuxBatchWorker:
         current_path = passive_observation.current_path
         pane_dead = passive_observation.pane_dead
         if not session_exists:
+            if self._is_prelaunch_without_session():
+                self.agent_state = AgentRuntimeState.STARTING
+                return WorkerHealthSnapshot(
+                    session_exists=False,
+                    health_status="unknown",
+                    health_note="launch pending",
+                    agent_state=AgentRuntimeState.STARTING.value,
+                    pane_title=self.last_pane_title,
+                    last_heartbeat_at=observed_at,
+                    last_log_offset=self.last_log_offset,
+                    current_command=self.current_command,
+                    current_path=self.current_path,
+                    pane_id=self.pane_id,
+                    session_name=self.session_name,
+                )
             self.agent_state = AgentRuntimeState.DEAD
             return WorkerHealthSnapshot(
                 session_exists=False,
@@ -2770,61 +2914,10 @@ class TmuxBatchWorker:
             relaunch_timeout_sec: float = 30.0,
             notify_on_change: bool = True,
     ) -> WorkerHealthSnapshot:
-        if not auto_relaunch:
-            return self._refresh_health_state_nonintrusive(notify_on_change=notify_on_change)
-        session_exists = self.session_exists()
-        health_status = "alive" if session_exists else "missing_session"
-        health_note = "alive" if session_exists else "missing_session"
-
-        if session_exists:
-            try:
-                observation = self.observe(tail_lines=160)
-                health_status = "pane_dead" if observation.pane_dead else "alive"
-                health_note = "pane_dead" if observation.pane_dead else "alive"
-                return WorkerHealthSnapshot(
-                    session_exists=True,
-                    health_status=health_status,
-                    health_note=health_note,
-                    agent_state=self.get_agent_state(observation).value,
-                    pane_title=observation.pane_title,
-                    last_heartbeat_at=self.last_heartbeat_at,
-                    last_log_offset=self.last_log_offset,
-                    current_command=self.current_command,
-                    current_path=self.current_path,
-                    pane_id=self.pane_id,
-                    session_name=self.session_name,
-                )
-            except Exception as error:
-                health_status = "observe_error"
-                health_note = str(error)
-
+        _ = relaunch_timeout_sec
         if auto_relaunch:
-            try:
-                self.agent_state = AgentRuntimeState.STARTING
-                self.ensure_agent_ready(timeout_sec=relaunch_timeout_sec)
-                health_status = "auto_relaunched"
-                health_note = "auto_relaunched"
-            except Exception as error:
-                health_status = "relaunch_failed"
-                health_note = str(error)
-
-        return WorkerHealthSnapshot(
-            session_exists=self.session_exists(),
-            health_status=health_status,
-            health_note=health_note,
-            agent_state=(
-                self.agent_state.value
-                if health_status == "auto_relaunched"
-                else self.get_agent_state().value
-            ),
-            pane_title=self.last_pane_title,
-            last_heartbeat_at=self.last_heartbeat_at,
-            last_log_offset=self.last_log_offset,
-            current_command=self.current_command,
-            current_path=self.current_path,
-            pane_id=self.pane_id,
-            session_name=self.session_name,
-        )
+            self._log_event("auto_relaunch_blocked", reason="manual_intervention_required")
+        return self._refresh_health_state_nonintrusive(notify_on_change=notify_on_change)
 
     def _append_transcript(self, title: str, body: str) -> None:
         with self.transcript_path.open("a", encoding="utf-8") as file:
@@ -2857,7 +2950,38 @@ class TmuxBatchWorker:
         if not prompt_text:
             return False
         source_text = cls._normalize_prompt_text(source)
-        return bool(source_text) and prompt_text in source_text
+        if not source_text:
+            return False
+        if prompt_text in source_text:
+            return True
+
+        source_flat = re.sub(r"\s+", " ", source_text).strip()
+        prompt_flat = re.sub(r"\s+", " ", prompt_text).strip()
+        if prompt_flat and prompt_flat in source_flat:
+            return True
+
+        # Long TUI prompts are often hard-wrapped by interactive CLIs, so the
+        # full string is not recoverable from tmux output. Multiple stable
+        # fragments are enough to prove that this prompt, not stale footer text,
+        # reached the pane.
+        fragments: list[str] = []
+        for line in prompt_text.splitlines():
+            line_flat = re.sub(r"\s+", " ", line).strip()
+            if len(line_flat) < 16 or line_flat.startswith("[[ACX_TURN:"):
+                continue
+            fragments.append(line_flat[:48])
+            if len(line_flat) > 96:
+                fragments.append(line_flat[-48:])
+        unique_fragments = list(dict.fromkeys(fragments))
+        if len(unique_fragments) < 3:
+            return False
+        matched = 0
+        for fragment in unique_fragments:
+            if fragment in source_text or fragment in source_flat:
+                matched += 1
+                if matched >= 3:
+                    return True
+        return False
 
     @classmethod
     def _source_mentions_prompt_submission_marker(cls, source: str, prompt: str) -> bool:
@@ -2962,41 +3086,38 @@ class TmuxBatchWorker:
             except Exception as error:
                 stable_signature = None
                 stable_since_monotonic = 0.0
-                if status_done_seen:
-                    invalid_state = "missing"
-                    if contract.status_path.exists():
-                        try:
-                            status_stat = contract.status_path.stat()
-                            invalid_state = (
-                                status_stat.st_size,
-                                status_stat.st_mtime,
-                            )
-                        except OSError:
-                            invalid_state = "stat_error"
-                    current_invalid_signature = (
-                        invalid_state,
-                        type(error).__name__,
-                        str(error).strip(),
-                    )
-                    if current_invalid_signature == invalid_signature:
-                        invalid_elapsed = (
-                            time.monotonic() - invalid_since_monotonic
-                            if invalid_since_monotonic
-                            else 0.0
+                invalid_state = "missing"
+                if contract.status_path.exists():
+                    try:
+                        status_stat = contract.status_path.stat()
+                        invalid_state = (
+                            status_stat.st_size,
+                            status_stat.st_mtime,
                         )
-                    else:
-                        invalid_signature = current_invalid_signature
-                        invalid_since_monotonic = time.monotonic()
-                        invalid_elapsed = 0.0
+                    except OSError:
+                        invalid_state = "stat_error"
+                current_invalid_signature = (
+                    invalid_state,
+                    type(error).__name__,
+                    str(error).strip(),
+                )
+                if current_invalid_signature == invalid_signature:
+                    invalid_elapsed = (
+                        time.monotonic() - invalid_since_monotonic
+                        if invalid_since_monotonic
+                        else 0.0
+                    )
+                else:
+                    invalid_signature = current_invalid_signature
+                    invalid_since_monotonic = time.monotonic()
+                    invalid_elapsed = 0.0
+                if status_done_seen:
                     if invalid_elapsed >= max(post_done_grace_sec, 0.0):
                         raise RuntimeError(
                             f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
                             f"phase={contract.phase} status_path={contract.status_path} "
                             f"completion_source=task_status_done error={str(error).strip()}"
                         ) from error
-                else:
-                    invalid_signature = None
-                    invalid_since_monotonic = 0.0
                 observation, last_probe_monotonic = self._maybe_probe_agent_liveness_for_file_wait(
                     last_probe_monotonic=last_probe_monotonic,
                     status_done_seen=status_done_seen,
@@ -3015,6 +3136,7 @@ class TmuxBatchWorker:
                         observation=observation,
                         status_done_seen=status_done_seen,
                         output_exists=contract.status_path.exists(),
+                        invalid_output_stable_sec=invalid_elapsed,
                     )
                     if stalled:
                         raise RuntimeError(
@@ -3060,7 +3182,8 @@ class TmuxBatchWorker:
                     raise RuntimeError(
                         f"agent exited back to shell while waiting for turn artifacts:\n{self._diagnostic_visible_tail(160)}"
                     )
-                if self.get_agent_state(observation) == AgentRuntimeState.READY:
+                agent_state = self.get_agent_state(observation)
+                if agent_state == AgentRuntimeState.READY:
                     if task_status_path is not None:
                         write_task_status(task_status_path, status=TASK_STATUS_DONE)
                     status_done_seen = True
@@ -3073,6 +3196,21 @@ class TmuxBatchWorker:
                         turn_id=contract.turn_id,
                         phase=contract.phase,
                         status_path=str(contract.status_path),
+                    )
+                    return file_result
+                if self._stable_turn_artifacts_can_finish_task(contract):
+                    if task_status_path is not None:
+                        write_task_status(task_status_path, status=TASK_STATUS_DONE)
+                    self.current_task_runtime_status = TASK_STATUS_DONE
+                    self.current_command = observation.current_command
+                    self.current_path = observation.current_path
+                    self.last_heartbeat_at = observation.observed_at
+                    self._log_event(
+                        "turn_artifacts_ready_from_stable_contract",
+                        turn_id=contract.turn_id,
+                        phase=contract.phase,
+                        status_path=str(contract.status_path),
+                        agent_state=agent_state.value,
                     )
                     return file_result
             observation, last_probe_monotonic = self._maybe_probe_agent_liveness_for_file_wait(
@@ -3335,15 +3473,21 @@ class TmuxBatchWorker:
                     return task_result
 
     def _infer_prompt_submission_from_busy_agent_after_timeout(self) -> bool:
-        observation = self._busy_agent_observation_after_turn_timeout()
-        if observation is None:
-            return False
-        self._log_event(
-            "prompt_submission_inferred_from_busy_agent",
-            current_command=observation.current_command,
-            pane_title=observation.pane_title,
-        )
-        return True
+        probe_count = 10
+        for probe_index in range(probe_count):
+            observation = self._busy_agent_observation_after_turn_timeout()
+            if observation is not None:
+                self._log_event(
+                    "prompt_submission_inferred_from_busy_agent",
+                    current_command=observation.current_command,
+                    pane_title=observation.pane_title,
+                    probe_index=probe_index,
+                )
+                return True
+            if probe_index + 1 < probe_count:
+                time.sleep(0.5)
+        self._log_event("prompt_submission_busy_probe_exhausted")
+        return False
 
     def _turn_failure_runtime_state_extra(self, clean_output: str) -> dict[str, object]:
         if is_provider_runtime_error(clean_output):
@@ -3890,6 +4034,9 @@ class TmuxBatchWorker:
         if self.config.vendor != Vendor.CODEX:
             return False
         recent_output = "\n".join(str(visible_text or "").splitlines()[-80:])
+        effective_output = _codex_effective_recent_surface(recent_output, max_lines=80)
+        if effective_output != recent_output and self._visible_indicates_agent_ready(effective_output):
+            return False
         if re.search(r"Press enter to continue", recent_output, re.IGNORECASE) and any(
                 re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_TRUST_PROMPT_PATTERNS
         ):
@@ -3971,6 +4118,11 @@ class TmuxBatchWorker:
     ) -> TaskResultFile:
         return validate_task_result_file(contract=contract, result_path=result_path)
 
+    @staticmethod
+    def _stable_turn_artifacts_can_finish_task(contract: TurnFileContract) -> bool:
+        contract_kind = str(contract.kind or "").strip()
+        return contract_kind in {"routing_file_contract", "review_round"}
+
     def _probe_agent_liveness_for_file_wait(self) -> WorkerObservation:
         if type(self).observe is not TmuxBatchWorker.observe:
             return self.observe(tail_lines=80, tail_bytes=0)
@@ -4031,13 +4183,18 @@ class TmuxBatchWorker:
             observation: WorkerObservation,
             status_done_seen: bool,
             output_exists: bool,
+            invalid_output_stable_sec: float = 0.0,
     ) -> tuple[bool, float]:
-        if status_done_seen or output_exists:
+        if status_done_seen:
+            return False, 0.0
+        if output_exists and invalid_output_stable_sec < TASK_CONTRACT_STALL_IDLE_SEC:
             return False, 0.0
         if self.current_task_runtime_status != TASK_STATUS_RUNNING:
             return False, 0.0
         if observation.current_command in SHELL_COMMANDS or not self._agent_running(observation.current_command):
             return False, 0.0
+        if output_exists and invalid_output_stable_sec >= TASK_CONTRACT_STALL_IDLE_SEC:
+            return True, invalid_output_stable_sec
         idle_elapsed = self._terminal_idle_elapsed_sec()
         if idle_elapsed < TASK_CONTRACT_STALL_IDLE_SEC:
             return False, idle_elapsed
@@ -4144,11 +4301,17 @@ class TmuxBatchWorker:
         return self.agent_started
 
     def has_ever_launched(self) -> bool:
+        return worker_state_has_launch_evidence(self)
+
+    def _is_prelaunch_without_session(self) -> bool:
         if self.agent_started:
-            return True
+            return False
         if str(self.pane_id or "").strip():
+            return False
+        try:
+            return not self.session_exists()
+        except Exception:  # noqa: BLE001
             return True
-        return self.state_path.exists()
 
     def _is_prelaunch_shell_window(self, observation: WorkerObservation | None = None) -> bool:
         if self.agent_started:
@@ -4174,6 +4337,8 @@ class TmuxBatchWorker:
 
     def _classify_agent_state(self, observation: WorkerObservation | None = None) -> AgentRuntimeState:
         if observation is None:
+            if self._is_prelaunch_without_session():
+                return AgentRuntimeState.STARTING
             if self._is_prelaunch_shell_window(observation):
                 return AgentRuntimeState.STARTING
             if not self.is_agent_alive(observation):
@@ -4241,6 +4406,7 @@ class TmuxBatchWorker:
         if not recent_output.strip():
             return False
         if self.config.vendor == Vendor.CODEX:
+            recent_output = _codex_effective_recent_surface(recent_output)
             if (
                     any(re.search(pattern, recent_output, re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS)
                     and not any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_STARTING_PATTERNS)
@@ -4285,6 +4451,7 @@ class TmuxBatchWorker:
         if not recent_output.strip():
             return False
         if self.config.vendor == Vendor.CODEX:
+            recent_output = _codex_effective_recent_surface(recent_output)
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_TRUST_PROMPT_PATTERNS):
                 return False
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in CODEX_MODEL_SELECTION_PROMPT_PATTERNS):
@@ -4298,6 +4465,8 @@ class TmuxBatchWorker:
             return bool(re.search(r"^\s*❯", recent_output, re.MULTILINE))
         if self.config.vendor == Vendor.GEMINI:
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_TRUST_PROMPT_PATTERNS + GEMINI_NOT_READY_PATTERNS):
+                return False
+            if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_BUSY_PATTERNS):
                 return False
             return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_INPUT_BOX_PATTERNS + GEMINI_READY_PATTERNS)
         if self.config.vendor == Vendor.OPENCODE:
@@ -4408,7 +4577,8 @@ class TmuxBatchWorker:
 
     def launch_agent(self, timeout_sec: float = 60.0) -> None:
         last_error: Exception | None = None
-        for attempt in range(1, 4):
+        max_attempts = 1
+        for attempt in range(1, max_attempts + 1):
             try:
                 with self.launch_coordinator.startup_slot(self.config.vendor):
                     if not self.pane_id or not self.target_exists():
@@ -4431,7 +4601,14 @@ class TmuxBatchWorker:
                 self.agent_started = False
                 self.wrapper_state = WrapperState.NOT_READY
                 self._log_event("launch_failed", attempt=attempt, error=str(error))
-                if attempt >= 3:
+                self.mark_awaiting_reconfiguration(
+                    reason_text=(
+                        f"{self.session_name} 启动失败，系统不会自动重试或重建该智能体。\n"
+                        f"请人工进入会话处理: tmux attach -t {self.session_name}\n"
+                        f"原因: {error}"
+                    )
+                )
+                if attempt >= max_attempts:
                     break
                 if self.session_exists():
                     try:
@@ -4443,12 +4620,28 @@ class TmuxBatchWorker:
         if last_error is not None:
             raise last_error
 
+    def _raise_ready_relaunch_blocked(self, *, reason: str) -> None:
+        reason_text = str(reason or "").strip() or "agent_not_ready"
+        intervention_text = (
+            f"检测到 {self.session_name} 需要重新启动或重建，但系统不会自动执行。\n"
+            f"请人工进入会话处理: tmux attach -t {self.session_name}\n"
+            f"原因: {reason_text}"
+        )
+        self.mark_awaiting_reconfiguration(reason_text=intervention_text)
+        self._log_event(
+            "ensure_ready_relaunch_blocked_manual_intervention_required",
+            reason=reason_text,
+        )
+        raise RuntimeError(intervention_text)
+
     def ensure_agent_ready(self, timeout_sec: float = 60.0) -> None:
         if self.session_exists() and self.pane_id:
             self._ensure_health_supervisor_started()
         if not self.pane_id or not self.target_exists():
+            if self.has_ever_launched():
+                self._raise_ready_relaunch_blocked(reason="tmux pane missing")
             self.agent_state = AgentRuntimeState.STARTING
-            self._log_event("ensure_ready_relaunch", reason="missing_pane")
+            self._log_event("ensure_ready_initial_launch", reason="missing_pane")
             self.launch_agent(timeout_sec=timeout_sec)
             return
 
@@ -4459,11 +4652,13 @@ class TmuxBatchWorker:
             return
 
         if current_command in SHELL_COMMANDS:
+            if self.has_ever_launched():
+                self._raise_ready_relaunch_blocked(reason="agent exited back to shell")
             self.agent_state = AgentRuntimeState.STARTING
             self.agent_started = False
             self.agent_ready = False
             self.wrapper_state = WrapperState.NOT_READY
-            self._log_event("ensure_ready_relaunch", reason="shell_fallback")
+            self._log_event("ensure_ready_initial_launch", reason="shell_fallback")
             self.launch_agent(timeout_sec=timeout_sec)
             return
 
@@ -4509,7 +4704,42 @@ class TmuxBatchWorker:
             pane_title=observation.pane_title,
         )
 
-    def _ensure_agent_ready_for_turn_start(self, *, timeout_sec: float) -> None:
+    def _restart_stale_busy_agent_for_turn_start(self, *, timeout_sec: float, reason: str) -> None:
+        _ = timeout_sec
+        reason_text = str(reason or "").strip() or "stale_busy_agent"
+        intervention_text = (
+            f"检测到 {self.session_name} 上一轮仍处于异常 BUSY/失败状态。\n"
+            "系统不会自动重启该智能体。\n"
+            f"请人工进入会话处理: tmux attach -t {self.session_name}\n"
+            f"原因: {reason_text}"
+        )
+        self.mark_awaiting_reconfiguration(reason_text=intervention_text)
+        self._log_event(
+            "turn_start_relaunch_blocked_manual_intervention_required",
+            reason=reason_text,
+        )
+        raise RuntimeError(intervention_text)
+
+    def _busy_agent_can_continue_waiting_for_turn_start(self, *, reason: str) -> bool:
+        if not self.last_terminal_signature:
+            return False
+        idle_elapsed = self._terminal_idle_elapsed_sec()
+        if not self.terminal_recently_changed and idle_elapsed >= TASK_CONTRACT_STALL_IDLE_SEC:
+            return False
+        self._log_event(
+            "turn_start_busy_agent_still_active_waiting",
+            reason=str(reason or "").strip() or "busy_agent_active",
+            idle_sec=round(idle_elapsed, 3),
+        )
+        return True
+
+    def _ensure_agent_ready_for_turn_start(
+            self,
+            *,
+            timeout_sec: float,
+            previous_task_runtime_status: str = "",
+            previous_worker_status: str = "",
+    ) -> None:
         try:
             self.ensure_agent_ready()
             return
@@ -4522,6 +4752,15 @@ class TmuxBatchWorker:
                 error=current_error,
                 timeout_sec=timeout_sec,
             )
+            previous_task_status = str(previous_task_runtime_status).strip().lower()
+            previous_status = str(previous_worker_status).strip().lower()
+            stale_reason = ""
+            if previous_task_status == TASK_STATUS_DONE:
+                stale_reason = "previous_task_done"
+            elif previous_status in {"failed", "stale_failed", "error"}:
+                stale_reason = "previous_worker_failed"
+            if stale_reason and not self._busy_agent_can_continue_waiting_for_turn_start(reason=stale_reason):
+                self._restart_stale_busy_agent_for_turn_start(timeout_sec=timeout_sec, reason=stale_reason)
             try:
                 self.ensure_agent_ready(timeout_sec=timeout_sec)
                 return
@@ -4848,6 +5087,8 @@ class TmuxBatchWorker:
         started_at = _now_iso()
         last_timeout: TimeoutError | None = None
         for attempt in range(1, 3):
+            previous_task_runtime_status = self.current_task_runtime_status
+            previous_worker_status = str(self.read_state().get("status", "")).strip()
             turn_token = f"[[ACX_TURN:{uuid.uuid4().hex[:8]}:DONE]]"
             task_status_path = self._build_task_status_path(label=label, attempt=attempt)
             result_path = self._build_task_result_path(label=label, attempt=attempt)
@@ -4887,7 +5128,11 @@ class TmuxBatchWorker:
             )
 
             try:
-                self._ensure_agent_ready_for_turn_start(timeout_sec=timeout_sec)
+                self._ensure_agent_ready_for_turn_start(
+                    timeout_sec=timeout_sec,
+                    previous_task_runtime_status=previous_task_runtime_status,
+                    previous_worker_status=previous_worker_status,
+                )
                 baseline_observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
                 baseline_visible = baseline_observation.visible_text
                 baseline_raw_log_tail = baseline_observation.raw_log_tail
@@ -5163,6 +5408,8 @@ class TmuxBatchWorker:
                 self.agent_ready = False
                 self.agent_state = AgentRuntimeState.STARTING
                 self.current_task_runtime_status = read_task_status(task_status_path)
+                if self.current_task_runtime_status == TASK_STATUS_RUNNING:
+                    self.current_task_runtime_status = ""
                 if attempt < 2:
                     self._log_event("turn_timeout_retry", label=label, attempt=attempt)
                     self._write_state(
@@ -5224,6 +5471,8 @@ class TmuxBatchWorker:
                 clean_output = "\n".join(part for part in [str(error).strip(), current_visible.strip()] if part).strip()
                 runtime_state_extra = self._turn_failure_runtime_state_extra(clean_output)
                 self.current_task_runtime_status = read_task_status(task_status_path)
+                if self.current_task_runtime_status == TASK_STATUS_RUNNING:
+                    self.current_task_runtime_status = ""
                 error_extra = {
                     "label": label,
                     "result_status": "failed",

@@ -22,16 +22,34 @@ test('PromptInputPanel centralizes title, optional helper lines, and textarea wi
   expect(content.includes("type Props = {")).toBe(true)
   expect(content.includes("mode?: 'singleline' | 'multiline'")).toBe(true)
   expect(content.includes('hintLines?: string[]')).toBe(true)
+  expect(content.includes('textareaHeight?: number')).toBe(true)
+  expect(content.includes('rememberHistory?: boolean')).toBe(true)
   expect(content.includes('showSubmitHelper?: boolean')).toBe(true)
   expect(content.includes('onBack?: () => void')).toBe(true)
-  expect(content.includes("if (event.name !== 'escape') return")).toBe(true)
+  expect(content.includes('readPromptDraft')).toBe(true)
+  expect(content.includes('rememberPromptValue')).toBe(true)
+  expect(content.includes('submittedPromptToken')).toBe(true)
+  expect(content.includes("props.focused && props.onBack && event.name === 'escape'")).toBe(true)
   expect(content.includes('<text fg="#00d2ff">[上一步]</text>')).toBe(true)
   expect(content.includes("props.showSubmitHelper && multiline() ? 'Enter 提交，Shift+Enter / Meta+Enter / Ctrl+J 换行' : ''")).toBe(true)
   expect(content.includes('<PromptTextarea')).toBe(true)
   expect(content.includes('focusToken={props.focusToken}')).toBe(true)
   expect(content.includes('focused={props.focused}')).toBe(true)
-  expect(content.includes('height={multiline() ? 5 : 1}')).toBe(true)
+  expect(content.includes('height={textareaHeight()}')).toBe(true)
+  expect(content.includes('rememberHistory={props.rememberHistory}')).toBe(true)
+  expect(content.includes('onSubmit={submitValue}')).toBe(true)
   expect(content.includes('<For each={props.hintLines ?? []}>')).toBe(true)
+})
+
+test('PromptInputPanel catches Enter key events and submits the current draft once', () => {
+  const content = readFileSync(join(import.meta.dir, 'ui/PromptInputPanel.tsx'), 'utf8')
+  expect(content.includes("['return', 'linefeed', 'enter'].includes(event.name)")).toBe(true)
+  expect(content.includes("event.raw === '\\r'")).toBe(true)
+  expect(content.includes("event.sequence === '\\n'")).toBe(true)
+  expect(content.includes('if (event.shift || event.meta || event.ctrl) return')).toBe(true)
+  expect(content.includes("if (props.focused === false && !readPromptDraft(props.draftKey).trim()) return")).toBe(true)
+  expect(content.includes('event.stopPropagation()')).toBe(true)
+  expect(content.includes('submitCurrentDraft()')).toBe(true)
 })
 
 test('DialogPrompt delegates to PromptInputPanel instead of assembling its own helper and textarea layout', () => {
@@ -43,20 +61,36 @@ test('DialogPrompt delegates to PromptInputPanel instead of assembling its own h
   expect(content.includes('<PromptTextarea')).toBe(false)
 })
 
-test('TUI startup enables mouse capture, alternate-screen mode, and console copy-selection wiring', () => {
+test('TUI startup enables mouse capture, alternate-screen mode, and disables noisy console overlay', () => {
   const content = readFileSync(join(import.meta.dir, 'index.tsx'), 'utf8')
   expect(content.includes('useMouse: true')).toBe(true)
   expect(content.includes("screenMode: 'alternate-screen'")).toBe(true)
+  expect(content.includes("consoleMode: 'disabled'")).toBe(true)
+  expect(content.includes('openConsoleOnError: false')).toBe(true)
   expect(content.includes('consoleOptions: {')).toBe(true)
   expect(content.includes("keyBindings: [{ name: 'y', ctrl: true, action: 'copy-selection' }]")).toBe(true)
   expect(content.includes('onCopySelection: (text) => {')).toBe(true)
   expect(content.includes('void copyToClipboard(text)')).toBe(true)
 })
 
+test('App document preview wiring references the active prompt preview signal', () => {
+  const content = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  expect(content.includes('const promptPreview = createMemo<DocumentPreviewState | null>')).toBe(true)
+  expect(content.includes('if (!promptPreview()) setDocumentPreviewOpen(false)')).toBe(true)
+  expect(content.includes('dialogPreview')).toBe(false)
+})
+
 test('PromptTextarea binds Shift+Enter and Ctrl+J to newline for multiline input', () => {
   const content = readFileSync(join(import.meta.dir, 'ui/PromptTextarea.tsx'), 'utf8')
   expect(content.includes("{ name: 'return', shift: true, action: 'newline' }")).toBe(true)
+  expect(content.includes("{ name: 'linefeed', shift: true, action: 'newline' }")).toBe(true)
   expect(content.includes("{ name: 'j', ctrl: true, action: 'newline' }")).toBe(true)
+})
+
+test('PromptTextarea submits return and linefeed key events', () => {
+  const content = readFileSync(join(import.meta.dir, 'ui/PromptTextarea.tsx'), 'utf8')
+  expect(content.includes("{ name: 'return', action: 'submit' }")).toBe(true)
+  expect(content.includes("{ name: 'linefeed', action: 'submit' }")).toBe(true)
 })
 
 test('PromptTextarea explicitly focuses the textarea on mount and reset', () => {
@@ -76,6 +110,8 @@ test('PromptTextarea persists draft and remembers submitted history for prompt r
   expect(content.includes('readPromptDraft')).toBe(true)
   expect(content.includes('writePromptDraft')).toBe(true)
   expect(content.includes('rememberPromptValue')).toBe(true)
+  expect(content.includes('props.rememberHistory === false')).toBe(true)
+  expect(content.includes('if (props.rememberHistory !== false) rememberPromptValue')).toBe(true)
   expect(content.includes('<box flexDirection="row" width="100%">')).toBe(true)
   expect(content.includes("{row.active ? '#' : '|'}")).toBe(true)
   expect(content.includes('onMouseScroll={(event) => {')).toBe(true)

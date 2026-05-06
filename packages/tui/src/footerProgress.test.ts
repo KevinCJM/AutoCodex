@@ -68,6 +68,31 @@ test('replaces stale startup footer text with live design review progress', () =
   expect(line).toContain('2 个智能体执行中')
 })
 
+test('does not count stale busy workers whose task runtime is already done', () => {
+  const line = resolveFooterProgressLine(
+    {
+      status: 'running',
+      route: 'home',
+      activeStage: 'stage.a04.start',
+      activeStageLabel: '需求评审',
+      routingWorkers: [],
+      requirementsWorkers: [],
+      reviewWorkers: [
+        worker({ sessionName: '审核器-已完成', agentState: 'BUSY', status: 'running', currentTaskRuntimeStatus: 'done' }),
+        worker({ sessionName: '审核器-运行中', agentState: 'BUSY', status: 'running', currentTaskRuntimeStatus: 'running' }),
+      ],
+      designWorkers: [],
+      taskSplitWorkers: [],
+      developmentWorkers: [],
+      overallReviewWorkers: [],
+    },
+    '⠦ 智能体启动中...',
+    0,
+  )
+  expect(line).toContain('需求评审 / 审核中')
+  expect(line).not.toContain('2 个智能体执行中')
+})
+
 test('derives busy footer text from live workers when no progress event is visible', () => {
   const line = resolveFooterProgressLine(
     {

@@ -97,11 +97,13 @@ function workerHasLiveWork(worker: Record<string, unknown>): boolean {
   const status = String(worker.status ?? '').trim().toLowerCase()
   const runtimeStatus = String(worker.current_task_runtime_status ?? worker.currentTaskRuntimeStatus ?? '').trim().toLowerCase()
   const healthStatus = String(worker.health_status ?? worker.healthStatus ?? '').trim().toLowerCase()
-  const sessionExists = worker.session_exists ?? worker.sessionExists
   if (agentState === 'DEAD' || healthStatus === 'dead') return false
+  if (agentState === 'READY') return false
+  if (['done', 'succeeded', 'completed'].includes(runtimeStatus)) return false
+  if (['done', 'succeeded', 'completed', 'ready', 'idle', 'failed', 'stale_failed', 'error'].includes(status)) return false
   if (agentState === 'BUSY' || agentState === 'STARTING') return true
   if (status === 'running' || status === 'pending' || runtimeStatus === 'running') return true
-  return sessionExists === true && ['ready', 'alive', 'auto_relaunched'].includes(healthStatus)
+  return false
 }
 
 function stageSnapshotForAction(snapshots: Record<string, unknown>, activeStage: string): unknown {
@@ -129,9 +131,15 @@ export function shouldRecoverRunningFromStageSnapshot(
   activeStage: string,
   route: string,
   snapshot: unknown,
+  hasPendingInput = false,
 ): boolean {
   const normalizedStatus = String(currentStatus ?? '').trim().toLowerCase()
-  if (normalizedStatus !== 'failed' && normalizedStatus !== 'error') return false
+  if (
+    normalizedStatus !== 'failed' &&
+    normalizedStatus !== 'error' &&
+    normalizedStatus !== 'awaiting-input'
+  ) return false
+  if (normalizedStatus === 'awaiting-input' && hasPendingInput) return false
   const activeRoute = stageRouteForAction(activeStage)
   if (!activeRoute || String(route || '').trim() !== activeRoute) return false
   return stageSnapshotHasLiveWork(snapshot)

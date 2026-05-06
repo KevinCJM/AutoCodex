@@ -2,287 +2,210 @@
   "schema_version": "1.1",
   "scope_mode": "subtree_only",
   "condition_code_registry": {
-    "trigger_action_codes": {
+    "trigger_actions": {
       "TA01": "edit_wrapper_without_target_trace",
-      "TA02": "route_from_wrapper_or_test_name_only",
-      "TA03": "edit_prompt_without_explicit_permission",
-      "TA04": "move_runtime_logic_into_prompt_layer",
-      "TA05": "edit_vendor_tree_or_treat_vendor_as_owned",
-      "TA06": "edit_workflow_stage_or_runtime_without_widened_reads",
-      "TA07": "change_bridge_or_client_without_cross_boundary_check",
-      "TA08": "claim_external_runtime_behavior_without_visible_artifact",
-      "TA09": "treat_routing_docs_as_implementation_truth"
+      "TA02": "edit_protected_business_prompt",
+      "TA03": "edit_vendor_node_modules",
+      "TA04": "change_shared_runtime_or_artifact_contract",
+      "TA05": "change_bridge_payload_without_both_sides",
+      "TA06": "treat_routing_docs_as_implementation_truth",
+      "TA07": "claim_external_runtime_behavior_as_visible_fact",
+      "TA08": "treat_generated_artifact_as_source",
+      "TA09": "change_web_port_proxy_assumptions"
     },
-    "pre_edit_check_codes": {
-      "PC01": "read_wrapper_and_target_together",
-      "PC02": "anchor_edit_to_direct_caller_or_test",
-      "PC03": "confirm_prompt_change_is_authorized_and_prompt_side",
-      "PC04": "reroute_to_owned_packages_tui_src_surface",
-      "PC05": "widen_to_linked_modules_and_contracts",
-      "PC06": "read_both_sides_of_bridge_protocol",
-      "PC07": "separate_visible_logic_from_external_dependency",
-      "PC08": "re_read_code_before_using_routing_docs_as_truth"
+    "pre_edit_checks": {
+      "PC01": "read_wrapper_and_implementation_target",
+      "PC02": "require_explicit_user_permission_for_business_prompts",
+      "PC03": "reroute_to_owned_source_not_vendor",
+      "PC04": "read_linked_workflow_stage_runtime_tests",
+      "PC05": "read_protocol_producer_and_consumer",
+      "PC06": "recheck_code_tests_configs_after_routing",
+      "PC07": "mark_external_behavior_out_of_scope_unless_visible",
+      "PC08": "confirm_generator_before_generated_output_edit",
+      "PC09": "check_launcher_and_vite_proxy_together"
     },
-    "safe_observation_codes": {
-      "SO01": "start_from_visible_test_then_trace",
-      "SO02": "read_AGENTS_and_boundary_tests_first",
-      "SO03": "inspect_package_entry_files_not_vendor_tree",
-      "SO04": "widen_from_workflow_or_failing_test",
-      "SO05": "start_from_protocol_tests_then_client_and_bridge",
-      "SO06": "use_visible_runtime_tests_and_record_unknowns",
-      "SO07": "use_docs_only_to_narrow_then_verify"
+    "safe_observation_methods": {
+      "SO01": "start_from_visible_test_then_trace_imports",
+      "SO02": "read_prompt_file_only_without_permission",
+      "SO03": "inspect_package_entry_config_outside_node_modules",
+      "SO04": "trace_artifact_writer_and_reader",
+      "SO05": "compare_python_protocol_helpers_with_frontend_client",
+      "SO06": "use_routing_docs_only_to_narrow_search",
+      "SO07": "separate_visible_code_from_external_process_effects",
+      "SO08": "inspect_generated_path_and_nearest_generator_test",
+      "SO09": "verify_port_constants_and_frontend_proxy_config"
     }
   },
   "pitfalls": [
     {
       "id": "P01",
-      "title": "wrapper_alias_surfaces_can_misroute_edits",
+      "title": "wrapper_alias_can_misroute_edits",
       "severity": "high",
       "confidence": "high",
-      "symptoms": [
-        "top-level file change has no effect",
-        "test names point to wrapper files",
-        "implementation target is unclear"
+      "symptoms": ["top_level_alias", "wrapper_named_test", "no_effect_edit"],
+      "trigger_actions": ["TA01"],
+      "why_risky": "wrapper_may_delegate_to_implementation_tree",
+      "related_selectors": [
+        {"type": "literal", "path": "A00_main_tui.py"},
+        {"type": "literal", "path": "T05_hitl_runtime.py"},
+        {"type": "literal", "path": "T11_tui_backend.py"},
+        {"type": "literal", "path": "T11_web_backend.py"},
+        {"type": "subtree", "path": "tmux_core"}
       ],
-      "trigger_action_codes": [
-        "TA01",
-        "TA02"
-      ],
-      "why_risky": "compatibility wrappers can hide the real implementation surface under owned subtrees",
-      "related_paths": [
-        "A00_main.py",
-        "A01_Routing_LayerPlanning.py",
-        "A02_RequirementIntake.py",
-        "A03_RequirementsClarification.py",
-        "A05_DetailedDesign.py",
-        "A06_TaskSplit.py",
-        "A07_Development.py",
-        "A08_OverallReview.py",
-        "T02_tmux_agents.py",
-        "T05_hitl_runtime.py",
-        "T11_tui_backend.py",
-        "T11_web_backend.py",
-        "tmux_core/compat.py"
-      ],
-      "affected_modules": [
-        "M01_workflow_entry",
-        "M02_stage_kernel_family",
-        "M05_bridge_backend",
-        "M07_shared_support"
-      ],
-      "blast_radius": "misrouted_edit_or_false_fix",
-      "pre_edit_check_codes": [
-        "PC01",
-        "PC02"
-      ],
-      "safe_observation_codes": [
-        "SO01"
-      ]
+      "affected_modules": ["M01_workflow_entry", "M03_stage_family", "M05_tmux_runtime_hitl", "M06_bridge_protocol_backends"],
+      "blast_radius": "misrouted_fix",
+      "check_before_edit": ["PC01", "PC06"],
+      "safe_observation_methods": ["SO01", "SO06"]
     },
     {
       "id": "P02",
-      "title": "business_prompt_files_are_protected",
+      "title": "business_prompt_files_protected",
       "severity": "high",
       "confidence": "high",
-      "symptoms": [
-        "task asks for prompt wording change",
-        "prompt files appear easier than runtime change",
-        "prompt and runtime responsibility is blurred"
+      "symptoms": ["prompt_wording_task", "prompt_runtime_boundary_blur"],
+      "trigger_actions": ["TA02"],
+      "why_risky": "prompt_change_affects_agent_behavior",
+      "related_selectors": [
+        {"type": "owned_paths_role", "module_id": "M04_prompt_contracts", "role": "business_prompt"},
+        {"type": "literal", "path": "T04_common_prompt.py"}
       ],
-      "trigger_action_codes": [
-        "TA03",
-        "TA04"
-      ],
-      "why_risky": "prompt files are routable surfaces but not editable without explicit user permission",
-      "related_paths": [
-        "T04_common_prompt.py",
-        "Prompt_01_RoutingLayerPlanning.py",
-        "Prompt_02_RequirementIntake.py",
-        "Prompt_03_RequirementsClarification.py",
-        "Prompt_04_RequirementsReview.py",
-        "Prompt_05_DetailedDesign.py",
-        "Prompt_06_TaskSplit.py",
-        "Prompt_07_Development.py",
-        "Prompt_08_OverallReview.py",
-        "tmux_core/prompt_contracts"
-      ],
-      "affected_modules": [
-        "M04_prompt_contract_family",
-        "M02_stage_kernel_family"
-      ],
+      "affected_modules": ["M04_prompt_contracts", "M03_stage_family", "M09_routing_init_layer"],
       "blast_radius": "multi_stage_agent_behavior",
-      "pre_edit_check_codes": [
-        "PC03"
-      ],
-      "safe_observation_codes": [
-        "SO02"
-      ]
+      "check_before_edit": ["PC02", "PC06"],
+      "safe_observation_methods": ["SO02"]
     },
     {
       "id": "P03",
-      "title": "packages_tui_node_modules_is_read_only",
+      "title": "vendor_tree_is_read_only",
       "severity": "high",
       "confidence": "high",
-      "symptoms": [
-        "search results show many vendor files",
-        "requested path is under node_modules",
-        "fix appears to require third-party patching"
+      "symptoms": ["node_modules_search_hit", "third_party_source_edit"],
+      "trigger_actions": ["TA03"],
+      "why_risky": "vendor_dependencies_are_not_owned_source",
+      "related_selectors": [
+        {"type": "subtree", "path": "packages/tui/node_modules"}
       ],
-      "trigger_action_codes": [
-        "TA05"
-      ],
-      "why_risky": "vendor tree is visible but not an owned implementation surface",
-      "related_paths": [
-        "packages/tui/node_modules"
-      ],
-      "affected_modules": [
-        "M06_tui_package"
-      ],
-      "blast_radius": "unsupported_vendor_edit",
-      "pre_edit_check_codes": [
-        "PC04"
-      ],
-      "safe_observation_codes": [
-        "SO03"
-      ]
+      "affected_modules": ["M07_frontend_packages"],
+      "blast_radius": "unsupported_vendor_patch",
+      "check_before_edit": ["PC03"],
+      "safe_observation_methods": ["SO03"]
     },
     {
       "id": "P04",
-      "title": "workflow_and_stage_changes_have_shared_runtime_blast_radius",
+      "title": "workflow_stage_runtime_contracts_share_state",
       "severity": "high",
       "confidence": "medium",
-      "symptoms": [
-        "small stage change breaks multiple later stages",
-        "handoff or completion state regresses",
-        "review flow or resume flow changes unexpectedly"
+      "symptoms": ["later_stage_break", "resume_behavior_change", "artifact_status_mismatch"],
+      "trigger_actions": ["TA04"],
+      "why_risky": "workflow_stage_runtime_support_share_contracts",
+      "related_selectors": [
+        {"type": "literal", "path": "A00_main_tui.py"},
+        {"type": "subtree", "path": "tmux_core/workflow"},
+        {"type": "subtree", "path": "tmux_core/stage_kernel"},
+        {"type": "literal", "path": "T02_tmux_agents.py"},
+        {"type": "literal", "path": "T05_hitl_runtime.py"},
+        {"type": "literal", "path": "T08_pre_development.py"},
+        {"type": "literal", "path": "T09_terminal_ops.py"}
       ],
-      "trigger_action_codes": [
-        "TA06"
-      ],
-      "why_risky": "workflow, stage, runtime, and support modules share handoff and completion surfaces",
-      "related_paths": [
-        "tmux_core/workflow/entry.py",
-        "tmux_core/stage_kernel",
-        "tmux_core/runtime",
-        "T08_pre_development.py",
-        "T09_terminal_ops.py",
-        "tests/test_a00_main.py",
-        "tests/test_stage_kernel_review_design_shared.py",
-        "tests/test_runtime_contract_compat.py"
-      ],
-      "affected_modules": [
-        "M01_workflow_entry",
-        "M02_stage_kernel_family",
-        "M03_runtime_family",
-        "M07_shared_support"
-      ],
+      "affected_modules": ["M01_workflow_entry", "M03_stage_family", "M05_tmux_runtime_hitl", "M08_shared_support"],
       "blast_radius": "multi_module_python_flow",
-      "pre_edit_check_codes": [
-        "PC05"
-      ],
-      "safe_observation_codes": [
-        "SO04"
-      ]
+      "check_before_edit": ["PC04", "PC06"],
+      "safe_observation_methods": ["SO04"]
     },
     {
       "id": "P05",
-      "title": "bridge_protocol_spans_python_and_tui",
+      "title": "bridge_protocol_crosses_python_and_frontend",
       "severity": "high",
       "confidence": "medium",
-      "symptoms": [
-        "backend fix breaks tui client",
-        "protocol test fails on payload shape",
-        "web and tui launch paths diverge"
+      "symptoms": ["backend_ui_mismatch", "payload_shape_mismatch", "protocol_version_mismatch"],
+      "trigger_actions": ["TA05"],
+      "why_risky": "protocol_helpers_backends_clients_must_sync",
+      "related_selectors": [
+        {"type": "literal", "path": "T10_tui_protocol.py"},
+        {"type": "literal", "path": "T11_tui_backend.py"},
+        {"type": "literal", "path": "T11_web_backend.py"},
+        {"type": "subtree", "path": "tmux_core/bridge"},
+        {"type": "subtree", "path": "packages/tui/src"},
+        {"type": "subtree", "path": "packages/web/src"}
       ],
-      "trigger_action_codes": [
-        "TA07"
-      ],
-      "why_risky": "bridge payloads and launch behavior cross python and tui ownership boundaries",
-      "related_paths": [
-        "tmux_core/bridge/backend.py",
-        "tmux_core/bridge/web_backend.py",
-        "T11_tui_backend.py",
-        "T11_web_backend.py",
-        "packages/tui/src/backend/client.ts",
-        "packages/tui/src/stageRegistry.ts",
-        "tests/test_t10_tui_protocol.py",
-        "tests/test_t11_tui_backend.py",
-        "tests/test_t11_web_backend.py"
-      ],
-      "affected_modules": [
-        "M05_bridge_backend",
-        "M06_tui_package"
-      ],
-      "blast_radius": "bridge_protocol_and_launch_path",
-      "pre_edit_check_codes": [
-        "PC06"
-      ],
-      "safe_observation_codes": [
-        "SO05"
-      ]
+      "affected_modules": ["M02_web_launcher", "M06_bridge_protocol_backends", "M07_frontend_packages"],
+      "blast_radius": "python_frontend_bridge",
+      "check_before_edit": ["PC05", "PC06"],
+      "safe_observation_methods": ["SO05"]
     },
     {
       "id": "P06",
-      "title": "tmux_and_provider_dependencies_are_partly_out_of_scope",
-      "severity": "medium",
-      "confidence": "medium",
-      "symptoms": [
-        "code assumes tmux exists",
-        "provider behavior is explained without visible code",
-        "runtime issue depends on external environment"
-      ],
-      "trigger_action_codes": [
-        "TA08"
-      ],
-      "why_risky": "runtime wrappers are visible here, but external processes and credentials are not fully represented in this subtree",
-      "related_paths": [
-        "T02_tmux_agents.py",
-        "tmux_core/runtime/tmux_runtime.py",
-        "tmux_core/runtime/vendor_catalog.py",
-        "tests/test_t02_tmux_agents.py",
-        "tests/test_vendor_catalog.py"
-      ],
-      "affected_modules": [
-        "M03_runtime_family"
-      ],
-      "blast_radius": "external_runtime_assumption",
-      "pre_edit_check_codes": [
-        "PC07"
-      ],
-      "safe_observation_codes": [
-        "SO06"
-      ]
-    },
-    {
-      "id": "P07",
       "title": "routing_docs_are_navigation_only",
       "severity": "medium",
       "confidence": "high",
-      "symptoms": [
-        "agent edits docs without re-reading code",
-        "docs start carrying architecture prose",
-        "docs and code drift apart"
+      "symptoms": ["route_code_conflict", "stale_path", "implementation_truth_claim_from_docs"],
+      "trigger_actions": ["TA06"],
+      "why_risky": "routing_docs_cannot_prove_behavior",
+      "related_selectors": [
+        {"type": "literal", "path": "AGENTS.md"},
+        {"type": "literal", "path": "docs/repo_map.json"},
+        {"type": "literal", "path": "docs/task_routes.json"},
+        {"type": "literal", "path": "docs/pitfalls.json"}
       ],
-      "trigger_action_codes": [
-        "TA09"
+      "affected_modules": ["M09_routing_init_layer", "M11_tests"],
+      "blast_radius": "false_assumption",
+      "check_before_edit": ["PC06"],
+      "safe_observation_methods": ["SO06"]
+    },
+    {
+      "id": "P07",
+      "title": "external_runtime_behavior_is_out_of_scope",
+      "severity": "medium",
+      "confidence": "high",
+      "symptoms": ["external_cli_inference", "auth_network_assumption", "external_process_failure"],
+      "trigger_actions": ["TA07"],
+      "why_risky": "external_tools_are_not_subtree_facts",
+      "related_selectors": [
+        {"type": "literal", "path": "T02_tmux_agents.py"},
+        {"type": "literal", "path": "A00_main_web.py"},
+        {"type": "literal", "path": "A00_main_tui.py"},
+        {"type": "literal", "path": "T11_tui_backend.py"},
+        {"type": "literal", "path": "T11_web_backend.py"}
       ],
-      "why_risky": "routing files narrow search but never replace code, tests, or configs as truth sources",
-      "related_paths": [
-        "AGENTS.md",
-        "docs/repo_map.json",
-        "docs/task_routes.json",
-        "docs/pitfalls.json"
+      "affected_modules": ["M01_workflow_entry", "M02_web_launcher", "M05_tmux_runtime_hitl", "M06_bridge_protocol_backends"],
+      "blast_radius": "incorrect_environment_claim",
+      "check_before_edit": ["PC07"],
+      "safe_observation_methods": ["SO07"]
+    },
+    {
+      "id": "P08",
+      "title": "generated_artifacts_are_not_source_truth",
+      "severity": "medium",
+      "confidence": "medium",
+      "symptoms": ["source_inferred_from_generated_output", "fixture_only_fix"],
+      "trigger_actions": ["TA08"],
+      "why_risky": "generated_outputs_are_not_canonical_implementation",
+      "related_selectors": [
+        {"type": "subtree", "path": "_tui_e2e_projects"},
+        {"type": "subtree", "path": ".tmp"}
       ],
-      "affected_modules": [
-        "M08_routing_docs"
+      "affected_modules": ["M10_generated_artifacts", "M09_routing_init_layer"],
+      "blast_radius": "fixture_only_fix",
+      "check_before_edit": ["PC08", "PC06"],
+      "safe_observation_methods": ["SO08"]
+    },
+    {
+      "id": "P09",
+      "title": "web_launcher_uses_fixed_ports_and_proxy",
+      "severity": "medium",
+      "confidence": "high",
+      "symptoms": ["non_default_port_rejected", "frontend_proxy_mismatch", "health_check_timeout"],
+      "trigger_actions": ["TA09"],
+      "why_risky": "launcher_constants_and_proxy_must_agree",
+      "related_selectors": [
+        {"type": "literal", "path": "A00_main_web.py"},
+        {"type": "literal", "path": "packages/web/vite.config.ts"},
+        {"type": "literal", "path": "packages/web/package.json"}
       ],
-      "blast_radius": "downstream_agent_misrouting",
-      "pre_edit_check_codes": [
-        "PC08"
-      ],
-      "safe_observation_codes": [
-        "SO07"
-      ]
+      "affected_modules": ["M02_web_launcher", "M07_frontend_packages"],
+      "blast_radius": "web_console_launch_failure",
+      "check_before_edit": ["PC09", "PC06"],
+      "safe_observation_methods": ["SO09"]
     }
   ]
 }

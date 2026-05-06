@@ -326,6 +326,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
 
         self.assertEqual(result.requirement_name, "需求A")
         self.assertEqual(result.original_requirement_path, str(original_path.resolve()))
+        self.assertTrue(result.reuse_existing_original_requirement)
 
     def test_run_requirement_intake_stage_reprompts_after_overwrite_declined(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -394,6 +395,74 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
         self.assertTrue(overwrite_requests[0].payload["allow_back"])
         self.assertEqual(overwrite_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
         self.assertEqual(overwrite_requests[0].payload["stage_step_index"], 5)
+
+    def test_input_type_prompt_allows_previous_stage_back_under_bridge_ui(self):
+        from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, use_terminal_ui
+
+        captured_requests: list[BridgePromptRequest] = []
+
+        def emit_event(_event_type: str, _payload: dict[str, object]) -> None:
+            return None
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            return {"value": PROMPT_BACK_VALUE}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with use_terminal_ui(BridgeTerminalUI(emit_event=emit_event, request_prompt=request_prompt)):
+                with self.assertRaises(PromptBackRequested):
+                    collect_request(
+                        build_parser().parse_args(
+                            [
+                                "--project-dir",
+                                tmpdir,
+                                "--requirement-name",
+                                "需求A",
+                                "--allow-previous-stage-back",
+                            ]
+                        )
+                    )
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(captured_requests[0].prompt_type, "select")
+        self.assertEqual(captured_requests[0].payload["prompt_text"], "选择输入方式")
+        self.assertTrue(captured_requests[0].payload["allow_back"])
+        self.assertEqual(captured_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(captured_requests[0].payload["stage_step_index"], 3)
+
+    def test_existing_requirement_selector_allows_previous_stage_back_under_bridge_ui(self):
+        from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, use_terminal_ui
+
+        captured_requests: list[BridgePromptRequest] = []
+
+        def emit_event(_event_type: str, _payload: dict[str, object]) -> None:
+            return None
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured_requests.append(request)
+            return {"value": PROMPT_BACK_VALUE}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "需求A_原始需求.md").write_text("正文A\n", encoding="utf-8")
+            with use_terminal_ui(BridgeTerminalUI(emit_event=emit_event, request_prompt=request_prompt)):
+                with self.assertRaises(PromptBackRequested):
+                    collect_request(
+                        build_parser().parse_args(
+                            [
+                                "--project-dir",
+                                tmpdir,
+                                "--allow-previous-stage-back",
+                            ]
+                        )
+                    )
+
+        self.assertEqual(len(captured_requests), 1)
+        self.assertEqual(captured_requests[0].prompt_type, "select")
+        self.assertEqual(captured_requests[0].payload["prompt_text"], "选择已有需求或创建新需求")
+        self.assertTrue(captured_requests[0].payload["allow_back"])
+        self.assertEqual(captured_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(captured_requests[0].payload["stage_step_index"], 1)
 
     def test_clarification_collect_request_clears_existing_human_exchange_file(self):
         from A03_RequirementsClarification import build_parser as build_clarification_parser, collect_request as collect_clarification_request
@@ -749,6 +818,24 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
         self.assertIn("需求A:running/BUSY", text)
         self.assertIn("health=alive", text)
         self.assertIn("turn:read_notion_requirement", text)
+
+    def test_render_notion_progress_line_displays_prelaunch_dead_state_as_starting(self):
+        class _Worker:
+            def read_state(self):
+                return {
+                    "status": "running",
+                    "result_status": "running",
+                    "agent_state": "DEAD",
+                    "agent_started": False,
+                    "pane_id": "",
+                    "health_status": "missing_session",
+                    "note": "turn:read_notion_requirement",
+                    "workflow_stage": "pending",
+                }
+
+        text = render_notion_progress_line(worker=_Worker(), requirement_name="需求A", tick=7)
+
+        self.assertIn("需求A:running/STARTING", text)
 
     def test_render_agent_boot_progress_line_contains_boot_message(self):
         text = render_agent_boot_progress_line(tick=6)

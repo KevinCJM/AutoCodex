@@ -33,6 +33,7 @@ from T02_tmux_agents import (
     AgentRunConfig,
     TmuxBatchWorker,
     cleanup_registered_tmux_workers,
+    worker_state_is_prelaunch_active,
 )
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop, validate_hitl_status_file
 from T08_pre_development import ensure_pre_development_task_record, mark_requirement_intake_completed
@@ -96,6 +97,7 @@ class RequirementIntakeStageResult:
     requirement_name: str
     original_requirement_path: str
     cleanup_paths: tuple[str, ...] = ()
+    reuse_existing_original_requirement: bool = False
 
 
 class NotionInputRetryRequired(RuntimeError):
@@ -383,7 +385,9 @@ def render_notion_progress_line(*, worker: TmuxBatchWorker, requirement_name: st
         or "starting"
     ).strip() or "starting"
     agent_state = str(state.get("agent_state", "")).strip().upper()
-    if agent_state not in {"DEAD", "STARTING", "READY", "BUSY"}:
+    if worker_state_is_prelaunch_active(state):
+        agent_state = "STARTING"
+    elif agent_state not in {"DEAD", "STARTING", "READY", "BUSY"}:
         provider_phase = str(state.get("provider_phase", "")).strip().lower()
         wrapper_state = str(state.get("wrapper_state", "")).strip().upper()
         if wrapper_state == "READY" or provider_phase in {"waiting_input", "idle_ready", "completed_response"}:
@@ -729,7 +733,11 @@ def collect_request(args: argparse.Namespace) -> RequirementIntakeRequest:
                     step = 5
                     continue
                 if not input_type:
-                    with _requirement_prompt_step(3, allow_back=step > first_prompt_step):
+                    with _requirement_prompt_step(
+                        3,
+                        allow_back=(step > first_prompt_step)
+                        or (step == first_prompt_step and allow_previous_stage_back),
+                    ):
                         input_type = prompt_input_type("text")
                 else:
                     input_type = normalize_input_type(input_type)
@@ -846,6 +854,7 @@ def run_requirement_intake_stage(argv: Sequence[str] | None = None) -> Requireme
         project_dir=str(resolve_existing_directory(request.project_dir)),
         requirement_name=request.requirement_name,
         original_requirement_path=str(output_path.resolve()),
+        reuse_existing_original_requirement=request.reuse_existing_original_requirement,
     )
 
 

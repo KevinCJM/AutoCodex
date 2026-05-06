@@ -5,7 +5,7 @@ import shutil
 from pathlib import Path
 from typing import Sequence
 
-from tmux_core.runtime.tmux_runtime import TmuxRuntimeController
+from tmux_core.runtime.tmux_runtime import TmuxRuntimeController, worker_state_is_prelaunch_active
 
 
 def _safe_read_worker_state(state_path: Path) -> dict[str, object]:
@@ -54,6 +54,8 @@ def _is_legacy_stale_worker(
     session_name: str,
     tmux_runtime: TmuxRuntimeController,
 ) -> bool:
+    if worker_state_is_prelaunch_active(payload):
+        return False
     agent_state = str(payload.get("agent_state", "") or "").strip().upper()
     if agent_state == "DEAD":
         return True
@@ -105,6 +107,8 @@ def cleanup_runtime_dirs_by_scope(
         if resolved_worker_dir.name == "_locks":
             continue
         payload = _safe_read_worker_state(state_path)
+        if worker_state_is_prelaunch_active(payload):
+            continue
         session_name = str(payload.get("session_name", "") or "").strip()
         if session_name and session_name in preserve_sessions:
             continue

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
-from tmux_core.runtime.tmux_runtime import DEFAULT_COMMAND_TIMEOUT_SEC
+from tmux_core.runtime.tmux_runtime import (
+    DEFAULT_COMMAND_TIMEOUT_SEC,
+    is_worker_death_error,
+    worker_state_is_prelaunch_active,
+)
 from tmux_core.stage_kernel.role_orchestration import ensure_main_ready, ensure_reviewers_ready
 
 TMain = TypeVar("TMain")
@@ -30,6 +33,8 @@ def _state_name(worker: object | None) -> str:
 
 def _is_dead(owner: object | None) -> bool:
     worker = _resolve_worker(owner)
+    if worker_state_is_prelaunch_active(worker):
+        return False
     return _has_ever_launched(worker) and _state_name(worker) == "DEAD"
 
 
@@ -46,13 +51,7 @@ def _has_ever_launched(worker: object | None) -> bool:
         return True
     if str(getattr(worker, "pane_id", "") or "").strip():
         return True
-    state_path = getattr(worker, "state_path", None)
-    if state_path is None:
-        return True
-    try:
-        return Path(state_path).expanduser().exists()
-    except Exception:
-        return False
+    return False
 
 
 def drop_dead_reviewers(
@@ -91,6 +90,66 @@ def replace_dead_main(
     return replace_owner(main_owner)
 
 
+def _main_ready_error_requires_replacement(
+    error: Exception,
+    main_owner: object | None,
+    *,
+    reviewers: Sequence[object] = (),
+) -> bool:
+    if _is_dead(main_owner):
+        return True
+    message = str(error or "").strip()
+    if not message:
+        return False
+    lowered = message.lower()
+    if not (
+        is_worker_death_error(error)
+        or "需要重新启动或重建" in message
+        or "tmux pane missing" in lowered
+    ):
+        return False
+    worker = _resolve_worker(main_owner)
+    session_name = str(getattr(worker, "session_name", "") or "").strip()
+    if not session_name:
+        return not bool(reviewers)
+    return session_name in message
+
+
+def _ensure_main_ready_with_replacement(
+    current_main: TMain,
+    current_reviewers: Sequence[TReviewer],
+    *,
+    replace_dead_main_owner: Callable[[TMain], TMain],
+    main_label: str,
+    reviewer_label_getter: Callable[[TReviewer, int], str] | None,
+    timeout_sec: float,
+    allow_completed_nonready: bool = False,
+) -> TMain:
+    try:
+        ensure_main_ready(
+            current_main,
+            current_reviewers,
+            main_label=main_label,
+            reviewer_label_getter=reviewer_label_getter,
+            timeout_sec=timeout_sec,
+            allow_completed_nonready=allow_completed_nonready,
+        )
+        return current_main
+    except RuntimeError as error:
+        if not _main_ready_error_requires_replacement(error, current_main, reviewers=current_reviewers):
+            raise
+    replacement = replace_dead_main_owner(current_main)
+    ensure_main_ready(
+        replacement,
+        current_reviewers,
+        main_label=main_label,
+        reviewer_label_getter=reviewer_label_getter,
+        timeout_sec=timeout_sec,
+        allow_completed_nonready=allow_completed_nonready,
+    )
+    return replacement
+
+
 def run_main_phase_with_death_handling(
     main_owner: TMain,
     *,
@@ -111,9 +170,10 @@ def run_main_phase_with_death_handling(
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
-    ensure_main_ready(
+    current_main = _ensure_main_ready_with_replacement(
         current_main,
         current_reviewers,
+        replace_dead_main_owner=replace_dead_main_owner,
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
@@ -127,9 +187,10 @@ def run_main_phase_with_death_handling(
         reviewer_label_getter=reviewer_label_getter,
         notify=notify,
     )
-    ensure_main_ready(
+    updated_main = _ensure_main_ready_with_replacement(
         updated_main,
         current_reviewers,
+        replace_dead_main_owner=replace_dead_main_owner,
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,

@@ -1,7 +1,7 @@
 import { stageRouteForAction } from './stageRegistry'
 import type { HomeAgentItem, WorkerSnapshot } from './types'
 
-const LIVE_WORKER_HEALTH_STATUSES = new Set(['alive', 'auto_relaunched', 'observe_error', 'provider_auth_error'])
+const LIVE_WORKER_HEALTH_STATUSES = new Set(['alive', 'observe_error', 'provider_auth_error'])
 const SOURCE_RANK: Record<HomeAgentItem['source'], number> = {
   control: 7,
   routing: 6,
