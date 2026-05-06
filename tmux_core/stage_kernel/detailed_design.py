@@ -66,6 +66,12 @@ from tmux_core.stage_kernel.death_orchestration import (
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
+from tmux_core.stage_kernel.stage_audit import (
+    StageAuditRunContext,
+    append_stage_audit_record,
+    begin_stage_audit_run,
+    record_before_cleanup,
+)
 from tmux_core.stage_kernel.shared_review import (
     ReviewLimitHitlConfig,
     ReviewRoundPolicy,
@@ -74,6 +80,7 @@ from tmux_core.stage_kernel.shared_review import (
     ReviewAgentSelection,
     ReviewStageProgress,
     ReviewerRuntime,
+    collect_auto_review_limit_hitl_response,
     collect_reviewer_agent_selections,
     ensure_empty_file,
     ensure_review_artifacts,
@@ -323,18 +330,43 @@ def cleanup_existing_detailed_design_artifacts(
     requirement_name: str,
     *,
     clear_detailed_design: bool = True,
+    audit_context: StageAuditRunContext | None = None,
 ) -> tuple[str, ...]:
     project_root = paths["project_root"]
     safe_name = sanitize_requirement_name(requirement_name)
     removed: list[str] = []
+    review_json_candidates: list[Path] = []
+    review_md_candidates: list[Path] = []
     for pattern in (
         f"{safe_name}_评审记录_*.json",
         f"{safe_name}_详设评审记录_*.md",
     ):
         for candidate in project_root.glob(pattern):
             if candidate.is_file():
-                candidate.unlink()
-                removed.append(str(candidate.resolve()))
+                if candidate.suffix == ".json":
+                    review_json_candidates.append(candidate)
+                else:
+                    review_md_candidates.append(candidate)
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {
+                "merged_review": paths["merged_review_path"],
+                "ba_feedback": paths["ba_feedback_path"],
+                "ask_human": paths["ask_human_path"],
+                "detailed_design": paths["detailed_design_path"],
+            },
+            metadata={
+                "trigger": "cleanup_existing_detailed_design_artifacts",
+                "clear_detailed_design": bool(clear_detailed_design),
+            },
+            reviewer_markdown_paths=review_md_candidates,
+            reviewer_json_paths=review_json_candidates,
+        )
+    for candidate in (*review_json_candidates, *review_md_candidates):
+        if candidate.is_file():
+            candidate.unlink()
+            removed.append(str(candidate.resolve()))
     for candidate in (
         paths["merged_review_path"],
         paths["ba_feedback_path"],
@@ -1146,6 +1178,8 @@ def run_ba_turn_with_recovery(
                     requirement_name=effective_requirement_name,
                     previous_handoff=current_handoff,
                     progress=progress,
+                    required_reconfiguration=True,
+                    reason_text=f"{ba_display_name}已死亡，必须重新选择厂商/模型/推理/代理后从当前阶段继续。",
                 )
                 if replacement is None:
                     raise RuntimeError(f"{ba_display_name} 已死亡，且未能重建需求分析师") from error
@@ -1461,8 +1495,18 @@ def run_reviewer_turn_with_recreation(
                 current_reviewer = replacement
                 continue
             if is_worker_death_error(error):
-                message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
-                return None
+                replacement = recreate_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=current_reviewer,
+                    reviewer_spec=reviewer_spec,
+                    progress=progress,
+                )
+                if replacement is None:
+                    message(f"{reviewer_display_name} 已死亡，用户选择不重建，当前阶段将忽略该审核智能体。")
+                    return None
+                current_reviewer = replacement
+                continue
             raise
 
 
@@ -1576,6 +1620,8 @@ def repair_reviewer_outputs(
         max_attempts=MAX_REVIEWER_REPAIR_ATTEMPTS,
         error_prefix="详设审核智能体修复输出失败:",
         final_error="详设审核智能体多次修复后仍未按协议更新文档",
+        stage_label=DETAILED_DESIGN_TASK_NAME,
+        progress=progress,
     )
 
 
@@ -1614,6 +1660,23 @@ def _active_reviewer_files(reviewers: Sequence[ReviewerRuntime]) -> tuple[list[s
     return json_files, md_files
 
 
+def _reviewer_audit_metadata(reviewers: Sequence[ReviewerRuntime], *, trigger: str = "") -> dict[str, object]:
+    agent_names: list[str] = []
+    session_names: list[str] = []
+    for reviewer in reviewers:
+        reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
+        if reviewer_name:
+            agent_names.append(reviewer_name)
+        session_name = str(getattr(getattr(reviewer, "worker", None), "session_name", "") or "").strip()
+        if session_name:
+            session_names.append(session_name)
+    return {
+        "trigger": trigger,
+        "agent_names": agent_names,
+        "session_names": session_names,
+    }
+
+
 def _replace_dead_detailed_design_ba(
     handoff: RequirementsAnalystHandoff,
     *,
@@ -1624,6 +1687,8 @@ def _replace_dead_detailed_design_ba(
         project_dir=project_dir,
         previous_handoff=handoff,
         progress=progress,
+        required_reconfiguration=True,
+        reason_text="主工作智能体已死亡，必须重新选择厂商/模型/推理/代理后从当前阶段继续。",
     )
     if replacement is None:
         ba_display_name = _detailed_design_ba_display_name(project_dir=project_dir, handoff=handoff)
@@ -1660,8 +1725,20 @@ def run_ba_modify_loop(
     paths: dict[str, Path],
     review_msg: str,
     progress: ReviewStageProgress | None = None,
+    audit_context: StageAuditRunContext | None = None,
+    review_round_index: int | None = None,
 ) -> RequirementsAnalystHandoff:
     current_handoff = handoff
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {
+                "ask_human": paths["ask_human_path"],
+                "ba_feedback": paths["ba_feedback_path"],
+            },
+            metadata={"trigger": "detailed_design_modify_prepare"},
+            review_round_index=review_round_index,
+        )
     ensure_empty_file(paths["ask_human_path"])
     ensure_empty_file(paths["ba_feedback_path"])
     feedback_result_contract = build_detailed_design_feedback_result_contract(paths)
@@ -1686,12 +1763,44 @@ def run_ba_modify_loop(
     for hitl_round in range(1, MAX_DETAILED_DESIGN_HITL_ROUNDS + 1):
         if not get_markdown_content(paths["ask_human_path"]).strip():
             return current_handoff
+        if audit_context is not None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="hitl_question",
+                source_paths={"ask_human": paths["ask_human_path"]},
+                hitl_round_index=hitl_round,
+                review_round_index=review_round_index,
+                metadata={"trigger": "detailed_design_modify_hitl"},
+            )
         human_msg = _collect_design_hitl_response(
             paths["ask_human_path"],
             hitl_round=hitl_round,
             answer_path=paths["hitl_record_path"],
             progress=progress,
         )
+        if audit_context is not None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="hitl_answer",
+                source_paths={
+                    "human_answer": "",
+                    "hitl_record": paths["hitl_record_path"],
+                },
+                hitl_round_index=hitl_round,
+                review_round_index=review_round_index,
+                metadata={
+                    "trigger": "detailed_design_modify_hitl",
+                    "human_answer_source": "runtime_payload",
+                },
+                snapshot_overrides={"human_answer": human_msg},
+            )
+            record_before_cleanup(
+                audit_context,
+                {"ask_human": paths["ask_human_path"]},
+                metadata={"trigger": "detailed_design_hitl_reply_prepare"},
+                hitl_round_index=hitl_round,
+                review_round_index=review_round_index,
+            )
         ensure_empty_file(paths["ask_human_path"])
         current_handoff, _ = run_ba_turn_with_recovery(
             current_handoff,
@@ -1722,10 +1831,50 @@ def run_detailed_design_review_limit_hitl_loop(
     review_limit: int,
     review_rounds_used: int,
     progress: ReviewStageProgress | None = None,
+    human_input_provider=None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> object:
     current_handoff = handoff
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {
+                "ask_human": paths["ask_human_path"],
+                "ba_feedback": paths["ba_feedback_path"],
+            },
+            metadata={"trigger": "detailed_design_review_limit_hitl_prepare"},
+        )
     ensure_empty_file(paths["ask_human_path"])
     ensure_empty_file(paths["ba_feedback_path"])
+
+    def audit_hitl_question(hitl_round: int, ask_human_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_question",
+            source_paths={"ask_human": ask_human_file},
+            hitl_round_index=hitl_round,
+            metadata={"trigger": "detailed_design_review_limit_hitl"},
+        )
+
+    def audit_hitl_answer(hitl_round: int, human_msg: str, hitl_record_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_answer",
+            source_paths={
+                "human_answer": "",
+                "hitl_record": hitl_record_file,
+            },
+            hitl_round_index=hitl_round,
+            metadata={
+                "trigger": "detailed_design_review_limit_hitl",
+                "human_answer_source": "runtime_payload",
+            },
+            snapshot_overrides={"human_answer": human_msg},
+        )
 
     def initial_turn() -> object:
         nonlocal current_handoff
@@ -1776,8 +1925,11 @@ def run_detailed_design_review_limit_hitl_loop(
         hitl_record_path=paths["hitl_record_path"],
         initial_turn=initial_turn,
         human_reply_turn=human_reply_turn,
+        human_input_provider=human_input_provider,
         progress=progress,
         max_hitl_rounds=MAX_DETAILED_DESIGN_HITL_ROUNDS,
+        on_hitl_question=audit_hitl_question,
+        on_hitl_answer=audit_hitl_answer,
     )
     return result
 
@@ -1827,6 +1979,7 @@ def run_detailed_design_stage(
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_paths: tuple[str, ...] = ()
     reviewer_specs_by_name: dict[str, DetailedDesignReviewerSpec] = {}
+    audit_context: StageAuditRunContext | None = None
     lock_context = requirement_concurrency_lock(
         project_dir,
         requirement_name,
@@ -1834,6 +1987,16 @@ def run_detailed_design_stage(
     )
     lock_context.__enter__()
     try:
+        audit_context = begin_stage_audit_run(
+            project_dir,
+            requirement_name,
+            "A05",
+            metadata={
+                "trigger": "run_detailed_design_stage",
+                "argv": list(argv or []),
+                "args": vars(args),
+            },
+        )
         existing_design_mode = decide_existing_detailed_design_mode(
             args,
             paths=paths,
@@ -1852,6 +2015,15 @@ def run_detailed_design_stage(
             message("用户选择跳过详细设计阶段")
             update_pre_development_task_status(project_dir, requirement_name, task_key="详细设计", completed=True)
             message("已将详细设计标记为完成，继续后续阶段")
+            append_stage_audit_record(
+                audit_context,
+                event_type="stage_passed",
+                source_paths={
+                    "merged_review": paths["merged_review_path"],
+                    "ba_feedback": paths["ba_feedback_path"],
+                    "detailed_design": paths["detailed_design_path"],
+                },
+            )
             return DetailedDesignStageResult(
                 project_dir=project_dir,
                 requirement_name=requirement_name,
@@ -1871,6 +2043,7 @@ def run_detailed_design_stage(
             paths,
             requirement_name,
             clear_detailed_design=existing_design_mode == "rerun",
+            audit_context=audit_context,
         )
         reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"详设审核智能体 {index}"  # noqa: E731
         review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
@@ -2004,6 +2177,7 @@ def run_detailed_design_stage(
         def initial_prompt_builder(reviewer: ReviewerRuntime, reviewer_spec: DetailedDesignReviewerSpec) -> str:
             return review_detailed_design(
                 reviewer_spec.role_prompt,
+                init_prompt="",
                 task_name=DETAILED_DESIGN_TASK_NAME,
                 original_requirement_md=str(paths["original_requirement_path"].resolve()),
                 requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
@@ -2101,6 +2275,8 @@ def run_detailed_design_stage(
                             paths=paths,
                             review_msg=review_msg,
                             progress=progress,
+                            audit_context=audit_context,
+                            review_round_index=round_index,
                         ),
                         replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                             owner,
@@ -2113,6 +2289,16 @@ def run_detailed_design_stage(
                     )
                 post_hitl_continue_completed = False
                 ba_reply = _read_required_detailed_design_ba_feedback(paths)
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="feedback_written",
+                    source_paths={
+                        "ba_feedback": paths["ba_feedback_path"],
+                        "merged_review": paths["merged_review_path"],
+                    },
+                    review_round_index=round_index,
+                    metadata={"trigger": "detailed_design_feedback"},
+                )
 
                 def again_prompt_builder(reviewer: ReviewerRuntime, reviewer_spec: DetailedDesignReviewerSpec) -> str:
                     return again_review_detailed_design(
@@ -2182,11 +2368,30 @@ def run_detailed_design_stage(
                 json_files=review_json_files,
                 md_files=review_md_files,
             )
+            append_stage_audit_record(
+                audit_context,
+                event_type="review_merged",
+                source_paths={"merged_review": paths["merged_review_path"]},
+                reviewer_markdown_paths=review_md_files,
+                reviewer_json_paths=review_json_files,
+                review_round_index=round_index,
+                metadata=_reviewer_audit_metadata(reviewer_workers, trigger="task_done"),
+            )
             if passed:
                 if pending_discard_ba_handoff is not None:
                     _discard_unused_ba_handoff(pending_discard_ba_handoff)
                     pending_discard_ba_handoff = None
                 mark_detailed_design_completed(project_dir, requirement_name)
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="stage_passed",
+                    source_paths={
+                        "merged_review": paths["merged_review_path"],
+                        "ba_feedback": paths["ba_feedback_path"],
+                        "detailed_design": paths["detailed_design_path"],
+                    },
+                    review_round_index=round_index,
+                )
                 result_ba_handoff = active_ba_handoff if preserve_workers else None
                 result_reviewer_handoff = _export_reviewer_handoff(
                     reviewer_workers,
@@ -2256,6 +2461,14 @@ def run_detailed_design_stage(
                         review_limit=review_round_policy.max_rounds,
                         review_rounds_used=review_round_policy.quota_count,
                         progress=progress,
+                        human_input_provider=(
+                            lambda question_path, hitl_round: collect_auto_review_limit_hitl_response(
+                                question_path,
+                                stage_label="详细设计评审超限",
+                                hitl_round=hitl_round,
+                            )
+                        ) if bool(getattr(args, "yes", False)) else None,
+                        audit_context=audit_context,
                     ),
                     owner_getter=lambda result: result.owner,
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
@@ -2270,7 +2483,17 @@ def run_detailed_design_stage(
                 post_hitl_continue_completed = bool(getattr(hitl_result, "post_hitl_continue_completed", False))
                 review_round_policy.reset_after_hitl()
             round_index += 1
-    except Exception:
+    except Exception as error:
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_failed",
+            source_paths={
+                "merged_review": paths["merged_review_path"],
+                "ba_feedback": paths["ba_feedback_path"],
+                "detailed_design": paths["detailed_design_path"],
+            },
+            metadata={"error": str(error)},
+        )
         if pending_discard_ba_handoff is not None:
             _discard_unused_ba_handoff(pending_discard_ba_handoff)
         _shutdown_workers(

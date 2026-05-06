@@ -6,7 +6,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from A06_TaskSplit import (
     ReviewAgentHandoff,
@@ -16,6 +16,7 @@ from A06_TaskSplit import (
     TaskSplitStageResult,
     _run_reviewer_result_turn,
     _run_reviewer_turn_with_resume,
+    _shutdown_workers,
     build_parser,
     build_reviewer_init_result_contract,
     build_reviewer_workers,
@@ -87,6 +88,80 @@ def _dummy_contract() -> TurnFileContract:
 
 
 class A06TaskSplitTests(unittest.TestCase):
+    def test_shutdown_workers_cleans_reused_detailed_design_runtime_workers_on_success(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            detailed_runtime_root = project_dir / ".detailed_design_runtime" / "需求A"
+            ba_worker = _FakeWorker(
+                session_name="需求分析师-天佑星",
+                runtime_root=detailed_runtime_root,
+                runtime_dir=detailed_runtime_root / "ba",
+            )
+            reviewer_worker = _FakeWorker(
+                session_name="审核员-地雄星",
+                runtime_root=detailed_runtime_root,
+                runtime_dir=detailed_runtime_root / "reviewer",
+            )
+            ba_handoff = RequirementsAnalystHandoff(
+                worker=ba_worker,
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="审核员",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=reviewer_worker,
+                review_md_path=project_dir / "需求A_任务单评审记录_审核员.md",
+                review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                contract=_dummy_contract(),
+            )
+
+            removed = _shutdown_workers(
+                ba_handoff,
+                [reviewer],
+                project_dir=project_dir,
+                requirement_name="需求A",
+                cleanup_runtime=True,
+            )
+
+            self.assertTrue(ba_worker.killed)
+            self.assertTrue(reviewer_worker.killed)
+            self.assertFalse(ba_worker.runtime_dir.exists())
+            self.assertFalse(reviewer_worker.runtime_dir.exists())
+            self.assertIn(str((detailed_runtime_root / "ba").resolve()), removed)
+            self.assertIn(str((detailed_runtime_root / "reviewer").resolve()), removed)
+
+    def test_shutdown_workers_keeps_runtime_for_failure_debug_when_cleanup_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            detailed_runtime_root = project_dir / ".detailed_design_runtime" / "需求A"
+            ba_worker = _FakeWorker(
+                session_name="需求分析师-天佑星",
+                runtime_root=detailed_runtime_root,
+                runtime_dir=detailed_runtime_root / "ba",
+            )
+            ba_handoff = RequirementsAnalystHandoff(
+                worker=ba_worker,
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+
+            removed = _shutdown_workers(
+                ba_handoff,
+                [],
+                project_dir=project_dir,
+                requirement_name="需求A",
+                cleanup_runtime=False,
+            )
+
+            self.assertFalse(ba_worker.killed)
+            self.assertTrue(ba_worker.runtime_dir.exists())
+            self.assertEqual(removed, ())
+
     def test_resolve_review_max_rounds_supports_default_and_infinite(self):
         args = build_parser().parse_args([])
         self.assertEqual(resolve_review_max_rounds(args), 5)
@@ -206,10 +281,8 @@ class A06TaskSplitTests(unittest.TestCase):
             ) as prompt_mock, patch(
                 "A06_TaskSplit.resolve_review_max_rounds",
             ) as resolve_rounds_mock, patch(
-                "A06_TaskSplit.cleanup_stale_detailed_design_runtime_state",
-                return_value=("/tmp/design-runtime",),
-            ) as cleanup_design_runtime, patch(
                 "A06_TaskSplit.cleanup_stale_task_split_runtime_state",
+                return_value=("/tmp/task-split-runtime",),
             ) as cleanup_runtime, patch(
                 "A06_TaskSplit.cleanup_existing_task_split_artifacts",
             ) as cleanup_artifacts, patch(
@@ -226,13 +299,12 @@ class A06TaskSplitTests(unittest.TestCase):
             prompt_text = prompt_mock.call_args.kwargs["title"]
             self.assertIn("需求A_任务单.md", prompt_text)
             self.assertIn("需求A_任务单.json", prompt_text)
-            cleanup_design_runtime.assert_called_once_with(str(project_dir.resolve()), "需求A")
-            cleanup_runtime.assert_not_called()
+            cleanup_runtime.assert_called_once_with(str(project_dir.resolve()), "需求A")
             cleanup_artifacts.assert_not_called()
             prepare_ba.assert_not_called()
             build_reviewers.assert_not_called()
             resolve_rounds_mock.assert_not_called()
-            self.assertEqual(result.cleanup_paths, ("/tmp/design-runtime",))
+            self.assertEqual(result.cleanup_paths, ("/tmp/task-split-runtime",))
             pre_development_path = build_pre_development_task_record_path(project_dir, "需求A")
             payload = json.loads(pre_development_path.read_text(encoding="utf-8"))
             self.assertTrue(payload["任务拆分"]["任务拆分"])
@@ -317,6 +389,7 @@ class A06TaskSplitTests(unittest.TestCase):
                 "需求A",
                 clear_task_md=True,
                 clear_task_json=True,
+                audit_context=ANY,
             )
             generate_task_md.assert_called_once()
             generate_task_json.assert_called_once()
@@ -490,6 +563,7 @@ class A06TaskSplitTests(unittest.TestCase):
                 "需求A",
                 clear_task_md=False,
                 clear_task_json=False,
+                audit_context=ANY,
             )
             build_reviewers.assert_called_once()
             self.assertEqual(build_reviewers.call_args.kwargs["reviewer_handoff"], reviewer_handoff)

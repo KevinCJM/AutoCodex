@@ -12,7 +12,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor
 from A01_Routing_LayerPlanning import (
@@ -41,10 +41,17 @@ from T02_tmux_agents import (
     is_agent_ready_timeout_error,
     is_provider_auth_error,
     is_worker_death_error,
+    worker_state_is_prelaunch_active,
 )
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop
 from tmux_core.stage_kernel.shared_review import is_agent_config_error
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from tmux_core.stage_kernel.stage_audit import (
+    StageAuditRunContext,
+    append_stage_audit_record,
+    begin_stage_audit_run,
+    record_before_cleanup,
+)
 from T08_pre_development import mark_requirement_clarification_completed
 from T09_terminal_ops import (
     PROMPT_BACK_VALUE,
@@ -77,6 +84,8 @@ REQUIREMENTS_CLARIFICATION_TURN_PHASE = "requirements_clarification"
 REQUIREMENTS_CLARIFICATION_STAGE_NAME = "requirements_clarification"
 REQUIREMENTS_RUNTIME_ROOT_NAME = ".requirements_clarification_runtime"
 PLACEHOLDER_NEXT_STEP = "下一步进入需求评审阶段（待接入）"
+AUTO_HITL_RESPONSE_TEXT = """自动澄清（--yes）：
+本轮为非交互全流程测试，不再等待人工补充。请基于原始需求、已有澄清记录和验收示例做最小、保守、可测试的默认决策；把所有默认假设写入澄清记录和需求澄清文档，并继续完成需求澄清。除非原始需求完全无法实现，否则不要再次发起 HITL。"""
 
 
 @dataclass(frozen=True)
@@ -140,6 +149,16 @@ def stdin_is_interactive() -> bool:
     return terminal_ui_is_interactive()
 
 
+def collect_auto_requirements_hitl_response(question_path: str | Path, hitl_round: int = 0) -> str:
+    question_file = Path(question_path).expanduser().resolve()
+    question_text = get_markdown_content(question_file).strip()
+    round_label = f"第 {hitl_round} 轮" if hitl_round else "本轮"
+    message(f"A03 HITL {round_label} 已由 --yes 自动回复，继续非交互流程。")
+    if question_text:
+        return f"{AUTO_HITL_RESPONSE_TEXT}\n\n原问题文档摘要：\n{question_text}"
+    return AUTO_HITL_RESPONSE_TEXT
+
+
 def has_existing_requirements_clarification(project_dir: str | Path, requirement_name: str) -> bool:
     _, requirements_clear_path, _, _ = build_requirements_clarification_paths(project_dir, requirement_name)
     return bool(get_markdown_content(requirements_clear_path).strip())
@@ -199,7 +218,9 @@ def render_requirements_clarification_progress_line(*, worker: TmuxBatchWorker, 
         state = {}
     workflow_stage = str(state.get("workflow_stage") or state.get("current_turn_phase") or "starting").strip() or "starting"
     agent_state = str(state.get("agent_state", "")).strip().upper()
-    if agent_state not in {"DEAD", "STARTING", "READY", "BUSY"}:
+    if worker_state_is_prelaunch_active(state):
+        agent_state = "STARTING"
+    elif agent_state not in {"DEAD", "STARTING", "READY", "BUSY"}:
         provider_phase = str(state.get("provider_phase", "")).strip().lower()
         wrapper_state = str(state.get("wrapper_state", "")).strip().upper()
         if wrapper_state == "READY" or provider_phase in {"waiting_input", "idle_ready", "completed_response"}:
@@ -222,6 +243,7 @@ def render_requirements_clarification_progress_line(*, worker: TmuxBatchWorker, 
 
 def collect_requirements_clarification_agent_selection(args: argparse.Namespace) -> RequirementsClarificationAgentSelection:
     interactive = stdin_is_interactive()
+    auto_confirm = bool(getattr(args, "yes", False))
     vendor_value = str(getattr(args, "vendor", "") or "").strip()
     proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
@@ -229,62 +251,67 @@ def collect_requirements_clarification_agent_selection(args: argparse.Namespace)
         model_value = str(getattr(args, "model", "") or "").strip()
         effort_value = str(getattr(args, "effort", "") or "").strip()
         if interactive:
-            vendor = normalize_vendor_choice(vendor_value) if vendor_value else DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR
-            model = model_value
-            reasoning_effort = effort_value or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT
-            first_prompt_step = 0 if not vendor_value else (1 if not model_value else (2 if not effort_value else 3))
-            step = first_prompt_step
-            while step < 4:
-                try:
-                    if step == 0:
-                        with _clarification_prompt_step(
-                            0,
-                            allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
-                        ):
-                            vendor = prompt_vendor(vendor)
-                        if model:
-                            try:
-                                normalize_model_choice(vendor, model)
-                            except ValueError:
-                                model = ""
-                        step = 1
-                        continue
-                    if step == 1:
-                        if model_value and step < first_prompt_step:
-                            model = normalize_model_choice(vendor, model_value)
-                        else:
+            if auto_confirm and vendor_value and model_value and effort_value:
+                vendor = normalize_vendor_choice(vendor_value)
+                model = normalize_model_choice(vendor, model_value)
+                reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
+            else:
+                vendor = normalize_vendor_choice(vendor_value) if vendor_value else DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR
+                model = model_value
+                reasoning_effort = effort_value or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT
+                first_prompt_step = 0 if not vendor_value else (1 if not model_value else (2 if not effort_value else 3))
+                step = first_prompt_step
+                while step < 4:
+                    try:
+                        if step == 0:
                             with _clarification_prompt_step(
-                                1,
+                                0,
                                 allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
                             ):
-                                model = prompt_model(vendor, model or get_default_model_for_vendor(vendor))
-                        step = 2
-                        continue
-                    if step == 2:
-                        if effort_value and step < first_prompt_step:
-                            reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
-                        else:
+                                vendor = prompt_vendor(vendor)
+                            if model:
+                                try:
+                                    normalize_model_choice(vendor, model)
+                                except ValueError:
+                                    model = ""
+                            step = 1
+                            continue
+                        if step == 1:
+                            if model_value and step < first_prompt_step:
+                                model = normalize_model_choice(vendor, model_value)
+                            else:
+                                with _clarification_prompt_step(
+                                    1,
+                                    allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
+                                ):
+                                    model = prompt_model(vendor, model or get_default_model_for_vendor(vendor))
+                            step = 2
+                            continue
+                        if step == 2:
+                            if effort_value and step < first_prompt_step:
+                                reasoning_effort = normalize_effort_choice(vendor, model, effort_value)
+                            else:
+                                with _clarification_prompt_step(
+                                    2,
+                                    allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
+                                ):
+                                    reasoning_effort = prompt_effort(vendor, model, reasoning_effort or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
+                            step = 3
+                            continue
+                        if step == 3:
                             with _clarification_prompt_step(
-                                2,
+                                3,
                                 allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
                             ):
-                                reasoning_effort = prompt_effort(vendor, model, reasoning_effort or DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT)
-                        step = 3
-                        continue
-                    if step == 3:
-                        with _clarification_prompt_step(
-                            3,
-                            allow_back=(step > first_prompt_step) or (step == first_prompt_step and allow_previous_stage_back),
-                        ):
-                            proxy_url = prompt_proxy_url(proxy_url)
-                        step = 4
-                        continue
-                except PromptBackRequested:
-                    if step == first_prompt_step:
-                        if allow_previous_stage_back:
-                            raise
-                        continue
-                    step = max(first_prompt_step, step - 1)
+                                proxy_url = prompt_proxy_url(proxy_url)
+                            step = 4
+                            continue
+                    except PromptBackRequested:
+                        if step == first_prompt_step:
+                            if allow_previous_stage_back:
+                                raise
+                            continue
+                        step = max(first_prompt_step, step - 1)
         else:
             if not vendor_value:
                 raise RuntimeError("需求澄清阶段需要选择厂商；非交互模式请传入 --vendor、--model、--effort。")
@@ -388,6 +415,8 @@ def run_requirements_clarification(
         proxy_url: str = "",
         resume_existing: bool = False,
         preserve_ba_worker: bool = False,
+        human_input_provider: Callable[..., str] | None = None,
+        audit_context: StageAuditRunContext | None = None,
 ) -> RequirementsClarificationStageResult:
     project_root = resolve_existing_directory(project_dir)
     runtime_root = project_root / REQUIREMENTS_RUNTIME_ROOT_NAME
@@ -515,7 +544,45 @@ def run_requirements_clarification(
                     ask_human_md=str(Path(context.question_path).resolve()),
                 )
 
+            def audit_before_question_clear(context: HitlPromptContext) -> None:
+                record_before_cleanup(
+                    audit_context,
+                    {"ask_human": context.question_path},
+                    metadata={"trigger": "hitl_question_clear"},
+                    hitl_round_index=context.hitl_round,
+                )
+
+            def audit_hitl_question(context: HitlPromptContext, _decision: object) -> None:
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="hitl_question",
+                    source_paths={"ask_human": context.question_path},
+                    hitl_round_index=context.hitl_round,
+                )
+
+            def audit_hitl_answer(context: HitlPromptContext, human_msg: str, human_history_path: Path) -> None:
+                source_paths: dict[str, str | Path | None] = {
+                    "human_answer": "",
+                    "hitl_record": context.record_path,
+                }
+                if human_history_path:
+                    source_paths["runtime_human_answer"] = human_history_path
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="hitl_answer",
+                    source_paths=source_paths,
+                    metadata={
+                        "human_answer_source": "runtime_payload",
+                        "runtime_human_answer": str(Path(human_history_path).expanduser().resolve()) if human_history_path else "",
+                    },
+                    hitl_round_index=context.hitl_round,
+                    snapshot_overrides={"human_answer": human_msg},
+                )
+
             try:
+                hitl_loop_kwargs: dict[str, object] = {}
+                if human_input_provider is not None:
+                    hitl_loop_kwargs["human_input_provider"] = human_input_provider
                 loop_result = run_hitl_agent_loop(
                     worker=worker,
                     stage_name=REQUIREMENTS_CLARIFICATION_STAGE_NAME,
@@ -532,7 +599,11 @@ def run_requirements_clarification(
                     on_worker_started=handle_worker_started,
                     on_agent_turn_started=lambda context, live_worker: start_progress(),
                     on_agent_turn_finished=lambda context, live_worker: stop_progress(),
+                    on_before_question_clear=audit_before_question_clear,
+                    on_hitl_question=audit_hitl_question,
+                    on_hitl_answer=audit_hitl_answer,
                     timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
+                    **hitl_loop_kwargs,
                 )
                 if str(loop_result.decision.payload.get("status", "")).strip() != REQUIREMENTS_STATUS_OK:
                     raise RuntimeError(loop_result.decision.summary or "需求澄清未完成闭环")
@@ -557,6 +628,11 @@ def run_requirements_clarification(
                         str(Path(runtime_dir).expanduser().resolve()),
                         str(Path(runtime_root).expanduser().resolve()),
                     )
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="clarification_updated",
+                    source_paths={"requirements_clear": requirements_clear_path},
+                )
                 return RequirementsClarificationStageResult(
                     project_dir=str(project_root),
                     requirement_name=requirement_name,
@@ -661,7 +737,6 @@ def collect_request(args: argparse.Namespace) -> tuple[str, str]:
         requirement_name = str(args.requirement_name).strip()
     else:
         requirement_name = prompt_requirement_name_selection(project_dir, "").requirement_name
-    clear_requirements_human_exchange_file(project_dir, requirement_name)
     return project_dir, requirement_name
 
 
@@ -673,13 +748,35 @@ def run_requirements_clarification_stage(
     parser = build_parser()
     args = parser.parse_args(argv)
     project_dir, requirement_name = collect_request(args)
+    human_input_provider = collect_auto_requirements_hitl_response if bool(args.yes) else None
     lock_context = requirement_concurrency_lock(
         project_dir,
         requirement_name,
         action="stage.a03.start",
     )
     lock_context.__enter__()
+    audit_context: StageAuditRunContext | None = None
     try:
+        audit_context = begin_stage_audit_run(
+            project_dir,
+            requirement_name,
+            "A03",
+            metadata={
+                "trigger": "run_requirements_clarification_stage",
+                "argv": list(argv or []),
+                "args": vars(args),
+            },
+        )
+        _, requirements_clear_path, ask_human_path, hitl_record_path = build_requirements_clarification_paths(
+            project_dir,
+            requirement_name,
+        )
+        record_before_cleanup(
+            audit_context,
+            {"ask_human": ask_human_path},
+            metadata={"trigger": "clear_requirements_human_exchange_file"},
+        )
+        clear_requirements_human_exchange_file(project_dir, requirement_name)
         if has_existing_requirements_clarification(project_dir, requirement_name):
             if should_reuse_existing_requirements_clarification(
                     project_dir,
@@ -690,7 +787,20 @@ def run_requirements_clarification_stage(
             ):
                 message("复用已有的需求澄清，直接进入需求评审阶段")
                 result = reuse_existing_requirements_clarification(project_dir, requirement_name)
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="clarification_updated",
+                    source_paths={"requirements_clear": requirements_clear_path},
+                )
                 mark_requirement_clarification_completed(project_dir, requirement_name)
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="stage_passed",
+                    source_paths={
+                        "requirements_clear": requirements_clear_path,
+                        "hitl_record": hitl_record_path,
+                    },
+                )
                 return result
             message("不直接复用已有需求澄清，将启动需求分析师基于现有澄清继续核验")
             selection = collect_requirements_clarification_agent_selection(args)
@@ -704,6 +814,8 @@ def run_requirements_clarification_stage(
                 proxy_url=selection.proxy_url,
                 resume_existing=True,
                 preserve_ba_worker=preserve_ba_worker,
+                human_input_provider=human_input_provider,
+                audit_context=audit_context,
             )
         else:
             message("执行摘要: 未检测到可复用的需求澄清，需要启动需求分析师智能体执行需求澄清；请为需求分析师选择厂商、模型、推理强度、代理端口。")
@@ -718,8 +830,18 @@ def run_requirements_clarification_stage(
                 proxy_url=selection.proxy_url,
                 resume_existing=False,
                 preserve_ba_worker=preserve_ba_worker,
+                human_input_provider=human_input_provider,
+                audit_context=audit_context,
             )
         mark_requirement_clarification_completed(project_dir, requirement_name)
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_passed",
+            source_paths={
+                "requirements_clear": requirements_clear_path,
+                "hitl_record": hitl_record_path,
+            },
+        )
         cleanup_paths = result.cleanup_paths
         if cleanup_paths:
             cleanup_runtime_paths(cleanup_paths)
@@ -731,6 +853,17 @@ def run_requirements_clarification_stage(
             cleanup_paths=cleanup_paths,
             ba_handoff=result.ba_handoff,
         )
+    except Exception as error:  # noqa: BLE001
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_failed",
+            source_paths={
+                "requirements_clear": requirements_clear_path if "requirements_clear_path" in locals() else "",
+                "hitl_record": hitl_record_path if "hitl_record_path" in locals() else "",
+            },
+            metadata={"error": str(error)},
+        )
+        raise
     finally:
         lock_context.__exit__(None, None, None)
 

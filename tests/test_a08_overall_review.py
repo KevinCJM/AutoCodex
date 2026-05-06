@@ -17,6 +17,7 @@ from A07_Development import (
 )
 from A08_OverallReview import (
     OverallReviewStageResult,
+    _build_overall_review_active_code_context,
     bind_reviewer_runtime_from_handoff,
     build_overall_review_reviewer_completion_contract,
     build_overall_review_metadata_repair_result_contract,
@@ -208,6 +209,21 @@ class A08OverallReviewTests(unittest.TestCase):
         self.assertEqual(overall_review_paths["developer_output_path"], development_paths["developer_output_path"])
         self.assertNotEqual(overall_review_paths["merged_review_path"], development_paths["merged_review_path"])
         self.assertIn("整体代码复核记录", overall_review_paths["merged_review_path"].name)
+
+    def test_active_code_context_lists_project_code_despite_stale_routing_docs(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            (project_dir / "docs").mkdir()
+            (project_dir / "docs" / "repo_map.json").write_text(
+                json.dumps({"scope": {"notes": ["No business logic or application source code is present"]}}),
+                encoding="utf-8",
+            )
+            (project_dir / "text_stats.py").write_text("print('ok')\n", encoding="utf-8")
+
+            context = _build_overall_review_active_code_context(project_dir)
+
+        self.assertIn("text_stats.py", context)
+        self.assertIn("不能仅凭 `repo_map.json`", context)
 
     def test_shutdown_overall_review_workers_removes_requirement_scoped_runtime(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -497,6 +513,122 @@ class A08OverallReviewTests(unittest.TestCase):
             initialize_developer_mock.assert_called_once()
             refine_mock.assert_called_once()
             self.assertTrue(json.loads(Path(result.state_path).read_text(encoding="utf-8"))["passed"])
+
+    def test_run_overall_review_stage_allows_ambiguity_only_findings_as_passed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewer_handoff = ReviewAgentHandoff(
+                reviewer_key="测试工程师",
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+            )
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["merged_review_path"].write_text("- [Ambiguity] 任务单 Markdown 状态展示存在歧义\n", encoding="utf-8")
+                return False
+
+            with patch("A08_OverallReview.initialize_overall_review_reviewers", side_effect=lambda reviewers, **kwargs: list(reviewers)), patch(
+                "A08_OverallReview._run_parallel_overall_reviewers",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview.repair_overall_review_outputs",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A08_OverallReview.create_developer_runtime",
+            ) as create_developer_runtime_mock, patch(
+                "A08_OverallReview.refine_overall_review_code",
+            ) as refine_mock, patch(
+                "A08_OverallReview._shutdown_workers",
+                return_value=(),
+            ):
+                result = run_overall_review_stage(
+                    ["--project-dir", str(project_dir), "--requirement-name", "需求A"],
+                    developer_handoff=DevelopmentAgentHandoff(
+                        selection=developer.selection,
+                        role_prompt=developer.role_prompt,
+                        worker=developer.worker,
+                    ),
+                    reviewer_handoff=(reviewer_handoff,),
+                )
+
+            self.assertTrue(result.completed)
+            self.assertTrue(json.loads(Path(result.state_path).read_text(encoding="utf-8"))["passed"])
+            create_developer_runtime_mock.assert_not_called()
+            refine_mock.assert_not_called()
+
+    def test_run_overall_review_stage_stops_at_review_max_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_overall_review_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": True}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            reviewer_handoff = ReviewAgentHandoff(
+                reviewer_key="测试工程师",
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+            )
+
+            def fake_task_done(**kwargs):  # noqa: ANN001
+                paths["merged_review_path"].write_text("- [Error] 缺少关键测试覆盖\n", encoding="utf-8")
+                return False
+
+            with patch("A08_OverallReview.initialize_overall_review_reviewers", side_effect=lambda reviewers, **kwargs: list(reviewers)), patch(
+                "A08_OverallReview._run_parallel_overall_reviewers",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview.repair_overall_review_outputs",
+                side_effect=lambda reviewers, **kwargs: list(reviewers),
+            ), patch(
+                "A08_OverallReview.task_done",
+                side_effect=fake_task_done,
+            ), patch(
+                "A08_OverallReview.create_developer_runtime",
+            ) as create_developer_runtime_mock, patch(
+                "A08_OverallReview.refine_overall_review_code",
+            ) as refine_mock, patch(
+                "A08_OverallReview._shutdown_workers",
+                return_value=(),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "整体复核超过最大审核轮次 1"):
+                    run_overall_review_stage(
+                        ["--project-dir", str(project_dir), "--requirement-name", "需求A", "--review-max-rounds", "1"],
+                        developer_handoff=DevelopmentAgentHandoff(
+                            selection=developer.selection,
+                            role_prompt=developer.role_prompt,
+                            worker=developer.worker,
+                        ),
+                        reviewer_handoff=(reviewer_handoff,),
+                    )
+
+            self.assertFalse(json.loads(paths["state_path"].read_text(encoding="utf-8"))["passed"])
+            create_developer_runtime_mock.assert_not_called()
+            refine_mock.assert_not_called()
 
     def test_run_overall_review_turn_with_recreation_rebinds_recreated_reviewer_runtime(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

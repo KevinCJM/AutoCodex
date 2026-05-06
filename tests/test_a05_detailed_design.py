@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from tmux_core.runtime.contracts import resolve_task_result_decision
 
@@ -279,7 +279,7 @@ class A05DetailedDesignTests(unittest.TestCase):
             self.assertTrue(result.passed)
             prompt_mock.assert_called_once()
             cleanup_runtime.assert_called_once()
-            cleanup_artifacts.assert_called_once_with(paths, "需求A", clear_detailed_design=True)
+            cleanup_artifacts.assert_called_once_with(paths, "需求A", clear_detailed_design=True, audit_context=ANY)
             generate_design.assert_called_once()
             self.assertEqual(paths["detailed_design_path"].read_text(encoding="utf-8"), "重新生成的详细设计\n")
 
@@ -343,7 +343,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 )
 
             self.assertTrue(result.passed)
-            cleanup_artifacts.assert_called_once_with(paths, "需求A", clear_detailed_design=False)
+            cleanup_artifacts.assert_called_once_with(paths, "需求A", clear_detailed_design=False, audit_context=ANY)
             prepare_ba.assert_not_called()
             generate_design.assert_not_called()
             self.assertEqual(paths["detailed_design_path"].read_text(encoding="utf-8"), "已有详细设计\n")
@@ -365,10 +365,16 @@ class A05DetailedDesignTests(unittest.TestCase):
                 )
             ]
             parallel_calls: list[int] = []
+            observed_prompts: list[str] = []
 
             def fake_task_done(**kwargs):  # noqa: ANN001
                 Path(kwargs["directory"], kwargs["md_output_name"]).write_text("", encoding="utf-8")
                 return True
+
+            def fake_parallel_reviewers(reviewer_list, *, round_index, prompt_builder, **kwargs):  # noqa: ANN001
+                parallel_calls.append(round_index)
+                observed_prompts.append(prompt_builder(reviewer_list[0], DetailedDesignReviewerSpec(role_name="审核员", role_prompt="一致性视角", reviewer_key="审核员")))
+                return list(reviewer_list)
 
             with patch("A05_DetailedDesign.stdin_is_interactive", return_value=True), patch(
                 "A05_DetailedDesign.prompt_select_option",
@@ -387,7 +393,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 return_value=reviewers,
             ), patch(
                 "A05_DetailedDesign._run_parallel_reviewers",
-                side_effect=lambda reviewer_list, *, round_index, **kwargs: parallel_calls.append(round_index) or list(reviewer_list),
+                side_effect=fake_parallel_reviewers,
             ), patch(
                 "A05_DetailedDesign.repair_reviewer_outputs",
                 side_effect=lambda reviewer_list, **kwargs: list(reviewer_list),
@@ -407,6 +413,9 @@ class A05DetailedDesignTests(unittest.TestCase):
 
         self.assertTrue(result.passed)
         self.assertEqual(parallel_calls, [1])
+        self.assertEqual(len(observed_prompts), 1)
+        self.assertNotIn("Task Routing Assessment", observed_prompts[0])
+        self.assertNotIn("Output the Task Routing Assessment first", observed_prompts[0])
         self.assertEqual(fresh_worker.ensure_calls, 1)
 
     def test_run_stage_reviews_existing_detailed_design_then_modifies_if_review_fails(self):
@@ -451,7 +460,16 @@ class A05DetailedDesignTests(unittest.TestCase):
                 merged_path.write_text("", encoding="utf-8")
                 return True
 
-            def fake_run_ba_modify_loop(handoff, *, project_dir, paths, review_msg, progress=None):  # noqa: ANN001
+            def fake_run_ba_modify_loop(
+                handoff,
+                *,
+                project_dir,
+                paths,
+                review_msg,
+                progress=None,
+                audit_context=None,
+                review_round_index=None,
+            ):  # noqa: ANN001
                 _ = handoff
                 _ = project_dir
                 _ = progress
@@ -667,7 +685,16 @@ class A05DetailedDesignTests(unittest.TestCase):
                 call_sequence.append("prepare_ba")
                 return fake_handoff, True
 
-            def fake_run_ba_modify_loop(handoff, *, project_dir, paths, review_msg, progress=None):  # noqa: ANN001
+            def fake_run_ba_modify_loop(
+                handoff,
+                *,
+                project_dir,
+                paths,
+                review_msg,
+                progress=None,
+                audit_context=None,
+                review_round_index=None,
+            ):  # noqa: ANN001
                 _ = handoff
                 _ = project_dir
                 _ = review_msg
@@ -1333,21 +1360,25 @@ class A05DetailedDesignTests(unittest.TestCase):
             ), patch(
                 "A05_DetailedDesign.recreate_reviewer_runtime",
                 side_effect=AssertionError("contract violation should enter repair loop instead of rebuilding reviewer"),
+            ), patch(
+                "tmux_core.stage_kernel.turn_output_goals.request_file_noncompliance_intervention",
+                side_effect=RuntimeError("manual intervention requested"),
             ):
-                result = run_reviewer_turn_with_recreation(
-                    reviewer,
-                    project_dir=root,
-                    requirement_name="需求A",
-                    reviewer_spec=DetailedDesignReviewerSpec(
-                        role_name="审核员",
-                        role_prompt="一致性检查",
-                        reviewer_key="审核员#1",
-                    ),
-                    label="review",
-                    prompt="do review",
-                )
+                with self.assertRaises(RuntimeError) as raised:
+                    run_reviewer_turn_with_recreation(
+                        reviewer,
+                        project_dir=root,
+                        requirement_name="需求A",
+                        reviewer_spec=DetailedDesignReviewerSpec(
+                            role_name="审核员",
+                            role_prompt="一致性检查",
+                            reviewer_key="审核员#1",
+                        ),
+                        label="review",
+                        prompt="do review",
+                    )
 
-        self.assertIs(result, reviewer)
+        self.assertIn("manual intervention requested", str(raised.exception))
 
     def test_run_stage_auto_runs_a03_when_requirements_clear_missing_and_initializes_new_ba(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1632,7 +1663,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 side_effect=RuntimeError("tmux pane died while waiting for turn artifacts"),
             ), patch(
                 "A05_DetailedDesign.recreate_reviewer_runtime",
-                side_effect=AssertionError("dead reviewers should be dropped instead of recreated"),
+                return_value=None,
             ) as recreate_mock:
                 returned = run_reviewer_turn_with_recreation(
                     reviewer,
@@ -1648,7 +1679,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 )
 
         self.assertIsNone(returned)
-        recreate_mock.assert_not_called()
+        recreate_mock.assert_called_once()
 
     def test_run_reviewer_turn_with_recreation_reuses_materialized_outputs_after_runtime_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1727,7 +1758,16 @@ class A05DetailedDesignTests(unittest.TestCase):
                 parallel_calls.append(round_index)
                 return list(reviewers_arg)
 
-            def fake_run_ba_modify_loop(handoff, *, project_dir, paths, review_msg, progress=None):  # noqa: ANN001
+            def fake_run_ba_modify_loop(
+                handoff,
+                *,
+                project_dir,
+                paths,
+                review_msg,
+                progress=None,
+                audit_context=None,
+                review_round_index=None,
+            ):  # noqa: ANN001
                 _ = project_dir
                 _ = review_msg
                 _ = progress
@@ -1832,7 +1872,16 @@ class A05DetailedDesignTests(unittest.TestCase):
                 merged_path.write_text("", encoding="utf-8")
                 return True
 
-            def fake_run_ba_modify_loop(handoff, *, project_dir, paths, review_msg, progress=None):  # noqa: ANN001
+            def fake_run_ba_modify_loop(
+                handoff,
+                *,
+                project_dir,
+                paths,
+                review_msg,
+                progress=None,
+                audit_context=None,
+                review_round_index=None,
+            ):  # noqa: ANN001
                 _ = handoff
                 _ = project_dir
                 _ = progress

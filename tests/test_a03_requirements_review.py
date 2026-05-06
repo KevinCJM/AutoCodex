@@ -30,6 +30,7 @@ from A03_RequirementsReview import (
     run_ba_turn_with_recreation,
     run_reviewer_turn_with_recreation,
     run_human_check_loop,
+    run_requirements_review_limit_hitl_loop,
     run_requirements_review_stage,
     resolve_review_max_rounds,
     _shutdown_workers,
@@ -140,6 +141,66 @@ class A03RequirementsReviewTests(unittest.TestCase):
         self.assertEqual(contract.mode, "a03_ba_resume")
         self.assertIn("requirements_clear", contract.optional_artifacts)
 
+    def test_review_limit_hitl_does_not_gate_ba_turn_on_reviewer_ready(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            paths = build_requirements_review_paths(root, "需求A")
+            ba_handoff = RequirementsAnalystHandoff(
+                worker=_FakeWorker(runtime_root=root / ".requirements_review_runtime", runtime_dir=root / ".requirements_review_runtime" / "ba"),
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            review_md_path, review_json_path = build_reviewer_artifact_paths(root, "需求A", "R1")
+            reviewer = ReviewerRuntime(
+                reviewer_name="R1",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(runtime_root=root / ".requirements_review_runtime", runtime_dir=root / ".requirements_review_runtime" / "r1"),
+                review_md_path=review_md_path,
+                review_json_path=review_json_path,
+                contract=build_reviewer_completion_contract(
+                    requirement_name="需求A",
+                    reviewer_name="R1",
+                    review_md_path=review_md_path,
+                    review_json_path=review_json_path,
+                ),
+            )
+            observed_reviewer_groups: list[list[ReviewerRuntime]] = []
+
+            def fake_run_main_phase(main_owner, *, reviewers, run_phase, **kwargs):  # noqa: ANN001
+                _ = run_phase, kwargs
+                observed_reviewer_groups.append(list(reviewers))
+                return SimpleNamespace(ok=True), list(reviewers), main_owner
+
+            def fake_limit_cycle(*, initial_turn, human_reply_turn, **kwargs):  # noqa: ANN001
+                _ = kwargs
+                initial_turn()
+                human_reply_turn("确认继续")
+                return SimpleNamespace(post_hitl_continue_completed=True)
+
+            with patch(
+                "A03_RequirementsReview.run_main_phase_with_death_handling",
+                side_effect=fake_run_main_phase,
+            ), patch(
+                "A03_RequirementsReview.run_review_limit_hitl_cycle",
+                side_effect=fake_limit_cycle,
+            ):
+                result_handoff, result_reviewers, post_hitl_continue_completed = run_requirements_review_limit_hitl_loop(
+                    ba_handoff,
+                    reviewers=[reviewer],
+                    paths=paths,
+                    requirement_name="需求A",
+                    review_msg="需要人工确认",
+                    review_limit=1,
+                    review_rounds_used=1,
+                )
+
+            self.assertIs(result_handoff, ba_handoff)
+            self.assertEqual(result_reviewers, [reviewer])
+            self.assertTrue(post_hitl_continue_completed)
+            self.assertEqual(observed_reviewer_groups, [[], []])
+
     def test_create_reviewer_runtime_uses_worker_session_name_for_artifacts(self):
         import A04_RequirementsReview as review_module
 
@@ -204,6 +265,28 @@ class A03RequirementsReviewTests(unittest.TestCase):
         self.assertEqual(prompts[1]["stage_key"], "requirements_review")
         self.assertEqual(prompts[0]["stage_step_index"], 0)
         self.assertEqual(prompts[1]["stage_step_index"], 1)
+
+    def test_run_human_check_loop_auto_confirm_skips_feedback_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = build_requirements_review_paths(tmpdir, "需求A")
+            paths["requirements_clear_path"].write_text("需求澄清正文\n", encoding="utf-8")
+            handoff = RequirementsAnalystHandoff(
+                worker=_FakeWorker(),
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+
+            with patch("A04_RequirementsReview.prompt_yes_no_choice", side_effect=AssertionError("should not prompt")):
+                result = run_human_check_loop(
+                    handoff=handoff,
+                    paths=paths,
+                    requirement_name="需求A",
+                    auto_confirm=True,
+                )
+
+        self.assertIs(result, handoff)
 
     def test_run_human_check_loop_back_from_skip_review_returns_to_human_question_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1180,6 +1263,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
             def fake_continue(*, handoff, paths, initial_prompt, label_prefix, progress=None):  # noqa: ANN001
                 observed["label_prefix"] = label_prefix
                 observed["initial_prompt"] = initial_prompt
+                paths["ba_feedback_path"].write_text("需求分析师反馈正文\n", encoding="utf-8")
                 return handoff
 
             def fake_parallel(reviewers, *, project_dir, requirement_name, round_index, prompt_builder, label_prefix):  # noqa: ANN001
@@ -1211,7 +1295,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
             self.assertEqual(returned_reviewers, [reviewer])
             self.assertEqual(observed["label_prefix"], "requirements_review_feedback_round_2")
             self.assertIn("仍有问题", str(observed["initial_prompt"]))
-            self.assertIn("请基于最新需求澄清重新审核", str(observed["reply_prompt"]))
+            self.assertIn("需求分析师反馈正文", str(observed["reply_prompt"]))
 
     def test_run_review_feedback_loop_prepares_ba_on_demand_when_missing(self):
         import A04_RequirementsReview as review_module
@@ -1236,12 +1320,16 @@ class A03RequirementsReviewTests(unittest.TestCase):
             )
             observed: dict[str, object] = {}
 
+            def fake_continue_with_feedback(**kwargs):  # noqa: ANN003
+                kwargs["paths"]["ba_feedback_path"].write_text("需求分析师反馈正文\n", encoding="utf-8")
+                return kwargs["handoff"]
+
             with patch(
                 "A03_RequirementsReview.prepare_ba_handoff",
                 return_value=(created_handoff, ()),
             ) as mocked_prepare, patch(
                 "A03_RequirementsReview._run_review_clarification_continuation",
-                side_effect=lambda **kwargs: kwargs["handoff"],
+                side_effect=fake_continue_with_feedback,
             ), patch(
                 "A03_RequirementsReview._run_parallel_reviewers",
                 side_effect=lambda reviewers, **kwargs: list(reviewers),
@@ -1284,7 +1372,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                     encoding="utf-8",
                 )
                 reviewer.review_md_path.write_text("", encoding="utf-8")
-                _ = prompt_builder(reviewers[0])
+                observed_prompts.append(prompt_builder(reviewers[0]))
                 return list(reviewers)
 
             created_handoff = RequirementsAnalystHandoff(
@@ -1295,6 +1383,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 proxy_url="",
             )
             observed: dict[str, object] = {}
+            observed_prompts: list[str] = []
             with patch(
                 "A03_RequirementsReview.prompt_yes_no_choice",
                 return_value=False,
@@ -1324,6 +1413,9 @@ class A03RequirementsReviewTests(unittest.TestCase):
             self.assertTrue(result.passed)
             self.assertEqual(observed["project_dir"], root.resolve())
             self.assertEqual(observed["selection_title"], "进入需求评审阶段（需求分析师）")
+            self.assertEqual(len(observed_prompts), 1)
+            self.assertNotIn("Task Routing Assessment", observed_prompts[0])
+            self.assertNotIn("Output the Task Routing Assessment first", observed_prompts[0])
 
     def test_repair_reviewer_outputs_repairs_single_reviewer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1921,9 +2013,9 @@ class A03RequirementsReviewTests(unittest.TestCase):
                     prompt="do review",
                 )
 
-            self.assertIsNone(result)
-            self.assertEqual(call_counter["count"], 1)
-            recreate_mock.assert_not_called()
+            self.assertIs(result, recreated)
+            self.assertEqual(call_counter["count"], 2)
+            recreate_mock.assert_called_once()
 
     def test_run_reviewer_turn_with_recreation_returns_current_reviewer_on_contract_violation(self):
         with tempfile.TemporaryDirectory() as tmpdir:

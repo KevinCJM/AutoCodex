@@ -57,7 +57,6 @@ from tmux_core.runtime.tmux_runtime import (
 from tmux_core.stage_kernel.detailed_design import (
     DetailedDesignReviewerSpec,
     build_detailed_design_paths,
-    cleanup_stale_detailed_design_runtime_state,
     collect_ba_agent_selection,
     run_detailed_design_stage,
     resolve_reviewer_specs as resolve_design_reviewer_specs,
@@ -74,6 +73,12 @@ from tmux_core.stage_kernel.death_orchestration import (
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
+from tmux_core.stage_kernel.stage_audit import (
+    StageAuditRunContext,
+    append_stage_audit_record,
+    begin_stage_audit_run,
+    record_before_cleanup,
+)
 from tmux_core.stage_kernel.shared_review import (
     MAX_REVIEWER_REPAIR_ATTEMPTS,
     ReviewLimitHitlConfig,
@@ -82,6 +87,7 @@ from tmux_core.stage_kernel.shared_review import (
     ReviewAgentSelection,
     ReviewStageProgress,
     ReviewerRuntime,
+    collect_auto_review_limit_hitl_response,
     collect_reviewer_agent_selections,
     ensure_empty_file,
     ensure_review_artifacts,
@@ -327,18 +333,45 @@ def cleanup_existing_task_split_artifacts(
     *,
     clear_task_md: bool = True,
     clear_task_json: bool = True,
+    audit_context: StageAuditRunContext | None = None,
 ) -> tuple[str, ...]:
     project_root = paths["project_root"]
     safe_name = sanitize_requirement_name(requirement_name)
     removed: list[str] = []
+    review_json_candidates: list[Path] = []
+    review_md_candidates: list[Path] = []
     for pattern in (
         f"{safe_name}_评审记录_*.json",
         f"{safe_name}_任务单评审记录_*.md",
     ):
         for candidate in project_root.glob(pattern):
             if candidate.is_file():
-                candidate.unlink()
-                removed.append(str(candidate.resolve()))
+                if candidate.suffix == ".json":
+                    review_json_candidates.append(candidate)
+                else:
+                    review_md_candidates.append(candidate)
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {
+                "merged_review": paths["merged_review_path"],
+                "ba_feedback": paths["ba_feedback_path"],
+                "ask_human": paths["ask_human_path"],
+                "task_md": paths["task_md_path"],
+                "task_json": paths["task_json_path"],
+            },
+            metadata={
+                "trigger": "cleanup_existing_task_split_artifacts",
+                "clear_task_md": bool(clear_task_md),
+                "clear_task_json": bool(clear_task_json),
+            },
+            reviewer_markdown_paths=review_md_candidates,
+            reviewer_json_paths=review_json_candidates,
+        )
+    for candidate in (*review_json_candidates, *review_md_candidates):
+        if candidate.is_file():
+            candidate.unlink()
+            removed.append(str(candidate.resolve()))
     for candidate in (
         paths["merged_review_path"],
         paths["ba_feedback_path"],
@@ -948,6 +981,8 @@ def run_ba_turn_with_recovery(
                     requirement_name=effective_requirement_name,
                     previous_handoff=current_handoff,
                     progress=progress,
+                    required_reconfiguration=True,
+                    reason_text=f"{ba_display_name}已死亡，必须重新选择厂商/模型/推理/代理后从当前阶段继续。",
                 )
                 if replacement is None:
                     raise RuntimeError(f"{ba_display_name} 已死亡，且未能重建需求分析师") from error
@@ -1337,8 +1372,22 @@ def _run_reviewer_result_turn(
             provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             if is_worker_death_error(error):
-                message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
-                return None
+                replacement = recreate_task_split_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=current_reviewer,
+                    reviewer_spec=reviewer_spec or TaskSplitReviewerSpec(
+                        role_name=current_reviewer.reviewer_name,
+                        role_prompt="",
+                        reviewer_key=current_reviewer.reviewer_name,
+                    ),
+                    progress=progress,
+                )
+                if replacement is None:
+                    message(f"{reviewer_display_name} 已死亡，用户选择不重建，当前阶段将忽略该审核智能体。")
+                    return None
+                current_reviewer = replacement
+                continue
             if auth_error or provider_runtime_error or ready_timeout_error:
                 reason_text = (
                     f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
@@ -1407,8 +1456,22 @@ def _run_reviewer_turn_with_resume(
             provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             if is_worker_death_error(error):
-                message(f"{reviewer_display_name} 已死亡，当前阶段将忽略该审核智能体。")
-                return None
+                replacement = recreate_task_split_reviewer_runtime(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer=current_reviewer,
+                    reviewer_spec=reviewer_spec or TaskSplitReviewerSpec(
+                        role_name=current_reviewer.reviewer_name,
+                        role_prompt="",
+                        reviewer_key=current_reviewer.reviewer_name,
+                    ),
+                    progress=progress,
+                )
+                if replacement is None:
+                    message(f"{reviewer_display_name} 已死亡，用户选择不重建，当前阶段将忽略该审核智能体。")
+                    return None
+                current_reviewer = replacement
+                continue
             if auth_error or provider_runtime_error or ready_timeout_error:
                 reason_text = (
                     f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
@@ -1432,7 +1495,7 @@ def _run_reviewer_turn_with_resume(
                     reason_text=reason_text,
                 )
                 if replacement is None:
-                    raise RuntimeError(f"{reviewer_display_name} 无法继续，自动恢复失败") from error
+                    raise RuntimeError(f"{reviewer_display_name} 无法继续，系统不会自动恢复，请人工介入处理。") from error
                 current_reviewer = replacement
                 continue
             raise
@@ -1527,6 +1590,7 @@ def repair_reviewer_outputs(
     project_dir: str | Path,
     requirement_name: str,
     round_index: int,
+    progress: ReviewStageProgress | None = None,
 ) -> list[ReviewerRuntime]:
     json_pattern = f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json"
     md_pattern = f"{sanitize_requirement_name(requirement_name)}_任务单评审记录_*.md"
@@ -1552,6 +1616,8 @@ def repair_reviewer_outputs(
         max_attempts=MAX_REVIEWER_REPAIR_ATTEMPTS,
         error_prefix="任务拆分审核智能体修复输出失败:",
         final_error="任务拆分审核智能体多次修复后仍未按协议更新文档",
+        stage_label=TASK_SPLIT_TASK_NAME,
+        progress=progress,
     )
 
 
@@ -1568,6 +1634,23 @@ def _active_reviewer_files(reviewers: Sequence[ReviewerRuntime]) -> tuple[list[s
     return json_files, md_files
 
 
+def _reviewer_audit_metadata(reviewers: Sequence[ReviewerRuntime], *, trigger: str = "") -> dict[str, object]:
+    agent_names: list[str] = []
+    session_names: list[str] = []
+    for reviewer in reviewers:
+        reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
+        if reviewer_name:
+            agent_names.append(reviewer_name)
+        session_name = str(getattr(getattr(reviewer, "worker", None), "session_name", "") or "").strip()
+        if session_name:
+            session_names.append(session_name)
+    return {
+        "trigger": trigger,
+        "agent_names": agent_names,
+        "session_names": session_names,
+    }
+
+
 def _replace_dead_task_split_ba(
     handoff: RequirementsAnalystHandoff,
     *,
@@ -1578,6 +1661,8 @@ def _replace_dead_task_split_ba(
         project_dir=project_dir,
         previous_handoff=handoff,
         progress=progress,
+        required_reconfiguration=True,
+        reason_text="主工作智能体已死亡，必须重新选择厂商/模型/推理/代理后从当前阶段继续。",
     )
     if replacement is None:
         ba_display_name = _task_split_ba_display_name(project_dir=project_dir, handoff=handoff)
@@ -1592,8 +1677,21 @@ def run_ba_modify_loop(
     paths: dict[str, Path],
     review_msg: str,
     progress: ReviewStageProgress | None = None,
+    audit_context: StageAuditRunContext | None = None,
+    review_round_index: int | None = None,
 ) -> RequirementsAnalystHandoff:
     current_handoff = handoff
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {
+                "ask_human": paths["ask_human_path"],
+                "ba_feedback": paths["ba_feedback_path"],
+                "task_json": paths["task_json_path"],
+            },
+            metadata={"trigger": "task_split_modify_prepare"},
+            review_round_index=review_round_index,
+        )
     ensure_empty_file(paths["ask_human_path"])
     ensure_empty_file(paths["ba_feedback_path"])
     ensure_empty_file(paths["task_json_path"])
@@ -1617,6 +1715,15 @@ def run_ba_modify_loop(
     for hitl_round in range(1, MAX_TASK_SPLIT_HITL_ROUNDS + 1):
         if not get_markdown_content(paths["ask_human_path"]).strip():
             return current_handoff
+        if audit_context is not None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="hitl_question",
+                source_paths={"ask_human": paths["ask_human_path"]},
+                hitl_round_index=hitl_round,
+                review_round_index=review_round_index,
+                metadata={"trigger": "task_split_modify_hitl"},
+            )
         human_msg = collect_review_limit_hitl_response(
             paths["ask_human_path"],
             stage_label=TASK_SPLIT_TASK_NAME,
@@ -1624,6 +1731,29 @@ def run_ba_modify_loop(
             answer_path=paths["hitl_record_path"],
             progress=progress,
         )
+        if audit_context is not None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="hitl_answer",
+                source_paths={
+                    "human_answer": "",
+                    "hitl_record": paths["hitl_record_path"],
+                },
+                hitl_round_index=hitl_round,
+                review_round_index=review_round_index,
+                metadata={
+                    "trigger": "task_split_modify_hitl",
+                    "human_answer_source": "runtime_payload",
+                },
+                snapshot_overrides={"human_answer": human_msg},
+            )
+            record_before_cleanup(
+                audit_context,
+                {"ask_human": paths["ask_human_path"]},
+                metadata={"trigger": "task_split_hitl_reply_prepare"},
+                hitl_round_index=hitl_round,
+                review_round_index=review_round_index,
+            )
         ensure_empty_file(paths["ask_human_path"])
         if progress is not None:
             progress.set_phase("任务拆分 / 处理 HITL 回复")
@@ -1653,10 +1783,50 @@ def run_task_split_review_limit_hitl_loop(
     review_limit: int,
     review_rounds_used: int,
     progress: ReviewStageProgress | None = None,
+    human_input_provider=None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> object:
     current_handoff = handoff
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {
+                "ask_human": paths["ask_human_path"],
+                "ba_feedback": paths["ba_feedback_path"],
+            },
+            metadata={"trigger": "task_split_review_limit_hitl_prepare"},
+        )
     ensure_empty_file(paths["ask_human_path"])
     ensure_empty_file(paths["ba_feedback_path"])
+
+    def audit_hitl_question(hitl_round: int, ask_human_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_question",
+            source_paths={"ask_human": ask_human_file},
+            hitl_round_index=hitl_round,
+            metadata={"trigger": "task_split_review_limit_hitl"},
+        )
+
+    def audit_hitl_answer(hitl_round: int, human_msg: str, hitl_record_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_answer",
+            source_paths={
+                "human_answer": "",
+                "hitl_record": hitl_record_file,
+            },
+            hitl_round_index=hitl_round,
+            metadata={
+                "trigger": "task_split_review_limit_hitl",
+                "human_answer_source": "runtime_payload",
+            },
+            snapshot_overrides={"human_answer": human_msg},
+        )
 
     def initial_turn() -> object:
         nonlocal current_handoff
@@ -1707,8 +1877,11 @@ def run_task_split_review_limit_hitl_loop(
         hitl_record_path=paths["hitl_record_path"],
         initial_turn=initial_turn,
         human_reply_turn=human_reply_turn,
+        human_input_provider=human_input_provider,
         progress=progress,
         max_hitl_rounds=MAX_TASK_SPLIT_HITL_ROUNDS,
+        on_hitl_question=audit_hitl_question,
+        on_hitl_answer=audit_hitl_answer,
     )
     return result
 
@@ -1719,8 +1892,15 @@ def generate_task_split_json(
     project_dir: str | Path,
     paths: dict[str, Path],
     progress: ReviewStageProgress | None = None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> RequirementsAnalystHandoff:
     current_handoff = handoff
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"task_json": paths["task_json_path"]},
+            metadata={"trigger": "generate_task_split_json_prepare"},
+        )
     ensure_empty_file(paths["task_json_path"])
     if progress is not None:
         progress.set_phase("任务拆分 / 生成任务单 JSON")
@@ -1736,6 +1916,12 @@ def generate_task_split_json(
     ]
     last_error: Exception | None = None
     for attempt in range(1, MAX_TASK_SPLIT_JSON_REPAIR_ATTEMPTS + 1):
+        if audit_context is not None:
+            record_before_cleanup(
+                audit_context,
+                {"task_json": paths["task_json_path"]},
+                metadata={"trigger": "generate_task_split_json_attempt", "attempt": attempt},
+            )
         ensure_empty_file(paths["task_json_path"])
         prompt = prompts[0] if attempt == 1 else prompts[1]
         try:
@@ -1770,7 +1956,6 @@ def _shutdown_workers(
         ba_handoff,
         reviewers,
         cleanup_runtime=cleanup_runtime,
-        runtime_root_filter=build_task_split_runtime_root(project_dir, requirement_name),
     )
 
 
@@ -1797,6 +1982,7 @@ def run_task_split_stage(
     active_reviewer_handoff = tuple(reviewer_handoff or ())
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_paths: tuple[str, ...] = ()
+    audit_context: StageAuditRunContext | None = None
     lock_context = requirement_concurrency_lock(
         project_dir,
         requirement_name,
@@ -1804,6 +1990,16 @@ def run_task_split_stage(
     )
     lock_context.__enter__()
     try:
+        audit_context = begin_stage_audit_run(
+            project_dir,
+            requirement_name,
+            "A06",
+            metadata={
+                "trigger": "run_task_split_stage",
+                "argv": list(argv or []),
+                "args": vars(args),
+            },
+        )
         paths, active_ba_handoff, active_reviewer_handoff = ensure_task_split_inputs(
             args,
             project_dir=project_dir,
@@ -1826,9 +2022,19 @@ def run_task_split_stage(
         if existing_task_split_mode == "skip":
             message(f"检测到已存在《{paths['task_md_path'].name}》与《{paths['task_json_path'].name}》")
             message("用户选择跳过任务拆分阶段")
-            cleanup_paths = cleanup_stale_detailed_design_runtime_state(project_dir, requirement_name)
+            cleanup_paths = cleanup_stale_task_split_runtime_state(project_dir, requirement_name)
             update_pre_development_task_status(project_dir, requirement_name, task_key="任务拆分", completed=True)
             message("已将任务拆分标记为完成，继续后续阶段")
+            append_stage_audit_record(
+                audit_context,
+                event_type="stage_passed",
+                source_paths={
+                    "merged_review": paths["merged_review_path"],
+                    "ba_feedback": paths["ba_feedback_path"],
+                    "task_md": paths["task_md_path"],
+                    "task_json": paths["task_json_path"],
+                },
+            )
             return TaskSplitStageResult(
                 project_dir=project_dir,
                 requirement_name=requirement_name,
@@ -1848,6 +2054,7 @@ def run_task_split_stage(
             requirement_name,
             clear_task_md=existing_task_split_mode == "rerun",
             clear_task_json=existing_task_split_mode == "rerun",
+            audit_context=audit_context,
         )
         reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"任务拆分审核智能体 {index}"  # noqa: E731
         review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
@@ -2037,6 +2244,7 @@ def run_task_split_stage(
                         project_dir=project_dir,
                         requirement_name=requirement_name,
                         round_index=round_index,
+                        progress=progress,
                     ),
                     replace_dead_main_owner=lambda owner: _replace_dead_task_split_ba(
                         owner,
@@ -2091,6 +2299,8 @@ def run_task_split_stage(
                             paths=paths,
                             review_msg=review_msg,
                             progress=progress,
+                            audit_context=audit_context,
+                            review_round_index=round_index,
                         ),
                         replace_dead_main_owner=lambda owner: _replace_dead_task_split_ba(
                             owner,
@@ -2103,6 +2313,16 @@ def run_task_split_stage(
                     )
                 post_hitl_continue_completed = False
                 ba_reply = _read_required_task_split_ba_feedback(paths)
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="feedback_written",
+                    source_paths={
+                        "ba_feedback": paths["ba_feedback_path"],
+                        "merged_review": paths["merged_review_path"],
+                    },
+                    review_round_index=round_index,
+                    metadata={"trigger": "task_split_feedback"},
+                )
 
                 def again_prompt_builder(reviewer: ReviewerRuntime, reviewer_spec: TaskSplitReviewerSpec) -> str:
                     del reviewer_spec
@@ -2145,6 +2365,7 @@ def run_task_split_stage(
                         project_dir=project_dir,
                         requirement_name=requirement_name,
                         round_index=round_index,
+                        progress=progress,
                     ),
                     replace_dead_main_owner=lambda owner: _replace_dead_task_split_ba(
                         owner,
@@ -2168,6 +2389,15 @@ def run_task_split_stage(
                 md_output_name=paths["merged_review_path"].name,
                 json_files=review_json_files,
                 md_files=review_md_files,
+            )
+            append_stage_audit_record(
+                audit_context,
+                event_type="review_merged",
+                source_paths={"merged_review": paths["merged_review_path"]},
+                reviewer_markdown_paths=review_md_files,
+                reviewer_json_paths=review_json_files,
+                review_round_index=round_index,
+                metadata=_reviewer_audit_metadata(reviewer_workers, trigger="task_done"),
             )
             if passed:
                 current_task_md_hash = _task_md_content_hash(paths["task_md_path"])
@@ -2216,6 +2446,7 @@ def run_task_split_stage(
                                 project_dir=project_dir,
                                 paths=paths,
                                 progress=progress,
+                                audit_context=audit_context,
                             ),
                             replace_dead_main_owner=lambda owner: _replace_dead_task_split_ba(
                                 owner,
@@ -2230,6 +2461,17 @@ def run_task_split_stage(
                     update_pre_development_task_status(project_dir, requirement_name, task_key="任务拆分", completed=False)
                     raise
                 mark_task_split_completed(project_dir, requirement_name)
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="stage_passed",
+                    source_paths={
+                        "merged_review": paths["merged_review_path"],
+                        "ba_feedback": paths["ba_feedback_path"],
+                        "task_md": paths["task_md_path"],
+                        "task_json": paths["task_json_path"],
+                    },
+                    review_round_index=round_index,
+                )
                 cleanup_paths = _shutdown_workers(
                     active_ba_handoff,
                     reviewer_workers,
@@ -2263,6 +2505,14 @@ def run_task_split_stage(
                         review_limit=review_round_policy.max_rounds,
                         review_rounds_used=review_round_policy.quota_count,
                         progress=progress,
+                        human_input_provider=(
+                            lambda question_path, hitl_round: collect_auto_review_limit_hitl_response(
+                                question_path,
+                                stage_label="任务拆分评审超限",
+                                hitl_round=hitl_round,
+                            )
+                        ) if bool(getattr(args, "yes", False)) else None,
+                        audit_context=audit_context,
                     ),
                     owner_getter=lambda result: result.owner,
                     replace_dead_main_owner=lambda owner: _replace_dead_task_split_ba(
@@ -2277,7 +2527,19 @@ def run_task_split_stage(
                 post_hitl_continue_completed = bool(getattr(hitl_result, "post_hitl_continue_completed", False))
                 review_round_policy.reset_after_hitl()
             round_index += 1
-    except Exception:
+    except Exception as error:
+        stage_failed_paths = paths if "paths" in locals() else build_task_split_paths(project_dir, requirement_name)
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_failed",
+            source_paths={
+                "merged_review": stage_failed_paths["merged_review_path"],
+                "ba_feedback": stage_failed_paths["ba_feedback_path"],
+                "task_md": stage_failed_paths["task_md_path"],
+                "task_json": stage_failed_paths["task_json_path"],
+            },
+            metadata={"error": str(error)},
+        )
         _shutdown_workers(
             active_ba_handoff,
             reviewer_workers,

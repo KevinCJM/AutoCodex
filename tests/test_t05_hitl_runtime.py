@@ -450,6 +450,149 @@ class HitlRuntimeTests(unittest.TestCase):
             ],
         )
 
+    def test_run_hitl_agent_loop_invokes_optional_hitl_callbacks_without_protocol_change(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_path = root / "output.md"
+            question_path = root / "question.md"
+            record_path = root / "record.md"
+            stage_status_path = root / "status.json"
+            turns_root = root / "turns"
+            question_path.write_text("旧问题\n", encoding="utf-8")
+
+            def behavior(worker, label, prompt, completion_contract, timeout_sec):  # noqa: ANN001
+                stage_status = stage_status_path
+                if worker.turn_calls == 1:
+                    question_path.write_text("需要补充\n", encoding="utf-8")
+                    record_path.write_text("待确认\n", encoding="utf-8")
+                    _write_stage_status(
+                        stage_status,
+                        stage="demo_stage",
+                        turn_id=completion_contract.turn_id,
+                        hitl_round=1,
+                        status=HITL_STATUS_HITL,
+                        output_path=None,
+                        question_path=question_path,
+                        record_path=record_path,
+                        summary="need hitl",
+                    )
+                    _write_turn_status(
+                        completion_contract.status_path,
+                        turn_id=completion_contract.turn_id,
+                        phase="demo_phase",
+                        stage_status_path=stage_status,
+                        artifact_paths=[question_path, record_path],
+                    )
+                else:
+                    output_path.write_text("最终正文\n", encoding="utf-8")
+                    record_path.write_text("已确认\n", encoding="utf-8")
+                    _write_stage_status(
+                        stage_status,
+                        stage="demo_stage",
+                        turn_id=completion_contract.turn_id,
+                        hitl_round=2,
+                        status=HITL_STATUS_COMPLETED,
+                        output_path=output_path,
+                        question_path=None,
+                        record_path=record_path,
+                        summary="done",
+                    )
+                    _write_turn_status(
+                        completion_contract.status_path,
+                        turn_id=completion_contract.turn_id,
+                        phase="demo_phase",
+                        stage_status_path=stage_status,
+                        artifact_paths=[output_path, record_path],
+                    )
+
+            worker = _FakeWorker(behavior, runtime_dir=root / "runtime")
+            events: list[tuple[str, object, object]] = []
+
+            result = run_hitl_agent_loop(
+                worker=worker,
+                stage_name="demo_stage",
+                output_path=output_path,
+                question_path=question_path,
+                record_path=record_path,
+                stage_status_path=stage_status_path,
+                turns_root=turns_root,
+                initial_prompt_builder=lambda context: f"initial::{context.turn_id}",
+                hitl_prompt_builder=lambda human_msg, context: f"followup::{human_msg}::{context.turn_id}",
+                label_prefix="demo_turn",
+                turn_phase="demo_phase",
+                human_input_provider=lambda path, hitl_round: "补充说明",
+                on_before_question_clear=lambda context: events.append(
+                    ("before_clear", context.hitl_round, Path(context.question_path).read_text(encoding="utf-8"))
+                ),
+                on_hitl_question=lambda context, decision: events.append(
+                    ("question", context.hitl_round, Path(decision.question_path).read_text(encoding="utf-8"))
+                ),
+                on_hitl_answer=lambda context, human_msg, answer_path: events.append(
+                    ("answer", human_msg, answer_path.read_text(encoding="utf-8"))
+                ),
+            )
+
+        self.assertEqual(result.decision.status, HITL_STATUS_COMPLETED)
+        self.assertEqual(
+            events,
+            [
+                ("before_clear", 1, "旧问题\n"),
+                ("question", 1, "需要补充\n"),
+                ("answer", "补充说明", "补充说明\n"),
+                ("before_clear", 2, "需要补充\n"),
+            ],
+        )
+
+    def test_run_hitl_agent_loop_callback_failure_only_warns(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_path = root / "output.md"
+            question_path = root / "question.md"
+            record_path = root / "record.md"
+            stage_status_path = root / "status.json"
+            turns_root = root / "turns"
+
+            def behavior(worker, label, prompt, completion_contract, timeout_sec):  # noqa: ANN001
+                output_path.write_text("最终正文\n", encoding="utf-8")
+                _write_stage_status(
+                    stage_status_path,
+                    stage="demo_stage",
+                    turn_id=completion_contract.turn_id,
+                    hitl_round=1,
+                    status=HITL_STATUS_COMPLETED,
+                    output_path=output_path,
+                    question_path=None,
+                    record_path=None,
+                    summary="done",
+                )
+                _write_turn_status(
+                    completion_contract.status_path,
+                    turn_id=completion_contract.turn_id,
+                    phase="demo_phase",
+                    stage_status_path=stage_status_path,
+                    artifact_paths=[output_path],
+                )
+
+            worker = _FakeWorker(behavior, runtime_dir=root / "runtime")
+            with patch("T05_hitl_runtime.message") as message_mock:
+                result = run_hitl_agent_loop(
+                    worker=worker,
+                    stage_name="demo_stage",
+                    output_path=output_path,
+                    question_path=question_path,
+                    record_path=record_path,
+                    stage_status_path=stage_status_path,
+                    turns_root=turns_root,
+                    initial_prompt_builder=lambda context: f"initial::{context.turn_id}",
+                    hitl_prompt_builder=lambda human_msg, context: f"followup::{human_msg}::{context.turn_id}",
+                    label_prefix="demo_turn",
+                    turn_phase="demo_phase",
+                    on_before_question_clear=lambda context: (_ for _ in ()).throw(RuntimeError("boom")),
+                )
+
+        self.assertEqual(result.decision.status, HITL_STATUS_COMPLETED)
+        message_mock.assert_called()
+
     def test_run_hitl_agent_loop_notifies_worker_starting_before_ready(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -709,6 +852,70 @@ class HitlRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(result.rounds_used, 2)
         self.assertEqual(result.decision.status, HITL_STATUS_COMPLETED)
+
+    def test_run_hitl_agent_loop_repairs_contract_failure_same_round(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_path = root / "output.md"
+            question_path = root / "question.md"
+            record_path = root / "record.md"
+            stage_status_path = root / "status.json"
+            turns_root = root / "turns"
+
+            class RepairWorker:
+                def __init__(self) -> None:
+                    self.runtime_dir = root / "runtime"
+                    self.ensure_ready_calls = 0
+                    self.turn_calls = 0
+                    self.prompts: list[str] = []
+
+                def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ANN001
+                    self.ensure_ready_calls += 1
+                    return None
+
+                def run_turn(self, *, label, prompt, completion_contract, timeout_sec):  # noqa: ANN001, ARG002
+                    self.turn_calls += 1
+                    self.prompts.append(prompt)
+                    if self.turn_calls == 1:
+                        return type(
+                            "CommandResult",
+                            (),
+                            {
+                                "ok": False,
+                                "clean_output": (
+                                    "turn artifacts contract violation after task completion: "
+                                    f"phase=demo_phase status_path={completion_contract.status_path} runtime_stalled"
+                                ),
+                                "exit_code": 1,
+                            },
+                        )()
+                    output_path.write_text("最终正文\n", encoding="utf-8")
+                    question_path.write_text("", encoding="utf-8")
+                    record_path.write_text("- [已确认] 默认边界\n", encoding="utf-8")
+                    completion_contract.validator(completion_contract.status_path)
+                    return type("CommandResult", (), {"ok": True, "clean_output": "", "exit_code": 0})()
+
+            worker = RepairWorker()
+            result = run_hitl_agent_loop(
+                worker=worker,
+                stage_name="demo_stage",
+                output_path=output_path,
+                question_path=question_path,
+                record_path=record_path,
+                stage_status_path=stage_status_path,
+                turns_root=turns_root,
+                initial_prompt_builder=lambda context: f"initial::{context.turn_id}",
+                hitl_prompt_builder=lambda human_msg, context: f"followup::{human_msg}::{context.turn_id}",
+                label_prefix="demo_turn",
+                turn_phase="demo_phase",
+                human_input_provider=lambda path, round_index: "unused",
+            )
+
+        self.assertEqual(result.rounds_used, 1)
+        self.assertEqual(result.decision.status, HITL_STATUS_COMPLETED)
+        self.assertEqual(worker.turn_calls, 2)
+        self.assertIn("HITL 文件契约未通过校验", worker.prompts[1])
+        self.assertIn(str(output_path.resolve()), worker.prompts[1])
 
     def test_run_hitl_agent_loop_enters_hitl_when_question_exists_and_record_file_is_empty(self):
         with tempfile.TemporaryDirectory() as tmpdir:

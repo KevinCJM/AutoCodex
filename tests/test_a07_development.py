@@ -13,6 +13,7 @@ from A07_Development import (
     DevelopmentStageResult,
     DeveloperPlan,
     DeveloperRuntime,
+    _development_review_human_override_requested,
     _build_reviewer_protocol_repair_prompt,
     _build_reviewer_turn_goal,
     _shutdown_workers as shutdown_development_workers,
@@ -21,25 +22,33 @@ from A07_Development import (
     _replace_dead_developer_with_bootstrap,
     build_reviewer_completion_contract,
     build_developer_review_feedback_result_contract,
+    build_developer_init_prompt,
     build_development_paths,
     build_development_runtime_root,
     build_parser,
+    build_reviewer_artifact_paths,
+    build_reviewer_init_prompt,
     cleanup_stale_development_runtime_state,
     create_developer_runtime,
     create_reviewer_runtime,
     develop_current_task,
+    apply_development_review_human_override,
     ensure_developer_metadata,
     ensure_development_inputs,
     initialize_development_workers,
     prepare_review_round_artifacts,
+    repair_reviewer_outputs,
     recreate_developer_runtime,
     recreate_development_workers,
     refine_current_task,
     recreate_development_reviewer_runtime,
     resolve_developer_max_turns,
+    resolve_developer_role_prompt,
     resolve_review_max_rounds,
     run_development_stage,
     run_developer_hitl_loop,
+    run_reviewer_turn_with_recreation,
+    fintech_developer_role,
 )
 from tmux_core.runtime.contracts import TaskResultContract, TurnFileContract, TurnFileResult
 from tmux_core.runtime.tmux_runtime import CommandResult, TURN_ARTIFACT_CONTRACT_ERROR_PREFIX
@@ -85,6 +94,19 @@ class _ReconfigurableWorker(_FakeWorker):
 
     def mark_awaiting_reconfiguration(self, *, reason_text: str) -> None:
         self.reconfig_reason = reason_text
+
+
+class _LiveReadyWorker(_FakeWorker):
+    def read_state(self):
+        return {
+            "status": "failed",
+            "result_status": "failed",
+            "agent_state": "READY",
+            "health_status": "alive",
+        }
+
+    def get_agent_state(self):
+        return type("State", (), {"value": "READY"})()
 
 
 class _FreshReviewerWorker:
@@ -141,6 +163,64 @@ def _write_required_inputs(paths: dict[str, Path]) -> None:
 
 
 class A07DevelopmentTests(unittest.TestCase):
+    def test_repair_reviewer_outputs_accepts_progress_object(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            review_md_path, review_json_path = build_reviewer_artifact_paths(project_dir, "需求A", "测试工程师-天寿星")
+            worker = _FakeWorker(
+                session_name="测试工程师-天寿星",
+                runtime_root=project_dir / ".runtime",
+                runtime_dir=project_dir / ".runtime" / "worker",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt", "high", ""),
+                worker=worker,
+                review_md_path=review_md_path,
+                review_json_path=review_json_path,
+                contract=_dummy_contract(),
+            )
+            progress = object()
+            captured: dict[str, object] = {}
+
+            def fake_repair(reviewer_list, **kwargs):
+                captured["progress"] = kwargs.get("progress")
+                return list(reviewer_list)
+
+            with patch("A07_Development.repair_reviewer_round_outputs", side_effect=fake_repair):
+                result = repair_reviewer_outputs(
+                    [reviewer],
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": DevelopmentReviewerSpec(role_name="测试工程师", role_prompt="测试")},
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M1-T3",
+                    round_index=1,
+                    progress=progress,
+                )
+
+        self.assertEqual(result, [reviewer])
+        self.assertIs(captured["progress"], progress)
+
+    def test_initialization_prompts_do_not_append_task_routing_assessment(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = build_development_paths(Path(tmp_dir), "需求A")
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="审核角色",
+                reviewer_key="测试工程师",
+            )
+
+            developer_prompt = build_developer_init_prompt(paths, role_prompt="开发角色")
+            reviewer_prompt = build_reviewer_init_prompt(paths, reviewer_spec=reviewer_spec)
+
+            for prompt in (developer_prompt, reviewer_prompt):
+                self.assertIn("准备就绪", prompt)
+                self.assertIn("禁止", prompt)
+                self.assertNotIn("Task Routing Assessment", prompt)
+                self.assertNotIn("Output the Task Routing Assessment first", prompt)
+
     def test_prepare_review_round_artifacts_precreates_empty_review_json(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -162,6 +242,101 @@ class A07DevelopmentTests(unittest.TestCase):
             self.assertEqual(paths["merged_review_path"].read_text(encoding="utf-8"), "")
             self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
             self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [])
+
+    def test_prepare_review_round_artifacts_preserves_existing_valid_task_review(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            paths["merged_review_path"].write_text("stale", encoding="utf-8")
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天寿星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-天寿星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
+                contract=_dummy_contract(),
+            )
+            reviewer.review_md_path.write_text("", encoding="utf-8")
+            reviewer.review_json_path.write_text(
+                json.dumps([{"task_name": "M1-T3", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            prepare_review_round_artifacts(paths, [reviewer], task_name="M1-T3")
+
+            self.assertEqual(paths["merged_review_path"].read_text(encoding="utf-8"), "")
+            self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [{"task_name": "M1-T3", "review_pass": True}])
+
+    def test_development_review_human_override_detector_requires_scope_and_context(self):
+        self.assertTrue(
+            _development_review_human_override_requested(
+                "M3-T1 已人工验收通过；评审环境不可复现时按人工验收通过，review_pass 置为 true。",
+                task_name="M3-T1",
+            )
+        )
+        self.assertTrue(
+            _development_review_human_override_requested(
+                "这是评审误报。当前 task_counter.py 已通过 python3 -m py_compile。请忽略该失败评审，将 M3-T1 视为通过并继续。",
+                task_name="M3-T1",
+            )
+        )
+        self.assertTrue(
+            _development_review_human_override_requested(
+                "选择 A。继续沿用既有决策：该任务语法错误为评审误报，已通过 py_compile。请忽略该类重复失败评审，将 M3-T1 视为通过。",
+                task_name="M3-T1",
+            )
+        )
+        self.assertTrue(
+            _development_review_human_override_requested(
+                "M4-T2 评审中的 Unicode 新口径为本次范围外、非行动项，不新增需求，不阻塞当前任务，继续后续任务。",
+                task_name="M4-T2",
+            )
+        )
+        self.assertFalse(
+            _development_review_human_override_requested(
+                "已人工验收通过。",
+                task_name="M3-T1",
+            )
+        )
+        self.assertFalse(
+            _development_review_human_override_requested(
+                "M3-T2 已人工验收通过；评审环境不可复现。",
+                task_name="M3-T1",
+            )
+        )
+
+    def test_apply_development_review_human_override_marks_reviewers_passed(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            merged_review_path = project_dir / "需求A_代码评审记录.md"
+            merged_review_path.write_text("阻断意见", encoding="utf-8")
+            reviewer_a = SimpleNamespace(
+                review_md_path=project_dir / "需求A_代码评审记录_审核员A.md",
+                review_json_path=project_dir / "需求A_评审记录_审核员A.json",
+            )
+            reviewer_b = SimpleNamespace(
+                review_md_path=project_dir / "需求A_代码评审记录_审核员B.md",
+                review_json_path=project_dir / "需求A_评审记录_审核员B.json",
+            )
+            reviewer_a.review_md_path.write_text("pytest 环境失败", encoding="utf-8")
+            reviewer_b.review_md_path.write_text("旧意见", encoding="utf-8")
+            reviewer_a.review_json_path.write_text(
+                json.dumps([{"task_name": "M3-T1", "review_pass": False}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            reviewer_b.review_json_path.write_text("[]", encoding="utf-8")
+
+            apply_development_review_human_override(
+                task_name="M3-T1",
+                reviewer_workers=[reviewer_a, reviewer_b],
+                merged_review_path=merged_review_path,
+            )
+
+            for reviewer in (reviewer_a, reviewer_b):
+                self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
+                review_payload = json.loads(reviewer.review_json_path.read_text(encoding="utf-8"))
+                self.assertIn({"task_name": "M3-T1", "review_pass": True}, review_payload)
+            self.assertEqual(merged_review_path.read_text(encoding="utf-8"), "")
 
     def test_recreate_development_reviewer_runtime_retires_superseded_runtime(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -196,7 +371,10 @@ class A07DevelopmentTests(unittest.TestCase):
                 contract=_dummy_contract(),
             )
 
-            with patch("A07_Development.create_reviewer_runtime", return_value=replacement):
+            with patch("A07_Development.stdin_is_interactive", return_value=True), patch(
+                "A07_Development.prompt_replacement_review_agent_selection",
+                return_value=reviewer.selection,
+            ) as prompt_replace, patch("A07_Development.create_reviewer_runtime", return_value=replacement):
                 returned = recreate_development_reviewer_runtime(
                     project_dir=project_dir,
                     requirement_name="需求A",
@@ -209,9 +387,152 @@ class A07DevelopmentTests(unittest.TestCase):
                     force_model_change=False,
                 )
             self.assertIs(returned, replacement)
+            prompt_replace.assert_called_once()
             self.assertTrue(reviewer.worker.killed)
             self.assertFalse(old_runtime_dir.exists())
             self.assertTrue(new_runtime_dir.exists())
+
+    def test_reviewer_turn_rebuilds_prompt_after_replacement(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            old_reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-旧星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-旧星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-旧星.json",
+                contract=_dummy_contract(),
+            )
+            new_reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=old_reviewer.selection,
+                worker=_FakeWorker(session_name="测试工程师-新星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-新星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-新星.json",
+                contract=_dummy_contract(),
+            )
+            prompts: list[str] = []
+
+            def death_then_success(**kwargs):  # noqa: ANN001
+                prompts.append(kwargs["prompt"])
+                if len(prompts) == 1:
+                    raise RuntimeError("tmux pane died")
+                return {}
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=death_then_success,
+            ), patch(
+                "A07_Development.recreate_development_reviewer_runtime",
+                return_value=new_reviewer,
+            ), patch(
+                "A07_Development._run_single_reviewer_initialization",
+                return_value=new_reviewer,
+            ):
+                result = run_reviewer_turn_with_recreation(
+                    old_reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M3-T1",
+                    reviewer_spec=DevelopmentReviewerSpec(
+                        role_name="测试工程师",
+                        role_prompt="测试视角",
+                        reviewer_key="测试工程师",
+                    ),
+                    paths=paths,
+                    reviewer_specs_by_name={
+                        "测试工程师": DevelopmentReviewerSpec(
+                            role_name="测试工程师",
+                            role_prompt="测试视角",
+                            reviewer_key="测试工程师",
+                        )
+                    },
+                    label="development_review_again_M3-T1_测试工程师_round_2",
+                    prompt_builder=lambda reviewer: f"write {reviewer.review_json_path.name}",
+                )
+
+        self.assertIs(result, new_reviewer)
+        self.assertEqual(prompts, ["write 需求A_评审记录_测试工程师-旧星.json", "write 需求A_评审记录_测试工程师-新星.json"])
+
+    def test_live_reviewer_non_death_failure_does_not_prompt_recreation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_LiveReadyWorker(session_name="测试工程师-天寿星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-天寿星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=RuntimeError("协议输出不合规"),
+            ), patch("A07_Development.recreate_development_reviewer_runtime") as recreate_runtime:
+                result = run_reviewer_turn_with_recreation(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M3-T1",
+                    reviewer_spec=reviewer_spec,
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                    label="development_review_M3-T1_测试工程师",
+                )
+
+        recreate_runtime.assert_not_called()
+        self.assertIsNone(result)
+
+    def test_reviewer_turn_reuses_existing_valid_output_without_rerun(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_LiveReadyWorker(session_name="测试工程师-天寿星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-天寿星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
+                contract=_dummy_contract(),
+            )
+            reviewer.review_md_path.write_text("", encoding="utf-8")
+            reviewer.review_json_path.write_text(
+                json.dumps([{"task_name": "M1-T3", "review_pass": True}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=AssertionError("should not rerun completed reviewer"),
+            ):
+                result = run_reviewer_turn_with_recreation(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M1-T3",
+                    reviewer_spec=reviewer_spec,
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                    label="development_review_M1-T3_测试工程师",
+                )
+
+        self.assertIs(result, reviewer)
 
     def test_reviewer_protocol_repair_prompt_uses_check_reviewer_job_for_exact_paths(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -327,6 +648,20 @@ class A07DevelopmentTests(unittest.TestCase):
 
         self.assertEqual(value, 8)
         prompt_mock.assert_called_once()
+
+    def test_resolve_developer_role_prompt_yes_uses_default_without_prompt(self):
+        args = build_parser().parse_args(["--yes"])
+
+        with patch(
+            "tmux_core.stage_kernel.shared_review.prompt_yes_no_choice",
+            side_effect=AssertionError("should not prompt"),
+        ), patch(
+            "A07_Development._prompt_reviewer_text",
+            side_effect=AssertionError("should not prompt"),
+        ):
+            value = resolve_developer_role_prompt(args)
+
+        self.assertEqual(value, fintech_developer_role)
 
     def test_build_developer_review_feedback_result_contract_uses_file_contract_only(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -469,18 +804,16 @@ class A07DevelopmentTests(unittest.TestCase):
             ) as create_runtime, patch(
                 "A07_Development.prompt_replacement_review_agent_selection",
             ) as prompt_replace:
-                recreated = recreate_developer_runtime(
-                    project_dir=tmp_dir,
-                    developer=original,
-                    progress=None,
-                )
+                with self.assertRaises(RuntimeError) as raised:
+                    recreate_developer_runtime(
+                        project_dir=tmp_dir,
+                        developer=original,
+                        progress=None,
+                    )
 
-        self.assertIs(recreated, replacement)
+        self.assertIn("需要人工选择厂商/模型/推理/代理", str(raised.exception))
         prompt_replace.assert_not_called()
-        create_runtime.assert_called_once()
-        kwargs = create_runtime.call_args.kwargs
-        self.assertEqual(kwargs["selection"], original.selection)
-        self.assertEqual(kwargs["role_prompt"], original.role_prompt)
+        create_runtime.assert_not_called()
 
     def test_run_development_stage_resolves_review_max_rounds_before_runtime_creation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1995,6 +2328,9 @@ class A07DevelopmentTests(unittest.TestCase):
                 "A07_Development.recreate_development_workers",
                 return_value=(developer2, reviewers2, ("cleanup/runtime1",)),
             ) as recreate_workers, patch(
+                "A07_Development.request_worker_manual_intervention",
+                return_value="recheck_after_manual_intervention",
+            ) as manual_intervention, patch(
                 "A07_Development._shutdown_workers",
                 return_value=(),
             ):
@@ -2003,8 +2339,9 @@ class A07DevelopmentTests(unittest.TestCase):
                 )
 
         self.assertTrue(result.completed)
-        recreate_workers.assert_called_once()
-        self.assertEqual(used_developers, ["开发工程师-天魁星", "开发工程师-天罡星"])
+        recreate_workers.assert_not_called()
+        manual_intervention.assert_called_once()
+        self.assertEqual(used_developers, ["开发工程师-天魁星", "开发工程师-天魁星"])
 
     def test_run_development_stage_does_not_recreate_workers_when_turn_limit_is_infinite(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2353,6 +2690,27 @@ class A07DevelopmentTests(unittest.TestCase):
                 json.dumps({"session_name": "开发-遗留死亡", "agent_state": "DEAD"}, ensure_ascii=False),
                 encoding="utf-8",
             )
+            prelaunch_dir = runtime_root / "prelaunch-worker"
+            prelaunch_dir.mkdir(parents=True, exist_ok=True)
+            (prelaunch_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "session_name": "开发-预启动",
+                        "project_dir": str(root.resolve()),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a07.start",
+                        "status": "running",
+                        "result_status": "running",
+                        "workflow_stage": "pending",
+                        "agent_state": "DEAD",
+                        "agent_started": False,
+                        "pane_id": "",
+                        "health_status": "missing_session",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             killed_sessions: list[str] = []
 
             class FakeTmuxRuntimeController:
@@ -2368,6 +2726,7 @@ class A07DevelopmentTests(unittest.TestCase):
 
             self.assertFalse(target_dir.exists())
             self.assertFalse(legacy_dead_dir.exists())
+            self.assertTrue(prelaunch_dir.exists())
             self.assertTrue(other_requirement_dir.exists())
             self.assertTrue(legacy_live_dir.exists())
             self.assertIn("开发-当前需求", killed_sessions)

@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
@@ -72,8 +72,18 @@ from tmux_core.stage_kernel.death_orchestration import (
     run_main_phase_with_death_handling,
     run_reviewer_phase_with_death_handling,
 )
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_WORKER_DEAD,
+    request_worker_manual_intervention,
+)
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
+from tmux_core.stage_kernel.stage_audit import (
+    StageAuditRunContext,
+    append_stage_audit_record,
+    begin_stage_audit_run,
+    record_before_cleanup,
+)
 from tmux_core.stage_kernel.shared_review import (
     AGENT_READY_TIMEOUT_RETRY,
     AGENT_READY_TIMEOUT_SKIP,
@@ -87,6 +97,7 @@ from tmux_core.stage_kernel.shared_review import (
     ReviewAgentSelection,
     ReviewStageProgress,
     ReviewerRuntime,
+    collect_auto_review_limit_hitl_response,
     ensure_empty_file,
     ensure_review_artifacts,
     is_recoverable_startup_failure,
@@ -324,18 +335,42 @@ def build_reviewer_artifact_paths(project_dir: str | Path, requirement_name: str
     return review_md_path, review_json_path
 
 
-def cleanup_existing_development_artifacts(paths: dict[str, Path], requirement_name: str) -> tuple[str, ...]:
+def cleanup_existing_development_artifacts(
+    paths: dict[str, Path],
+    requirement_name: str,
+    audit_context: StageAuditRunContext | None = None,
+) -> tuple[str, ...]:
     project_root = paths["project_root"]
     safe_name = sanitize_requirement_name(requirement_name)
     removed: list[str] = []
+    review_json_candidates: list[Path] = []
+    review_md_candidates: list[Path] = []
     for pattern in (
         f"{safe_name}_评审记录_*.json",
         f"{safe_name}_代码评审记录_*.md",
     ):
         for candidate in project_root.glob(pattern):
             if candidate.is_file():
-                candidate.unlink()
-                removed.append(str(candidate.resolve()))
+                if candidate.suffix == ".json":
+                    review_json_candidates.append(candidate)
+                else:
+                    review_md_candidates.append(candidate)
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {
+                "ask_human": paths["ask_human_path"],
+                "developer_output": paths["developer_output_path"],
+                "merged_review": paths["merged_review_path"],
+            },
+            metadata={"trigger": "cleanup_existing_development_artifacts"},
+            reviewer_markdown_paths=review_md_candidates,
+            reviewer_json_paths=review_json_candidates,
+        )
+    for candidate in (*review_json_candidates, *review_md_candidates):
+        if candidate.is_file():
+            candidate.unlink()
+            removed.append(str(candidate.resolve()))
     for candidate in (
         paths["ask_human_path"],
         paths["developer_output_path"],
@@ -618,6 +653,8 @@ def resolve_developer_role_prompt(
     value = str(getattr(args, "developer_role_prompt", "") or "").strip()
     if value:
         return value
+    if bool(getattr(args, "yes", False)):
+        return fintech_developer_role
     if not stdin_is_interactive():
         return fintech_developer_role
     from tmux_core.stage_kernel.shared_review import prompt_yes_no_choice
@@ -701,13 +738,7 @@ def recreate_developer_runtime(
     if required_reconfiguration and not stdin_is_interactive():
         raise RuntimeError("开发工程师需要重新配置智能体，但当前环境无法交互选择厂商/模型。")
     if not required_reconfiguration and not stdin_is_interactive():
-        return create_developer_runtime(
-            project_dir=project_dir,
-            requirement_name=scope_requirement_name,
-            selection=developer.selection,
-            role_prompt=developer.role_prompt,
-            launch_coordinator=launch_coordinator,
-        )
+        raise RuntimeError("开发工程师已死亡，需要人工选择厂商/模型/推理/代理后才能重建。")
     developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
     selection = (
         prompt_required_replacement_review_agent_selection(
@@ -779,6 +810,7 @@ def prepare_developer_runtime(
 def build_developer_init_prompt(paths: dict[str, Path], *, role_prompt: str) -> str:
     return init_developer(
         role_prompt,
+        init_prompt="",
         ask_human_md=str(paths["ask_human_path"].resolve()),
         hitl_record_md=str(paths["hitl_record_path"].resolve()),
         requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
@@ -928,6 +960,7 @@ def build_development_review_limit_human_reply_prompt(
 def build_reviewer_init_prompt(paths: dict[str, Path], *, reviewer_spec: DevelopmentReviewerSpec) -> str:
     return init_code_reviewer(
         reviewer_spec.role_prompt,
+        init_prompt="",
         hitl_record_md=str(paths["hitl_record_path"].resolve()),
         requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
         detailed_design_md=str(paths["detailed_design_path"].resolve()),
@@ -1552,6 +1585,9 @@ def _run_single_reviewer_initialization(
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
             if is_worker_death_error(error):
+                if _worker_appears_live_for_reviewer_recovery(current_reviewer.worker):
+                    message(f"{reviewer_display_name} 当前仍存活但初始化失败，当前阶段将忽略该审核智能体。")
+                    return None
                 failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
                 failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
                 if reviewer_requires_manual_model_reconfiguration(failed_reviewer):
@@ -1659,6 +1695,7 @@ def initialize_development_workers(
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
     replace_dead_developer_for_init=None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> tuple[DeveloperRuntime, list[ReviewerRuntime]]:
     current_developer = developer
     reviewer_list = list(reviewers)
@@ -1687,6 +1724,7 @@ def initialize_development_workers(
             progress=progress,
             turn_policy=turn_policy,
             replace_dead_developer=replace_dead_developer,
+            audit_context=audit_context,
         )
     if initialize_reviewers:
         reviewer_list = _run_parallel_reviewer_initialization(
@@ -1734,6 +1772,7 @@ def run_developer_hitl_loop(
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> DeveloperRuntime:
     current_developer = developer
     payload = initial_payload
@@ -1742,12 +1781,41 @@ def run_developer_hitl_loop(
             return current_developer
         if not get_markdown_content(paths["ask_human_path"]).strip():
             return current_developer
+        if audit_context is not None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="hitl_question",
+                source_paths={"ask_human": paths["ask_human_path"]},
+                hitl_round_index=hitl_round,
+                metadata={"trigger": "developer_init_hitl"},
+            )
         human_msg = _collect_development_hitl_response(
             paths["ask_human_path"],
             hitl_round=hitl_round,
             answer_path=paths["hitl_record_path"],
             progress=progress,
         )
+        if audit_context is not None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="hitl_answer",
+                source_paths={
+                    "human_answer": "",
+                    "hitl_record": paths["hitl_record_path"],
+                },
+                hitl_round_index=hitl_round,
+                metadata={
+                    "trigger": "developer_init_hitl",
+                    "human_answer_source": "runtime_payload",
+                },
+                snapshot_overrides={"human_answer": human_msg},
+            )
+            record_before_cleanup(
+                audit_context,
+                {"ask_human": paths["ask_human_path"]},
+                metadata={"trigger": "developer_init_hitl_reply_prepare"},
+                hitl_round_index=hitl_round,
+            )
         ensure_empty_file(paths["ask_human_path"])
         current_developer, payload = _run_developer_result_turn(
             current_developer,
@@ -1773,8 +1841,49 @@ def run_development_review_limit_hitl_loop(
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
+    apply_human_review_override: Callable[[str], None] | None = None,
+    human_input_provider=None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> object:
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"ask_human": paths["ask_human_path"]},
+            metadata={"trigger": "development_review_limit_hitl_prepare"},
+            task_name=task_name,
+        )
     ensure_empty_file(paths["ask_human_path"])
+
+    def audit_hitl_question(hitl_round: int, ask_human_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_question",
+            source_paths={"ask_human": ask_human_file},
+            hitl_round_index=hitl_round,
+            task_name=task_name,
+            metadata={"trigger": "development_review_limit_hitl"},
+        )
+
+    def audit_hitl_answer(hitl_round: int, human_msg: str, hitl_record_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_answer",
+            source_paths={
+                "human_answer": "",
+                "hitl_record": hitl_record_file,
+            },
+            hitl_round_index=hitl_round,
+            task_name=task_name,
+            metadata={
+                "trigger": "development_review_limit_hitl",
+                "human_answer_source": "runtime_payload",
+            },
+            snapshot_overrides={"human_answer": human_msg},
+        )
 
     def initial_turn() -> object:
         nonlocal developer
@@ -1802,6 +1911,13 @@ def run_development_review_limit_hitl_loop(
 
     def human_reply_turn(human_msg: str) -> object:
         nonlocal developer
+        if (
+            apply_human_review_override is not None
+            and _development_review_human_override_requested(human_msg, task_name=task_name)
+        ):
+            apply_human_review_override(human_msg)
+            ensure_empty_file(paths["ask_human_path"])
+            return developer
         developer, _ = _run_developer_result_turn(
             developer,
             label=f"development_review_limit_human_reply_{sanitize_requirement_name(task_name)}",
@@ -1829,8 +1945,11 @@ def run_development_review_limit_hitl_loop(
         hitl_record_path=paths["hitl_record_path"],
         initial_turn=initial_turn,
         human_reply_turn=human_reply_turn,
+        human_input_provider=human_input_provider,
         progress=progress,
         max_hitl_rounds=MAX_DEVELOPMENT_HITL_ROUNDS,
+        on_hitl_question=audit_hitl_question,
+        on_hitl_answer=audit_hitl_answer,
     )
     return result
 
@@ -1843,6 +1962,8 @@ def _run_reviewer_turn_with_resume(
     prompt: str,
 ) -> ReviewerRuntime | None:
     while True:
+        if _reviewer_has_materialized_outputs(reviewer, task_name):
+            return reviewer
         ensure_review_artifacts(reviewer.review_md_path, reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(reviewer)
         try:
@@ -1873,7 +1994,8 @@ def _run_reviewer_turn_with_resume(
                 return None
             if try_resume_worker(reviewer.worker, timeout_sec=60.0):
                 continue
-            raise RuntimeError(f"{reviewer.worker.session_name or reviewer.reviewer_name} 无法继续，自动恢复失败") from error
+            message(f"{reviewer.worker.session_name or reviewer.reviewer_name} 无法继续，当前阶段将忽略该审核智能体。")
+            return None
 
 
 def recreate_development_reviewer_runtime(
@@ -1913,7 +2035,17 @@ def recreate_development_reviewer_runtime(
         if selection is None:
             return None
     else:
-        selection = reviewer.selection
+        if not stdin_is_interactive():
+            return None
+        selection = prompt_replacement_review_agent_selection(
+            reason_text=f"检测到{reviewer_display_name}已死亡，需要由人类决定是否重建审核智能体。",
+            previous_selection=reviewer.selection,
+            force_model_change=False,
+            role_label=reviewer_display_name,
+            progress=progress,
+        )
+        if selection is None:
+            return None
     replacement = create_reviewer_runtime(
         project_dir=project_dir,
         requirement_name=requirement_name,
@@ -1935,6 +2067,41 @@ def recreate_development_reviewer_runtime(
     return replacement
 
 
+def _worker_appears_live_for_reviewer_recovery(worker: object | None) -> bool:
+    if worker is None:
+        return False
+    session_exists = getattr(worker, "session_exists", None)
+    if callable(session_exists):
+        try:
+            if not session_exists():
+                return False
+        except Exception:
+            pass
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        try:
+            state = read_state()
+        except Exception:
+            state = {}
+        if isinstance(state, dict):
+            agent_state = str(state.get("agent_state", "") or "").strip().upper()
+            health_status = str(state.get("health_status", "") or "").strip().lower()
+            if agent_state in {"READY", "BUSY", "STARTING"} and health_status not in {
+                "dead",
+                "missing_session",
+                "pane_dead",
+            }:
+                return True
+    get_agent_state = getattr(worker, "get_agent_state", None)
+    if callable(get_agent_state):
+        try:
+            state = get_agent_state()
+            return str(getattr(state, "value", state) or "").strip().upper() in {"READY", "BUSY", "STARTING"}
+        except Exception:
+            return False
+    return False
+
+
 def run_reviewer_turn_with_recreation(
     reviewer: ReviewerRuntime,
     *,
@@ -1945,20 +2112,24 @@ def run_reviewer_turn_with_recreation(
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
     label: str,
-    prompt: str,
+    prompt: str = "",
+    prompt_builder=None,
     progress: ReviewStageProgress | None = None,
     can_skip_ready_timeout: bool = True,
     ready_timeout_skip_budget: _ReadyTimeoutSkipBudget | None = None,
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
+        if _reviewer_has_materialized_outputs(current_reviewer, task_name):
+            return current_reviewer
         ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
+        current_prompt = prompt_builder(current_reviewer) if prompt_builder is not None else prompt
         try:
             run_completion_turn_with_repair(
                 worker=current_reviewer.worker,
                 label=label,
-                prompt=prompt,
+                prompt=current_prompt,
                 completion_contract=build_reviewer_completion_contract(
                     reviewer_name=current_reviewer.reviewer_name,
                     task_name=task_name,
@@ -2047,6 +2218,9 @@ def run_reviewer_turn_with_recreation(
                 current_reviewer = initialized
                 continue
             if is_worker_death_error(error):
+                if _worker_appears_live_for_reviewer_recovery(current_reviewer.worker):
+                    message(f"{reviewer_display_name} 当前仍存活但本轮执行异常，当前阶段将忽略该审核智能体。")
+                    return None
                 failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
                 failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
                 if reviewer_requires_manual_model_reconfiguration(failed_reviewer):
@@ -2097,6 +2271,9 @@ def run_reviewer_turn_with_recreation(
                 continue
             if try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
                 continue
+            if _worker_appears_live_for_reviewer_recovery(current_reviewer.worker):
+                message(f"{reviewer_display_name} 当前仍存活但上一轮执行异常，当前阶段将忽略该审核智能体。")
+                return None
             replacement = recreate_development_reviewer_runtime(
                 project_dir=project_dir,
                 requirement_name=requirement_name,
@@ -2106,7 +2283,8 @@ def run_reviewer_turn_with_recreation(
                 force_model_change=False,
             )
             if replacement is None:
-                raise RuntimeError(f"{reviewer_display_name} 无法继续，自动恢复失败") from error
+                message(f"{reviewer_display_name} 未重建，当前阶段将忽略该审核智能体。")
+                return None
             initialized = _run_single_reviewer_initialization(
                 replacement,
                 project_dir=project_dir,
@@ -2150,7 +2328,7 @@ def _run_parallel_reviewers(
             paths=paths,
             reviewer_specs_by_name=reviewer_specs_by_name,
             label=f"{label_prefix}_{sanitize_requirement_name(reviewer.reviewer_name)}_round_{round_index}",
-            prompt=prompt_builder(reviewer),
+            prompt_builder=prompt_builder,
             progress=progress,
             can_skip_ready_timeout=True,
             ready_timeout_skip_budget=skip_budget,
@@ -2173,6 +2351,7 @@ def repair_reviewer_outputs(
     requirement_name: str,
     task_name: str,
     round_index: int,
+    progress: ReviewStageProgress | None = None,
 ) -> list[ReviewerRuntime]:
     json_pattern = f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json"
     md_pattern = f"{sanitize_requirement_name(requirement_name)}_代码评审记录_*.md"
@@ -2190,7 +2369,7 @@ def repair_reviewer_outputs(
             reviewer_specs_by_name=reviewer_specs_by_name,
             label=f"development_review_fix_{sanitize_requirement_name(task_name)}_{sanitize_requirement_name(reviewer.reviewer_name)}_round_{round_index}_attempt_{repair_attempt}",
             prompt=fix_prompt,
-            progress=None,
+            progress=progress,
             can_skip_ready_timeout=True,
             ready_timeout_skip_budget=skip_budget,
         )
@@ -2210,12 +2389,33 @@ def repair_reviewer_outputs(
         max_attempts=MAX_REVIEWER_REPAIR_ATTEMPTS,
         error_prefix=f"{task_name} 代码评审智能体修复输出失败:",
         final_error="代码评审智能体多次修复后仍未按协议更新文档",
+        stage_label="任务开发",
+        progress=progress,
     )
 
 
-def prepare_review_round_artifacts(paths: dict[str, Path], reviewers: Sequence[ReviewerRuntime]) -> None:
+def prepare_review_round_artifacts(
+    paths: dict[str, Path],
+    reviewers: Sequence[ReviewerRuntime],
+    *,
+    task_name: str = "",
+    audit_context: StageAuditRunContext | None = None,
+    review_round_index: int | None = None,
+) -> None:
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"merged_review": paths["merged_review_path"]},
+            metadata={"trigger": "prepare_review_round_artifacts"},
+            reviewer_markdown_paths=[reviewer.review_md_path for reviewer in reviewers],
+            reviewer_json_paths=[reviewer.review_json_path for reviewer in reviewers],
+            review_round_index=review_round_index,
+            task_name=task_name,
+        )
     ensure_empty_file(paths["merged_review_path"])
     for reviewer in reviewers:
+        if task_name and _reviewer_has_materialized_outputs(reviewer, task_name):
+            continue
         ensure_review_artifacts(reviewer.review_md_path, reviewer.review_json_path)
 
 
@@ -2223,6 +2423,121 @@ def _active_reviewer_files(reviewers: Sequence[ReviewerRuntime]) -> tuple[list[s
     json_files = [str(reviewer.review_json_path.resolve()) for reviewer in reviewers]
     md_files = [str(reviewer.review_md_path.resolve()) for reviewer in reviewers]
     return json_files, md_files
+
+
+def _reviewer_audit_metadata(reviewers: Sequence[ReviewerRuntime], *, trigger: str = "") -> dict[str, object]:
+    agent_names: list[str] = []
+    session_names: list[str] = []
+    for reviewer in reviewers:
+        reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
+        if reviewer_name:
+            agent_names.append(reviewer_name)
+        session_name = str(getattr(getattr(reviewer, "worker", None), "session_name", "") or "").strip()
+        if session_name:
+            session_names.append(session_name)
+    return {
+        "trigger": trigger,
+        "agent_names": agent_names,
+        "session_names": session_names,
+    }
+
+
+def _development_review_human_override_requested(human_msg: str, *, task_name: str) -> bool:
+    normalized = " ".join(str(human_msg or "").lower().split())
+    if not normalized:
+        return False
+
+    normalized_task = str(task_name or "").strip().lower()
+    task_scoped = (
+        bool(normalized_task and normalized_task in normalized)
+        or "当前任务" in normalized
+        or "本次" in normalized
+        or "该任务" in normalized
+    )
+    if not task_scoped:
+        return False
+
+    pass_markers = (
+        "人工验收通过",
+        "人工确认通过",
+        "人工已验收",
+        "人工已通过",
+        "人类已使用",
+        "免检通过",
+        "强行闭环",
+        "强制通过",
+        "视为通过",
+        "按通过处理",
+        "按通过继续",
+        "不阻塞",
+        "不再阻塞",
+        "human verified pass",
+    )
+    json_pass_marker = "review_pass" in normalized and (
+        "true" in normalized
+        or "置为 true" in normalized
+        or "设为 true" in normalized
+        or "统一置为 true" in normalized
+    )
+    if not (any(marker in normalized for marker in pass_markers) or json_pass_marker):
+        return False
+
+    context_markers = (
+        "评审环境",
+        "工具链",
+        "误报",
+        "false positive",
+        "py_compile",
+        "无法复现",
+        "不可复现",
+        "no module named",
+        "pytest",
+        "忽略该失败评审",
+        "忽略该类重复失败评审",
+        "禁止修改",
+        "不要修改",
+        "不新增需求",
+        "非行动项",
+        "范围外",
+        "不再要求评审",
+        "不再针对",
+    )
+    return any(marker in normalized for marker in context_markers)
+
+
+def _mark_review_task_passed(review_json_path: str | Path, *, task_name: str) -> None:
+    target = Path(review_json_path).expanduser().resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    task_key = str(task_name or "").strip()
+    records: list[object] = []
+    if target.exists() and target.read_text(encoding="utf-8").strip():
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict):
+            records = [payload]
+
+    found = False
+    for record in records:
+        if isinstance(record, dict) and str(record.get("task_name", "")).strip() == task_key:
+            record["review_pass"] = True
+            found = True
+    if not found:
+        records.append({"task_name": task_key, "review_pass": True})
+
+    target.write_text(json.dumps(records, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def apply_development_review_human_override(
+    *,
+    task_name: str,
+    reviewer_workers: Sequence[ReviewerRuntime],
+    merged_review_path: str | Path,
+) -> None:
+    for reviewer in reviewer_workers:
+        _mark_review_task_passed(reviewer.review_json_path, task_name=task_name)
+        ensure_empty_file(reviewer.review_md_path)
+    ensure_empty_file(merged_review_path)
 
 
 def _replace_dead_developer(
@@ -2264,8 +2579,12 @@ def _replace_dead_developer(
         developer=developer,
         progress=progress,
         launch_coordinator=launch_coordinator,
-        required_reconfiguration=startup_reconfigure,
-        reason_text=reason_text if startup_reconfigure else "",
+        required_reconfiguration=True,
+        reason_text=(
+            reason_text
+            if startup_reconfigure
+            else f"{developer_name}已死亡，必须重新选择厂商/模型/推理/代理后从当前阶段继续。"
+        ),
     )
     if replacement is None:
         raise RuntimeError(f"{developer_name} 已死亡，且未能重建开发工程师")
@@ -2424,7 +2743,15 @@ def develop_current_task(
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> tuple[DeveloperRuntime, str]:
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"developer_output": paths["developer_output_path"]},
+            metadata={"trigger": "develop_current_task_prepare"},
+            task_name=task_name,
+        )
     ensure_empty_file(paths["developer_output_path"])
     if progress is not None:
         progress.set_phase(f"任务开发 / 开发中 | {task_name}")
@@ -2453,7 +2780,7 @@ def develop_current_task(
         replace_dead_developer=replace_dead_developer,
         progress=progress,
     )
-    return ensure_developer_metadata(
+    result = ensure_developer_metadata(
         current_developer,
         paths=paths,
         task_name=task_name,
@@ -2462,6 +2789,15 @@ def develop_current_task(
         turn_policy=turn_policy,
         replace_dead_developer=replace_dead_developer,
     )
+    if audit_context is not None:
+        append_stage_audit_record(
+            audit_context,
+            event_type="developer_output",
+            source_paths={"developer_output": paths["developer_output_path"]},
+            task_name=task_name,
+            metadata={"trigger": "develop_current_task"},
+        )
+    return result
 
 
 def refine_current_task(
@@ -2473,7 +2809,17 @@ def refine_current_task(
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
+    audit_context: StageAuditRunContext | None = None,
+    review_round_index: int | None = None,
 ) -> tuple[DeveloperRuntime, str]:
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"developer_output": paths["developer_output_path"]},
+            metadata={"trigger": "refine_current_task_prepare"},
+            review_round_index=review_round_index,
+            task_name=task_name,
+        )
     ensure_empty_file(paths["developer_output_path"])
     if progress is not None:
         progress.set_phase(f"任务开发 / 修订中 | {task_name}")
@@ -2499,7 +2845,7 @@ def refine_current_task(
         replace_dead_developer=replace_dead_developer,
         progress=progress,
     )
-    return ensure_developer_metadata(
+    result = ensure_developer_metadata(
         current_developer,
         paths=paths,
         task_name=task_name,
@@ -2508,6 +2854,27 @@ def refine_current_task(
         turn_policy=turn_policy,
         replace_dead_developer=replace_dead_developer,
     )
+    if audit_context is not None:
+        append_stage_audit_record(
+            audit_context,
+            event_type="developer_output",
+            source_paths={"developer_output": paths["developer_output_path"]},
+            review_round_index=review_round_index,
+            task_name=task_name,
+            metadata={"trigger": "refine_current_task"},
+        )
+        append_stage_audit_record(
+            audit_context,
+            event_type="change_after_review",
+            source_paths={
+                "developer_output": paths["developer_output_path"],
+                "merged_review": paths["merged_review_path"],
+            },
+            review_round_index=review_round_index,
+            task_name=task_name,
+            metadata={"trigger": "refine_current_task"},
+        )
+    return result
 
 
 def run_first_task_with_parallel_reviewer_init(
@@ -2523,6 +2890,7 @@ def run_first_task_with_parallel_reviewer_init(
     progress: ReviewStageProgress | None = None,
     turn_policy: DeveloperTurnPolicy | None = None,
     replace_dead_developer=None,
+    audit_context: StageAuditRunContext | None = None,
 ) -> tuple[DeveloperRuntime, str, list[ReviewerRuntime]]:
     reviewer_list = list(reviewers)
     if not reviewer_list:
@@ -2534,6 +2902,7 @@ def run_first_task_with_parallel_reviewer_init(
             progress=progress,
             turn_policy=turn_policy,
             replace_dead_developer=replace_dead_developer,
+            audit_context=audit_context,
         )
         return current_developer, code_change, reviewer_list
 
@@ -2550,6 +2919,7 @@ def run_first_task_with_parallel_reviewer_init(
                 progress=progress,
                 turn_policy=turn_policy,
                 replace_dead_developer=replace_dead_developer,
+                audit_context=audit_context,
             ): "developer_task",
             executor.submit(
                 initialize_development_workers,
@@ -2717,14 +3087,35 @@ def run_development_stage(
     developer: DeveloperRuntime | None = None
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_records: list[str] = []
+    audit_context: StageAuditRunContext | None = None
+    current_task_name = ""
     try:
+        audit_context = begin_stage_audit_run(
+            project_dir,
+            requirement_name,
+            "A07",
+            metadata={
+                "trigger": "run_development_stage",
+                "argv": list(argv or []),
+                "args": vars(args),
+            },
+        )
         paths = ensure_development_inputs(args, project_dir=project_dir, requirement_name=requirement_name)
         cleanup_records.extend(cleanup_stale_development_runtime_state(project_dir, requirement_name))
-        cleanup_records.extend(cleanup_existing_development_artifacts(paths, requirement_name))
+        cleanup_records.extend(cleanup_existing_development_artifacts(paths, requirement_name, audit_context))
         launch_coordinator = DevelopmentStageLaunchCoordinator(build_development_runtime_root(project_dir, requirement_name))
 
         next_task = get_first_false_task(paths["task_json_path"])
         if next_task is None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="stage_passed",
+                source_paths={
+                    "task_json": paths["task_json_path"],
+                    "developer_output": paths["developer_output_path"],
+                    "merged_review": paths["merged_review_path"],
+                },
+            )
             return DevelopmentStageResult(
                 project_dir=project_dir,
                 requirement_name=requirement_name,
@@ -2883,6 +3274,7 @@ def run_development_stage(
                     launch_coordinator=launch_coordinator,
                     error=error,
                 ),
+                audit_context=audit_context,
             )[0],
             replace_dead_main_owner=replace_dead_developer_owner,
             main_label="开发工程师",
@@ -2892,6 +3284,7 @@ def run_development_stage(
         review_round_policy = ReviewRoundPolicy(review_round_limit)
 
         while next_task is not None:
+            current_task_name = str(next_task)
             if not reviewers_built:
                 reviewer_workers = build_reviewer_workers(
                     args,
@@ -2926,6 +3319,7 @@ def run_development_stage(
                         launch_coordinator=launch_coordinator,
                         error=error,
                     ),
+                    audit_context=audit_context,
                 )
                 reviewers_initialized = True
             else:
@@ -2950,6 +3344,7 @@ def run_development_stage(
                                 launch_coordinator=launch_coordinator,
                                 error=error,
                             ),
+                            audit_context=audit_context,
                         ),
                         owner_getter=lambda result: result[0],
                     replace_dead_main_owner=replace_dead_developer_owner,
@@ -2962,7 +3357,13 @@ def run_development_stage(
             post_hitl_continue_completed = False
             while True:
                 if not review_round_policy.initial_review_done:
-                    prepare_review_round_artifacts(paths, reviewer_workers)
+                    prepare_review_round_artifacts(
+                        paths,
+                        reviewer_workers,
+                        task_name=next_task,
+                        audit_context=audit_context,
+                        review_round_index=round_index,
+                    )
                     reviewer_workers, developer = run_reviewer_phase_with_death_handling(
                         developer,
                         reviewer_workers,
@@ -3017,6 +3418,8 @@ def run_development_stage(
                                     launch_coordinator=launch_coordinator,
                                     error=error,
                                 ),
+                                audit_context=audit_context,
+                                review_round_index=round_index,
                             ),
                             owner_getter=lambda result: result[0],
                             replace_dead_main_owner=replace_dead_developer_owner,
@@ -3026,7 +3429,13 @@ def run_development_stage(
                             notify=message,
                         )
                     post_hitl_continue_completed = False
-                    prepare_review_round_artifacts(paths, reviewer_workers)
+                    prepare_review_round_artifacts(
+                        paths,
+                        reviewer_workers,
+                        task_name=next_task,
+                        audit_context=audit_context,
+                        review_round_index=round_index,
+                    )
                     reviewer_workers, developer = run_reviewer_phase_with_death_handling(
                         developer,
                         reviewer_workers,
@@ -3068,6 +3477,7 @@ def run_development_stage(
                         requirement_name=requirement_name,
                         task_name=next_task,
                         round_index=round_index,
+                        progress=progress,
                     ),
                     replace_dead_main_owner=replace_dead_developer_owner,
                     replace_dead_reviewer=replace_dead_reviewer,
@@ -3087,7 +3497,28 @@ def run_development_stage(
                     json_files=review_json_files,
                     md_files=review_md_files,
                 )
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="review_merged",
+                    source_paths={"merged_review": paths["merged_review_path"]},
+                    reviewer_markdown_paths=review_md_files,
+                    reviewer_json_paths=review_json_files,
+                    review_round_index=round_index,
+                    task_name=next_task,
+                    metadata=_reviewer_audit_metadata(reviewer_workers, trigger="task_done"),
+                )
                 if passed:
+                    append_stage_audit_record(
+                        audit_context,
+                        event_type="task_passed",
+                        source_paths={
+                            "task_json": paths["task_json_path"],
+                            "developer_output": paths["developer_output_path"],
+                            "merged_review": paths["merged_review_path"],
+                        },
+                        review_round_index=round_index,
+                        task_name=next_task,
+                    )
                     break
                 review_msg = get_markdown_content(paths["merged_review_path"]).strip()
                 if not review_msg:
@@ -3118,6 +3549,19 @@ def run_development_stage(
                                 launch_coordinator=launch_coordinator,
                                 error=error,
                             ),
+                            apply_human_review_override=lambda human_msg: apply_development_review_human_override(
+                                task_name=next_task,
+                                reviewer_workers=reviewer_workers,
+                                merged_review_path=paths["merged_review_path"],
+                            ),
+                            human_input_provider=(
+                                lambda question_path, hitl_round: collect_auto_review_limit_hitl_response(
+                                    question_path,
+                                    stage_label="任务开发评审超限",
+                                    hitl_round=hitl_round,
+                                )
+                            ) if bool(getattr(args, "yes", False)) else None,
+                            audit_context=audit_context,
                         ),
                         owner_getter=lambda result: result.owner,
                         replace_dead_main_owner=replace_dead_developer_owner,
@@ -3127,6 +3571,40 @@ def run_development_stage(
                     )
                     post_hitl_continue_completed = bool(getattr(hitl_result, "post_hitl_continue_completed", False))
                     review_round_policy.reset_after_hitl()
+                    review_json_files, review_md_files = _active_reviewer_files(reviewer_workers)
+                    passed = task_done(
+                        directory=project_dir,
+                        file_path=paths["task_json_path"],
+                        task_name=next_task,
+                        json_pattern=f"{sanitize_requirement_name(requirement_name)}_评审记录_*.json",
+                        md_pattern=f"{sanitize_requirement_name(requirement_name)}_代码评审记录_*.md",
+                        md_output_name=paths["merged_review_path"].name,
+                        json_files=review_json_files,
+                        md_files=review_md_files,
+                    )
+                    append_stage_audit_record(
+                        audit_context,
+                        event_type="review_merged",
+                        source_paths={"merged_review": paths["merged_review_path"]},
+                        reviewer_markdown_paths=review_md_files,
+                        reviewer_json_paths=review_json_files,
+                        review_round_index=round_index,
+                        task_name=next_task,
+                        metadata=_reviewer_audit_metadata(reviewer_workers, trigger="post_hitl_task_done"),
+                    )
+                    if passed:
+                        append_stage_audit_record(
+                            audit_context,
+                            event_type="task_passed",
+                            source_paths={
+                                "task_json": paths["task_json_path"],
+                                "developer_output": paths["developer_output_path"],
+                                "merged_review": paths["merged_review_path"],
+                            },
+                            review_round_index=round_index,
+                            task_name=next_task,
+                        )
+                        break
                 round_index += 1
 
             next_task = get_first_false_task(paths["task_json_path"])
@@ -3136,26 +3614,26 @@ def run_development_stage(
                 and reviewer_workers
                 and developer_turn_policy.should_recreate_before_next_task()
             ):
-                message(
-                    f"开发工程师已达到最大对话轮数 {developer_turn_policy.max_turns}，"
-                    f"将在进入 {next_task} 前重建开发与评审智能体。"
-                )
-                developer, reviewer_workers, recreated_cleanup_paths = recreate_development_workers(
-                    developer,
-                    reviewer_workers,
-                    project_dir=project_dir,
-                    requirement_name=requirement_name,
-                    paths=paths,
-                    reviewer_specs_by_name=reviewer_specs_by_name,
+                decision = request_worker_manual_intervention(
+                    stage_label="任务开发",
+                    role_label=str(developer.worker.session_name or "开发工程师").strip() or "开发工程师",
+                    worker=developer.worker,
+                    reason_text=(
+                        f"开发工程师已达到最大对话轮数 {developer_turn_policy.max_turns}。"
+                        "系统不会自动重建开发与评审智能体。请人工进入 tmux 交涉或关闭智能体，"
+                        f"确认可以继续后再进入任务 {next_task}。"
+                    ),
+                    target_paths=(paths["task_json_path"], paths["developer_output_path"]),
                     progress=progress,
-                    turn_policy=developer_turn_policy,
-                    launch_coordinator=launch_coordinator,
                 )
-                cleanup_records.extend(recreated_cleanup_paths)
-                reviewers_built = True
-                reviewers_initialized = False
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    developer = replace_dead_developer_owner(developer)
+                    reviewers_built = False
+                    reviewers_initialized = False
+                developer_turn_policy.reset()
             review_round_policy = ReviewRoundPolicy(review_round_limit)
 
+        current_task_name = ""
         result_developer_handoff = _export_developer_handoff(developer) if preserve_workers else None
         result_reviewer_handoff = _export_reviewer_handoff(
             reviewer_workers,
@@ -3170,6 +3648,15 @@ def run_development_stage(
             preserve_developer=preserve_workers,
             preserve_reviewer_keys=[item.reviewer_key for item in result_reviewer_handoff],
         ))
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_passed",
+            source_paths={
+                "task_json": paths["task_json_path"],
+                "developer_output": paths["developer_output_path"],
+                "merged_review": paths["merged_review_path"],
+            },
+        )
         return DevelopmentStageResult(
             project_dir=project_dir,
             requirement_name=requirement_name,
@@ -3181,7 +3668,32 @@ def run_development_stage(
             developer_handoff=result_developer_handoff,
             reviewer_handoff=result_reviewer_handoff,
         )
-    except Exception:
+    except Exception as error:
+        failed_paths = paths if "paths" in locals() else build_development_paths(project_dir, requirement_name)
+        if current_task_name:
+            append_stage_audit_record(
+                audit_context,
+                event_type="task_failed",
+                source_paths={
+                    "task_json": failed_paths["task_json_path"],
+                    "developer_output": failed_paths["developer_output_path"],
+                    "merged_review": failed_paths["merged_review_path"],
+                    "ask_human": failed_paths["ask_human_path"],
+                    "hitl_record": failed_paths["hitl_record_path"],
+                },
+                task_name=current_task_name,
+                metadata={"error": str(error)},
+            )
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_failed",
+            source_paths={
+                "task_json": failed_paths["task_json_path"],
+                "developer_output": failed_paths["developer_output_path"],
+                "merged_review": failed_paths["merged_review_path"],
+            },
+            metadata={"error": str(error)},
+        )
         _shutdown_workers(
             developer,
             reviewer_workers,

@@ -17,7 +17,11 @@ from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
-from tmux_core.runtime.tmux_runtime import DEFAULT_COMMAND_TIMEOUT_SEC, is_worker_death_error
+from tmux_core.runtime.tmux_runtime import (
+    DEFAULT_COMMAND_TIMEOUT_SEC,
+    is_turn_artifact_contract_error,
+    is_worker_death_error,
+)
 from T09_terminal_ops import (
     BridgeTerminalUI,
     get_terminal_ui,
@@ -36,6 +40,7 @@ HITL_ALLOWED_STATUSES = {
     HITL_STATUS_ERROR,
 }
 TURN_STATUS_SCHEMA_VERSION = "1.0"
+DEFAULT_HITL_CONTRACT_REPAIR_ATTEMPTS = 2
 
 
 @dataclass(frozen=True)
@@ -347,6 +352,34 @@ def _materialize_turn_status_file(
     return _write_json_atomic(status_path, payload)
 
 
+def build_hitl_contract_repair_prompt(
+    *,
+    context: HitlPromptContext,
+    error_text: str,
+) -> str:
+    lines = [
+        "上一轮已经结束，但 HITL 文件契约未通过校验，需要补齐或修正本轮允许的产物。",
+        f"阶段: {context.stage_name}",
+        f"本轮: {context.turn_id}",
+        "允许修改的文件:",
+        f"- output: {context.output_path}",
+        f"- question: {context.question_path}",
+        f"- record: {context.record_path}",
+    ]
+    cleaned_error = str(error_text or "").strip()
+    if cleaned_error:
+        lines.append(f"上次校验错误: {cleaned_error[:1200]}")
+    lines.extend(
+        [
+            "根据你上一轮真实意图只选择一种结果:",
+            "- 若信息足够: 写入非空 output，清空 question，可按需更新 record。",
+            "- 若仍需人类补充: 写入非空 question，并确保 record 文件存在且同步当前事实。",
+            "不要修改其他文件，不要重新发起无关分析；补齐后仍按原输出协议返回。",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def build_turn_status_contract(
     *,
     turn_status_path: str | Path,
@@ -624,6 +657,22 @@ def collect_terminal_hitl_response(question_path: str | Path, *, hitl_round: int
     )
 
 
+def _invoke_optional_hitl_callback(
+    callback: Callable[..., object] | None,
+    callback_name: str,
+    *args: object,
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(*args)
+    except Exception as error:  # noqa: BLE001
+        try:
+            message(f"警告：HITL 回调失败 callback={callback_name} error={error}")
+        except Exception:
+            pass
+
+
 def run_hitl_agent_loop(
     *,
     worker,
@@ -642,9 +691,13 @@ def run_hitl_agent_loop(
     on_worker_started: Callable[[object], None] | None = None,
     on_agent_turn_started: Callable[[HitlPromptContext, object], None] | None = None,
     on_agent_turn_finished: Callable[[HitlPromptContext, object], None] | None = None,
+    on_before_question_clear: Callable[[HitlPromptContext], None] | None = None,
+    on_hitl_question: Callable[[HitlPromptContext, HitlStatusDecision], None] | None = None,
+    on_hitl_answer: Callable[[HitlPromptContext, str, Path], None] | None = None,
     replace_dead_worker: Callable[[object, BaseException], object] | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
     max_hitl_rounds: int = 8,
+    max_contract_repair_attempts: int = DEFAULT_HITL_CONTRACT_REPAIR_ATTEMPTS,
     fresh_completion_paths: Sequence[str | Path] = (),
     fresh_completion_start_round: int = 1,
 ) -> HitlLoopResult:
@@ -688,7 +741,6 @@ def run_hitl_agent_loop(
         turn_id = f"{label_prefix}_{hitl_round}"
         turn_status_path = turns_dir / turn_id / "turn_status.json"
         turn_status_path.parent.mkdir(parents=True, exist_ok=True)
-        question_file.write_text("", encoding="utf-8")
         context = HitlPromptContext(
             stage_name=stage_name,
             hitl_round=hitl_round,
@@ -700,6 +752,8 @@ def run_hitl_agent_loop(
             stage_status_path=str(status_file),
             turn_status_path=str(turn_status_path),
         )
+        _invoke_optional_hitl_callback(on_before_question_clear, "on_before_question_clear", context)
+        question_file.write_text("", encoding="utf-8")
         prompt = (
             initial_prompt_builder(context)
             if hitl_round == 1
@@ -725,6 +779,7 @@ def run_hitl_agent_loop(
             fresh_completion_paths=effective_fresh_completion_paths,
             baseline_fresh_hashes=baseline_fresh_hashes,
         )
+        contract_repair_attempts = 0
         while True:
             turn_worker = worker
             if on_agent_turn_started is not None:
@@ -749,6 +804,17 @@ def run_hitl_agent_loop(
                 if is_worker_death_error(error):
                     _replace_worker(turn_worker, error)
                     continue
+            if (
+                not result.ok
+                and is_turn_artifact_contract_error(result.clean_output)
+                and contract_repair_attempts < max_contract_repair_attempts
+            ):
+                contract_repair_attempts += 1
+                prompt = build_hitl_contract_repair_prompt(
+                    context=context,
+                    error_text=result.clean_output,
+                )
+                continue
             break
         if not result.ok:
             raise RuntimeError(result.clean_output or f"{stage_name} 阶段执行失败")
@@ -772,6 +838,7 @@ def run_hitl_agent_loop(
             raise RuntimeError(decision.summary or f"{stage_name} 状态文件返回 error")
         if hitl_round >= max_hitl_rounds:
             raise RuntimeError(f"{stage_name} HITL 轮次超过上限: {max_hitl_rounds}")
+        _invoke_optional_hitl_callback(on_hitl_question, "on_hitl_question", context, decision)
         try:
             human_message = human_input_provider(decision.question_path, hitl_round=hitl_round)
         except TypeError as error:
@@ -780,5 +847,12 @@ def run_hitl_agent_loop(
             human_message = human_input_provider(decision.question_path, hitl_round)
         human_history_path = turns_dir / turn_id / f"human_response_round_{hitl_round}.md"
         human_history_path.write_text(human_message.strip() + "\n", encoding="utf-8")
+        _invoke_optional_hitl_callback(
+            on_hitl_answer,
+            "on_hitl_answer",
+            context,
+            human_message,
+            human_history_path,
+        )
         human_responses.append(human_message)
     raise RuntimeError(f"{stage_name} HITL 轮次超过上限: {max_hitl_rounds}")

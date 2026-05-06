@@ -956,6 +956,27 @@ def collect_review_limit_hitl_response(
         )
 
 
+def collect_auto_review_limit_hitl_response(
+    question_path: str | Path,
+    *,
+    stage_label: str,
+    hitl_round: int,
+) -> str:
+    question_file = Path(question_path).expanduser().resolve()
+    question_text = question_file.read_text(encoding="utf-8").strip() if question_file.exists() else ""
+    message()
+    message(f"{stage_label} 第 {hitl_round} 轮 已由 --yes 自动回复，继续非交互流程。")
+    return (
+        f"{stage_label} 第 {hitl_round} 轮自动回复：当前以 --yes 非交互模式运行。"
+        "请采用最保守的修正路径：严格按已有原始需求、澄清记录和评审记录补齐遗漏，"
+        "删除或改写无来源依据的扩展内容，不新增需求、不跳过评审、不再等待人工输入。"
+        "若问题文档提供多个方案，优先选择“原样同步/最小修正/无扩展”的方案；"
+        "将本轮自动决策和假设追加到 HITL 记录，随后清空问题文档并继续当前阶段。"
+        "\n\n[自动回复所依据的问题文档]\n"
+        f"{question_text or '(问题文档为空)'}"
+    )
+
+
 def parse_review_max_rounds(value: object, *, source: str, default: int = DEFAULT_STAGE_REVIEW_MAX_ROUNDS) -> int | None:
     text = str(value or "").strip()
     if not text:
@@ -1085,8 +1106,11 @@ def run_review_limit_hitl_cycle(
     hitl_record_path: str | Path,
     initial_turn: Callable[[], object],
     human_reply_turn: Callable[[str], object],
+    human_input_provider: Callable[[Path, int], str] | None = None,
     progress: ReviewStageProgress | None = None,
     max_hitl_rounds: int = 8,
+    on_hitl_question: Callable[[int, Path], None] | None = None,
+    on_hitl_answer: Callable[[int, str, Path], None] | None = None,
 ) -> ReviewLimitHitlResult:
     ask_human_file = Path(ask_human_path).expanduser().resolve()
     hitl_record_file = Path(hitl_record_path).expanduser().resolve()
@@ -1094,6 +1118,18 @@ def run_review_limit_hitl_cycle(
     if not ask_human_file.exists() or not ask_human_file.read_text(encoding="utf-8").strip():
         raise RuntimeError(f"{stage_label} 超限后未生成有效《{ask_human_file.name}》")
     post_hitl_continue_completed = False
+
+    def _invoke_callback(callback: Callable[..., object] | None, callback_name: str, *args: object) -> None:
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception as error:  # noqa: BLE001
+            try:
+                message(f"警告：评审超限 HITL 回调失败 callback={callback_name} error={error}")
+            except Exception:
+                pass
+
     for hitl_round in range(1, max_hitl_rounds + 1):
         if not ask_human_file.read_text(encoding="utf-8").strip():
             return ReviewLimitHitlResult(
@@ -1101,13 +1137,18 @@ def run_review_limit_hitl_cycle(
                 rounds_used=hitl_round - 1,
                 post_hitl_continue_completed=post_hitl_continue_completed,
             )
-        human_msg = collect_review_limit_hitl_response(
-            ask_human_file,
-            stage_label=stage_label,
-            hitl_round=hitl_round,
-            answer_path=hitl_record_file,
-            progress=progress,
-        )
+        _invoke_callback(on_hitl_question, "on_hitl_question", hitl_round, ask_human_file)
+        if human_input_provider is not None:
+            human_msg = human_input_provider(ask_human_file, hitl_round)
+        else:
+            human_msg = collect_review_limit_hitl_response(
+                ask_human_file,
+                stage_label=stage_label,
+                hitl_round=hitl_round,
+                answer_path=hitl_record_file,
+                progress=progress,
+            )
+        _invoke_callback(on_hitl_answer, "on_hitl_answer", hitl_round, human_msg, hitl_record_file)
         owner = human_reply_turn(human_msg)
         post_hitl_continue_completed = True
     raise RuntimeError(f"{stage_label} HITL 轮次超过上限: {max_hitl_rounds}")

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import A01_Routing_LayerPlanning as routing_stage
@@ -39,6 +40,29 @@ class StageKernelSharedTests(unittest.TestCase):
         self.assertTrue(hasattr(reviewer_orchestration, "run_parallel_reviewer_round"))
         self.assertTrue(hasattr(reviewer_orchestration, "repair_reviewer_round_outputs"))
         self.assertTrue(hasattr(reviewer_orchestration, "shutdown_stage_workers"))
+
+    def test_reviewer_orchestration_does_not_drop_prelaunch_missing_session_reviewer(self):
+        class _PrelaunchReviewer:
+            agent_started = False
+            pane_id = ""
+
+            def get_agent_state(self):
+                return "DEAD"
+
+            def read_state(self):
+                return {
+                    "status": "running",
+                    "result_status": "running",
+                    "agent_state": "DEAD",
+                    "agent_started": False,
+                    "pane_id": "",
+                    "health_status": "missing_session",
+                    "workflow_stage": "pending",
+                }
+
+        reviewer = SimpleNamespace(worker=_PrelaunchReviewer(), reviewer_name="审核员")
+
+        self.assertFalse(reviewer_orchestration._owner_is_dead(reviewer))  # noqa: SLF001
 
     def test_parse_review_max_rounds_supports_default_and_infinite(self):
         self.assertEqual(shared_review.parse_review_max_rounds("", source="--review-max-rounds"), 5)
@@ -86,6 +110,62 @@ class StageKernelSharedTests(unittest.TestCase):
         self.assertEqual(policy.quota_count, 0)
         self.assertTrue(policy.initial_review_done)
         self.assertFalse(policy.should_escalate_before_next_review())
+
+    def test_auto_review_limit_hitl_response_includes_question_and_non_interactive_policy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            question_path = Path(tmpdir) / "ask.md"
+            question_path.write_text("请选择方案1原样同步。", encoding="utf-8")
+
+            with patch.object(shared_review, "message") as message_mock:
+                response = shared_review.collect_auto_review_limit_hitl_response(
+                    question_path,
+                    stage_label="需求评审超限",
+                    hitl_round=2,
+                )
+
+        self.assertIn("--yes", response)
+        self.assertIn("不跳过评审", response)
+        self.assertIn("请选择方案1原样同步。", response)
+        self.assertTrue(any("--yes 自动回复" in str(call.args[0]) for call in message_mock.call_args_list if call.args))
+
+    def test_review_limit_hitl_cycle_uses_human_input_provider(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ask_path = Path(tmpdir) / "ask.md"
+            hitl_record_path = Path(tmpdir) / "hitl.md"
+            ask_path.write_text("需要人工确认", encoding="utf-8")
+            received_messages: list[str] = []
+
+            def initial_turn():
+                return "owner-before-hitl"
+
+            def human_reply_turn(human_msg: str):
+                received_messages.append(human_msg)
+                ask_path.write_text("", encoding="utf-8")
+                return "owner-after-hitl"
+
+            def provider(question_path: Path, hitl_round: int) -> str:
+                self.assertEqual(question_path, ask_path.resolve())
+                self.assertEqual(hitl_round, 1)
+                return "自动继续"
+
+            with patch.object(
+                shared_review,
+                "collect_review_limit_hitl_response",
+                side_effect=AssertionError("should not prompt"),
+            ):
+                result = shared_review.run_review_limit_hitl_cycle(
+                    stage_label="需求评审超限",
+                    ask_human_path=ask_path,
+                    hitl_record_path=hitl_record_path,
+                    initial_turn=initial_turn,
+                    human_reply_turn=human_reply_turn,
+                    human_input_provider=provider,
+                )
+
+        self.assertEqual(result.owner, "owner-after-hitl")
+        self.assertEqual(result.rounds_used, 1)
+        self.assertTrue(result.post_hitl_continue_completed)
+        self.assertEqual(received_messages, ["自动继续"])
 
     def test_shell_initialization_timeout_is_recoverable_startup_failure(self):
         error = RuntimeError("Shell initialization timed out.\nzsh prompt")

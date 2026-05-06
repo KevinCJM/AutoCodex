@@ -68,8 +68,15 @@ from tmux_core.stage_kernel.reviewer_orchestration import (
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
+from tmux_core.stage_kernel.stage_audit import (
+    StageAuditRunContext,
+    append_stage_audit_record,
+    begin_stage_audit_run,
+    record_before_cleanup,
+)
 from tmux_core.stage_kernel.shared_review import (
     MAX_REVIEWER_REPAIR_ATTEMPTS,
+    ReviewRoundPolicy,
     ReviewAgentHandoff,
     ReviewAgentSelection,
     ReviewStageProgress,
@@ -83,6 +90,7 @@ from tmux_core.stage_kernel.shared_review import (
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
     note_reviewer_failure,
+    parse_review_max_rounds,
     resolve_stage_agent_config,
     reviewer_requires_manual_model_reconfiguration,
     worker_has_provider_auth_error,
@@ -106,6 +114,7 @@ from T12_requirements_common import (
 
 OVERALL_REVIEW_TASK_NAME = "全面复核"
 PLACEHOLDER_NEXT_STEP = "下一步进入测试阶段（功能测试 + 全面回归，待接入）"
+MAX_OVERALL_REVIEW_ROUNDS = 5
 
 
 @dataclass(frozen=True)
@@ -132,10 +141,40 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=<key>,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖复核角色列表")
     parser.add_argument("--reviewer-role-prompt", action="append", default=[], help="重复传入以覆盖对应角色提示词")
+    parser.add_argument("--review-max-rounds", default="", help="整体复核最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
     return parser
+
+
+def resolve_overall_review_max_rounds(args: argparse.Namespace) -> int | None:
+    explicit = getattr(args, "review_max_rounds", "")
+    if str(explicit or "").strip():
+        return parse_review_max_rounds(
+            explicit,
+            source="--review-max-rounds",
+            default=MAX_OVERALL_REVIEW_ROUNDS,
+        )
+    return MAX_OVERALL_REVIEW_ROUNDS
+
+
+def _review_line_is_nonblocking_ambiguity(line: str) -> bool:
+    stripped = str(line or "").strip()
+    if not stripped:
+        return True
+    if stripped in {"---", "***"}:
+        return True
+    if "[Ambiguity]" in stripped or "[疑问]" in stripped or "[歧义]" in stripped:
+        return True
+    return False
+
+
+def _review_text_is_only_nonblocking_ambiguities(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(_review_line_is_nonblocking_ambiguity(line) for line in lines)
 
 
 def _consume_stage_back(allow_previous_stage_back: bool, will_prompt: bool) -> tuple[bool, bool]:
@@ -167,18 +206,38 @@ def build_overall_review_reviewer_artifact_paths(
     return review_md_path, review_json_path
 
 
-def cleanup_existing_overall_review_artifacts(paths: dict[str, Path], requirement_name: str) -> tuple[str, ...]:
+def cleanup_existing_overall_review_artifacts(
+    paths: dict[str, Path],
+    requirement_name: str,
+    audit_context: StageAuditRunContext | None = None,
+) -> tuple[str, ...]:
     project_root = paths["project_root"]
     safe_name = sanitize_requirement_name(requirement_name)
     removed: list[str] = []
+    review_json_candidates: list[Path] = []
+    review_md_candidates: list[Path] = []
     for pattern in (
         f"{safe_name}_整体复核记录_*.json",
         f"{safe_name}_整体代码复核记录_*.md",
     ):
         for candidate in project_root.glob(pattern):
             if candidate.is_file():
-                candidate.unlink()
-                removed.append(str(candidate.resolve()))
+                if candidate.suffix == ".json":
+                    review_json_candidates.append(candidate)
+                else:
+                    review_md_candidates.append(candidate)
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"overall_review": paths["merged_review_path"]},
+            metadata={"trigger": "cleanup_existing_overall_review_artifacts"},
+            reviewer_markdown_paths=review_md_candidates,
+            reviewer_json_paths=review_json_candidates,
+        )
+    for candidate in (*review_json_candidates, *review_md_candidates):
+        if candidate.is_file():
+            candidate.unlink()
+            removed.append(str(candidate.resolve()))
     merged_review_path = paths["merged_review_path"]
     if merged_review_path.exists() and merged_review_path.is_file():
         merged_review_path.write_text("", encoding="utf-8")
@@ -200,6 +259,23 @@ def load_overall_review_state(state_path: str | Path) -> dict[str, object]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _reviewer_audit_metadata(reviewers: Sequence[ReviewerRuntime], *, trigger: str = "") -> dict[str, object]:
+    agent_names: list[str] = []
+    session_names: list[str] = []
+    for reviewer in reviewers:
+        reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
+        if reviewer_name:
+            agent_names.append(reviewer_name)
+        session_name = str(getattr(getattr(reviewer, "worker", None), "session_name", "") or "").strip()
+        if session_name:
+            session_names.append(session_name)
+    return {
+        "trigger": trigger,
+        "agent_names": agent_names,
+        "session_names": session_names,
+    }
 
 
 def overall_review_passed(state_path: str | Path) -> bool:
@@ -800,14 +876,100 @@ def build_overall_review_reviewer_completion_contract(
     )
 
 
-def build_overall_review_init_prompt(paths: dict[str, Path]) -> str:
-    return init_reviewer(
+_OVERALL_REVIEW_ACTIVE_CODE_SUFFIXES = {
+    ".py",
+    ".js",
+    ".jsx",
+    ".ts",
+    ".tsx",
+    ".mjs",
+    ".cjs",
+    ".sh",
+    ".go",
+    ".rs",
+    ".java",
+    ".kt",
+    ".swift",
+    ".c",
+    ".cc",
+    ".cpp",
+    ".h",
+    ".hpp",
+    ".cs",
+    ".rb",
+    ".php",
+    ".toml",
+    ".yaml",
+    ".yml",
+}
+
+_OVERALL_REVIEW_CONTEXT_EXCLUDED_DIRS = {
+    ".development_runtime",
+    ".routing_init_runtime",
+    ".tmux_stage_locks",
+    ".tmux_workflow",
+    ".git",
+    "__pycache__",
+    "docs",
+    "node_modules",
+}
+
+
+def _discover_overall_review_active_files(project_dir: str | Path, *, limit: int = 40) -> tuple[str, ...]:
+    root = Path(project_dir).expanduser().resolve()
+    if not root.exists():
+        return ()
+    discovered: list[str] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        if any(part in _OVERALL_REVIEW_CONTEXT_EXCLUDED_DIRS for part in rel.parts):
+            continue
+        if path.suffix.lower() not in _OVERALL_REVIEW_ACTIVE_CODE_SUFFIXES:
+            continue
+        if rel.name.startswith(".") and rel.suffix.lower() not in {".toml", ".yaml", ".yml"}:
+            continue
+        discovered.append(rel.as_posix())
+        if len(discovered) >= limit:
+            break
+    return tuple(discovered)
+
+
+def _build_overall_review_active_code_context(project_dir: str | Path) -> str:
+    root = Path(project_dir).expanduser().resolve()
+    files = _discover_overall_review_active_files(root)
+    if not files:
+        return (
+            "\n\n## 当前代码事实补充\n"
+            f"- 当前项目根目录: `{root}`\n"
+            "- 未自动发现常见代码/配置文件；如 routing docs 与实际目录不一致，必须以当前目录实际文件检查结果为准。\n"
+            "- routing docs 只用于导航，不能仅凭 `repo_map.json` 的历史 scope_notes 判定代码不存在。\n"
+        )
+    file_lines = "\n".join(f"- `{item}`" for item in files)
+    return (
+        "\n\n## 当前代码事实补充\n"
+        f"- 当前项目根目录: `{root}`\n"
+        "- 以下是在当前项目目录内发现的活跃代码/配置入口，复核时必须实际检查这些文件。\n"
+        "- routing docs 只用于导航，不能仅凭 `repo_map.json` 的历史 scope_notes 判定业务代码不存在。\n"
+        f"{file_lines}\n"
+    )
+
+
+def build_overall_review_init_prompt(paths: dict[str, Path], *, project_dir: str | Path | None = None) -> str:
+    prompt = init_reviewer(
         hitl_record_md=str(paths["hitl_record_path"].resolve()),
         requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
         original_requirement_md=str(paths["original_requirement_path"].resolve()),
         detailed_design_md=str(paths["detailed_design_path"].resolve()),
         task_split_md=str(paths["task_md_path"].resolve()),
     )
+    if project_dir is not None:
+        prompt += _build_overall_review_active_code_context(project_dir)
+    return prompt
 
 
 def build_overall_review_turn_goal(*, mode: str, paths: dict[str, Path]) -> TaskTurnGoal:
@@ -838,16 +1000,21 @@ def _replace_dead_overall_review_developer(
     progress: ReviewStageProgress | None = None,
     error: Exception | None = None,
 ) -> DeveloperRuntime:
+    developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
+    startup_reconfigure = bool(error and is_recoverable_startup_failure(error, developer.worker))
     replacement = recreate_developer_runtime(
         project_dir=project_dir,
         requirement_name=requirement_name,
         developer=developer,
         progress=progress,
-        reason_text=str(error or ""),
-        required_reconfiguration=bool(error and is_recoverable_startup_failure(error, developer.worker)),
+        reason_text=(
+            str(error or "")
+            if startup_reconfigure
+            else f"{developer_name}已死亡，必须重新选择厂商/模型/推理/代理后从当前阶段继续。"
+        ),
+        required_reconfiguration=True,
     )
     if replacement is None:
-        developer_name = str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
         raise RuntimeError(f"{developer_name} 无法继续，且未能重建开发工程师")
     _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
     return replacement
@@ -918,7 +1085,7 @@ def initialize_overall_review_developer(
         project_dir=project_dir,
         requirement_name=requirement_name,
         label="overall_review_developer_init",
-        prompt=build_overall_review_init_prompt(paths),
+        prompt=build_overall_review_init_prompt(paths, project_dir=project_dir),
         result_contract=build_overall_review_init_result_contract(paths, mode="a08_developer_init"),
         paths=paths,
         progress=progress,
@@ -933,7 +1100,16 @@ def refine_overall_review_code(
     paths: dict[str, Path],
     review_msg: str,
     progress: ReviewStageProgress | None = None,
+    audit_context: StageAuditRunContext | None = None,
+    review_round_index: int | None = None,
 ) -> tuple[DeveloperRuntime, str]:
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"developer_output": paths["developer_output_path"]},
+            metadata={"trigger": "refine_overall_review_code_prepare"},
+            review_round_index=review_round_index,
+        )
     ensure_empty_file(paths["developer_output_path"])
     if progress is not None:
         progress.set_phase("复核阶段 / 开发工程师修订代码")
@@ -975,6 +1151,17 @@ def refine_overall_review_code(
         code_change = get_markdown_content(paths["developer_output_path"]).strip()
     if not code_change:
         raise RuntimeError(f"复核阶段修订完成后，开发工程师仍未按协议更新《{paths['developer_output_path'].name}》")
+    if audit_context is not None:
+        append_stage_audit_record(
+            audit_context,
+            event_type="change_after_overall_review",
+            source_paths={
+                "developer_output": paths["developer_output_path"],
+                "overall_review": paths["merged_review_path"],
+            },
+            review_round_index=review_round_index,
+            metadata={"trigger": "refine_overall_review_code"},
+        )
     return current_developer, code_change
 
 
@@ -1000,7 +1187,7 @@ def _run_single_overall_review_reviewer_init(
             run_task_result_turn_with_repair(
                 worker=current_reviewer.worker,
                 label=f"overall_review_reviewer_init_{sanitize_requirement_name(current_reviewer.reviewer_name)}",
-                prompt=build_overall_review_init_prompt(paths),
+                prompt=build_overall_review_init_prompt(paths, project_dir=project_dir),
                 result_contract=init_contract,
                 parse_result_payload=_parse_lenient_result_payload,
                 turn_goal=build_overall_review_turn_goal(mode=init_contract.mode, paths=paths),
@@ -1261,7 +1448,7 @@ def run_overall_review_turn_with_recreation(
                 force_model_change=False,
             )
             if replacement is None:
-                raise RuntimeError(f"{reviewer_display_name} 无法继续，自动恢复失败") from error
+                raise RuntimeError(f"{reviewer_display_name} 无法继续，系统不会自动恢复，请人工介入处理。") from error
             _set_worker_stage_metadata(replacement.worker, project_dir=project_dir, requirement_name=requirement_name)
             initialized = _run_single_overall_review_reviewer_init(
                 replacement,
@@ -1346,6 +1533,8 @@ def repair_overall_review_outputs(
         max_attempts=MAX_REVIEWER_REPAIR_ATTEMPTS,
         error_prefix="复核阶段审核智能体修复输出失败:",
         final_error="复核阶段审核智能体多次修复后仍未按协议更新文档",
+        stage_label=OVERALL_REVIEW_TASK_NAME,
+        progress=progress,
     )
 
 
@@ -1387,7 +1576,18 @@ def run_overall_review_stage(
     developer: DeveloperRuntime | None = None
     reviewers: list[ReviewerRuntime] = []
     cleanup_paths: list[str] = []
+    audit_context: StageAuditRunContext | None = None
     try:
+        audit_context = begin_stage_audit_run(
+            project_dir,
+            requirement_name,
+            "A08",
+            metadata={
+                "trigger": "run_overall_review_stage",
+                "argv": list(argv or []),
+                "args": vars(args),
+            },
+        )
         paths = ensure_overall_review_inputs(project_dir=project_dir, requirement_name=requirement_name)
         explicit_live_developer_handoff = developer_handoff if _is_live_developer_handoff(developer_handoff) else None
         explicit_live_reviewer_handoffs = tuple(item for item in reviewer_handoff if _is_live_reviewer_handoff(item))
@@ -1414,8 +1614,14 @@ def run_overall_review_stage(
             ))
             cleanup_paths.extend(cleanup_stale_overall_review_runtime_state(project_dir, requirement_name))
         effective_reviewer_handoffs = live_reviewer_handoffs or tuple(reviewer_handoff)
-        cleanup_paths.extend(cleanup_existing_overall_review_artifacts(paths, requirement_name))
+        cleanup_paths.extend(cleanup_existing_overall_review_artifacts(paths, requirement_name, audit_context))
         _write_overall_review_state(paths["state_path"], passed=False)
+        append_stage_audit_record(
+            audit_context,
+            event_type="developer_output",
+            source_paths={"developer_output": paths["developer_output_path"]},
+            metadata={"trigger": "overall_review_initial_input"},
+        )
 
         developer_plan: DeveloperPlan | None = None
         if live_developer_handoff is not None:
@@ -1506,10 +1712,16 @@ def run_overall_review_stage(
 
         developer_initialized = False
         round_index = 1
+        review_round_policy = ReviewRoundPolicy(resolve_overall_review_max_rounds(args))
         previous_review_msg = ""
         code_change_msg = ""
         while True:
-            prepare_review_round_artifacts(paths, reviewers)
+            prepare_review_round_artifacts(
+                paths,
+                reviewers,
+                audit_context=audit_context,
+                review_round_index=round_index,
+            )
             if not previous_review_msg:
                 reviewers = _run_parallel_overall_reviewers(
                     reviewers,
@@ -1519,16 +1731,17 @@ def run_overall_review_stage(
                     reviewer_specs_by_name=reviewer_specs_by_name,
                     label_prefix="overall_review_initial",
                     prompt_builder=lambda reviewer: review_all_code(
-                        reviewer_specs_by_name[reviewer.reviewer_name].role_prompt,
-                        OVERALL_REVIEW_TASK_NAME,
-                        hitl_record_md=str(paths["hitl_record_path"].resolve()),
-                        requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
-                        original_requirement_md=str(paths["original_requirement_path"].resolve()),
-                        detailed_design_md=str(paths["detailed_design_path"].resolve()),
-                        task_split_md=str(paths["task_md_path"].resolve()),
-                        review_md=str(reviewer.review_md_path.resolve()),
-                        review_json=str(reviewer.review_json_path.resolve()),
-                    ),
+                            reviewer_specs_by_name[reviewer.reviewer_name].role_prompt,
+                            OVERALL_REVIEW_TASK_NAME,
+                            hitl_record_md=str(paths["hitl_record_path"].resolve()),
+                            requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+                            original_requirement_md=str(paths["original_requirement_path"].resolve()),
+                            detailed_design_md=str(paths["detailed_design_path"].resolve()),
+                            task_split_md=str(paths["task_md_path"].resolve()),
+                            review_md=str(reviewer.review_md_path.resolve()),
+                            review_json=str(reviewer.review_json_path.resolve()),
+                        )
+                        + _build_overall_review_active_code_context(project_dir),
                     round_index=round_index,
                     progress=progress,
                 )
@@ -1541,16 +1754,17 @@ def run_overall_review_stage(
                     reviewer_specs_by_name=reviewer_specs_by_name,
                     label_prefix="overall_review_again",
                     prompt_builder=lambda reviewer: review_all_code_again(
-                        previous_review_msg,
-                        code_change_msg,
-                        OVERALL_REVIEW_TASK_NAME,
-                        hitl_record_md=str(paths["hitl_record_path"].resolve()),
-                        requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
-                        original_requirement_md=str(paths["original_requirement_path"].resolve()),
-                        detailed_design_md=str(paths["detailed_design_path"].resolve()),
-                        review_md=str(reviewer.review_md_path.resolve()),
-                        review_json=str(reviewer.review_json_path.resolve()),
-                    ),
+                            previous_review_msg,
+                            code_change_msg,
+                            OVERALL_REVIEW_TASK_NAME,
+                            hitl_record_md=str(paths["hitl_record_path"].resolve()),
+                            requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
+                            original_requirement_md=str(paths["original_requirement_path"].resolve()),
+                            detailed_design_md=str(paths["detailed_design_path"].resolve()),
+                            review_md=str(reviewer.review_md_path.resolve()),
+                            review_json=str(reviewer.review_json_path.resolve()),
+                        )
+                        + _build_overall_review_active_code_context(project_dir),
                     round_index=round_index,
                     progress=progress,
                 )
@@ -1563,6 +1777,8 @@ def run_overall_review_stage(
                 round_index=round_index,
                 progress=progress,
             )
+            review_round_policy.record_review_attempt()
+            review_json_files, review_md_files = _active_reviewer_files(reviewers)
             passed = task_done(
                 directory=project_dir,
                 file_path=paths["task_json_path"],
@@ -1570,8 +1786,17 @@ def run_overall_review_stage(
                 json_pattern=f"{sanitize_requirement_name(requirement_name)}_整体复核记录_*.json",
                 md_pattern=f"{sanitize_requirement_name(requirement_name)}_整体代码复核记录_*.md",
                 md_output_name=paths["merged_review_path"].name,
-                json_files=_active_reviewer_files(reviewers)[0],
-                md_files=_active_reviewer_files(reviewers)[1],
+                json_files=review_json_files,
+                md_files=review_md_files,
+            )
+            append_stage_audit_record(
+                audit_context,
+                event_type="overall_review_merged",
+                source_paths={"overall_review": paths["merged_review_path"]},
+                reviewer_markdown_paths=review_md_files,
+                reviewer_json_paths=review_json_files,
+                review_round_index=round_index,
+                metadata=_reviewer_audit_metadata(reviewers, trigger="task_done"),
             )
             if passed:
                 _write_overall_review_state(paths["state_path"], passed=True)
@@ -1579,6 +1804,17 @@ def run_overall_review_stage(
             previous_review_msg = get_markdown_content(paths["merged_review_path"]).strip()
             if not previous_review_msg:
                 raise RuntimeError(f"{OVERALL_REVIEW_TASK_NAME} 未通过，但《{paths['merged_review_path'].name}》为空")
+            if _review_text_is_only_nonblocking_ambiguities(previous_review_msg):
+                message("整体复核仅剩非阻断歧义，已保留复核记录并继续完成。")
+                _write_overall_review_state(paths["state_path"], passed=True)
+                break
+            if review_round_policy.should_escalate_before_next_review():
+                if review_round_policy.max_rounds is None:
+                    raise RuntimeError("review_round_policy 配置错误：无限轮次不应触发整体复核超限")
+                raise RuntimeError(
+                    f"整体复核超过最大审核轮次 {review_round_policy.max_rounds}，仍未通过:\n"
+                    f"{previous_review_msg}"
+                )
             if developer is None:
                 if developer_plan is None:
                     developer_plan = resolve_developer_plan(args, project_dir=project_dir, progress=progress)
@@ -1605,6 +1841,8 @@ def run_overall_review_stage(
                 paths=paths,
                 review_msg=previous_review_msg,
                 progress=progress,
+                audit_context=audit_context,
+                review_round_index=round_index,
             )
             round_index += 1
 
@@ -1617,6 +1855,15 @@ def run_overall_review_stage(
                 cleanup_runtime=True,
             )
         )
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_passed",
+            source_paths={
+                "overall_review": paths["merged_review_path"],
+                "developer_output": paths["developer_output_path"],
+                "state": paths["state_path"],
+            },
+        )
         return OverallReviewStageResult(
             project_dir=project_dir,
             requirement_name=requirement_name,
@@ -1626,8 +1873,19 @@ def run_overall_review_stage(
             completed=True,
             cleanup_paths=tuple(dict.fromkeys(cleanup_paths)),
         )
-    except Exception:
-        _write_overall_review_state(build_overall_review_paths(project_dir, requirement_name)["state_path"], passed=False)
+    except Exception as error:
+        failed_paths = paths if "paths" in locals() else build_overall_review_paths(project_dir, requirement_name)
+        _write_overall_review_state(failed_paths["state_path"], passed=False)
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_failed",
+            source_paths={
+                "overall_review": failed_paths["merged_review_path"],
+                "developer_output": failed_paths["developer_output_path"],
+                "state": failed_paths["state_path"],
+            },
+            metadata={"error": str(error)},
+        )
         _shutdown_workers(
             developer,
             reviewers,
