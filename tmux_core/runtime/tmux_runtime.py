@@ -64,6 +64,8 @@ TASK_RESULT_POST_DONE_GRACE_SEC = 10.0
 TASK_RESULT_READY_MISSING_GRACE_SEC = 2.0
 STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX = "stale_busy_without_contract"
 TASK_CONTRACT_STALL_IDLE_SEC = 45.0
+TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS = 3
+TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC = 60.0
 FILE_CONTRACT_POLL_INTERVAL_SEC = 0.5
 ACTIVE_AGENT_PROBE_INTERVAL_SEC = 2.0
 POST_DONE_AGENT_PROBE_INTERVAL_SEC = 5.0
@@ -302,8 +304,12 @@ CODEX_UPDATE_NOTICE_PATTERNS = (
     r"Press enter to continue",
 )
 CODEX_STARTING_PATTERNS = (
+    r"\bmodel:\s*loading\b",
     r"Starting MCP servers",
     r"MCP servers \(\d+/\d+\)",
+)
+CODEX_PROMPT_REJECTION_PATTERNS = (
+    r"No active thread is available",
 )
 GEMINI_READY_PATTERNS = (
     r"Type your message",
@@ -383,16 +389,41 @@ def _codex_effective_recent_surface(text: str, *, max_lines: int = 120) -> str:
     return "\n".join(lines[start_index:])
 
 
+def _codex_surface_has_ready_blocker(text: str) -> bool:
+    surface = str(text or "")
+    if not surface.strip():
+        return False
+    return any(
+        re.search(pattern, surface, re.IGNORECASE)
+        for pattern in (
+            *CODEX_STARTING_PATTERNS,
+            *CODEX_PROMPT_REJECTION_PATTERNS,
+        )
+    )
+
+
+def _codex_surface_has_prompt_rejection(text: str) -> bool:
+    surface = str(text or "")
+    if not surface.strip():
+        return False
+    return any(re.search(pattern, surface, re.IGNORECASE) for pattern in CODEX_PROMPT_REJECTION_PATTERNS)
+
+
+def _join_nonempty_text_parts(*parts: str) -> str:
+    return "\n".join(part for part in (str(part or "") for part in parts) if part.strip())
+
+
 def _codex_surface_indicates_ready_prompt(text: str) -> bool:
     surface = str(text or "")
     if not surface.strip():
         return False
     if not any(re.search(pattern, surface, re.IGNORECASE | re.MULTILINE) for pattern in CODEX_READY_PATTERNS):
         return False
+    if _codex_surface_has_ready_blocker(surface):
+        return False
     return not any(
         re.search(pattern, surface, re.IGNORECASE)
         for pattern in (
-            *CODEX_STARTING_PATTERNS,
             *CODEX_TRUST_PROMPT_PATTERNS,
             *CODEX_MODEL_SELECTION_PROMPT_PATTERNS,
         )
@@ -1195,6 +1226,18 @@ def is_stale_busy_without_contract_error(error: BaseException | str) -> bool:
 
 class RuntimeShutdownRequested(RuntimeError):
     """Raised inside worker code when the owning backend is shutting down."""
+
+
+class PromptSubmissionRejectedError(TimeoutError):
+    """Raised when the agent explicitly rejects a submitted prompt."""
+
+    def __init__(self, reason: str, diagnostic: str = "") -> None:
+        self.reason = str(reason or "").strip() or "prompt_submission_rejected"
+        message = self.reason
+        diagnostic_text = str(diagnostic or "").strip()
+        if diagnostic_text:
+            message = f"{message}:\n{diagnostic_text}"
+        super().__init__(message)
 
 
 _RUNTIME_SHUTDOWN_REQUESTED = threading.Event()
@@ -2163,6 +2206,8 @@ class CodexOutputDetector(BaseOutputDetector):
             return AgentRuntimeState.STARTING
         if BRAILLE_SPINNER_PREFIX_RE.match(title):
             return AgentRuntimeState.BUSY
+        if _codex_surface_has_ready_blocker(surface):
+            return AgentRuntimeState.STARTING
         if _codex_surface_indicates_ready_input(effective_surface):
             return AgentRuntimeState.READY
         return AgentRuntimeState.STARTING
@@ -2333,6 +2378,11 @@ def classify_agent_runtime_state(
         detector: BaseOutputDetector,
 ) -> AgentRuntimeState:
     current_command = str(observation.current_command or "").strip()
+    codex_surface = ""
+    codex_ready_blocked = False
+    if context.vendor == Vendor.CODEX:
+        codex_surface = _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+        codex_ready_blocked = _codex_surface_has_ready_blocker(codex_surface)
     if not observation.session_exists or observation.pane_dead or not str(context.pane_id or "").strip():
         return AgentRuntimeState.DEAD
     if not context.agent_started and current_command in SHELL_COMMANDS:
@@ -2341,14 +2391,15 @@ def classify_agent_runtime_state(
         return AgentRuntimeState.DEAD
     if not context.agent_started:
         if context.vendor == Vendor.CODEX:
-            if context.title_ready:
+            if context.title_ready and not codex_ready_blocked:
                 return AgentRuntimeState.READY
             if context.title_busy:
                 return detector.classify_agent_state(observation)
-        if context.title_ready:
-            return AgentRuntimeState.READY
-        if context.title_busy:
-            return AgentRuntimeState.BUSY
+        else:
+            if context.title_ready:
+                return AgentRuntimeState.READY
+            if context.title_busy:
+                return AgentRuntimeState.BUSY
         if context.vendor == Vendor.GEMINI:
             surface = "\n".join(
                 part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip()
@@ -2373,13 +2424,16 @@ def classify_agent_runtime_state(
                 return surface_state
         return AgentRuntimeState.STARTING
     if context.pre_submit_ready_probe and not context.task_running:
-        if context.title_ready:
+        if context.title_ready and (context.vendor != Vendor.CODEX or not codex_ready_blocked):
             return AgentRuntimeState.READY
-        surface = "\n".join(
+        surface = codex_surface if context.vendor == Vendor.CODEX else "\n".join(
             part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip()
         )
         if context.vendor == Vendor.CODEX:
-            if _codex_surface_indicates_ready_input(_codex_effective_recent_surface(surface)):
+            if (
+                    not codex_ready_blocked
+                    and _codex_surface_indicates_ready_input(_codex_effective_recent_surface(surface))
+            ):
                 return AgentRuntimeState.READY
         elif context.vendor == Vendor.CLAUDE:
             if (
@@ -3658,6 +3712,51 @@ class TmuxBatchWorker:
                 return True
         return False
 
+    def _observation_indicates_prompt_submission_rejection(
+            self,
+            observation: WorkerObservation,
+            *,
+            prompt_visible: bool,
+            prompt_in_delta: bool,
+            marker_visible: bool,
+            marker_in_delta: bool,
+    ) -> bool:
+        if self.config.vendor != Vendor.CODEX:
+            return False
+        if _codex_surface_has_prompt_rejection(observation.raw_log_delta):
+            return True
+        prompt_echo_observed = prompt_visible or prompt_in_delta or marker_visible or marker_in_delta
+        if not prompt_echo_observed:
+            return False
+        return _codex_surface_has_prompt_rejection(
+            _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+        )
+
+    def _record_prompt_submission_rejected(
+            self,
+            *,
+            label: str,
+            error: PromptSubmissionRejectedError,
+            timeout_sec: float,
+    ) -> None:
+        self.dispatch_state = "delayed"
+        self.dispatch_reason = error.reason
+        self._write_state(
+            WorkerStatus.RUNNING,
+            note=f"dispatch_delayed:{label}",
+            extra={
+                "dispatch_state": self.dispatch_state,
+                "dispatch_reason": self.dispatch_reason,
+                "dispatch_timeout_sec": timeout_sec,
+            },
+        )
+        self._log_event(
+            "prompt_submission_rejected",
+            label=label,
+            reason=self.dispatch_reason,
+            timeout_sec=timeout_sec,
+        )
+
     def _wait_for_prompt_submission(
             self,
             *,
@@ -3688,6 +3787,17 @@ class TmuxBatchWorker:
             marker_visible = self._source_mentions_prompt_submission_marker(observation.visible_text, prompt)
             marker_in_delta = self._source_mentions_prompt_submission_marker(observation.raw_log_delta, prompt)
             current_state = self.get_agent_state(observation)
+            if self._observation_indicates_prompt_submission_rejection(
+                    observation,
+                    prompt_visible=prompt_visible,
+                    prompt_in_delta=prompt_in_delta,
+                    marker_visible=marker_visible,
+                    marker_in_delta=marker_in_delta,
+            ):
+                raise PromptSubmissionRejectedError(
+                    "prompt_submission_rejected:no_active_thread",
+                    self._diagnostic_visible_tail(200),
+                )
             busy_transition = initial_state == AgentRuntimeState.READY and current_state == AgentRuntimeState.BUSY
             submission_observed = (
                 submission_observed
@@ -3735,6 +3845,8 @@ class TmuxBatchWorker:
         post_done_since_monotonic = time.monotonic() if status_done_seen else 0.0
         post_done_grace_sec = max(float(contract.quiet_window_sec), TURN_ARTIFACT_POST_DONE_GRACE_SEC)
         last_probe_monotonic = 0.0
+        last_validation_error: Exception | None = None
+        last_file_wait_observation: WorkerObservation | None = None
 
         while time.monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for turn artifacts")
@@ -3750,6 +3862,7 @@ class TmuxBatchWorker:
                 file_result = contract.validator(contract.status_path)
                 validate_turn_file_artifact_rules(contract, file_result)
             except Exception as error:
+                last_validation_error = error
                 stable_signature = None
                 stable_since_monotonic = 0.0
                 invalid_state = "missing"
@@ -3793,6 +3906,7 @@ class TmuxBatchWorker:
                         raise RuntimeError("tmux pane exited while waiting for turn artifacts")
                     if observation.pane_dead:
                         raise RuntimeError(f"tmux pane died while waiting for turn artifacts:\n{self._diagnostic_visible_tail(160)}")
+                    last_file_wait_observation = observation
                     if observation.current_command in SHELL_COMMANDS and not status_done_seen:
                         self.agent_ready = False
                         raise RuntimeError(
@@ -3821,6 +3935,7 @@ class TmuxBatchWorker:
                 time.sleep(FILE_CONTRACT_POLL_INTERVAL_SEC)
                 continue
 
+            last_validation_error = None
             status_stat = contract.status_path.stat()
             invalid_signature = None
             invalid_since_monotonic = 0.0
@@ -3861,6 +3976,7 @@ class TmuxBatchWorker:
                     raise RuntimeError("tmux pane exited while waiting for turn artifacts")
                 if observation.pane_dead:
                     raise RuntimeError(f"tmux pane died while waiting for turn artifacts:\n{self._diagnostic_visible_tail(160)}")
+                last_file_wait_observation = observation
                 if observation.current_command in SHELL_COMMANDS:
                     self.agent_ready = False
                     raise RuntimeError(
@@ -3915,6 +4031,7 @@ class TmuxBatchWorker:
                     raise RuntimeError("tmux pane exited while waiting for turn artifacts")
                 if observation.pane_dead:
                     raise RuntimeError(f"tmux pane died while waiting for turn artifacts:\n{self._diagnostic_visible_tail(160)}")
+                last_file_wait_observation = observation
                 if observation.current_command in SHELL_COMMANDS:
                     if not status_done_seen:
                         self.agent_ready = False
@@ -3952,6 +4069,53 @@ class TmuxBatchWorker:
                         f"runtime_stalled idle_sec={idle_elapsed:.1f}"
                     )
             time.sleep(FILE_CONTRACT_POLL_INTERVAL_SEC)
+
+        status_done_seen = self._track_task_completion_signal(
+            task_status_path=task_status_path,
+            status_done_seen=status_done_seen,
+        )
+        try:
+            file_result = contract.validator(contract.status_path)
+            validate_turn_file_artifact_rules(contract, file_result)
+        except Exception as error:
+            if contract.status_path.exists():
+                still_busy = False
+                if last_file_wait_observation is not None and not status_done_seen:
+                    with contextlib.suppress(Exception):
+                        still_busy = self.get_agent_state(last_file_wait_observation) == AgentRuntimeState.BUSY
+                if still_busy:
+                    raise TimeoutError(
+                        f"等待 turn 文件结果超时: phase={contract.phase} status_path={contract.status_path}\n"
+                        f"{self._diagnostic_visible_tail(200)}"
+                    ) from None
+                error_text = str(error).strip()
+                if not error_text and last_validation_error is not None:
+                    error_text = str(last_validation_error).strip()
+                raise RuntimeError(
+                    f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
+                    f"phase={contract.phase} status_path={contract.status_path} "
+                    f"timeout_validation_error={error_text}"
+                ) from error
+        else:
+            if not self._turn_artifacts_are_fresh_for_task(
+                contract,
+                task_status_path=task_status_path,
+            ):
+                raise RuntimeError(
+                    f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
+                    f"phase={contract.phase} status_path={contract.status_path} "
+                    f"stale_review_round_artifacts task_status_path={task_status_path}"
+                )
+            if task_status_path is not None:
+                write_task_status(task_status_path, status=TASK_STATUS_DONE)
+            self.current_task_runtime_status = TASK_STATUS_DONE
+            self._log_event(
+                "turn_artifacts_ready_after_deadline_validation",
+                turn_id=contract.turn_id,
+                phase=contract.phase,
+                status_path=str(contract.status_path),
+            )
+            return file_result
 
         raise TimeoutError(
             f"等待 turn 文件结果超时: phase={contract.phase} status_path={contract.status_path}\n"
@@ -4055,6 +4219,10 @@ class TmuxBatchWorker:
             raise RuntimeError("tmux pane exited while finalizing task result after busy timeout")
         if observation.pane_dead:
             raise RuntimeError(f"tmux pane died while finalizing task result after busy timeout:\n{self._diagnostic_visible_tail(160)}")
+        if contract.mode in {"a07_developer_init", "a07_developer_human_reply"}:
+            legacy_status = self._a07_legacy_task_result_status_from_delta(observation.raw_log_delta)
+            if legacy_status and legacy_status != decision_status:
+                return None
         current_command = observation.current_command or self.current_command
         if current_command in SHELL_COMMANDS or not self._agent_running(current_command):
             return None
@@ -4065,7 +4233,7 @@ class TmuxBatchWorker:
         agent_state = self.get_agent_state(observation)
         if agent_state == AgentRuntimeState.READY:
             ready_evidence = "agent_state"
-        elif decision_status in {TASK_RESULT_READY, TASK_RESULT_HITL} and self._observation_indicates_ready_or_idle_surface(observation):
+        elif decision_status == TASK_RESULT_HITL and self._observation_indicates_ready_or_idle_surface(observation):
             ready_evidence = "idle_surface"
         else:
             return None
@@ -4095,6 +4263,75 @@ class TmuxBatchWorker:
         )
         return result_file
 
+    @staticmethod
+    def _a07_legacy_task_result_status_from_delta(raw_log_delta: str) -> str:
+        for line in reversed(clean_ansi(str(raw_log_delta or "")).splitlines()):
+            if _extract_protocol_token_from_line(line, ("准备就绪",)):
+                return TASK_RESULT_READY
+            if _extract_protocol_token_from_line(line, ("阻断",)):
+                return TASK_RESULT_HITL
+        return ""
+
+    @staticmethod
+    def _contract_artifact_text(contract: TaskResultContract, alias: str) -> str:
+        path = contract.optional_artifacts.get(alias) or contract.required_artifacts.get(alias)
+        if path is None:
+            return ""
+        target = Path(path).expanduser().resolve()
+        if not target.exists() or not target.is_file():
+            return ""
+        with contextlib.suppress(Exception):
+            return target.read_text(encoding="utf-8", errors="replace").strip()
+        return ""
+
+    def _try_finalize_a07_legacy_task_result_from_observation(
+            self,
+            *,
+            contract: TaskResultContract,
+            task_status_path: Path | None,
+            result_path: Path,
+            observation: WorkerObservation,
+    ) -> TaskResultFile | None:
+        if contract.mode not in {"a07_developer_init", "a07_developer_human_reply"}:
+            return None
+        if result_path.exists():
+            return None
+        status = self._a07_legacy_task_result_status_from_delta(observation.raw_log_delta)
+        if not status or status not in set(contract.expected_statuses):
+            return None
+        ask_human_path = contract.optional_artifacts.get("ask_human") or contract.required_artifacts.get("ask_human")
+        ask_human_text = self._contract_artifact_text(contract, "ask_human")
+        if status == TASK_RESULT_READY and ask_human_text:
+            return None
+        if status == TASK_RESULT_HITL and (ask_human_path is None or not ask_human_text):
+            return None
+        try:
+            result_file = finalize_task_result(
+                contract=contract,
+                result_path=result_path,
+                task_status_path=task_status_path,
+            )
+        except Exception:
+            return None
+        if str(result_file.payload.get("status", "")).strip() != status:
+            return None
+        self.current_task_runtime_status = TASK_STATUS_DONE
+        self.current_command = observation.current_command
+        self.current_path = observation.current_path
+        self.last_heartbeat_at = observation.observed_at
+        self.agent_ready = True
+        self.agent_started = True
+        self.agent_state = AgentRuntimeState.READY
+        self.wrapper_state = WrapperState.READY
+        self._log_event(
+            "task_result_ready_from_a07_legacy_protocol",
+            turn_id=contract.turn_id,
+            phase=contract.phase,
+            result_path=str(result_path),
+            status=status,
+        )
+        return result_file
+
     def _busy_agent_observation_after_turn_timeout(self) -> WorkerObservation | None:
         observation = self._probe_agent_liveness_for_file_wait()
         if not observation.session_exists:
@@ -4110,6 +4347,12 @@ class TmuxBatchWorker:
             return None
         self._raise_on_provider_runtime_error(observation, context="waiting for timed-out turn")
         if self.get_agent_state(observation) != AgentRuntimeState.BUSY:
+            return None
+        if (
+            not str(observation.raw_log_delta or "").strip()
+            and self._observation_indicates_ready_or_idle_surface(observation)
+        ):
+            self._mark_agent_ready_from_observation(observation, note="agent_ready_after_timed_out_turn")
             return None
         self.agent_ready = False
         self.agent_started = True
@@ -4208,8 +4451,29 @@ class TmuxBatchWorker:
     ) -> TaskResultFile | None:
         if not prompt_submission_observed:
             return None
+        extension_count = 0
+        extension_timeout_sec = min(
+            max(float(timeout_sec or 0.0), FILE_CONTRACT_POLL_INTERVAL_SEC),
+            TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC,
+        )
         while True:
             raise_if_runtime_shutdown_requested("waiting for busy agent task result")
+            if extension_count >= max(int(TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS), 0):
+                self.dispatch_state = "delayed"
+                self.dispatch_reason = (
+                    f"{STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX}:"
+                    f"phase={contract.phase} result_path={result_path} "
+                    f"busy_extensions_exhausted={extension_count}"
+                )
+                self._log_event(
+                    "task_result_busy_timeout_extensions_exhausted",
+                    label=label,
+                    attempt=attempt,
+                    extension_count=extension_count,
+                    result_path=str(result_path),
+                    dispatch_reason=self.dispatch_reason,
+                )
+                return None
             observation = self._busy_agent_observation_after_turn_timeout()
             if observation is None:
                 return self._try_finalize_task_result_from_ready_agent_after_busy_timeout(
@@ -4218,10 +4482,11 @@ class TmuxBatchWorker:
                     result_path=result_path,
                     prompt_submission_observed=prompt_submission_observed,
                 )
+            extension_count += 1
             self._record_turn_timeout_extended_for_busy_agent(
                 label=label,
-                attempt=attempt,
-                timeout_sec=timeout_sec,
+                attempt=attempt + extension_count - 1,
+                timeout_sec=extension_timeout_sec,
                 task_status_path=task_status_path,
                 observation=observation,
             )
@@ -4230,7 +4495,7 @@ class TmuxBatchWorker:
                     contract=contract,
                     task_status_path=task_status_path,
                     result_path=result_path,
-                    timeout_sec=timeout_sec,
+                    timeout_sec=extension_timeout_sec,
                     baseline_visible=baseline_visible,
                     baseline_raw_log_tail=baseline_raw_log_tail,
                 )
@@ -4440,6 +4705,14 @@ class TmuxBatchWorker:
                 )
                 if result_file is not None:
                     return result_file
+                legacy_result_file = self._try_finalize_a07_legacy_task_result_from_observation(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    observation=observation,
+                )
+                if legacy_result_file is not None:
+                    return legacy_result_file
                 self._raise_if_stale_busy_without_contract(
                     observation=observation,
                     phase=contract.phase,
@@ -4630,6 +4903,14 @@ class TmuxBatchWorker:
                         )
                         if result_file is not None:
                             return result_file
+                        legacy_result_file = self._try_finalize_a07_legacy_task_result_from_observation(
+                            contract=contract,
+                            task_status_path=task_status_path,
+                            result_path=result_path,
+                            observation=observation,
+                        )
+                        if legacy_result_file is not None:
+                            return legacy_result_file
                         self._raise_if_stale_busy_without_contract(
                             observation=observation,
                             phase=contract.phase,
@@ -4689,6 +4970,14 @@ class TmuxBatchWorker:
                     )
                     if result_file is not None:
                         return result_file
+                    legacy_result_file = self._try_finalize_a07_legacy_task_result_from_observation(
+                        contract=contract,
+                        task_status_path=task_status_path,
+                        result_path=result_path,
+                        observation=observation,
+                    )
+                    if legacy_result_file is not None:
+                        return legacy_result_file
                     if (
                         not status_done_seen
                         and not result_path.exists()
@@ -5330,11 +5619,13 @@ class TmuxBatchWorker:
         if not recent_output.strip():
             return False
         if self.config.vendor == Vendor.CODEX:
-            recent_output = _codex_effective_recent_surface(recent_output)
-            if _codex_surface_indicates_ready_prompt(recent_output):
+            if _codex_surface_has_ready_blocker(recent_output):
+                return True
+            effective_output = _codex_effective_recent_surface(recent_output)
+            if _codex_surface_indicates_ready_prompt(effective_output):
                 return False
             return any(
-                re.search(pattern, recent_output, re.IGNORECASE)
+                re.search(pattern, effective_output, re.IGNORECASE)
                 for pattern in (
                     *CODEX_TRUST_PROMPT_PATTERNS,
                     *CODEX_UPDATE_NOTICE_PATTERNS,
@@ -5394,7 +5685,7 @@ class TmuxBatchWorker:
         current_command = observation.current_command or self.current_command
         if not self._agent_running(current_command):
             return ""
-        surface = observation.visible_text or observation.raw_log_tail
+        surface = _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
         if self._visible_indicates_agent_starting(surface):
             return ""
         if not self._visible_indicates_agent_ready(
@@ -5412,10 +5703,13 @@ class TmuxBatchWorker:
         current_command = observation.current_command or self.current_command
         if not self._agent_running(current_command):
             return False
+        if self.config.vendor == Vendor.CODEX:
+            surface = _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+            if _codex_surface_has_ready_blocker(surface):
+                return False
         if self._title_indicates_ready(observation.pane_title):
             return True
         if self.config.vendor == Vendor.CODEX:
-            surface = "\n".join(part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip())
             return _codex_surface_indicates_ready_input(_codex_effective_recent_surface(surface))
         return self._visible_indicates_agent_ready(
             observation.visible_text,
@@ -5609,7 +5903,17 @@ class TmuxBatchWorker:
                 continue
 
             if self._agent_running(current_command):
-                ready_signature = observation.pane_title if self._title_indicates_ready(observation.pane_title) else ""
+                codex_ready_blocked = (
+                    self.config.vendor == Vendor.CODEX
+                    and _codex_surface_has_ready_blocker(
+                        _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+                    )
+                )
+                ready_signature = (
+                    observation.pane_title
+                    if self._title_indicates_ready(observation.pane_title) and not codex_ready_blocked
+                    else ""
+                )
                 if not ready_signature:
                     ready_signature = self._visible_ready_signature(observation)
                 if ready_signature and ready_signature == previous_ready_signature:
@@ -5747,6 +6051,8 @@ class TmuxBatchWorker:
 
     def _try_mark_turn_start_ready_from_current_observation(self, *, label: str, delayed: bool) -> bool:
         if not self.pane_id:
+            return False
+        if not self.agent_started and not str(self.current_command or "").strip():
             return False
         try:
             if not self.session_exists() or not self.target_exists():
@@ -6406,6 +6712,13 @@ class TmuxBatchWorker:
                         self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
                         self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                         prompt_submission_observed = True
+                    except PromptSubmissionRejectedError as error:
+                        self._record_prompt_submission_rejected(
+                            label=label,
+                            error=error,
+                            timeout_sec=prompt_confirmation_timeout,
+                        )
+                        raise
                     except TimeoutError as error:
                         self.dispatch_state = "delayed"
                         self.dispatch_reason = f"prompt_confirm_timeout:{error}"
@@ -6451,6 +6764,13 @@ class TmuxBatchWorker:
                             self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
                             self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                             prompt_submission_observed = True
+                        except PromptSubmissionRejectedError as error:
+                            self._record_prompt_submission_rejected(
+                                label=label,
+                                error=error,
+                                timeout_sec=prompt_confirmation_timeout,
+                            )
+                            raise
                         except TimeoutError as error:
                             self.dispatch_state = "delayed"
                             self.dispatch_reason = f"prompt_confirm_timeout:{error}"
@@ -6524,7 +6844,10 @@ class TmuxBatchWorker:
                 )
                 return result
             except TimeoutError as error:
+                prompt_submission_rejected = isinstance(error, PromptSubmissionRejectedError)
                 if (
+                        not prompt_submission_rejected
+                        and
                         not prompt_submission_observed
                         and (completion_contract is not None or result_contract is not None)
                 ):
@@ -6691,13 +7014,22 @@ class TmuxBatchWorker:
                             },
                         )
                         return result
+                    if prompt_submission_observed:
+                        if not str(self.dispatch_reason or "").startswith(STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX):
+                            self.dispatch_state = "delayed"
+                            self.dispatch_reason = (
+                                f"{STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX}:"
+                                f"phase={result_contract.phase} result_path={result_path} "
+                                "task_result_missing_after_timeout"
+                            )
+                        error = TimeoutError(f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: {self.dispatch_reason}")
                 last_timeout = error
                 self.agent_ready = False
                 self.agent_state = AgentRuntimeState.STARTING
                 self.current_task_runtime_status = read_task_status(task_status_path)
                 if self.current_task_runtime_status == TASK_STATUS_RUNNING:
                     self.current_task_runtime_status = ""
-                if attempt < 2:
+                if attempt < 2 and not is_task_result_contract_error(error):
                     self._log_event("turn_timeout_retry", label=label, attempt=attempt)
                     self._write_state(
                         WorkerStatus.RUNNING,

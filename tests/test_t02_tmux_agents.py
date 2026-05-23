@@ -27,6 +27,7 @@ from T02_tmux_agents import (
     WorkerHealthSnapshot,
     WorkerStatus,
     TIMEOUT_EXIT_CODE,
+    PromptSubmissionRejectedError,
     TaskResultContract,
     TmuxBackend,
     TmuxBatchWorker,
@@ -1323,6 +1324,36 @@ workspace (/directory)                                                     branc
             )
         )
         self.assertEqual(codex_waiting_with_update_banner_phase, AgentRuntimeState.READY)
+
+        codex_loading_with_ready_footer_phase = CodexOutputDetector().classify_agent_state(
+            WorkerObservation(
+                visible_text="\n".join(
+                    [
+                        "model: loading",
+                        "• Starting MCP servers (0/2): notion (0s • esc to interrupt)",
+                        "› Improve documentation in @filename",
+                        "  gpt-5.4 xhigh · ~/project",
+                    ]
+                ),
+                raw_log_delta="",
+                raw_log_tail="\n".join(
+                    [
+                        "model: loading",
+                        "• Starting MCP servers (0/2): notion (0s • esc to interrupt)",
+                        "› Improve documentation in @filename",
+                        "  gpt-5.4 xhigh · ~/project",
+                    ]
+                ),
+                current_command="codex",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-05-23T10:16:37",
+                pane_title="project",
+            )
+        )
+        self.assertEqual(codex_loading_with_ready_footer_phase, AgentRuntimeState.STARTING)
 
         codex_booting_phase = CodexOutputDetector().classify_agent_state(
             WorkerObservation(
@@ -2806,6 +2837,130 @@ workspace (/directory)                                                     branc
         self.assertEqual(len(worker.sent_prompts), 1)
         self.assertEqual(worker.wait_calls, 1)
 
+    def test_run_turn_retries_after_codex_no_active_thread_prompt_rejection(self):
+        class NoActiveThreadThenReadyWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+                self.prompt_confirm_calls = 0
+                self.ensure_calls = 0
+                self.wait_calls = 0
+                self.state_notes = []
+
+            def _append_transcript(self, title, body):  # noqa: ANN001, ARG002
+                return None
+
+            def _write_state(self, status, *, note, extra=None):  # noqa: ANN001
+                self.state_notes.append((status.value, note, extra or {}))
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.ensure_calls += 1
+                self.pane_id = "%1"
+                self.agent_ready = True
+                self.agent_started = True
+                self.agent_state = AgentRuntimeState.READY
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "project"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Improve documentation in @filename\n  gpt-5.4 xhigh · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-23T10:17:00",
+                    pane_title="project",
+                )
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                self.prompt_confirm_calls += 1
+                if self.prompt_confirm_calls == 1:
+                    raise PromptSubmissionRejectedError("prompt_submission_rejected:no_active_thread")
+                return self.observe()
+
+            def wait_for_turn_artifacts(self, *, contract, task_status_path=None, timeout_sec):  # noqa: ANN001, ARG002
+                self.wait_calls += 1
+                artifact_path.write_text("routing protocol", encoding="utf-8")
+                contract.status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "turn_id": contract.turn_id,
+                            "phase": contract.phase,
+                            "status": "done",
+                            "written_at": "2026-05-23T10:17:03+08:00",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                if task_status_path is not None:
+                    write_task_status(task_status_path, status="done")
+                self.current_task_runtime_status = "done"
+                return contract.validator(contract.status_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            contract_path = root / "turn_status.json"
+            artifact_path = root / "AGENTS.md"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"agents": str(artifact_path)},
+                    artifact_hashes={"agents": "sha256:agents"},
+                    validated_at="2026-05-23T10:17:04",
+                )
+
+            worker = NoActiveThreadThenReadyWorker(
+                worker_id="codex-no-active-thread-retry-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                runtime_root=root / "runtime",
+            )
+            result = worker.run_turn(
+                label="create_routing_layer",
+                prompt="write routing files only",
+                completion_contract=TurnFileContract(
+                    turn_id="create_routing_layer_1",
+                    phase="routing_layer_create",
+                    status_path=contract_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                    kind="routing_file_contract",
+                ),
+                timeout_sec=1.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 2)
+        self.assertEqual(worker.prompt_confirm_calls, 2)
+        self.assertEqual(worker.wait_calls, 1)
+        self.assertTrue(
+            any(
+                extra.get("dispatch_reason") == "prompt_submission_rejected:no_active_thread"
+                for _, _, extra in worker.state_notes
+            )
+        )
+
     def test_run_turn_does_not_retry_when_agent_becomes_busy_after_prompt_timeout(self):
         class DelayedBusyAfterPromptTimeoutWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -3036,6 +3191,126 @@ workspace (/directory)                                                     branc
             )
             self.assertEqual(Path(result.status_path).resolve(), status_path.resolve())
             self.assertEqual(Path(result.artifact_paths["artifact.txt"]).resolve(), artifact_path.resolve())
+
+    def test_wait_for_turn_artifacts_accepts_valid_status_on_deadline_validation(self):
+        class FileContractWorker(TmuxBatchWorker):
+            def capture_visible(self, tail_lines=500):
+                return "visible"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            artifact_path = root / "artifact.txt"
+            artifact_path.write_text("artifact-body", encoding="utf-8")
+            status_path = root / "turn_status.json"
+            status_path.write_text(json.dumps({"ok": True}), encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not payload.get("ok"):
+                    raise ValueError("not ready")
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"artifact.txt": str(artifact_path)},
+                    artifact_hashes={"artifact.txt": "sha256:test"},
+                    validated_at="2026-04-12T00:00:00",
+                )
+
+            worker = FileContractWorker(
+                worker_id="deadline-file-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            result = worker.wait_for_turn_artifacts(
+                contract=TurnFileContract(
+                    turn_id="create_routing_layer_1",
+                    phase="routing_layer_create",
+                    status_path=status_path,
+                    validator=validator,
+                    quiet_window_sec=1.0,
+                ),
+                timeout_sec=0.0,
+            )
+            self.assertEqual(Path(result.status_path).resolve(), status_path.resolve())
+            self.assertEqual(worker.current_task_runtime_status, TASK_STATUS_DONE)
+
+    def test_wait_for_turn_artifacts_reports_invalid_existing_status_after_deadline(self):
+        class FileContractWorker(TmuxBatchWorker):
+            def capture_visible(self, tail_lines=500):
+                return "visible"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            status_path = root / "turn_status.json"
+            status_path.write_text(json.dumps({"ok": False}), encoding="utf-8")
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if not payload.get("ok"):
+                    raise ValueError("not ready")
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={},
+                    artifact_hashes={},
+                    validated_at="2026-04-12T00:00:00",
+                )
+
+            worker = FileContractWorker(
+                worker_id="invalid-deadline-file-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            with self.assertRaisesRegex(RuntimeError, f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}.*not ready"):
+                worker.wait_for_turn_artifacts(
+                    contract=TurnFileContract(
+                        turn_id="create_routing_layer_1",
+                        phase="routing_layer_create",
+                        status_path=status_path,
+                        validator=validator,
+                        quiet_window_sec=1.0,
+                    ),
+                    timeout_sec=0.0,
+                )
+
+    def test_wait_for_turn_artifacts_keeps_timeout_when_status_file_missing_after_deadline(self):
+        class FileContractWorker(TmuxBatchWorker):
+            def capture_visible(self, tail_lines=500):
+                return "visible"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            status_path = root / "turn_status.json"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={},
+                    artifact_hashes={},
+                    validated_at="2026-04-12T00:00:00",
+                )
+
+            worker = FileContractWorker(
+                worker_id="missing-deadline-file-contract-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            with self.assertRaisesRegex(TimeoutError, "等待 turn 文件结果超时"):
+                worker.wait_for_turn_artifacts(
+                    contract=TurnFileContract(
+                        turn_id="create_routing_layer_1",
+                        phase="routing_layer_create",
+                        status_path=status_path,
+                        validator=validator,
+                        quiet_window_sec=1.0,
+                    ),
+                    timeout_sec=0.0,
+                )
 
     def test_wait_for_turn_artifacts_ignores_transient_target_exists_false_after_observe(self):
         class FileContractWorker(TmuxBatchWorker):
@@ -4508,6 +4783,220 @@ workspace (/directory)                                                     branc
                         result_path=result_path,
                         timeout_sec=1.0,
                     )
+
+    def test_task_result_busy_after_timeout_extension_is_bounded(self):
+        class EndlessBusyWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.wait_calls = 0
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="Working on files...\nesc interrupt",
+                    raw_log_delta="",
+                    raw_log_tail="Working on files...\nesc interrupt",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-19T12:00:00",
+                    pane_title="⠋ codex",
+                )
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.BUSY
+
+            def wait_for_task_result(self, **kwargs):  # noqa: ANN003
+                self.wait_calls += 1
+                raise TimeoutError("still waiting for task result")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            worker = EndlessBusyWorker(
+                worker_id="endless-busy-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": root / "工程师开发内容.md"},
+            )
+
+            with mock.patch("T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 2), mock.patch(
+                "T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC",
+                0.01,
+            ):
+                result = worker._wait_for_task_result_while_agent_busy_after_timeout(  # noqa: SLF001
+                    label="development_start_M1-T1",
+                    attempt=1,
+                    timeout_sec=1200.0,
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    baseline_visible="",
+                    baseline_raw_log_tail="",
+                    prompt_submission_observed=True,
+                )
+
+            self.assertIsNone(result)
+            self.assertEqual(worker.wait_calls, 4)
+            self.assertTrue(worker.dispatch_reason.startswith("stale_busy_without_contract:"))
+
+    def test_task_result_busy_after_timeout_finalizes_when_ready_surface_has_no_delta(self):
+        class ReadySurfaceWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Improve documentation in @filename\n  gpt-5.4-mini high · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-19T12:00:00",
+                    pane_title="TmuxCodingTeam",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            time.sleep(0.01)
+            developer_output = root / "工程师开发内容.md"
+            developer_output.write_text("- **完成任务**: `M1-T1`\n", encoding="utf-8")
+            result_path = root / "result.json"
+            worker = ReadySurfaceWorker(
+                worker_id="ready-surface-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_task_runtime_status = "running"
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": developer_output},
+            )
+
+            result = worker._wait_for_task_result_while_agent_busy_after_timeout(  # noqa: SLF001
+                label="development_start_M1-T1",
+                attempt=1,
+                timeout_sec=1200.0,
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                baseline_visible="",
+                baseline_raw_log_tail="",
+                prompt_submission_observed=True,
+            )
+
+            self.assertIsNotNone(result)
+            self.assertEqual(result.payload["status"], "completed")
+            self.assertTrue(result_path.exists())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertEqual(worker.current_task_runtime_status, "done")
+
+    def test_run_turn_result_contract_missing_after_ready_timeout_returns_contract_error(self):
+        class ReadyMissingResultWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts: list[str] = []
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                raise TimeoutError("prompt confirm timeout")
+
+            def wait_for_task_result(self, **kwargs):  # noqa: ANN003
+                raise TimeoutError("等待任务结果超时")
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Improve documentation in @filename\n  gpt-5.4-mini high · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-19T12:00:00",
+                    pane_title="TmuxCodingTeam",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "› Improve documentation in @filename"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            worker = ReadyMissingResultWorker(
+                worker_id="ready-missing-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": root / "工程师开发内容.md"},
+            )
+
+            result = worker.run_turn(
+                label="development_start_M1-T1",
+                prompt="write developer output",
+                result_contract=contract,
+                timeout_sec=0.01,
+                prompt_submit_timeout_sec=0.01,
+            )
+
+        self.assertFalse(result.ok)
+        self.assertIn(TASK_RESULT_CONTRACT_ERROR_PREFIX, result.clean_output)
+        self.assertIn("task_result_missing_after_timeout", result.clean_output)
 
     def test_wait_for_task_result_marks_task_done_when_result_stable_and_agent_ready(self):
         class ResultReadyWorker(TmuxBatchWorker):
@@ -6359,6 +6848,62 @@ workspace (/directory)                                                     branc
                 worker._wait_for_prompt_submission(prompt="analyze", timeout_sec=0.01)
 
         self.assertGreaterEqual(worker.observe_calls, 1)
+
+    def test_wait_for_prompt_submission_rejects_codex_no_active_thread_with_prompt_echo(self):
+        class NoActiveThreadPromptWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+                self.surface = ""
+
+            def observe(self, *, tail_lines=320, tail_bytes=24000):
+                self.observe_calls += 1
+                return WorkerObservation(
+                    visible_text=self.surface,
+                    raw_log_delta=self.surface,
+                    raw_log_tail=self.surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-23T10:16:39",
+                    pane_title="project",
+                )
+
+            def capture_visible(self, tail_lines=500):
+                return self.surface
+
+        prompt = "\n".join(
+            [
+                "请生成路由初始化文件并覆盖当前仓库的机器路由配置。",
+                "必须写入 AGENTS.md docs/repo_map.json docs/task_routes.json docs/pitfalls.json。",
+                "完成后只依赖文件契约，不要在终端输出额外完成协议。",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = NoActiveThreadPromptWorker(
+                worker_id="codex-no-active-thread-prompt-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.READY
+            worker.surface = "\n".join(
+                [
+                    prompt,
+                    "■ No active thread is available.",
+                    "› Improve documentation in @filename",
+                    "  gpt-5.4 xhigh · ~/project",
+                ]
+            )
+
+            with self.assertRaisesRegex(PromptSubmissionRejectedError, "prompt_submission_rejected:no_active_thread"):
+                worker._wait_for_prompt_submission(prompt=prompt, timeout_sec=1.0)
+
+        self.assertEqual(worker.observe_calls, 1)
 
     def test_source_mentions_prompt_accepts_multiple_wrapped_fragments(self):
         prompt = "\n".join(
@@ -10058,7 +10603,7 @@ Do you trust the files in this folder?
         self.assertFalse(awaiting_reconfig_resumed)
         self.assertFalse(stale_busy_resumed)
 
-    def test_wait_for_task_result_finalizes_ready_contract_when_tmux_title_is_stale_busy(self):
+    def test_wait_for_task_result_does_not_finalize_ready_contract_when_tmux_title_is_stale_busy(self):
         class StaleBusyTaskResultWorker(TmuxBatchWorker):
             def target_exists(self, target=None):  # noqa: ANN001, ARG002
                 return True
@@ -10107,6 +10652,75 @@ Do you trust the files in this folder?
                 expected_statuses=("ready",),
             )
 
+            with self.assertRaisesRegex(RuntimeError, TASK_RESULT_CONTRACT_ERROR_PREFIX):
+                worker.wait_for_task_result(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    timeout_sec=0.6,
+                )
+
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "running"})
+            self.assertFalse(result_path.exists())
+            self.assertEqual(worker.dispatch_state, "delayed")
+            self.assertIn("stale_busy_without_contract", worker.dispatch_reason)
+
+    def test_wait_for_task_result_finalizes_a07_ready_from_legacy_delta_on_stale_busy(self):
+        class StaleBusyTaskResultWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def _terminal_idle_elapsed_sec(self):
+                return 60.0
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Find and fix a bug in @filename\n  gpt-5.5 xhigh · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="• 准备就绪\n",
+                    raw_log_tail=f"done\n• 准备就绪\n{surface}",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-19T00:00:03",
+                    pane_title="⠋ TmuxCodingTeam",
+                )
+
+            def capture_visible(self, tail_lines=200):  # noqa: ARG002
+                return "› Find and fix a bug in @filename\n  gpt-5.5 xhigh · ~/project"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            ask_human = root / "与人类交流.md"
+            ask_human.write_text("", encoding="utf-8")
+            result_path = root / "result.json"
+            worker = StaleBusyTaskResultWorker(
+                worker_id="stale-busy-a07-ready-legacy-delta",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_command = "codex"
+            contract = TaskResultContract(
+                turn_id="a07_developer_init",
+                phase="a07_developer_init",
+                task_kind="a07_developer_init",
+                mode="a07_developer_init",
+                expected_statuses=("ready", "hitl"),
+                optional_artifacts={"ask_human": ask_human},
+                outcome_artifacts={
+                    "ready": {"forbids": ("ask_human",)},
+                    "hitl": {"requires": ("ask_human",)},
+                },
+            )
+
             result = worker.wait_for_task_result(
                 contract=contract,
                 task_status_path=task_status_path,
@@ -10118,6 +10732,73 @@ Do you trust the files in this folder?
             self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
             self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
             self.assertTrue(result_path.exists())
+
+    def test_wait_for_task_result_rejects_a07_ready_delta_when_hitl_file_is_present(self):
+        class StaleBusyTaskResultWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def _terminal_idle_elapsed_sec(self):
+                return 60.0
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Find and fix a bug in @filename\n  gpt-5.5 xhigh · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="• 准备就绪\n",
+                    raw_log_tail=f"done\n• 准备就绪\n{surface}",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-19T00:00:03",
+                    pane_title="⠋ TmuxCodingTeam",
+                )
+
+            def capture_visible(self, tail_lines=200):  # noqa: ARG002
+                return "› Find and fix a bug in @filename\n  gpt-5.5 xhigh · ~/project"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            ask_human = root / "与人类交流.md"
+            ask_human.write_text("请确认边界\n", encoding="utf-8")
+            result_path = root / "result.json"
+            worker = StaleBusyTaskResultWorker(
+                worker_id="stale-busy-a07-ready-legacy-conflict",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_command = "codex"
+            contract = TaskResultContract(
+                turn_id="a07_developer_init",
+                phase="a07_developer_init",
+                task_kind="a07_developer_init",
+                mode="a07_developer_init",
+                expected_statuses=("ready", "hitl"),
+                optional_artifacts={"ask_human": ask_human},
+                outcome_artifacts={
+                    "ready": {"forbids": ("ask_human",)},
+                    "hitl": {"requires": ("ask_human",)},
+                },
+            )
+
+            with self.assertRaisesRegex(RuntimeError, TASK_RESULT_CONTRACT_ERROR_PREFIX):
+                worker.wait_for_task_result(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    timeout_sec=0.6,
+                )
+
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "running"})
+            self.assertFalse(result_path.exists())
 
     def test_wait_for_task_result_finalizes_hitl_contract_when_tmux_title_is_stale_busy(self):
         class StaleBusyTaskResultWorker(TmuxBatchWorker):
