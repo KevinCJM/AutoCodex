@@ -3495,7 +3495,17 @@ class BridgeCore:
                 if str(worker.get("requirement_name", "")).strip() == requirement_name
             ]
             if scoped_matches:
-                filtered = scoped_matches
+                if normalized_action == "stage.a05.start":
+                    active_unscoped_design_ba = [
+                        worker
+                        for worker in requirement_scope_pool
+                        if str(worker.get("worker_id", "")).strip().lower() == "detailed-design-analyst"
+                        and not str(worker.get("requirement_name", "")).strip()
+                        and _worker_snapshot_is_actively_running(worker)
+                    ]
+                    filtered = _merge_worker_snapshots(scoped_matches, active_unscoped_design_ba)
+                else:
+                    filtered = scoped_matches
             elif any(str(worker.get("requirement_name", "")).strip() for worker in requirement_scope_pool):
                 filtered = []
             else:

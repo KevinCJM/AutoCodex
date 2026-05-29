@@ -1158,10 +1158,20 @@ def _scope_detailed_design_worker(worker: object, *, project_dir: str | Path, re
     set_runtime_metadata = getattr(worker, "set_runtime_metadata", None)
     if not callable(set_runtime_metadata):
         return
+    requirement_text = str(requirement_name or "").strip()
+    if not requirement_text:
+        read_state = getattr(worker, "read_state", None)
+        if callable(read_state):
+            with suppress(Exception):
+                state = read_state()
+                if isinstance(state, dict):
+                    requirement_text = str(state.get("requirement_name", "") or "").strip()
+    if not requirement_text:
+        requirement_text = _infer_detailed_design_runtime_scope(worker, project_dir)
     with suppress(Exception):
         set_runtime_metadata(
             project_dir=str(Path(project_dir).expanduser().resolve()),
-            requirement_name=str(requirement_name or "").strip(),
+            requirement_name=requirement_text,
             workflow_action="stage.a05.start",
         )
 
@@ -1327,10 +1337,14 @@ def run_ba_turn_with_recovery(
     current_handoff = handoff
     needs_initialize = False
     while True:
+        effective_requirement_name = str(requirement_name or "").strip() or _infer_detailed_design_runtime_scope(
+            current_handoff.worker,
+            project_dir,
+        )
         _scope_detailed_design_worker(
             current_handoff.worker,
             project_dir=project_dir,
-            requirement_name=requirement_name,
+            requirement_name=effective_requirement_name,
         )
         try:
             if needs_initialize:
@@ -1372,10 +1386,9 @@ def run_ba_turn_with_recovery(
             provider_runtime_error = worker_has_provider_runtime_error(current_handoff.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             if auth_error or provider_runtime_error or ready_timeout_error:
-                effective_requirement_name = requirement_name or _infer_detailed_design_runtime_scope(
-                    current_handoff.worker,
-                    project_dir,
-                )
+                effective_requirement_name = str(
+                    requirement_name or ""
+                ).strip() or _infer_detailed_design_runtime_scope(current_handoff.worker, project_dir)
                 reason_text = (
                     f"检测到{ba_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
                     if auth_error
@@ -1398,10 +1411,9 @@ def run_ba_turn_with_recovery(
                 needs_initialize = initialize_on_replacement
                 continue
             if is_worker_death_error(error):
-                effective_requirement_name = requirement_name or _infer_detailed_design_runtime_scope(
-                    current_handoff.worker,
-                    project_dir,
-                )
+                effective_requirement_name = str(
+                    requirement_name or ""
+                ).strip() or _infer_detailed_design_runtime_scope(current_handoff.worker, project_dir)
                 replacement = recreate_design_ba_handoff(
                     project_dir=project_dir,
                     requirement_name=effective_requirement_name,
@@ -1422,6 +1434,7 @@ def generate_detailed_design_document(
     handoff: RequirementsAnalystHandoff,
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     paths: dict[str, Path],
     initialize_first: bool,
     progress: ReviewStageProgress | None = None,
@@ -1433,12 +1446,14 @@ def generate_detailed_design_document(
         current_handoff = initialize_detailed_design_ba(
             current_handoff,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             paths=paths,
             progress=progress,
         )
     current_handoff, _ = run_ba_turn_with_recovery(
         current_handoff,
         project_dir=project_dir,
+        requirement_name=requirement_name,
         label="generate_detailed_design",
         prompt=build_detailed_design_prompt(paths),
         result_contract=build_detailed_design_generate_result_contract(paths),
@@ -1455,12 +1470,14 @@ def initialize_detailed_design_ba(
     handoff: RequirementsAnalystHandoff,
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     paths: dict[str, Path],
     progress: ReviewStageProgress | None = None,
 ) -> RequirementsAnalystHandoff:
     current_handoff, _ = run_ba_turn_with_recovery(
         handoff,
         project_dir=project_dir,
+        requirement_name=requirement_name,
         label="detailed_design_ba_init",
         prompt=build_detailed_design_init_prompt(paths),
         result_contract=build_ba_init_result_contract(paths),
@@ -1982,10 +1999,12 @@ def _replace_dead_detailed_design_ba(
     handoff: RequirementsAnalystHandoff,
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     progress: ReviewStageProgress | None = None,
 ) -> RequirementsAnalystHandoff:
     replacement = recreate_design_ba_handoff(
         project_dir=project_dir,
+        requirement_name=requirement_name,
         previous_handoff=handoff,
         progress=progress,
         required_reconfiguration=True,
@@ -2043,6 +2062,7 @@ def run_ba_modify_loop(
     handoff: RequirementsAnalystHandoff,
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     paths: dict[str, Path],
     review_msg: str,
     progress: ReviewStageProgress | None = None,
@@ -2066,6 +2086,7 @@ def run_ba_modify_loop(
     current_handoff, _ = run_ba_turn_with_recovery(
         current_handoff,
         project_dir=project_dir,
+        requirement_name=requirement_name,
         label="modify_detailed_design",
         prompt=modify_detailed_design(
             review_msg,
@@ -2126,6 +2147,7 @@ def run_ba_modify_loop(
         current_handoff, _ = run_ba_turn_with_recovery(
             current_handoff,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             label=f"detailed_design_hitl_reply_round_{hitl_round}",
             prompt=hitl_relpy(
                 human_msg,
@@ -2147,6 +2169,7 @@ def run_detailed_design_review_limit_hitl_loop(
     handoff: RequirementsAnalystHandoff,
     *,
     project_dir: str | Path,
+    requirement_name: str = "",
     paths: dict[str, Path],
     review_msg: str,
     review_limit: int,
@@ -2202,6 +2225,7 @@ def run_detailed_design_review_limit_hitl_loop(
         current_handoff, _ = run_ba_turn_with_recovery(
             current_handoff,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             label="detailed_design_review_limit_hitl",
             prompt=build_detailed_design_review_limit_force_hitl_prompt(
                 paths=paths,
@@ -2224,6 +2248,7 @@ def run_detailed_design_review_limit_hitl_loop(
         current_handoff, _ = run_ba_turn_with_recovery(
             current_handoff,
             project_dir=project_dir,
+            requirement_name=requirement_name,
             label="detailed_design_review_limit_human_reply",
             prompt=build_detailed_design_review_limit_human_reply_prompt(
                 paths=paths,
@@ -2433,6 +2458,7 @@ def run_detailed_design_stage(
                 run_phase=lambda handoff: generate_detailed_design_document(
                     handoff,
                     project_dir=project_dir,
+                    requirement_name=requirement_name,
                     paths=paths,
                     initialize_first=created_new_ba,
                     progress=progress,
@@ -2440,6 +2466,7 @@ def run_detailed_design_stage(
                 replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                     owner,
                     project_dir=project_dir,
+                    requirement_name=requirement_name,
                     progress=progress,
                 ),
                 main_label="详细设计需求分析师",
@@ -2528,6 +2555,7 @@ def run_detailed_design_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                         owner,
                         project_dir=project_dir,
+                        requirement_name=requirement_name,
                         progress=progress,
                     ),
                     replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
@@ -2555,6 +2583,7 @@ def run_detailed_design_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                         owner,
                         project_dir=project_dir,
+                        requirement_name=requirement_name,
                         progress=progress,
                     ),
                     replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
@@ -2588,12 +2617,14 @@ def run_detailed_design_stage(
                         run_phase=lambda handoff: initialize_detailed_design_ba(
                             handoff,
                             project_dir=project_dir,
+                            requirement_name=requirement_name,
                             paths=paths,
                             progress=progress,
                         ),
                         replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                             owner,
                             project_dir=project_dir,
+                            requirement_name=requirement_name,
                             progress=progress,
                         ),
                         main_label="详细设计需求分析师",
@@ -2607,6 +2638,7 @@ def run_detailed_design_stage(
                         run_phase=lambda handoff: run_ba_modify_loop(
                             handoff,
                             project_dir=project_dir,
+                            requirement_name=requirement_name,
                             paths=paths,
                             review_msg=review_msg,
                             progress=progress,
@@ -2616,6 +2648,7 @@ def run_detailed_design_stage(
                         replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                             owner,
                             project_dir=project_dir,
+                            requirement_name=requirement_name,
                             progress=progress,
                         ),
                         main_label="详细设计需求分析师",
@@ -2663,6 +2696,7 @@ def run_detailed_design_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                         owner,
                         project_dir=project_dir,
+                        requirement_name=requirement_name,
                         progress=progress,
                     ),
                     replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
@@ -2690,6 +2724,7 @@ def run_detailed_design_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                         owner,
                         project_dir=project_dir,
+                        requirement_name=requirement_name,
                         progress=progress,
                     ),
                     replace_dead_reviewer=lambda reviewer, _index: _replace_dead_detailed_design_reviewer(
@@ -2787,12 +2822,14 @@ def run_detailed_design_stage(
                         run_phase=lambda handoff: initialize_detailed_design_ba(
                             handoff,
                             project_dir=project_dir,
+                            requirement_name=requirement_name,
                             paths=paths,
                             progress=progress,
                         ),
                         replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                             owner,
                             project_dir=project_dir,
+                            requirement_name=requirement_name,
                             progress=progress,
                         ),
                         main_label="详细设计需求分析师",
@@ -2805,6 +2842,7 @@ def run_detailed_design_stage(
                     run_phase=lambda handoff: run_detailed_design_review_limit_hitl_loop(
                         handoff,
                         project_dir=project_dir,
+                        requirement_name=requirement_name,
                         paths=paths,
                         review_msg=review_msg,
                         review_limit=review_round_policy.max_rounds,
@@ -2823,6 +2861,7 @@ def run_detailed_design_stage(
                     replace_dead_main_owner=lambda owner: _replace_dead_detailed_design_ba(
                         owner,
                         project_dir=project_dir,
+                        requirement_name=requirement_name,
                         progress=progress,
                     ),
                     main_label="详细设计需求分析师",

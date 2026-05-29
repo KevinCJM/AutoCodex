@@ -26,10 +26,12 @@ from A05_DetailedDesign import (
     collect_interactive_reviewer_specs,
     create_reviewer_runtime,
     generate_detailed_design_document,
+    initialize_detailed_design_ba,
     prepare_design_ba_handoff,
     resolve_review_max_rounds,
     resolve_reviewer_specs,
     run_ba_modify_loop,
+    run_detailed_design_review_limit_hitl_loop,
     run_detailed_design_stage,
     run_reviewer_turn_with_recreation,
 )
@@ -277,7 +279,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 proxy_url="",
             )
 
-            def fake_generate(handoff, *, project_dir, paths, initialize_first, progress=None):  # noqa: ANN001
+            def fake_generate(handoff, *, project_dir, requirement_name="", paths, initialize_first, progress=None):  # noqa: ANN001
                 _ = handoff
                 _ = project_dir
                 _ = initialize_first
@@ -515,6 +517,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 handoff,
                 *,
                 project_dir,
+                requirement_name="",
                 paths,
                 review_msg,
                 progress=None,
@@ -535,7 +538,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 call_sequence.append("prepare_ba")
                 return fake_handoff, True
 
-            def fake_initialize_ba(handoff, *, project_dir, paths, progress=None):  # noqa: ANN001
+            def fake_initialize_ba(handoff, *, project_dir, requirement_name="", paths, progress=None):  # noqa: ANN001
                 _ = handoff
                 _ = project_dir
                 _ = paths
@@ -740,6 +743,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 handoff,
                 *,
                 project_dir,
+                requirement_name="",
                 paths,
                 review_msg,
                 progress=None,
@@ -816,7 +820,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 proxy_url="",
             )
 
-            def fake_generate(handoff, *, project_dir, paths, initialize_first, progress=None):  # noqa: ANN001
+            def fake_generate(handoff, *, project_dir, requirement_name="", paths, initialize_first, progress=None):  # noqa: ANN001
                 _ = handoff
                 _ = project_dir
                 _ = initialize_first
@@ -1279,7 +1283,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 self.assertEqual(kwargs["reviewer_specs"], specs)
                 return {"开发工程师": ReviewAgentSelection("claude", "sonnet", "medium", "")}
 
-            def fake_generate(handoff, *, project_dir, paths, initialize_first, progress=None):  # noqa: ANN001
+            def fake_generate(handoff, *, project_dir, requirement_name="", paths, initialize_first, progress=None):  # noqa: ANN001
                 _ = handoff
                 _ = project_dir
                 _ = initialize_first
@@ -1445,7 +1449,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 paths["requirements_clear_path"].write_text("需求澄清\n", encoding="utf-8")
                 return SimpleNamespace(requirement_name="需求A")
 
-            def fake_generate(handoff, *, project_dir, paths, initialize_first, progress=None):  # noqa: ANN001
+            def fake_generate(handoff, *, project_dir, requirement_name="", paths, initialize_first, progress=None):  # noqa: ANN001
                 generate_calls.append(bool(initialize_first))
                 paths["detailed_design_path"].write_text("详细设计正文\n", encoding="utf-8")
                 return handoff
@@ -1513,7 +1517,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 call_order.append("prepare_ba")
                 return fake_handoff, True
 
-            def fake_generate(handoff, *, project_dir, paths, initialize_first, progress=None):  # noqa: ANN001
+            def fake_generate(handoff, *, project_dir, requirement_name="", paths, initialize_first, progress=None):  # noqa: ANN001
                 _ = project_dir
                 _ = initialize_first
                 _ = progress
@@ -1628,6 +1632,138 @@ class A05DetailedDesignTests(unittest.TestCase):
                 ("generate_detailed_design", "a05_detailed_design_generate"),
             ],
         )
+
+    def test_detailed_design_ba_turns_scope_worker_to_requirement(self):
+        class _MetadataWorker:
+            session_name = "需求分析师-天佑星"
+
+            def __init__(self):
+                self.state: dict[str, object] = {}
+                self.metadata_calls: list[dict[str, object]] = []
+
+            def read_state(self):
+                return dict(self.state)
+
+            def set_runtime_metadata(self, **metadata):  # noqa: ANN001
+                self.state.update(metadata)
+                self.metadata_calls.append(dict(metadata))
+
+        def build_handoff(worker: _MetadataWorker) -> RequirementsAnalystHandoff:
+            return RequirementsAnalystHandoff(
+                worker=worker,
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            paths = build_detailed_design_paths(project_dir, "需求A")
+            for file_path in (
+                paths["original_requirement_path"],
+                paths["requirements_clear_path"],
+                paths["hitl_record_path"],
+                paths["detailed_design_path"],
+            ):
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text("ready\n", encoding="utf-8")
+
+            def fake_run_ba_turn(_handoff, *, label, result_contract, **_kwargs):  # noqa: ANN001
+                if label == "generate_detailed_design":
+                    paths["detailed_design_path"].write_text("详细设计正文\n", encoding="utf-8")
+                if label in {"modify_detailed_design", "detailed_design_review_limit_human_reply"}:
+                    paths["ask_human_path"].write_text("", encoding="utf-8")
+                    paths["ba_feedback_path"].write_text("已修订\n", encoding="utf-8")
+                return {"status": result_contract.expected_statuses[0]}
+
+            generate_worker = _MetadataWorker()
+            modify_worker = _MetadataWorker()
+            review_limit_worker = _MetadataWorker()
+
+            def fake_review_limit_cycle(**kwargs):  # noqa: ANN001
+                kwargs["initial_turn"]()
+                kwargs["human_reply_turn"]("人工补充")
+                return SimpleNamespace(owner=build_handoff(review_limit_worker))
+
+            with patch("A05_DetailedDesign._run_ba_turn", side_effect=fake_run_ba_turn):
+                initialize_detailed_design_ba(
+                    build_handoff(generate_worker),
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                )
+                generate_detailed_design_document(
+                    build_handoff(generate_worker),
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    initialize_first=False,
+                )
+                run_ba_modify_loop(
+                    build_handoff(modify_worker),
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    review_msg="需要修改",
+                )
+                with patch("A05_DetailedDesign.run_review_limit_hitl_cycle", side_effect=fake_review_limit_cycle):
+                    run_detailed_design_review_limit_hitl_loop(
+                        build_handoff(review_limit_worker),
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        paths=paths,
+                        review_msg="仍需修改",
+                        review_limit=1,
+                        review_rounds_used=1,
+                    )
+
+        all_calls = generate_worker.metadata_calls + modify_worker.metadata_calls + review_limit_worker.metadata_calls
+        self.assertTrue(all_calls)
+        self.assertEqual({call["requirement_name"] for call in all_calls}, {"需求A"})
+        self.assertEqual({call["workflow_action"] for call in all_calls}, {"stage.a05.start"})
+
+    def test_ba_turn_recovery_does_not_clear_existing_requirement_scope(self):
+        from A05_DetailedDesign import build_ba_init_result_contract, run_ba_turn_with_recovery
+
+        class _ScopedWorker:
+            session_name = "需求分析师-天佑星"
+
+            def __init__(self):
+                self.state: dict[str, object] = {"requirement_name": "需求A"}
+                self.metadata_calls: list[dict[str, object]] = []
+
+            def read_state(self):
+                return dict(self.state)
+
+            def set_runtime_metadata(self, **metadata):  # noqa: ANN001
+                self.state.update(metadata)
+                self.metadata_calls.append(dict(metadata))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            paths = build_detailed_design_paths(project_dir, "需求A")
+            worker = _ScopedWorker()
+            handoff = RequirementsAnalystHandoff(
+                worker=worker,
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+
+            with patch("A05_DetailedDesign._run_ba_turn", return_value={"status": "initialized"}):
+                run_ba_turn_with_recovery(
+                    handoff,
+                    project_dir=project_dir,
+                    label="detailed_design_ba_init",
+                    prompt="init",
+                    result_contract=build_ba_init_result_contract(paths),
+                    initialize_on_replacement=False,
+                    paths=paths,
+                )
+
+        self.assertEqual(worker.metadata_calls[-1]["requirement_name"], "需求A")
 
     def test_run_ba_modify_loop_uses_feedback_result_contract_for_modify_and_hitl_reply(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1908,7 +2044,7 @@ class A05DetailedDesignTests(unittest.TestCase):
             )
             parallel_calls: list[int] = []
 
-            def fake_generate(handoff, *, project_dir, paths, initialize_first, progress=None):  # noqa: ANN001
+            def fake_generate(handoff, *, project_dir, requirement_name="", paths, initialize_first, progress=None):  # noqa: ANN001
                 _ = project_dir
                 _ = initialize_first
                 _ = progress
@@ -1924,6 +2060,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 handoff,
                 *,
                 project_dir,
+                requirement_name="",
                 paths,
                 review_msg,
                 progress=None,
@@ -2014,7 +2151,7 @@ class A05DetailedDesignTests(unittest.TestCase):
             parallel_rounds: list[tuple[int, list[str]]] = []
             ba_modify_calls: list[str] = []
 
-            def fake_generate(handoff, *, project_dir, paths, initialize_first, progress=None):  # noqa: ANN001
+            def fake_generate(handoff, *, project_dir, requirement_name="", paths, initialize_first, progress=None):  # noqa: ANN001
                 _ = project_dir
                 _ = initialize_first
                 _ = progress
@@ -2038,6 +2175,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                 handoff,
                 *,
                 project_dir,
+                requirement_name="",
                 paths,
                 review_msg,
                 progress=None,

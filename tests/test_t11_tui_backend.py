@@ -3019,6 +3019,69 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertEqual([worker["session_name"] for worker in design["workers"]], ["审核员-天寿星"])
 
+    def test_design_snapshot_keeps_active_unscoped_ba_with_scoped_reviewers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            requirement_name = "贪吃蛇"
+            ba_runtime_dir = project_dir / DETAILED_DESIGN_RUNTIME_ROOT_NAME / requirement_name / "detailed-design-analyst-1"
+            ba_runtime_dir.mkdir(parents=True)
+            (ba_runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "detailed-design-analyst",
+                        "session_name": "需求分析师-地暴星",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "requirement_name": "",
+                        "workflow_action": "stage.a05.start",
+                        "status": "running",
+                        "result_status": "running",
+                        "current_task_runtime_status": "running",
+                        "dispatch_state": "submitted",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "note": "submitted:modify_detailed_design",
+                        "updated_at": "2026-04-22T22:58:05+08:00",
+                        "last_heartbeat_at": "2026-04-22T22:58:05+08:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            reviewer_runtime_dir = project_dir / DETAILED_DESIGN_RUNTIME_ROOT_NAME / requirement_name / "reviewer-1"
+            reviewer_runtime_dir.mkdir(parents=True)
+            (reviewer_runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "detailed-design-review-审核员",
+                        "session_name": "审核员-天退星",
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "requirement_name": requirement_name,
+                        "workflow_action": "stage.a05.start",
+                        "status": "ready",
+                        "result_status": "ready",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "updated_at": "2026-04-22T22:58:04+08:00",
+                        "last_heartbeat_at": "2026-04-22T22:58:04+08:00",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name in {"需求分析师-地暴星", "审核员-天退星"})  # noqa: SLF001
+            server._set_context(project_dir=str(project_dir), requirement_name=requirement_name, action="stage.a05.start")  # noqa: SLF001
+
+            design = server._build_design_snapshot()  # noqa: SLF001
+
+        sessions = {worker["session_name"] for worker in design["workers"]}
+        self.assertEqual(sessions, {"需求分析师-地暴星", "审核员-天退星"})
+
     def test_worker_context_filter_separates_requirements_in_same_project(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = str(Path(tmpdir).resolve())
