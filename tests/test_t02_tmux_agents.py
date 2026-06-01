@@ -1355,6 +1355,30 @@ workspace (/directory)                                                     branc
         )
         self.assertEqual(codex_loading_with_ready_footer_phase, AgentRuntimeState.STARTING)
 
+        codex_ready_over_stale_raw_history_phase = CodexOutputDetector().classify_agent_state(
+            WorkerObservation(
+                visible_text="› Run /review on my current changes\n  gpt-5.5 xhigh · ~/Desktop/KevinGit/PyFinance/WF",
+                raw_log_delta="",
+                raw_log_tail="\n".join(
+                    [
+                        "model: loading",
+                        "• Starting MCP servers (0/2): notion (0s • esc to interrupt)",
+                        "■ No active thread is available.",
+                        "› Run /review on my current changes",
+                        "  gpt-5.5 xhigh · ~/Desktop/KevinGit/PyFinance/WF",
+                    ]
+                ),
+                current_command="codex",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-05-23T10:16:38",
+                pane_title="WF",
+            )
+        )
+        self.assertEqual(codex_ready_over_stale_raw_history_phase, AgentRuntimeState.READY)
+
         codex_booting_phase = CodexOutputDetector().classify_agent_state(
             WorkerObservation(
                 visible_text="• Starting MCP servers (0/2): ossinsight, playwright (0s • esc to interrupt)\n› Find and fix a bug in @filename",
@@ -2961,6 +2985,130 @@ workspace (/directory)                                                     branc
             )
         )
 
+    def test_run_turn_sends_requirements_prompt_when_codex_ready_surface_has_stale_raw_history(self):
+        class RequirementsReadyWithStaleHistoryWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts = []
+                self.prompt_confirm_calls = 0
+                self.wait_calls = 0
+                self.ensure_calls = 0
+
+            def _append_transcript(self, title, body):  # noqa: ANN001, ARG002
+                return None
+
+            def _write_state(self, status, *, note, extra=None):  # noqa: ANN001, ARG002
+                return None
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.ensure_calls += 1
+                raise AssertionError("turn-start ready probe should accept the current Codex ready surface")
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                visible_text = "› Run /review on my current changes\n  gpt-5.5 xhigh · ~/Desktop/KevinGit/PyFinance/WF"
+                raw_history = "\n".join(
+                    [
+                        "model: loading",
+                        "• Starting MCP servers (0/2): notion (0s • esc to interrupt)",
+                        "■ No active thread is available.",
+                        visible_text,
+                    ]
+                )
+                return WorkerObservation(
+                    visible_text=visible_text,
+                    raw_log_delta="",
+                    raw_log_tail=raw_history,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-23T10:17:00",
+                    pane_title="WF",
+                )
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                self.prompt_confirm_calls += 1
+                return self.observe()
+
+            def wait_for_turn_artifacts(self, *, contract, task_status_path=None, timeout_sec):  # noqa: ANN001, ARG002
+                self.wait_calls += 1
+                artifact_path.write_text("# WF 需求澄清\n", encoding="utf-8")
+                contract.status_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "1.0",
+                            "turn_id": contract.turn_id,
+                            "phase": contract.phase,
+                            "status": "done",
+                            "written_at": "2026-05-23T10:17:03+08:00",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                if task_status_path is not None:
+                    write_task_status(task_status_path, status="done")
+                self.current_task_runtime_status = "done"
+                return contract.validator(contract.status_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            contract_path = root / "requirements_status.json"
+            artifact_path = root / "WF_需求澄清.md"
+
+            def validator(path: Path) -> TurnFileResult:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                return TurnFileResult(
+                    status_path=str(path),
+                    payload=payload,
+                    artifact_paths={"requirements": str(artifact_path)},
+                    artifact_hashes={"requirements": "sha256:wf"},
+                    validated_at="2026-05-23T10:17:04",
+                )
+
+            worker = RequirementsReadyWithStaleHistoryWorker(
+                worker_id="requirements-stale-codex-ready-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_ready = False
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.wrapper_state = WrapperState.NOT_READY
+            worker.current_command = "codex"
+            worker.current_path = str(root)
+            result = worker.run_turn(
+                label="requirements_clarification_round_1",
+                prompt="write requirements clarification files only",
+                completion_contract=TurnFileContract(
+                    turn_id="requirements_clarification_1",
+                    phase="requirements_clarification",
+                    status_path=contract_path,
+                    validator=validator,
+                    quiet_window_sec=0.0,
+                    kind="requirements_clarification",
+                ),
+                timeout_sec=1.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertEqual(worker.prompt_confirm_calls, 1)
+        self.assertEqual(worker.wait_calls, 1)
+        self.assertEqual(worker.ensure_calls, 0)
+
     def test_run_turn_does_not_retry_when_agent_becomes_busy_after_prompt_timeout(self):
         class DelayedBusyAfterPromptTimeoutWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -3987,7 +4135,7 @@ workspace (/directory)                                                     branc
             worker = StalledInvalidArtifactWorker(
                 worker_id="stalled-invalid-artifact-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="opencode", model="opencode/minimax-m2.5-free"),
+                config=AgentRunConfig(vendor="opencode", model="default"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -6905,6 +7053,70 @@ workspace (/directory)                                                     branc
 
         self.assertEqual(worker.observe_calls, 1)
 
+    def test_wait_for_prompt_submission_ignores_stale_codex_no_active_thread_in_raw_tail(self):
+        class StaleNoActiveThreadPromptWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+                self.prompt = ""
+
+            def observe(self, *, tail_lines=320, tail_bytes=24000):  # noqa: ARG002
+                self.observe_calls += 1
+                visible = "\n".join(
+                    [
+                        "• Working (0s • esc to interrupt)",
+                        self.prompt,
+                        "Messages to be submitted after next tool call (press esc to interrupt and send immediately)",
+                        "› Use /skills to list available skills",
+                        "  gpt-5.5 xhigh · ~/Desktop/KevinGit/PyFinance/WF",
+                    ]
+                )
+                return WorkerObservation(
+                    visible_text=visible,
+                    raw_log_delta=visible,
+                    raw_log_tail="\n".join(
+                        [
+                            "■ No active thread is available.",
+                            "⚠ MCP startup incomplete (failed: notion)",
+                            visible,
+                        ]
+                    ),
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-23T22:12:30",
+                    pane_title="⠋ PyFinance",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "queued prompt"
+
+        prompt = "\n".join(
+            [
+                "## 角色定位",
+                "你是具备 **高级开发思维** 的金融科技需求分析师。",
+                "## Output Protocol (Strict)",
+                "只允许返回 `信息足够`/`HITL`，禁止返回其他内容。",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = StaleNoActiveThreadPromptWorker(
+                worker_id="codex-stale-no-active-tail-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.prompt = prompt
+            observation = worker._wait_for_prompt_submission(prompt=prompt, timeout_sec=1.0)
+
+        self.assertEqual(observation.pane_title, "⠋ PyFinance")
+        self.assertEqual(worker.observe_calls, 1)
+
     def test_source_mentions_prompt_accepts_multiple_wrapped_fragments(self):
         prompt = "\n".join(
             [
@@ -7126,7 +7338,7 @@ workspace (/directory)                                                     branc
                         "session_name": "测试工程师-天寿星",
                         "pane_id": "%24",
                         "work_dir": str(root),
-                        "config": {"vendor": "opencode", "model": "opencode/minimax-m2.5-free", "reasoning_effort": "high"},
+                        "config": {"vendor": "opencode", "model": "default", "reasoning_effort": "high"},
                         "agent_state": "READY",
                         "agent_started": True,
                         "agent_ready": True,
@@ -7141,7 +7353,7 @@ workspace (/directory)                                                     branc
             worker = LoadedOpenCodeReadyWorker(
                 worker_id="development-review-测试工程师",
                 work_dir=root,
-                config=AgentRunConfig(vendor="opencode", model="opencode/minimax-m2.5-free"),
+                config=AgentRunConfig(vendor="opencode", model="default"),
                 runtime_root=runtime_root,
                 existing_runtime_dir=runtime_dir,
                 existing_session_name="测试工程师-天寿星",
@@ -7392,6 +7604,62 @@ workspace (/directory)                                                     branc
             self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
             self.assertEqual(state["agent_ready"], True)
             self.assertEqual(state["pane_title"], "tmux-api-v3")
+
+    def test_wait_for_agent_ready_uses_current_codex_surface_over_stale_raw_history(self):
+        class ReadyVisibleWithStaleHistoryWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_count = 0
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                self.observe_count += 1
+                visible_text = "› Run /review on my current changes\n  gpt-5.5 xhigh · ~/Desktop/KevinGit/PyFinance/WF"
+                raw_history = "\n".join(
+                    [
+                        "model: loading",
+                        "• Starting MCP servers (0/2): notion (0s • esc to interrupt)",
+                        "■ No active thread is available.",
+                        visible_text,
+                    ]
+                )
+                return WorkerObservation(
+                    visible_text=visible_text,
+                    raw_log_delta="",
+                    raw_log_tail=raw_history,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at=f"2026-05-23T10:17:0{self.observe_count}",
+                    pane_title="WF",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "› Run /review on my current changes"
+
+        with tempfile.TemporaryDirectory(prefix="codex-stale-ready-") as tmp_dir:
+            work_dir = Path(tmp_dir) / "WF"
+            work_dir.mkdir()
+            worker = ReadyVisibleWithStaleHistoryWorker(
+                worker_id="codex-ready-stale-history-worker",
+                work_dir=work_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+
+            with mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                worker._wait_for_agent_ready(timeout_sec=1.0)
+
+            self.assertTrue(worker.agent_started)
+            self.assertTrue(worker.agent_ready)
+            self.assertEqual(worker.wrapper_state, WrapperState.READY)
+            self.assertEqual(worker.last_pane_title, "WF")
+            self.assertEqual(worker.observe_count, 2)
 
     def test_ensure_agent_ready_syncs_codex_ready_title_to_state_file(self):
         class FastReadyWorker(TmuxBatchWorker):

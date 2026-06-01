@@ -393,13 +393,7 @@ def _codex_surface_has_ready_blocker(text: str) -> bool:
     surface = str(text or "")
     if not surface.strip():
         return False
-    return any(
-        re.search(pattern, surface, re.IGNORECASE)
-        for pattern in (
-            *CODEX_STARTING_PATTERNS,
-            *CODEX_PROMPT_REJECTION_PATTERNS,
-        )
-    )
+    return any(re.search(pattern, surface, re.IGNORECASE) for pattern in CODEX_STARTING_PATTERNS)
 
 
 def _codex_surface_has_prompt_rejection(text: str) -> bool:
@@ -411,6 +405,13 @@ def _codex_surface_has_prompt_rejection(text: str) -> bool:
 
 def _join_nonempty_text_parts(*parts: str) -> str:
     return "\n".join(part for part in (str(part or "") for part in parts) if part.strip())
+
+
+def _codex_current_ready_surface(visible_text: str, raw_log_tail: str = "") -> str:
+    visible = str(visible_text or "")
+    if visible.strip():
+        return visible
+    return str(raw_log_tail or "")
 
 
 def _codex_surface_indicates_ready_prompt(text: str) -> bool:
@@ -2197,9 +2198,7 @@ class CodexOutputDetector(BaseOutputDetector):
         base_state = super().classify_agent_state(observation)
         if base_state == AgentRuntimeState.DEAD:
             return base_state
-        surface = "\n".join(
-            part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip()
-        )
+        surface = _codex_current_ready_surface(observation.visible_text, observation.raw_log_tail)
         effective_surface = _codex_effective_recent_surface(surface)
         title = str(observation.pane_title or "").strip()
         if not title:
@@ -2381,7 +2380,7 @@ def classify_agent_runtime_state(
     codex_surface = ""
     codex_ready_blocked = False
     if context.vendor == Vendor.CODEX:
-        codex_surface = _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+        codex_surface = _codex_current_ready_surface(observation.visible_text, observation.raw_log_tail)
         codex_ready_blocked = _codex_surface_has_ready_blocker(codex_surface)
     if not observation.session_exists or observation.pane_dead or not str(context.pane_id or "").strip():
         return AgentRuntimeState.DEAD
@@ -3712,10 +3711,45 @@ class TmuxBatchWorker:
                 return True
         return False
 
+    @classmethod
+    def _source_has_prompt_rejection_after_prompt_evidence(cls, source: str, prompt: str) -> bool:
+        source_text = cls._normalize_prompt_text(source)
+        if not source_text or not _codex_surface_has_prompt_rejection(source_text):
+            return False
+        rejection_positions = [
+            match.start()
+            for pattern in CODEX_PROMPT_REJECTION_PATTERNS
+            for match in re.finditer(pattern, source_text, re.IGNORECASE)
+        ]
+        if not rejection_positions:
+            return False
+
+        prompt_text = cls._normalize_prompt_text(prompt)
+        evidence_positions: list[int] = []
+        if prompt_text:
+            evidence_positions.extend(match.start() for match in re.finditer(re.escape(prompt_text), source_text))
+            for marker in re.findall(r"\[\[ACX_TURN:[^\]]+:DONE\]\]", prompt_text):
+                evidence_positions.extend(match.start() for match in re.finditer(re.escape(marker), source_text))
+            fragments: list[str] = []
+            for line in prompt_text.splitlines():
+                line_flat = re.sub(r"\s+", " ", line).strip()
+                if len(line_flat) < 16 or line_flat.startswith("[[ACX_TURN:"):
+                    continue
+                fragments.append(line_flat[:48])
+                if len(line_flat) > 96:
+                    fragments.append(line_flat[-48:])
+            for fragment in dict.fromkeys(fragments):
+                evidence_positions.extend(match.start() for match in re.finditer(re.escape(fragment), source_text))
+        if not evidence_positions:
+            return False
+        first_evidence = min(evidence_positions)
+        return any(position >= first_evidence for position in rejection_positions)
+
     def _observation_indicates_prompt_submission_rejection(
             self,
             observation: WorkerObservation,
             *,
+            prompt: str,
             prompt_visible: bool,
             prompt_in_delta: bool,
             marker_visible: bool,
@@ -3724,13 +3758,14 @@ class TmuxBatchWorker:
         if self.config.vendor != Vendor.CODEX:
             return False
         if _codex_surface_has_prompt_rejection(observation.raw_log_delta):
-            return True
+            if not (prompt_in_delta or marker_in_delta):
+                return True
+            if self._source_has_prompt_rejection_after_prompt_evidence(observation.raw_log_delta, prompt):
+                return True
         prompt_echo_observed = prompt_visible or prompt_in_delta or marker_visible or marker_in_delta
         if not prompt_echo_observed:
             return False
-        return _codex_surface_has_prompt_rejection(
-            _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
-        )
+        return self._source_has_prompt_rejection_after_prompt_evidence(observation.visible_text, prompt)
 
     def _record_prompt_submission_rejected(
             self,
@@ -3789,6 +3824,7 @@ class TmuxBatchWorker:
             current_state = self.get_agent_state(observation)
             if self._observation_indicates_prompt_submission_rejection(
                     observation,
+                    prompt=prompt,
                     prompt_visible=prompt_visible,
                     prompt_in_delta=prompt_in_delta,
                     marker_visible=marker_visible,
@@ -5685,7 +5721,11 @@ class TmuxBatchWorker:
         current_command = observation.current_command or self.current_command
         if not self._agent_running(current_command):
             return ""
-        surface = _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+        surface = (
+            _codex_current_ready_surface(observation.visible_text, observation.raw_log_tail)
+            if self.config.vendor == Vendor.CODEX
+            else _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+        )
         if self._visible_indicates_agent_starting(surface):
             return ""
         if not self._visible_indicates_agent_ready(
@@ -5704,7 +5744,7 @@ class TmuxBatchWorker:
         if not self._agent_running(current_command):
             return False
         if self.config.vendor == Vendor.CODEX:
-            surface = _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+            surface = _codex_current_ready_surface(observation.visible_text, observation.raw_log_tail)
             if _codex_surface_has_ready_blocker(surface):
                 return False
         if self._title_indicates_ready(observation.pane_title):
@@ -5906,7 +5946,7 @@ class TmuxBatchWorker:
                 codex_ready_blocked = (
                     self.config.vendor == Vendor.CODEX
                     and _codex_surface_has_ready_blocker(
-                        _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
+                        _codex_current_ready_surface(observation.visible_text, observation.raw_log_tail)
                     )
                 )
                 ready_signature = (
