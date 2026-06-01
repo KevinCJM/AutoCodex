@@ -4,6 +4,13 @@ TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具�
 
 这个仓库已经扁平化为当前项目根目录；以下说明只描述当前仓库内可见代码。运行时依赖的外部 agent CLI、认证、代理、目标项目目录等环境能力不在仓库内。
 
+## 谁适合用
+
+- 正在用 Codex CLI、Claude Code、Gemini CLI 或 OpenCode 处理真实代码库，希望把需求、设计、开发和复核串成固定流程的开发者。
+- 维护中大型本地项目，需要把多个 agent 拆成需求分析、架构评审、任务拆分、开发、代码复核等角色的维护者。
+- 想在本机 tmux 会话里长期运行 coding agent，并保留阶段产物、评审记录、恢复状态和审计日志的团队。
+- 想研究 multi-agent software engineering workflow 的开发者，尤其关注 HITL、人类确认、任务单 JSON 状态和可恢复执行。
+
 ## 核心能力
 
 - 从项目目录开始生成或校验机器优先的路由层：`AGENTS.md`、`docs/repo_map.json`、`docs/task_routes.json`、`docs/pitfalls.json`。
@@ -64,6 +71,23 @@ TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具�
 - 至少一个可用的 agent CLI：`codex`、`claude`、`gemini` 或 `opencode`。
 - 对应 agent CLI 的登录状态、API 认证和网络代理。
 - 可选：Node.js。部分厂商模型探测会读取 Node 包元数据。
+
+## 安装命令
+
+```bash
+git clone https://github.com/KevinCJM/TmuxCodingTeam.git
+cd TmuxCodingTeam
+
+python3 -m pip install pytest
+
+cd packages/tui
+bun install --frozen-lockfile
+
+cd ../web
+bun install --frozen-lockfile
+
+cd ../..
+```
 
 仓库没有 Python 依赖清单文件；运行时代码主要使用标准库，测试需要 `pytest`。如果本机没有 pytest：
 
@@ -141,7 +165,44 @@ python3 A00_main_tui.py \
 python3 A00_main_tui.py --skip-overall-review
 ```
 
-### 3. 直接运行某个阶段
+### 3. 最小 demo
+
+下面的 demo 会在一个临时项目里跑路由初始化，适合先确认本机 Python、tmux 和 agent CLI 环境是否可用：
+
+```bash
+mkdir -p /tmp/tmuxcodingteam-demo
+cd /tmp/tmuxcodingteam-demo
+git init
+printf '# Demo\n' > README.md
+
+cd /path/to/TmuxCodingTeam
+python3 A01_Routing_LayerPlanning.py \
+  --project-dir /tmp/tmuxcodingteam-demo \
+  --vendor codex \
+  --model gpt-5.4 \
+  --effort medium \
+  --yes
+```
+
+成功后，demo 项目中应出现：
+
+```text
+/tmp/tmuxcodingteam-demo/AGENTS.md
+/tmp/tmuxcodingteam-demo/docs/repo_map.json
+/tmp/tmuxcodingteam-demo/docs/task_routes.json
+/tmp/tmuxcodingteam-demo/docs/pitfalls.json
+```
+
+如果你想直接体验完整交互流程，可以改为：
+
+```bash
+python3 A00_main_tui.py \
+  --project-dir /tmp/tmuxcodingteam-demo \
+  --requirement-name demo需求 \
+  --main-agent vendor=codex,model=gpt-5.4,effort=medium
+```
+
+### 4. 直接运行某个阶段
 
 每个阶段都可以独立启动，适合恢复、调试或只处理某个产物：
 
@@ -338,6 +399,18 @@ bun run test:e2e
 - 改桥接协议时同时检查 Python 后端、TUI/Web 客户端和协议测试。
 - 改阶段完成逻辑时同时检查文件契约、JSON 写入、validator 和恢复路径。
 
+## 维护路线图
+
+- v0.1.x：稳定 A01-A08 主流程，补齐 README、license、release notes 和最小 demo，保证新用户能在本地跑通基础流程。
+- v0.2.x：完善 Web 控制台和 OpenTUI 的运行时可观测性，包括 worker 状态、阶段事件、文件预览和失败恢复提示。
+- v0.3.x：增强 release automation、测试执行和 PR review 支持，让 Codex/Claude/Gemini/OpenCode 可以更稳定地参与维护工作流。
+- v0.4.x：补充插件化 agent provider 配置、更多模型厂商适配和可复用 workflow template。
+- 长期方向：把 TmuxCodingTeam 打磨成可审计、可恢复、可扩展的本地 multi-agent software maintenance toolkit。
+
+## 许可证
+
+本项目使用 MIT License。详见 `LICENSE`。
+
 ## 常见问题
 
 ### 运行后没有进入 OpenTUI
@@ -387,4 +460,3 @@ tmux kill-session -t <session-name>
 ### 如何判断一个需求是否已经完成
 
 检查 `{需求名}_任务单.json` 中任务是否全部为 `true`，再检查 `{需求名}_复核阶段状态.json` 中 `passed` 是否为 `true`。同时保留各阶段评审记录，便于回溯。
-
