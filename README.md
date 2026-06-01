@@ -1,78 +1,82 @@
 # TmuxCodingTeam
 
-TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具。它用 Python 串联需求、设计、任务拆分、开发和复核流程，用 tmux 承载长期运行的 coding agent 会话，并提供 OpenTUI 终端界面和 Web 控制台两种交互入口。
+[English](README.md) | [简体中文](README.zh-CN.md)
 
-这个仓库已经扁平化为当前项目根目录；以下说明只描述当前仓库内可见代码。运行时依赖的外部 agent CLI、认证、代理、目标项目目录等环境能力不在仓库内。
+TmuxCodingTeam is a local multi-agent software development orchestration tool. It uses Python to connect requirements, design, task splitting, implementation, and review workflows, uses tmux to host long-running coding-agent sessions, and provides both an OpenTUI terminal interface and a Web console.
 
-## 谁适合用
+The project is designed for heterogeneous coding-agent collaboration: different vendors and models, such as Codex CLI, Claude Code, Gemini CLI, and OpenCode, can work together through one auditable workflow from initial requirements analysis to final full-code review.
 
-- 正在用 Codex CLI、Claude Code、Gemini CLI 或 OpenCode 处理真实代码库，希望把需求、设计、开发和复核串成固定流程的开发者。
-- 维护中大型本地项目，需要把多个 agent 拆成需求分析、架构评审、任务拆分、开发、代码复核等角色的维护者。
-- 想在本机 tmux 会话里长期运行 coding agent，并保留阶段产物、评审记录、恢复状态和审计日志的团队。
-- 想研究 multi-agent software engineering workflow 的开发者，尤其关注 HITL、人类确认、任务单 JSON 状态和可恢复执行。
+This repository has been flattened into the current project root. The documentation below only describes code visible in this repository. External agent CLIs, authentication, network proxies, target project directories, and account setup are runtime requirements and are not included in this repository.
 
-## 核心能力
+## Who Should Use This
 
-- 从项目目录开始生成或校验机器优先的路由层：`AGENTS.md`、`docs/repo_map.json`、`docs/task_routes.json`、`docs/pitfalls.json`。
-- 录入需求，支持文本、文件和 Notion 输入方式。
-- 由需求分析师 agent 生成需求澄清文档，并通过 HITL 文件协议向人类追问。
-- 并行启动多个评审 agent，对需求澄清、详细设计、任务单、代码修改和整体代码进行评审。
-- 将详细设计拆成可跟踪的任务单 Markdown 和 JSON 进度文件。
-- 用 tmux 长会话驱动开发 agent 执行任务，并在任务级别做评审、修复和状态更新。
-- 支持阶段回退、运行时恢复、worker 重建、模型/厂商选择、代理配置和评审轮次限制。
-- 提供 OpenTUI 终端 UI、Web 控制台、legacy Python CLI 三种使用形态。
+- Developers who already use Codex CLI, Claude Code, Gemini CLI, or OpenCode on real codebases and want to turn requirements, design, implementation, and review into a repeatable workflow.
+- Maintainers of medium or large local projects who want multiple agents to play distinct roles, such as requirements analyst, architect, task splitter, developer, and code reviewer.
+- Teams that want long-running coding-agent work to happen inside local tmux sessions while preserving stage artifacts, review records, recovery state, and audit logs.
+- Developers researching multi-agent software engineering workflows, especially HITL, human confirmation, task JSON state, and recoverable execution.
 
-## 当前已实现流程
+## Core Capabilities
 
-| 阶段 | 入口/动作 | 主要产物 |
+- Generate or validate machine-first routing artifacts for a target project: `AGENTS.md`, `docs/repo_map.json`, `docs/task_routes.json`, and `docs/pitfalls.json`.
+- Capture requirements from text, files, or Notion inputs.
+- Use a requirements analyst agent to produce a clarification document and ask the human follow-up questions through an HITL file protocol.
+- Launch multiple reviewer agents in parallel to review requirements clarification, detailed design, task lists, code changes, and final code quality.
+- Split detailed designs into trackable Markdown task lists and JSON progress files.
+- Drive development agents through long-running tmux sessions, then perform task-level review, repair, and status updates.
+- Support stage rollback, runtime recovery, worker reconstruction, model/vendor selection, proxy configuration, and review-round limits.
+- Provide three user interfaces: OpenTUI terminal UI, Web console, and legacy Python CLI.
+
+## Implemented Workflow
+
+| Stage | Entry point / action | Main artifacts |
 | --- | --- | --- |
-| A01 路由初始化 | `A01_Routing_LayerPlanning.py` | `AGENTS.md`、`docs/repo_map.json`、`docs/task_routes.json`、`docs/pitfalls.json` |
-| A02 需求录入 | `A02_RequirementIntake.py` | `{需求名}_原始需求.md` |
-| A03 需求澄清 | `A03_RequirementsClarification.py` | `{需求名}_需求澄清.md`、`{需求名}_与人类交流.md`、`{需求名}_人机交互澄清记录.md` |
-| A04 需求评审 | `A04_RequirementsReview.py` | `{需求名}_需求评审记录.md`、`{需求名}_需求评审记录_{评审者}.md`、`{需求名}_评审记录_{评审者}.json` |
-| A05 详细设计 | `A05_DetailedDesign.py` | `{需求名}_详细设计.md`、`{需求名}_详设评审记录.md` |
-| A06 任务拆分 | `A06_TaskSplit.py` | `{需求名}_任务单.md`、`{需求名}_任务单.json`、`{需求名}_任务单评审记录.md` |
-| A07 任务开发 | `A07_Development.py` | `{需求名}_工程师开发内容.md`、`{需求名}_代码评审记录.md`、任务单 JSON 进度更新 |
-| A08 整体复核 | `A08_OverallReview.py` | `{需求名}_整体代码复核记录.md`、`{需求名}_复核阶段状态.json` |
+| A01 Routing initialization | `A01_Routing_LayerPlanning.py` | `AGENTS.md`, `docs/repo_map.json`, `docs/task_routes.json`, `docs/pitfalls.json` |
+| A02 Requirement intake | `A02_RequirementIntake.py` | `{requirement}_原始需求.md` |
+| A03 Requirement clarification | `A03_RequirementsClarification.py` | `{requirement}_需求澄清.md`, `{requirement}_与人类交流.md`, `{requirement}_人机交互澄清记录.md` |
+| A04 Requirement review | `A04_RequirementsReview.py` | `{requirement}_需求评审记录.md`, reviewer-specific review Markdown and JSON files |
+| A05 Detailed design | `A05_DetailedDesign.py` | `{requirement}_详细设计.md`, `{requirement}_详设评审记录.md` |
+| A06 Task splitting | `A06_TaskSplit.py` | `{requirement}_任务单.md`, `{requirement}_任务单.json`, `{requirement}_任务单评审记录.md` |
+| A07 Development | `A07_Development.py` | `{requirement}_工程师开发内容.md`, `{requirement}_代码评审记录.md`, updated task JSON progress |
+| A08 Final review | `A08_OverallReview.py` | `{requirement}_整体代码复核记录.md`, `{requirement}_复核阶段状态.json` |
 
-`A00_main_tui.py` 是当前串联 A01 到 A08 的总入口。A08 后的测试、复利、提交代码、提交 PR 仍是占位阶段。
+`A00_main_tui.py` is the main entry point that currently wires A01 through A08 together. Post-A08 testing, compounding improvement, committing code, and submitting PRs are still placeholder stages.
 
-## 目录结构
+## Repository Layout
 
 ```text
 .
-├── A00_main_tui.py              # 总调度入口，默认会尝试启动 OpenTUI
-├── A00_main_web.py              # Web 控制台一键启动入口
-├── A01_*.py ... A08_*.py        # 各阶段兼容入口/阶段入口
-├── T01_*.py ... T12_*.py        # 共享工具、运行时、桥接、终端协议
-├── Prompt_*.py                  # 业务提示词文件，受保护，未明确允许不要修改
+├── A00_main_tui.py              # Main workflow entry, starts OpenTUI by default when possible
+├── A00_main_web.py              # One-command Web console launcher
+├── A01_*.py ... A08_*.py        # Stage compatibility entry points / stage entry points
+├── T01_*.py ... T12_*.py        # Shared tools, runtime, bridge, and terminal protocol
+├── Prompt_*.py                  # Business prompt files; protected unless explicitly changed
 ├── tmux_core/
-│   ├── workflow/                # 总流程编排实现
-│   ├── stage_kernel/            # 各阶段核心实现
-│   ├── runtime/                 # tmux worker、任务结果协议、模型厂商目录
-│   ├── bridge/                  # TUI/Web 后端桥接
-│   └── prompt_contracts/        # 各阶段输出契约和校验逻辑
+│   ├── workflow/                # Main workflow orchestration
+│   ├── stage_kernel/            # Core stage implementations
+│   ├── runtime/                 # tmux workers, task result protocol, model/vendor catalog
+│   ├── bridge/                  # TUI/Web backend bridge
+│   └── prompt_contracts/        # Stage output contracts and validation logic
 ├── packages/
-│   ├── tui/                     # Bun + Solid + OpenTUI 终端 UI
-│   └── web/                     # Bun + Vite + Solid Web 控制台
-├── docs/                        # 机器优先路由层事实源
-├── scripts/tmux-tui             # OpenTUI 启动脚本
-└── tests/                       # Python 回归测试
+│   ├── tui/                     # Bun + Solid + OpenTUI terminal UI
+│   └── web/                     # Bun + Vite + Solid Web console
+├── docs/                        # Machine-first routing facts
+├── scripts/tmux-tui             # OpenTUI launcher
+└── tests/                       # Python regression tests
 ```
 
-顶层部分文件是兼容入口，会通过 `tmux_core.compat.alias_module()` 映射到 `tmux_core` 内实现。改代码前要先追踪真实实现文件，不要只看顶层文件名。
+Some top-level files are compatibility entry points and map into real implementations through `tmux_core.compat.alias_module()`. When changing code, trace the actual implementation inside `tmux_core` instead of relying only on top-level filenames.
 
-## 环境要求
+## Requirements
 
-- macOS 或可用 tmux 的 Unix-like 环境。
-- Python 3.9+。当前本地验证环境为 Python 3.9.13。
-- tmux。
-- Bun，用于 `packages/tui` 和 `packages/web`。
-- 至少一个可用的 agent CLI：`codex`、`claude`、`gemini` 或 `opencode`。
-- 对应 agent CLI 的登录状态、API 认证和网络代理。
-- 可选：Node.js。部分厂商模型探测会读取 Node 包元数据。
+- macOS or a Unix-like environment with tmux.
+- Python 3.9+. The current local validation environment is Python 3.9.13.
+- tmux.
+- Bun for `packages/tui` and `packages/web`.
+- At least one available agent CLI: `codex`, `claude`, `gemini`, or `opencode`.
+- Login, API authentication, and network proxy setup for the selected agent CLI.
+- Optional: Node.js. Some provider/model detection code reads Node package metadata.
 
-## 安装命令
+## Installation
 
 ```bash
 git clone https://github.com/KevinCJM/TmuxCodingTeam.git
@@ -89,13 +93,15 @@ bun install --frozen-lockfile
 cd ../..
 ```
 
-仓库没有 Python 依赖清单文件；运行时代码主要使用标准库，测试需要 `pytest`。如果本机没有 pytest：
+The repository does not currently include a Python dependency manifest. Runtime Python code mostly uses the standard library, and tests require `pytest`.
+
+If `pytest` is missing:
 
 ```bash
 python3 -m pip install pytest
 ```
 
-前端依赖分别安装：
+Install frontend dependencies separately:
 
 ```bash
 cd packages/tui
@@ -105,52 +111,52 @@ cd ../web
 bun install --frozen-lockfile
 ```
 
-也可以让启动脚本自动安装缺失依赖：OpenTUI 和 Web 启动逻辑都会在发现依赖缺失时执行 `bun install --frozen-lockfile`。
+The OpenTUI and Web launch paths can also install missing frontend dependencies automatically by running `bun install --frozen-lockfile`.
 
-## 快速开始
+## Quick Start
 
-### 1. 启动 Web 控制台
+### 1. Start the Web console
 
 ```bash
 python3 A00_main_web.py
 ```
 
-默认行为：
+Default behavior:
 
-- 启动 Python WebBackend：`http://127.0.0.1:8765`
-- 启动 Vite 前端：`http://127.0.0.1:5173`
-- 前端通过 Vite proxy 访问 `/api/*`、`/healthz`
-- 启动完成后在浏览器打开 `http://127.0.0.1:5173`
+- Starts the Python WebBackend at `http://127.0.0.1:8765`.
+- Starts the Vite frontend at `http://127.0.0.1:5173`.
+- Proxies frontend `/api/*` and `/healthz` requests through Vite.
+- Opens `http://127.0.0.1:5173` in the browser after startup.
 
-可用参数：
+Useful options:
 
 ```bash
 python3 A00_main_web.py --skip-install
 python3 A00_main_web.py --backend-port 8765 --web-port 5173
 ```
 
-当前 Web 配置固定代理到 `127.0.0.1:8765`，前端固定端口 `5173`。
+The current Web setup expects the backend at `127.0.0.1:8765` and the frontend at `5173`.
 
-### 2. 启动总工作流
+### 2. Start the main workflow
 
-交互式终端中直接运行：
+Run this in an interactive terminal:
 
 ```bash
 python3 A00_main_tui.py
 ```
 
-当 stdin/stdout 是 TTY 且没有传入参数时，它会启动 `scripts/tmux-tui` 进入 OpenTUI。要显式使用 legacy Python CLI：
+When stdin/stdout are TTYs and no arguments are passed, it starts `scripts/tmux-tui` and enters OpenTUI. To explicitly use the legacy Python CLI:
 
 ```bash
 python3 A00_main_tui.py --no-tui --legacy-cli
 ```
 
-常用非交互参数：
+Common non-interactive usage:
 
 ```bash
 python3 A00_main_tui.py \
   --project-dir /absolute/path/to/target-project \
-  --requirement-name 新需求 \
+  --requirement-name new-feature \
   --main-agent vendor=codex,model=gpt-5.4,effort=high \
   --reviewer-agent name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium \
   --requirements-review-max-rounds 5 \
@@ -159,15 +165,15 @@ python3 A00_main_tui.py \
   --development-review-max-rounds 5
 ```
 
-需要跳过 A08 整体复核时：
+To skip the A08 final review stage:
 
 ```bash
 python3 A00_main_tui.py --skip-overall-review
 ```
 
-### 3. 最小 demo
+### 3. Minimal demo
 
-下面的 demo 会在一个临时项目里跑路由初始化，适合先确认本机 Python、tmux 和 agent CLI 环境是否可用：
+The following demo runs routing initialization in a temporary project. Use it first to verify that Python, tmux, and your agent CLI environment are available:
 
 ```bash
 mkdir -p /tmp/tmuxcodingteam-demo
@@ -184,7 +190,7 @@ python3 A01_Routing_LayerPlanning.py \
   --yes
 ```
 
-成功后，demo 项目中应出现：
+After success, the demo project should contain:
 
 ```text
 /tmp/tmuxcodingteam-demo/AGENTS.md
@@ -193,53 +199,53 @@ python3 A01_Routing_LayerPlanning.py \
 /tmp/tmuxcodingteam-demo/docs/pitfalls.json
 ```
 
-如果你想直接体验完整交互流程，可以改为：
+To try the full interactive workflow:
 
 ```bash
 python3 A00_main_tui.py \
   --project-dir /tmp/tmuxcodingteam-demo \
-  --requirement-name demo需求 \
+  --requirement-name demo-requirement \
   --main-agent vendor=codex,model=gpt-5.4,effort=medium
 ```
 
-### 4. 直接运行某个阶段
+### 4. Run a single stage directly
 
-每个阶段都可以独立启动，适合恢复、调试或只处理某个产物：
+Each stage can be started independently, which is useful for recovery, debugging, or processing a single artifact:
 
 ```bash
 python3 A01_Routing_LayerPlanning.py --project-dir /absolute/path/to/project
-python3 A02_RequirementIntake.py --project-dir /absolute/path/to/project --requirement-name 新需求
-python3 A03_RequirementsClarification.py --project-dir /absolute/path/to/project --requirement-name 新需求
-python3 A04_RequirementsReview.py --project-dir /absolute/path/to/project --requirement-name 新需求
-python3 A05_DetailedDesign.py --project-dir /absolute/path/to/project --requirement-name 新需求
-python3 A06_TaskSplit.py --project-dir /absolute/path/to/project --requirement-name 新需求
-python3 A07_Development.py --project-dir /absolute/path/to/project --requirement-name 新需求
-python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requirement-name 新需求
+python3 A02_RequirementIntake.py --project-dir /absolute/path/to/project --requirement-name new-feature
+python3 A03_RequirementsClarification.py --project-dir /absolute/path/to/project --requirement-name new-feature
+python3 A04_RequirementsReview.py --project-dir /absolute/path/to/project --requirement-name new-feature
+python3 A05_DetailedDesign.py --project-dir /absolute/path/to/project --requirement-name new-feature
+python3 A06_TaskSplit.py --project-dir /absolute/path/to/project --requirement-name new-feature
+python3 A07_Development.py --project-dir /absolute/path/to/project --requirement-name new-feature
+python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requirement-name new-feature
 ```
 
-多数阶段支持：
+Most stages support:
 
 - `--vendor codex|claude|gemini|opencode`
 - `--model <model>`
 - `--effort low|medium|high|xhigh|max`
-- `--proxy-url <port-or-url>` 或路由阶段的 `--proxy-port`
+- `--proxy-url <port-or-url>` or the routing-stage `--proxy-port`
 - `--reviewer-agent name=<key>,vendor=...,model=...,effort=...,proxy=...`
 - `--review-max-rounds <number|infinite>`
 - `--yes`
 - `--no-tui`
 - `--legacy-cli`
 
-## Agent 配置
+## Agent Configuration
 
-`--main-agent` 和 `--reviewer-agent` 使用逗号分隔的 `key=value` 字符串：
+`--main-agent` and `--reviewer-agent` use comma-separated `key=value` strings:
 
 ```bash
 --main-agent vendor=codex,model=gpt-5.4,effort=high,proxy=10809
---reviewer-agent name=架构师,vendor=claude,model=sonnet,effort=high
---reviewer-agent name=测试工程师,vendor=gemini,model=flash,effort=medium
+--reviewer-agent name=Architect,vendor=claude,model=sonnet,effort=high
+--reviewer-agent name=Tester,vendor=gemini,model=flash,effort=medium
 ```
 
-也可以把配置写入 JSON 文件，通过 `--agent-config` 传入。全局配置会作为默认值，`stages.<stage_key>` 可以覆盖单个阶段：
+You can also write configuration into a JSON file and pass it with `--agent-config`. Global configuration acts as the default, and `stages.<stage_key>` can override a single stage:
 
 ```json
 {
@@ -266,7 +272,7 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
       },
       "reviewers": [
         {
-          "name": "代码评审",
+          "name": "CodeReview",
           "vendor": "opencode",
           "model": "default",
           "effort": "high"
@@ -277,7 +283,7 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
 }
 ```
 
-当前总入口使用的阶段 key 包括：
+Current stage keys used by the main entry point:
 
 - `routing`
 - `requirements_clarification`
@@ -287,31 +293,33 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
 - `development`
 - `overall_review`
 
-命令行 `--main-agent`、`--reviewer-agent` 优先级高于 `--agent-config` 文件。
+Command-line `--main-agent` and `--reviewer-agent` options take precedence over the `--agent-config` file.
 
-## 运行时文件和状态
+## Runtime Files And State
 
-目标项目目录中会出现阶段产物和运行时目录。常见文件：
+The target project directory will contain stage artifacts and runtime directories.
+
+Common files:
 
 ```text
-{需求名}_原始需求.md
-{需求名}_需求澄清.md
-{需求名}_与人类交流.md
-{需求名}_人机交互澄清记录.md
-{需求名}_需求评审记录.md
-{需求名}_详细设计.md
-{需求名}_详设评审记录.md
-{需求名}_任务单.md
-{需求名}_任务单.json
-{需求名}_任务单评审记录.md
-{需求名}_工程师开发内容.md
-{需求名}_代码评审记录.md
-{需求名}_整体代码复核记录.md
-{需求名}_复核阶段状态.json
-{需求名}_开发前期.json
+{requirement}_原始需求.md
+{requirement}_需求澄清.md
+{requirement}_与人类交流.md
+{requirement}_人机交互澄清记录.md
+{requirement}_需求评审记录.md
+{requirement}_详细设计.md
+{requirement}_详设评审记录.md
+{requirement}_任务单.md
+{requirement}_任务单.json
+{requirement}_任务单评审记录.md
+{requirement}_工程师开发内容.md
+{requirement}_代码评审记录.md
+{requirement}_整体代码复核记录.md
+{requirement}_复核阶段状态.json
+{requirement}_开发前期.json
 ```
 
-常见运行时目录：
+Common runtime directories:
 
 ```text
 .routing_init_runtime/
@@ -323,18 +331,18 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
 .tmux_workflow/
 ```
 
-这些目录用于保存 worker 状态、turn 状态、任务结果、失败记录和恢复信息。不要手工删除正在运行的需求对应 runtime，除非明确要放弃恢复。
+These directories store worker state, turn state, task results, failure records, and recovery metadata. Do not manually delete the runtime directory for an active requirement unless you explicitly want to abandon recovery.
 
-## Web 和 TUI 桥接
+## Web And TUI Bridge
 
-Python 桥接层在 `tmux_core/bridge`：
+The Python bridge layer lives under `tmux_core/bridge`:
 
-- `T11_tui_backend.py` 是 OpenTUI stdio 后端兼容入口。
-- `T11_web_backend.py` 是 Web HTTP/SSE 后端兼容入口。
-- `tmux_core/bridge/backend.py` 负责统一 action 分发、快照构建、worker 控制、文件预览、prompt 响应、HITL 状态和运行时事件。
-- `tmux_core/bridge/web_backend.py` 暴露本地 HTTP API。
+- `T11_tui_backend.py` is the OpenTUI stdio backend compatibility entry point.
+- `T11_web_backend.py` is the Web HTTP/SSE backend compatibility entry point.
+- `tmux_core/bridge/backend.py` handles action dispatch, snapshot construction, worker control, file preview, prompt responses, HITL state, and runtime events.
+- `tmux_core/bridge/web_backend.py` exposes the local HTTP API.
 
-Web 后端提供的主要接口：
+Main Web backend endpoints:
 
 - `GET /healthz`
 - `GET /api/bootstrap`
@@ -347,23 +355,23 @@ Web 后端提供的主要接口：
 - `POST /api/request`
 - `POST /api/prompt-response`
 
-Web 后端只允许绑定 `127.0.0.1`。
+The Web backend only binds to `127.0.0.1`.
 
-## 测试和校验
+## Testing And Validation
 
-Python 测试：
+Python tests:
 
 ```bash
 python3 -m pytest
 ```
 
-只跑关键边界测试：
+Run key boundary tests only:
 
 ```bash
 python3 -m pytest tests/test_architecture_boundaries.py tests/test_runtime_contract_compat.py tests/test_t10_tui_protocol.py
 ```
 
-TUI 测试：
+TUI tests:
 
 ```bash
 cd packages/tui
@@ -371,7 +379,7 @@ bun test
 bun run typecheck
 ```
 
-Web 测试：
+Web tests:
 
 ```bash
 cd packages/web
@@ -380,56 +388,56 @@ bun run typecheck
 bun run build
 ```
 
-Web E2E：
+Web E2E:
 
 ```bash
 cd packages/web
 bun run test:e2e
 ```
 
-`test_models.py` 是本机模型探测脚本，它依赖用户本机的外部 CLI/脚本，不属于稳定仓库回归测试入口。
+`test_models.py` is a local model probing script. It depends on external CLIs and user-local scripts, so it is not a stable repository regression test entry point.
 
-## 开发约束
+## Development Constraints
 
-- `docs/repo_map.json`、`docs/task_routes.json`、`docs/pitfalls.json` 是机器优先路由事实源；README 只做人工说明，不替代这些文件。
-- 修改业务代码前先读 `AGENTS.md`，并按路由文件选择真实实现路径。
-- 不要把顶层兼容入口当成唯一实现事实，先追踪到 `tmux_core` 内模块。
-- 未经明确允许，不要修改 `Prompt_*.py` 和 `tmux_core/prompt_contracts` 中的业务提示词内容。
-- 不要修改 `packages/tui/node_modules/**` 或 `packages/web/node_modules/**`。
-- 改桥接协议时同时检查 Python 后端、TUI/Web 客户端和协议测试。
-- 改阶段完成逻辑时同时检查文件契约、JSON 写入、validator 和恢复路径。
+- `docs/repo_map.json`, `docs/task_routes.json`, and `docs/pitfalls.json` are machine-first routing facts. README is human-facing documentation and does not replace those files.
+- Read `AGENTS.md` before changing business code, then use the routing files to find the real implementation path.
+- Do not treat top-level compatibility entry points as the only implementation facts. Trace into `tmux_core` first.
+- Do not modify `Prompt_*.py` or `tmux_core/prompt_contracts` business prompts unless explicitly asked.
+- Do not modify `packages/tui/node_modules/**` or `packages/web/node_modules/**`.
+- When changing the bridge protocol, check the Python backend, TUI/Web clients, and protocol tests together.
+- When changing stage completion logic, check file contracts, JSON writes, validators, and recovery paths together.
 
-## 维护路线图
+## Roadmap
 
-- v0.1.x：稳定 A01-A08 主流程，补齐 README、license、release notes 和最小 demo，保证新用户能在本地跑通基础流程。
-- v0.2.x：完善 Web 控制台和 OpenTUI 的运行时可观测性，包括 worker 状态、阶段事件、文件预览和失败恢复提示。
-- v0.3.x：增强 release automation、测试执行和 PR review 支持，让 Codex/Claude/Gemini/OpenCode 可以更稳定地参与维护工作流。
-- v0.4.x：补充插件化 agent provider 配置、更多模型厂商适配和可复用 workflow template。
-- 长期方向：把 TmuxCodingTeam 打磨成可审计、可恢复、可扩展的本地 multi-agent software maintenance toolkit。
+- v0.1.x: Stabilize the A01-A08 workflow, keep README/license/release notes/minimal demo current, and make the basic local workflow easy for new users to run.
+- v0.2.x: Improve Web console and OpenTUI runtime observability, including worker state, stage events, file preview, and failure recovery hints.
+- v0.3.x: Improve release automation, test execution, and PR review support so Codex/Claude/Gemini/OpenCode can participate more reliably in maintenance workflows.
+- v0.4.x: Add plugin-style agent provider configuration, more model/vendor adapters, and reusable workflow templates.
+- Long term: Turn TmuxCodingTeam into an auditable, recoverable, extensible local multi-agent software maintenance toolkit.
 
-## 许可证
+## License
 
-本项目使用 MIT License。详见 `LICENSE`。
+This project is licensed under the MIT License. See `LICENSE`.
 
-## 常见问题
+## FAQ
 
-### 运行后没有进入 OpenTUI
+### Why did it not enter OpenTUI after startup?
 
-只有在没有传参数、stdin/stdout 是交互式 TTY、且没有 `--no-tui`/`--legacy-cli` 时，总入口才会自动进入 OpenTUI。否则会走 Python CLI 参数流程。
+The main entry point enters OpenTUI only when no arguments are passed, stdin/stdout are interactive TTYs, and neither `--no-tui` nor `--legacy-cli` is provided. Otherwise, it uses the Python CLI argument flow.
 
-### 提示缺少 Bun 或前端依赖
+### Bun or frontend dependencies are missing
 
-安装 Bun，然后在对应包目录执行：
+Install Bun, then run:
 
 ```bash
 bun install --frozen-lockfile
 ```
 
-也可以重新运行入口，让启动逻辑自动安装缺失依赖。
+inside the corresponding package directory. You can also rerun the entry point and let the startup logic install missing dependencies automatically.
 
-### agent 无法启动或卡在认证
+### Agent startup fails or gets stuck on authentication
 
-先确认对应 CLI 可直接在当前 shell 运行：
+First confirm that the selected CLI works directly in the current shell:
 
 ```bash
 codex --help
@@ -439,24 +447,24 @@ opencode --help
 tmux -V
 ```
 
-再确认 CLI 已登录、网络代理可用、模型名和 reasoning effort 被当前厂商支持。
+Then confirm that the CLI is logged in, the network proxy is available, and the selected model name and reasoning effort are supported by the provider.
 
-### 如何清理异常 tmux 会话
+### How do I clean up abnormal tmux sessions?
 
-优先通过 TUI/Web 控制台的 worker 控制能力停止或重启 worker。手工清理前先查看：
+Prefer stopping or restarting workers through the TUI/Web console. Before manually cleaning up, inspect sessions:
 
 ```bash
 tmux ls
 ```
 
-再按会话名清理：
+Then kill only the confirmed abandoned session:
 
 ```bash
 tmux kill-session -t <session-name>
 ```
 
-手工 kill 可能影响运行时恢复，应只处理确认已经废弃的会话。
+Manual kills may affect runtime recovery, so only use them for sessions you are sure are abandoned.
 
-### 如何判断一个需求是否已经完成
+### How do I know whether a requirement is complete?
 
-检查 `{需求名}_任务单.json` 中任务是否全部为 `true`，再检查 `{需求名}_复核阶段状态.json` 中 `passed` 是否为 `true`。同时保留各阶段评审记录，便于回溯。
+Check whether all tasks in `{requirement}_任务单.json` are `true`, then check whether `{requirement}_复核阶段状态.json` has `passed: true`. Keep all stage review records for traceability.
