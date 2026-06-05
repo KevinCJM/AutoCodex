@@ -94,7 +94,13 @@ def list_existing_requirements(project_dir: str | Path) -> tuple[str, ...]:
     for file_path in sorted(project_root.glob("*_原始需求.md")):
         if not file_path.is_file():
             continue
-        if not file_path.read_text(encoding="utf-8").strip():
+        if file_path.name.startswith("."):
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if not content.strip():
             continue
         requirement_name = file_path.name.removesuffix("_原始需求.md").strip()
         if requirement_name:

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+import tempfile
 import unittest
 
+from T12_requirements_common import list_existing_requirements
 from tmux_core.requirements_scope import (
     CREATE_NEW_REQUIREMENT_SELECTION_VALUE,
     build_requirement_scope_lock_prompt,
@@ -10,6 +13,26 @@ from tmux_core.requirements_scope import (
 
 
 class T12RequirementsCommonTests(unittest.TestCase):
+    def test_list_existing_requirements_skips_appledouble_sidecar_files(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "需求A_原始需求.md").write_text("正文A\n", encoding="utf-8")
+            (root / "._需求A_原始需求.md").write_bytes(b"\x00\x05\x16\x07\x00\x02\x00\x00\xb0")
+
+            result = list_existing_requirements(root)
+
+        self.assertEqual(result, ("需求A",))
+
+    def test_list_existing_requirements_skips_non_utf8_candidates(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "需求A_原始需求.md").write_text("正文A\n", encoding="utf-8")
+            (root / "坏编码_原始需求.md").write_bytes(b"\xb0not utf-8")
+
+            result = list_existing_requirements(root)
+
+        self.assertEqual(result, ("需求A",))
+
     def test_build_requirement_scope_lock_prompt_deduplicates_artifacts(self):
         prompt = build_requirement_scope_lock_prompt(
             "/tmp/基金数据生成器_原始需求.md",
