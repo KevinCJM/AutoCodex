@@ -491,7 +491,7 @@ RUNTIME_NOISE_PATTERNS = (
     r"^✗\s*Auto-update.*$",
     r"^(?:~|/)\S+\s+.+$",
     r"^(?:~|/).+\s{2,}.+$",
-    r"^(?:gemini|claude|codex|opencode)(?:[-_.a-z0-9]+)?$",
+    r"^(?:gemini|claude|codex|opencode|mimo)(?:[-_.a-z0-9]+)?$",
 )
 
 _LIVE_WORKERS: "weakref.WeakSet[TmuxBatchWorker]" = weakref.WeakSet()
@@ -637,6 +637,11 @@ class Vendor(str, Enum):
     CLAUDE = "claude"
     GEMINI = "gemini"
     OPENCODE = "opencode"
+    MIMO = "mimo"
+
+
+def _is_opencode_like_vendor(vendor: Vendor) -> bool:
+    return vendor in {Vendor.OPENCODE, Vendor.MIMO}
 
 
 class WorkerStatus(str, Enum):
@@ -2084,10 +2089,10 @@ def build_reasoning_note(
         parts.append(f"claude_effort={resolved.native_reasoning_level}")
     if vendor == Vendor.GEMINI and resolved.reasoning_control_mode == "model_family_routing":
         parts.append(f"gemini_model_family={resolved.resolved_model}")
-    if vendor == Vendor.OPENCODE:
-        parts.append(f"opencode_model={resolved.resolved_model}")
+    if _is_opencode_like_vendor(vendor):
+        parts.append(f"{vendor.value}_model={resolved.resolved_model}")
         if resolved.resolved_variant:
-            parts.append(f"opencode_variant={resolved.resolved_variant}")
+            parts.append(f"{vendor.value}_variant={resolved.resolved_variant}")
     return "; ".join(parts)
 
 
@@ -2345,7 +2350,7 @@ def build_output_detector(vendor: Vendor) -> BaseOutputDetector:
         return ClaudeOutputDetector()
     if vendor == Vendor.GEMINI:
         return GeminiOutputDetector()
-    if vendor == Vendor.OPENCODE:
+    if _is_opencode_like_vendor(vendor):
         return OpenCodeOutputDetector()
     raise ValueError(f"不支持的厂商: {vendor}")
 
@@ -2411,7 +2416,7 @@ def classify_agent_runtime_state(
             surface = "\n".join(
                 part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip()
             )
-        if context.vendor == Vendor.OPENCODE and (
+        if _is_opencode_like_vendor(context.vendor) and (
                 re.search(r"\bBuild\s*·", _normalize_opencode_surface(surface), re.IGNORECASE)
         ):
             surface_state = _classify_opencode_surface_state(
@@ -2449,7 +2454,7 @@ def classify_agent_runtime_state(
                     )
             ):
                 return AgentRuntimeState.READY
-        elif context.vendor == Vendor.OPENCODE:
+        elif _is_opencode_like_vendor(context.vendor):
             surface_state = _classify_opencode_surface_state(
                 visible_text=observation.visible_text,
                 recent_log=observation.raw_log_tail,
@@ -2470,7 +2475,7 @@ def classify_agent_runtime_state(
     if context.title_busy:
         return AgentRuntimeState.BUSY
     if (
-            context.vendor == Vendor.OPENCODE
+            _is_opencode_like_vendor(context.vendor)
             and not (str(observation.visible_text or "").strip() or str(observation.raw_log_tail or "").strip())
             and context.cached_state in {AgentRuntimeState.READY, AgentRuntimeState.BUSY}
     ):
@@ -2535,6 +2540,7 @@ class AgentRunConfig:
             Vendor.CLAUDE: ("claude", "claude.exe", "node"),
             Vendor.GEMINI: ("gemini", "node"),
             Vendor.OPENCODE: ("opencode", "node"),
+            Vendor.MIMO: ("mimo", "node"),
         }[self.vendor]
 
     def submit_enter_count(self) -> int:
@@ -2576,9 +2582,9 @@ class AgentRunConfig:
                 "--approval-mode",
                 "yolo",
             ]
-        elif self.vendor == Vendor.OPENCODE:
+        elif _is_opencode_like_vendor(self.vendor):
             args = [
-                "opencode",
+                self.vendor.value,
                 str(work_dir),
                 "--pure",
                 "--model",
@@ -3375,7 +3381,7 @@ class TmuxBatchWorker:
         _notify_runtime_state_changed_best_effort()
 
     def _capture_passive_observation(self, *, tail_lines: int = 120) -> WorkerObservation:
-        if self.config.vendor == Vendor.OPENCODE and self.agent_state == AgentRuntimeState.BUSY:
+        if _is_opencode_like_vendor(self.config.vendor) and self.agent_state == AgentRuntimeState.BUSY:
             return self.observe(tail_lines=tail_lines, tail_bytes=12000)
         observation = self._capture_lightweight_observation()
         if self._should_capture_visible_for_passive_health(observation):
@@ -3388,12 +3394,12 @@ class TmuxBatchWorker:
         current_command = observation.current_command or self.current_command
         if not self._agent_running(current_command):
             return False
-        if self.config.vendor == Vendor.OPENCODE:
+        if _is_opencode_like_vendor(self.config.vendor):
             title = str(observation.pane_title or "").strip()
             return (
                     not self.agent_started
                     or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
-                    or title == "OpenCode"
+                    or title in {"OpenCode", "MiMoCode", "MiMo Code"}
             )
         if self.config.vendor == Vendor.GEMINI:
             return not self.agent_started or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
@@ -4710,7 +4716,7 @@ class TmuxBatchWorker:
             except Exception:
                 pass
 
-            if saw_busy_after_submit and self.config.vendor != Vendor.OPENCODE:
+            if saw_busy_after_submit and not _is_opencode_like_vendor(self.config.vendor):
                 observation = self._probe_agent_liveness_for_file_wait()
             else:
                 observation = self.observe(tail_lines=160, tail_bytes=12000)
@@ -5357,7 +5363,7 @@ class TmuxBatchWorker:
             return self.observe(tail_lines=80, tail_bytes=0)
         if self.current_task_runtime_status == TASK_STATUS_RUNNING:
             return self.observe(tail_lines=80, tail_bytes=12000)
-        if self.config.vendor == Vendor.OPENCODE and self.agent_state == AgentRuntimeState.BUSY:
+        if _is_opencode_like_vendor(self.config.vendor) and self.agent_state == AgentRuntimeState.BUSY:
             return self.observe(tail_lines=80, tail_bytes=12000)
         return self._capture_lightweight_observation()
 
@@ -5677,7 +5683,7 @@ class TmuxBatchWorker:
                     *GEMINI_NOT_READY_PATTERNS,
                 )
             )
-        if self.config.vendor == Vendor.OPENCODE:
+        if _is_opencode_like_vendor(self.config.vendor):
             state = _classify_opencode_surface_state(
                 visible_text=recent_output,
                 recent_log="",
@@ -5708,7 +5714,7 @@ class TmuxBatchWorker:
             if any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_BUSY_PATTERNS):
                 return False
             return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_INPUT_BOX_PATTERNS + GEMINI_READY_PATTERNS)
-        if self.config.vendor == Vendor.OPENCODE:
+        if _is_opencode_like_vendor(self.config.vendor):
             state = _classify_opencode_surface_state(
                 visible_text=recent_output,
                 recent_log=raw_log_tail,
@@ -5826,7 +5832,7 @@ class TmuxBatchWorker:
             return WrapperState.NOT_READY
         if self.agent_started and self._title_indicates_ready(self.last_pane_title):
             return WrapperState.READY
-        if self.config.vendor == Vendor.OPENCODE and self.agent_started and self._visible_indicates_agent_ready(
+        if _is_opencode_like_vendor(self.config.vendor) and self.agent_started and self._visible_indicates_agent_ready(
                 visible_text,
                 raw_log_tail,
                 current_command=current_command,

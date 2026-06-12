@@ -1,25 +1,41 @@
 {
   "schema_version": "1.1",
   "scope_mode": "subtree_only",
-  "allowed_unresolved_sentinels": ["unknown", "out_of_scope", "needs_code_confirmation"],
+  "allowed_unresolved_sentinels": [
+    "unknown",
+    "out_of_scope",
+    "needs_code_confirmation"
+  ],
   "selector_contract": {
     "selector_types": {
       "literal": {
-        "required": ["type", "path"],
+        "required": [
+          "type",
+          "path"
+        ],
         "output": "exact_path",
         "path_policy": "relative_to_scope_root_no_parent_segments"
       },
       "subtree": {
-        "required": ["type", "path"],
+        "required": [
+          "type",
+          "path"
+        ],
         "output": "subtree_anchor",
         "enumeration_policy": "do_not_auto_enumerate_descendants"
       },
       "token": {
-        "required": ["type", "token"],
+        "required": [
+          "type",
+          "token"
+        ],
         "output": "resolver_defined"
       },
       "field_ref": {
-        "required": ["type", "field"],
+        "required": [
+          "type",
+          "field"
+        ],
         "allowed_fields": [
           "entry_selectors",
           "first_read_selectors",
@@ -32,53 +48,86 @@
         "output": "inline_same_module_field"
       },
       "owned_paths_role": {
-        "required": ["type", "role"],
+        "required": [
+          "type",
+          "role"
+        ],
         "output": "owned_paths_filtered_by_role"
       }
     },
     "token_registry": {
       "matched_stage_entry": {
-        "resolver_inputs": ["task_text", "route_id", "M03_stage_family.owned_paths[role=stage_entry]"],
+        "resolver_inputs": [
+          "task_text",
+          "route_id",
+          "M03_stage_family.owned_paths[role=stage_entry]"
+        ],
         "output_type": "literal",
         "fallback": "needs_code_confirmation"
       },
       "matched_prompt_file": {
-        "resolver_inputs": ["task_text", "route_id", "M04_prompt_contracts.owned_paths[role=business_prompt]"],
+        "resolver_inputs": [
+          "task_text",
+          "route_id",
+          "M04_prompt_contracts.owned_paths[role=business_prompt]"
+        ],
         "output_type": "literal",
         "fallback": "needs_code_confirmation"
       },
       "matched_shared_file": {
-        "resolver_inputs": ["task_text", "M08_shared_support.owned_paths"],
+        "resolver_inputs": [
+          "task_text",
+          "M08_shared_support.owned_paths"
+        ],
         "output_type": "literal",
         "fallback": "needs_code_confirmation"
       },
       "matched_failing_test": {
-        "resolver_inputs": ["test_failure_identifier", "task_text"],
+        "resolver_inputs": [
+          "test_failure_identifier",
+          "task_text"
+        ],
         "output_type": "literal",
         "fallback": "needs_code_confirmation"
       },
       "nearest_tested_module": {
-        "resolver_inputs": ["matched_failing_test", "repo_map.relations"],
+        "resolver_inputs": [
+          "matched_failing_test",
+          "repo_map.relations"
+        ],
         "output_type": "module_id_or_selector",
         "fallback": "needs_code_confirmation"
       },
       "implementation_under_test": {
-        "resolver_inputs": ["matched_failing_test", "import_trace_inside_scope"],
+        "resolver_inputs": [
+          "matched_failing_test",
+          "import_trace_inside_scope"
+        ],
         "output_type": "literal_or_subtree",
         "fallback": "needs_code_confirmation"
       },
       "direct_callers": {
-        "resolver_inputs": ["selected_path", "visible_import_or_call_trace"],
+        "resolver_inputs": [
+          "selected_path",
+          "visible_import_or_call_trace"
+        ],
         "output_type": "literal_list",
         "fallback": "needs_code_confirmation"
       },
       "specific_requested_generated_path": {
-        "resolver_inputs": ["task_text", "M10_generated_artifacts.owned_paths"],
+        "resolver_inputs": [
+          "task_text",
+          "M10_generated_artifacts.owned_paths"
+        ],
         "output_type": "literal_or_subtree",
         "fallback": "needs_code_confirmation"
       },
       "generator_or_test_for_artifact": {
-        "resolver_inputs": ["specific_requested_generated_path", "repo_map.relations", "related_test_selectors"],
+        "resolver_inputs": [
+          "specific_requested_generated_path",
+          "repo_map.relations",
+          "related_test_selectors"
+        ],
         "output_type": "literal_or_module_ref",
         "fallback": "needs_code_confirmation"
       }
@@ -91,14 +140,22 @@
       {
         "step": 1,
         "op": "match_routes",
-        "input_fields": ["routes[].match_keywords", "routes[].negative_keywords", "routes[].route_priority"],
+        "input_fields": [
+          "routes[].match_keywords",
+          "routes[].negative_keywords",
+          "routes[].route_priority"
+        ],
         "output_field": "matched_routes",
-        "dedupe_key": ["route_id"]
+        "dedupe_key": [
+          "route_id"
+        ]
       },
       {
         "step": 2,
         "op": "collect_module_defaults",
-        "input_fields": ["routes[].first_read_modules"],
+        "input_fields": [
+          "routes[].first_read_modules"
+        ],
         "module_fields": [
           "first_read_selectors",
           "then_check_selectors",
@@ -113,21 +170,43 @@
           "related_config_selectors",
           "minimum_regression_selectors"
         ],
-        "dedupe_key": ["type", "path", "token", "field", "role"]
+        "dedupe_key": [
+          "type",
+          "path",
+          "token",
+          "field",
+          "role"
+        ]
       },
       {
         "step": 3,
         "op": "apply_route_deltas",
-        "input_fields": ["routes[].selector_deltas"],
+        "input_fields": [
+          "routes[].selector_deltas"
+        ],
         "merge": "append",
-        "dedupe_key": ["type", "path", "token", "field", "role"]
+        "dedupe_key": [
+          "type",
+          "path",
+          "token",
+          "field",
+          "role"
+        ]
       },
       {
         "step": 4,
         "op": "apply_route_overrides",
-        "input_fields": ["routes[].selector_overrides"],
+        "input_fields": [
+          "routes[].selector_overrides"
+        ],
         "merge": "replace_named_output_field",
-        "dedupe_key": ["type", "path", "token", "field", "role"]
+        "dedupe_key": [
+          "type",
+          "path",
+          "token",
+          "field",
+          "role"
+        ]
       },
       {
         "step": 5,
@@ -173,136 +252,471 @@
     {
       "id": "R01_routing_layer",
       "task_type": "routing_layer_creation_or_validation",
-      "match_keywords": ["routing_layer", "agents_md", "repo_map", "task_routes", "pitfalls", "machine_first", "audit"],
-      "negative_keywords": ["human_docs", "architecture_overview"],
+      "match_keywords": [
+        "routing_layer",
+        "agents_md",
+        "repo_map",
+        "task_routes",
+        "pitfalls",
+        "machine_first",
+        "audit"
+      ],
+      "negative_keywords": [
+        "human_docs",
+        "architecture_overview"
+      ],
       "route_priority": 100,
-      "first_read_modules": ["M09_routing_init_layer", "M04_prompt_contracts", "M11_tests"],
+      "first_read_modules": [
+        "M09_routing_init_layer",
+        "M04_prompt_contracts",
+        "M11_tests"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P02", "P06", "P08"],
-      "expand_search_codes": ["TX03", "TX06", "TX07"],
-      "stop_codes": ["SV01", "SV02", "SV03"]
+      "pitfall_ids": [
+        "P02",
+        "P06",
+        "P08"
+      ],
+      "expand_search_codes": [
+        "TX03",
+        "TX06",
+        "TX07"
+      ],
+      "stop_codes": [
+        "SV01",
+        "SV02",
+        "SV03"
+      ]
     },
     {
       "id": "R02_workflow_entry",
       "task_type": "main_workflow_or_stage_chain",
-      "match_keywords": ["a00_main_tui", "workflow", "stage_chain", "legacy_cli", "skip_overall_review", "project_dir"],
-      "negative_keywords": ["web_console", "vite"],
+      "match_keywords": [
+        "a00_main_tui",
+        "workflow",
+        "stage_chain",
+        "legacy_cli",
+        "skip_overall_review",
+        "project_dir"
+      ],
+      "negative_keywords": [
+        "web_console",
+        "vite"
+      ],
       "route_priority": 90,
-      "first_read_modules": ["M01_workflow_entry", "M03_stage_family", "M05_tmux_runtime_hitl", "M08_shared_support"],
+      "first_read_modules": [
+        "M01_workflow_entry",
+        "M03_stage_family",
+        "M05_tmux_runtime_hitl",
+        "M08_shared_support"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P01", "P04", "P07"],
-      "expand_search_codes": ["TX01", "TX02", "TX03", "TX04"],
-      "stop_codes": ["SV01", "SV03"]
+      "pitfall_ids": [
+        "P01",
+        "P04",
+        "P07"
+      ],
+      "expand_search_codes": [
+        "TX01",
+        "TX02",
+        "TX03",
+        "TX04"
+      ],
+      "stop_codes": [
+        "SV01",
+        "SV03"
+      ]
     },
     {
       "id": "R03_stage_behavior",
       "task_type": "stage_logic_or_artifact_contract",
-      "match_keywords": ["requirement", "clarification", "review", "detailed_design", "task_split", "development", "overall_review", "artifact"],
+      "match_keywords": [
+        "requirement",
+        "clarification",
+        "review",
+        "detailed_design",
+        "task_split",
+        "development",
+        "overall_review",
+        "artifact"
+      ],
       "negative_keywords": [],
       "route_priority": 85,
-      "first_read_modules": ["M03_stage_family", "M04_prompt_contracts", "M05_tmux_runtime_hitl", "M08_shared_support"],
+      "first_read_modules": [
+        "M03_stage_family",
+        "M04_prompt_contracts",
+        "M05_tmux_runtime_hitl",
+        "M08_shared_support"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P01", "P02", "P04", "P06"],
-      "expand_search_codes": ["TX02", "TX03", "TX06"],
-      "stop_codes": ["SV02", "SV03"]
+      "pitfall_ids": [
+        "P01",
+        "P02",
+        "P04",
+        "P06"
+      ],
+      "expand_search_codes": [
+        "TX02",
+        "TX03",
+        "TX06"
+      ],
+      "stop_codes": [
+        "SV02",
+        "SV03"
+      ]
     },
     {
       "id": "R04_tmux_runtime_hitl",
       "task_type": "tmux_agent_runtime_or_hitl",
-      "match_keywords": ["tmux", "worker", "hitl", "human_input", "resume", "terminal", "agent_config", "provider", "model", "proxy"],
+      "match_keywords": [
+        "tmux",
+        "worker",
+        "hitl",
+        "human_input",
+        "resume",
+        "terminal",
+        "agent_config",
+        "provider",
+        "model",
+        "proxy"
+      ],
       "negative_keywords": [],
       "route_priority": 80,
-      "first_read_modules": ["M05_tmux_runtime_hitl", "M08_shared_support", "M03_stage_family"],
+      "first_read_modules": [
+        "M05_tmux_runtime_hitl",
+        "M08_shared_support",
+        "M03_stage_family"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P01", "P04", "P07"],
-      "expand_search_codes": ["TX02", "TX03", "TX04"],
-      "stop_codes": ["SV01", "SV03"]
+      "pitfall_ids": [
+        "P01",
+        "P04",
+        "P07"
+      ],
+      "expand_search_codes": [
+        "TX02",
+        "TX03",
+        "TX04"
+      ],
+      "stop_codes": [
+        "SV01",
+        "SV03"
+      ]
     },
     {
       "id": "R05_tui_bridge_protocol",
       "task_type": "opentui_backend_or_protocol",
-      "match_keywords": ["opentui", "tui", "protocol", "ndjson", "t11_tui_backend", "stage_registry", "client_ts"],
-      "negative_keywords": ["web_only"],
+      "match_keywords": [
+        "opentui",
+        "tui",
+        "protocol",
+        "ndjson",
+        "t11_tui_backend",
+        "stage_registry",
+        "client_ts"
+      ],
+      "negative_keywords": [
+        "web_only"
+      ],
       "route_priority": 80,
-      "first_read_modules": ["M06_bridge_protocol_backends", "M07_frontend_packages", "M05_tmux_runtime_hitl"],
+      "first_read_modules": [
+        "M06_bridge_protocol_backends",
+        "M07_frontend_packages",
+        "M05_tmux_runtime_hitl"
+      ],
       "selector_deltas": {
         "then_check_selectors": [
-          {"type": "literal", "path": "scripts/tmux-tui"}
+          {
+            "type": "literal",
+            "path": "scripts/tmux-tui"
+          }
         ]
       },
       "selector_overrides": {},
-      "pitfall_ids": ["P03", "P05", "P07"],
-      "expand_search_codes": ["TX02", "TX05"],
-      "stop_codes": ["SV02", "SV03"]
+      "pitfall_ids": [
+        "P03",
+        "P05",
+        "P07"
+      ],
+      "expand_search_codes": [
+        "TX02",
+        "TX05"
+      ],
+      "stop_codes": [
+        "SV02",
+        "SV03"
+      ]
     },
     {
       "id": "R06_web_console",
       "task_type": "web_console_or_web_backend",
-      "match_keywords": ["web_console", "a00_main_web", "vite", "webbackend", "healthz", "backend_port"],
-      "negative_keywords": ["opentui_only"],
+      "match_keywords": [
+        "web_console",
+        "a00_main_web",
+        "vite",
+        "webbackend",
+        "healthz",
+        "backend_port"
+      ],
+      "negative_keywords": [
+        "opentui_only"
+      ],
       "route_priority": 78,
-      "first_read_modules": ["M02_web_launcher", "M06_bridge_protocol_backends", "M07_frontend_packages"],
+      "first_read_modules": [
+        "M02_web_launcher",
+        "M06_bridge_protocol_backends",
+        "M07_frontend_packages"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P05", "P07", "P09"],
-      "expand_search_codes": ["TX05"],
-      "stop_codes": ["SV03"]
+      "pitfall_ids": [
+        "P05",
+        "P07",
+        "P09"
+      ],
+      "expand_search_codes": [
+        "TX05"
+      ],
+      "stop_codes": [
+        "SV03"
+      ]
     },
     {
       "id": "R07_prompt_contract",
       "task_type": "prompt_or_output_contract",
-      "match_keywords": ["prompt", "business_prompt", "contract", "output_schema", "reviewer_instruction", "agent_instruction"],
+      "match_keywords": [
+        "prompt",
+        "business_prompt",
+        "contract",
+        "output_schema",
+        "reviewer_instruction",
+        "agent_instruction"
+      ],
       "negative_keywords": [],
       "route_priority": 75,
-      "first_read_modules": ["M04_prompt_contracts", "M03_stage_family"],
+      "first_read_modules": [
+        "M04_prompt_contracts",
+        "M03_stage_family"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P02", "P06"],
-      "expand_search_codes": ["TX03", "TX06"],
-      "stop_codes": ["SV02", "SV03"]
+      "pitfall_ids": [
+        "P02",
+        "P06"
+      ],
+      "expand_search_codes": [
+        "TX03",
+        "TX06"
+      ],
+      "stop_codes": [
+        "SV02",
+        "SV03"
+      ]
     },
     {
       "id": "R08_shared_support",
       "task_type": "shared_config_or_helper",
-      "match_keywords": ["t01", "t08", "t12", "u01", "config", "helper", "pre_development", "requirements_common"],
+      "match_keywords": [
+        "t01",
+        "t08",
+        "t12",
+        "u01",
+        "config",
+        "helper",
+        "pre_development",
+        "requirements_common"
+      ],
       "negative_keywords": [],
       "route_priority": 60,
-      "first_read_modules": ["M08_shared_support", "M01_workflow_entry", "M03_stage_family"],
+      "first_read_modules": [
+        "M08_shared_support",
+        "M01_workflow_entry",
+        "M03_stage_family"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P04", "P06"],
-      "expand_search_codes": ["TX03"],
-      "stop_codes": ["SV03"]
+      "pitfall_ids": [
+        "P04",
+        "P06"
+      ],
+      "expand_search_codes": [
+        "TX03"
+      ],
+      "stop_codes": [
+        "SV03"
+      ]
     },
     {
       "id": "R09_tests_regression",
       "task_type": "test_failure_or_regression_routing",
-      "match_keywords": ["pytest", "test_failure", "regression", "tests", "boundary_test", "failing_test"],
+      "match_keywords": [
+        "pytest",
+        "test_failure",
+        "regression",
+        "tests",
+        "boundary_test",
+        "failing_test"
+      ],
       "negative_keywords": [],
       "route_priority": 70,
-      "first_read_modules": ["M11_tests"],
+      "first_read_modules": [
+        "M11_tests"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P01", "P06"],
-      "expand_search_codes": ["TX01", "TX02"],
-      "stop_codes": ["SV03"]
+      "pitfall_ids": [
+        "P01",
+        "P06"
+      ],
+      "expand_search_codes": [
+        "TX01",
+        "TX02"
+      ],
+      "stop_codes": [
+        "SV03"
+      ]
     },
     {
       "id": "R10_generated_artifacts",
       "task_type": "generated_fixture_or_e2e_output",
-      "match_keywords": ["_tui_e2e_projects", ".tmp", "fixture", "generated", "sample_project", "space_path"],
+      "match_keywords": [
+        "_tui_e2e_projects",
+        ".tmp",
+        "fixture",
+        "generated",
+        "sample_project",
+        "space_path"
+      ],
       "negative_keywords": [],
       "route_priority": 40,
-      "first_read_modules": ["M10_generated_artifacts", "M09_routing_init_layer"],
+      "first_read_modules": [
+        "M10_generated_artifacts",
+        "M09_routing_init_layer"
+      ],
       "selector_deltas": {},
       "selector_overrides": {},
-      "pitfall_ids": ["P08"],
-      "expand_search_codes": ["TX07"],
-      "stop_codes": ["SV01", "SV03"]
+      "pitfall_ids": [
+        "P08"
+      ],
+      "expand_search_codes": [
+        "TX07"
+      ],
+      "stop_codes": [
+        "SV01",
+        "SV03"
+      ]
+    },
+    {
+      "id": "R11_coding_agent_vendor_catalog",
+      "task_type": "coding_agent_vendor_or_model_catalog",
+      "match_keywords": [
+        "vendor",
+        "vendor_catalog",
+        "coding_agent",
+        "agent_vendor",
+        "agent catalog",
+        "model catalog",
+        "provider",
+        "model",
+        "opencode",
+        "mimo",
+        "codex",
+        "claude",
+        "gemini"
+      ],
+      "negative_keywords": [],
+      "route_priority": 90,
+      "first_read_modules": [
+        "M05_tmux_runtime_hitl",
+        "M09_routing_init_layer",
+        "M06_bridge_protocol_backends",
+        "M07_frontend_packages",
+        "M03_stage_family"
+      ],
+      "selector_deltas": {
+        "first_read_selectors": [
+          {
+            "type": "literal",
+            "path": "tmux_core/runtime/vendor_catalog.py"
+          },
+          {
+            "type": "literal",
+            "path": "tmux_core/runtime/tmux_runtime.py"
+          },
+          {
+            "type": "literal",
+            "path": "A01_Routing_LayerPlanning.py"
+          },
+          {
+            "type": "literal",
+            "path": "packages/tui/src/homeAgents.ts"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_vendor_catalog.py"
+          }
+        ],
+        "then_check_selectors": [
+          {
+            "type": "literal",
+            "path": "tests/test_t02_tmux_agents.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_a01_routing_layer_planning.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_t11_web_backend.py"
+          },
+          {
+            "type": "literal",
+            "path": "packages/tui/src/homeAgents.test.ts"
+          }
+        ],
+        "minimum_regression_selectors": [
+          {
+            "type": "literal",
+            "path": "tests/test_vendor_catalog.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_t02_tmux_agents.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_a01_routing_layer_planning.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_t11_web_backend.py"
+          },
+          {
+            "type": "literal",
+            "path": "packages/tui/src/homeAgents.test.ts"
+          }
+        ]
+      },
+      "selector_overrides": {},
+      "pitfall_ids": [
+        "P01",
+        "P04",
+        "P05",
+        "P07"
+      ],
+      "expand_search_codes": [
+        "TX03",
+        "TX04",
+        "TX05"
+      ],
+      "stop_codes": [
+        "SV01",
+        "SV03"
+      ]
     }
   ]
 }

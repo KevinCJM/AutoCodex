@@ -218,6 +218,11 @@ test('buildAgentConfigLabel formats vendor model and effort for home display', (
     model: 'gpt-5.5',
     reasoningEffort: 'high',
   }))).toBe('Codex | GPT-5.5, High')
+  expect(buildAgentConfigLabel(worker({
+    vendor: 'mimo',
+    model: 'mimo/mimo-v2.5-pro',
+    reasoningEffort: 'max',
+  }))).toBe('MiMo Code | mimo/mimo-v2.5-pro, Max')
 })
 
 test('buildHomeAgents omits config label when worker config is missing', () => {

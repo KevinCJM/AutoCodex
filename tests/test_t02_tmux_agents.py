@@ -591,6 +591,36 @@ s
             self.assertFalse(worker._visible_indicates_agent_ready(busy_visible))
             self.assertFalse(worker._visible_indicates_agent_ready(extreme_wrapped_busy_visible))
 
+    def test_mimo_reuses_opencode_like_ready_detection(self):
+        def fake_resolve_launch(vendor_id, requested_model, requested_effort):
+            return SimpleNamespace(
+                resolved_model=str(requested_model or "mimo/mimo-v2.5-pro"),
+                resolved_variant="",
+                reasoning_control_mode="implicit_default",
+                catalog_source_kind="test",
+                confidence="high",
+                native_reasoning_level="",
+                normalized_effort=str(requested_effort or "high"),
+                supports_reasoning=True,
+                notes=(),
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            side_effect=fake_resolve_launch,
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="mimo-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="mimo", model="mimo/mimo-v2.5-pro"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+
+            self.assertTrue(worker._visible_indicates_agent_starting("Performing one time database migration..."))
+            self.assertTrue(worker._visible_indicates_agent_ready('Ask anything... "Fix a TODO"\nctrl+p commands'))
+            self.assertFalse(worker._visible_indicates_agent_ready("Thinking...\nesc interrupt"))
+            self.assertEqual(worker.config.expected_current_commands(), ("mimo", "node"))
+
     def test_supported_vendor_state_classification_is_deterministic(self):
         cases = (
             (
@@ -630,6 +660,13 @@ s
                 "",
                 {"visible_text": "Ask anything...\nctrl+p commands", "raw_log_tail": "Ask anything...\nctrl+p commands", "current_command": "node", "pane_title": "OpenCode"},
                 {"visible_text": "esc interrupt", "raw_log_tail": "esc interrupt", "current_command": "node", "pane_title": "OpenCode"},
+            ),
+            (
+                "mimo",
+                "mimo/mimo-v2.5-pro",
+                "",
+                {"visible_text": "Ask anything...\nctrl+p commands", "raw_log_tail": "Ask anything...\nctrl+p commands", "current_command": "node", "pane_title": "MiMoCode"},
+                {"visible_text": "esc interrupt", "raw_log_tail": "esc interrupt", "current_command": "node", "pane_title": "MiMoCode"},
             ),
         )
         def fake_resolve_launch(vendor_id, requested_model, requested_effort):
@@ -1474,6 +1511,31 @@ workspace (/directory)                                                     branc
         self.assertIn(f"opencode /tmp/project --pure --model {mapped_opencode_model}", opencode_model_cmd)
         self.assertNotIn("--variant", opencode_model_cmd)
         self.assertNotIn("--dangerously-skip-permissions", opencode_model_cmd)
+
+    def test_mimo_launch_command_and_prompt_header_use_mimo_vendor(self):
+        def fake_resolve_launch(vendor_id, requested_model, requested_effort):
+            return SimpleNamespace(
+                resolved_model=str(requested_model or "mimo/mimo-v2.5-pro"),
+                resolved_variant="",
+                reasoning_control_mode="implicit_default",
+                catalog_source_kind="test",
+                confidence="high",
+                native_reasoning_level="",
+                normalized_effort=str(requested_effort or "high"),
+                supports_reasoning=True,
+                notes=(),
+            )
+
+        with mock.patch("tmux_core.runtime.tmux_runtime.resolve_launch", side_effect=fake_resolve_launch):
+            config = AgentRunConfig(vendor=Vendor.MIMO, model="mimo/mimo-v2.5-pro", reasoning_effort="max")
+            command = config.build_launch_command(Path("/tmp/project"))
+            header = build_prompt_header(Vendor.MIMO, "mimo/mimo-v2.5-pro", "max")
+
+        self.assertIn("mimo /tmp/project --pure --model mimo/mimo-v2.5-pro", command)
+        self.assertNotIn("--variant", command)
+        self.assertNotIn("--dangerously-skip-permissions", command)
+        self.assertIn("vendor: mimo", header)
+        self.assertIn("mimo_model=mimo/mimo-v2.5-pro", header)
 
     def test_build_session_name_is_stable_and_bounded(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

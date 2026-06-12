@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor, get_model_choices, get_normalized_effort_choices
@@ -88,6 +89,9 @@ class RoutingLayerCliTests(unittest.TestCase):
     def test_normalize_vendor_choice_supports_aliases(self):
         self.assertEqual("claude", normalize_vendor_choice("claude code"))
         self.assertEqual("opencode", normalize_vendor_choice("4"))
+        self.assertEqual("mimo", normalize_vendor_choice("5"))
+        self.assertEqual("mimo", normalize_vendor_choice("mimo code"))
+        self.assertEqual("mimo", normalize_vendor_choice("mimocode"))
         self.assertEqual("codex", normalize_vendor_choice("codex"))
         with self.assertRaises(ValueError):
             normalize_vendor_choice("qwen")
@@ -117,6 +121,23 @@ class RoutingLayerCliTests(unittest.TestCase):
                 model = prompt_model("opencode", DEFAULT_MODEL_BY_VENDOR["opencode"])
         self.assertEqual(model, opencode_models[1].model_id)
         self.assertNotIn("自定义输入 provider/model", stdout.getvalue())
+
+    def test_mimo_model_and_effort_normalization_use_catalog(self):
+        mimo_model = SimpleNamespace(model_id="mimo/mimo-v2.5-pro")
+        mimo_inventory = SimpleNamespace(installed=True)
+        with patch("A01_Routing_LayerPlanning.get_vendor_inventory", return_value=mimo_inventory), patch(
+            "A01_Routing_LayerPlanning.get_model_choices",
+            return_value=(mimo_model,),
+        ), patch(
+            "A01_Routing_LayerPlanning.get_default_model_for_vendor",
+            return_value="mimo/mimo-v2.5-pro",
+        ), patch(
+            "A01_Routing_LayerPlanning.get_normalized_effort_choices",
+            return_value=("low", "medium", "high", "xhigh", "max"),
+        ):
+            self.assertEqual("mimo/mimo-v2.5-pro", normalize_model_choice("mimo", "default"))
+            self.assertEqual("mimo/mimo-v2.5-pro", normalize_model_choice("mimo", "1"))
+            self.assertEqual("medium", normalize_effort_choice("mimo", "mimo/mimo-v2.5-pro", "2"))
 
     def test_collect_cli_request_normalizes_opencode_model_and_effort_in_parameter_mode(self):
         parser = build_parser()

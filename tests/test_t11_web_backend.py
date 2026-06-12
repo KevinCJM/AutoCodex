@@ -121,6 +121,7 @@ class WebBackendTests(unittest.TestCase):
             'claude': SimpleNamespace(vendor_id='claude', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='sonnet', models=[model('sonnet')]),
             'gemini': SimpleNamespace(vendor_id='gemini', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='auto', models=[model('auto'), model('flash', ('low', 'medium', 'high'), 'high')]),
             'opencode': SimpleNamespace(vendor_id='opencode', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='opencode/big-pickle', models=[model('opencode/big-pickle', ('low', 'medium', 'high', 'xhigh', 'max'), 'high')]),
+            'mimo': SimpleNamespace(vendor_id='mimo', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='mimo/mimo-v2.5-pro', models=[model('mimo/mimo-v2.5-pro', ('low', 'medium', 'high', 'xhigh', 'max'), 'high')]),
         }
         fake_snapshot = SimpleNamespace(
             generated_at='2026-04-27T00:00:00+08:00',
@@ -137,8 +138,9 @@ class WebBackendTests(unittest.TestCase):
         catalog = payload['payload']
         self.assertEqual(catalog['schema_version'], '1.0')
         vendors = {item['vendor_id']: item for item in catalog['vendors']}
-        self.assertEqual(tuple(vendors), ('codex', 'claude', 'gemini', 'opencode'))
+        self.assertEqual(tuple(vendors), ('codex', 'claude', 'gemini', 'opencode', 'mimo'))
         self.assertIn('default_model', vendors['gemini'])
+        self.assertEqual(vendors['mimo']['default_model'], 'mimo/mimo-v2.5-pro')
         self.assertIsInstance(vendors['gemini']['models'], list)
         flash = next(item for item in vendors['gemini']['models'] if item['model_id'] == 'flash')
         self.assertIn('high', flash['efforts'])

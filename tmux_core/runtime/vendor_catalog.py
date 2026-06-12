@@ -13,7 +13,7 @@ from typing import Any, Callable, Sequence
 
 SCHEMA_VERSION = "1.0"
 SCAN_TIMEOUT_SEC = 12.0
-VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode")
+VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode", "mimo")
 NORMALIZED_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 NATIVE_REASONING_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
 LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
@@ -21,12 +21,14 @@ LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
     "claude": "sonnet",
     "gemini": "auto",
     "opencode": "default",
+    "mimo": "mimo/mimo-v2.5-pro",
 }
 LEGACY_MODEL_CHOICES_BY_VENDOR: dict[str, tuple[str, ...]] = {
     "codex": ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"),
     "claude": ("sonnet", "opus", "haiku"),
     "gemini": ("auto", "flash", "pro"),
     "opencode": (),
+    "mimo": ("mimo/mimo-v2.5-pro",),
 }
 LEGACY_MODEL_ALIASES_BY_VENDOR: dict[str, dict[str, str]] = {
     "codex": {
@@ -464,6 +466,20 @@ def _fallback_reasoning_for_vendor(vendor_id: str, model_id: str, *, source_kind
                 notes=("legacy_synthetic_family_alias",),
             )
         return _unsupported_reasoning(vendor_id, model_id, source_kind=source_kind, confidence=confidence, note="legacy_fallback")
+    if vendor_id in {"opencode", "mimo"}:
+        return ReasoningInventory(
+            vendor_id=vendor_id,
+            model_id=model_id,
+            source_kind=source_kind,
+            confidence=confidence,
+            reasoning_control_mode=REASONING_IMPLICIT_DEFAULT,
+            supports_reasoning=True,
+            native_reasoning_levels=(),
+            normalized_reasoning_levels=_full_normalized_levels(),
+            default_normalized_effort="high",
+            default_native_level="",
+            notes=("legacy_fallback",),
+        )
     return _unsupported_reasoning(vendor_id, model_id, source_kind=source_kind, confidence=confidence, note="legacy_fallback")
 
 
@@ -707,7 +723,7 @@ def _build_codex_models(items: Sequence[dict[str, Any]]) -> tuple[ModelInventory
     return _unique_models(models)
 
 
-def _build_opencode_models(items: Sequence[dict[str, Any]]) -> tuple[ModelInventory, ...]:
+def _build_opencode_like_models(vendor_id: str, items: Sequence[dict[str, Any]]) -> tuple[ModelInventory, ...]:
     models: list[ModelInventory] = []
     for item in items:
         provider_id = str(item.get("providerID") or "").strip()
@@ -733,7 +749,7 @@ def _build_opencode_models(items: Sequence[dict[str, Any]]) -> tuple[ModelInvent
         if supports_reasoning and not native_levels:
             notes.append("reasoning_supported_without_explicit_variants")
         reasoning = ReasoningInventory(
-            vendor_id="opencode",
+            vendor_id=vendor_id,
             model_id=full_model_id,
             source_kind=SOURCE_DYNAMIC_CLI,
             confidence=CONFIDENCE_HIGH,
@@ -747,7 +763,7 @@ def _build_opencode_models(items: Sequence[dict[str, Any]]) -> tuple[ModelInvent
         )
         models.append(
             _build_model(
-                "opencode",
+                vendor_id,
                 full_model_id,
                 display_name=str(item.get("name") or full_model_id),
                 source_kind=SOURCE_DYNAMIC_CLI,
@@ -759,7 +775,11 @@ def _build_opencode_models(items: Sequence[dict[str, Any]]) -> tuple[ModelInvent
     return _unique_models(models)
 
 
-def _build_opencode_config_models(payload: dict[str, Any]) -> tuple[ModelInventory, ...]:
+def _build_opencode_models(items: Sequence[dict[str, Any]]) -> tuple[ModelInventory, ...]:
+    return _build_opencode_like_models("opencode", items)
+
+
+def _build_opencode_like_config_models(vendor_id: str, payload: dict[str, Any]) -> tuple[ModelInventory, ...]:
     provider_payload = payload.get("provider", {})
     if not isinstance(provider_payload, dict):
         return ()
@@ -777,13 +797,13 @@ def _build_opencode_config_models(payload: dict[str, Any]) -> tuple[ModelInvento
                 display_name = str(model_entry.get("name") or full_model_id).strip() or full_model_id
             models.append(
                 _build_model(
-                    "opencode",
+                    vendor_id,
                     full_model_id,
                     display_name=display_name,
                     source_kind=SOURCE_CONFIG_FILE,
                     confidence=CONFIDENCE_MEDIUM,
                     reasoning=ReasoningInventory(
-                        vendor_id="opencode",
+                        vendor_id=vendor_id,
                         model_id=full_model_id,
                         source_kind=SOURCE_CONFIG_FILE,
                         confidence=CONFIDENCE_MEDIUM,
@@ -799,6 +819,10 @@ def _build_opencode_config_models(payload: dict[str, Any]) -> tuple[ModelInvento
                 )
             )
     return _unique_models(models)
+
+
+def _build_opencode_config_models(payload: dict[str, Any]) -> tuple[ModelInventory, ...]:
+    return _build_opencode_like_config_models("opencode", payload)
 
 
 def _build_claude_models(model_ids: Sequence[str], effort_levels: Sequence[str]) -> tuple[ModelInventory, ...]:
@@ -898,24 +922,28 @@ def _scan_codex_vendor(binary_path: str) -> VendorInventory:
     )
 
 
-def _scan_opencode_vendor(binary_path: str) -> VendorInventory:
-    models_probe = _command_probe(["opencode", "models", "--verbose"], timeout_sec=15.0)
-    config_probe = _command_probe(["opencode", "debug", "config"])
-    dynamic_models = _build_opencode_models(parse_opencode_verbose_output(models_probe.stdout)) if models_probe.ok else ()
+def _scan_opencode_like_vendor(vendor_id: str, binary_name: str, binary_path: str) -> VendorInventory:
+    models_probe = _command_probe([binary_name, "models", "--verbose"], timeout_sec=15.0)
+    config_probe = _command_probe([binary_name, "debug", "config"])
+    dynamic_models = (
+        _build_opencode_like_models(vendor_id, parse_opencode_verbose_output(models_probe.stdout))
+        if models_probe.ok
+        else ()
+    )
     config_payload = parse_opencode_debug_config_output(config_probe.stdout) if config_probe.ok else {}
-    config_models = _build_opencode_config_models(config_payload)
+    config_models = _build_opencode_like_config_models(vendor_id, config_payload)
     models = _unique_models([*dynamic_models, *config_models])
     default_model = str(config_payload.get("model", "")).strip()
     if not models and default_model:
         models = _unique_models(
             [
                 _build_model(
-                    "opencode",
+                    vendor_id,
                     default_model,
                     source_kind=SOURCE_CONFIG_FILE,
                     confidence=CONFIDENCE_MEDIUM,
                     reasoning=ReasoningInventory(
-                        vendor_id="opencode",
+                        vendor_id=vendor_id,
                         model_id=default_model,
                         source_kind=SOURCE_CONFIG_FILE,
                         confidence=CONFIDENCE_MEDIUM,
@@ -932,13 +960,19 @@ def _scan_opencode_vendor(binary_path: str) -> VendorInventory:
             ]
         )
     if not models:
-        return _fallback_vendor("opencode", binary_path=binary_path, note="opencode_catalog_probe_failed", models=())
+        fallback_models = () if vendor_id == "opencode" else None
+        return _fallback_vendor(
+            vendor_id,
+            binary_path=binary_path,
+            note=f"{vendor_id}_catalog_probe_failed",
+            models=fallback_models,
+        )
     notes = []
     if default_model:
         notes.append(f"default_model={default_model}")
     default_model = _resolve_default_model(models, preferred=default_model)
     return VendorInventory(
-        vendor_id="opencode",
+        vendor_id=vendor_id,
         installed=True,
         scan_status=OK_SCAN_STATUS,
         source_kind=SOURCE_DYNAMIC_CLI if dynamic_models else SOURCE_CONFIG_FILE,
@@ -948,6 +982,14 @@ def _scan_opencode_vendor(binary_path: str) -> VendorInventory:
         default_model=default_model,
         notes=tuple(notes),
     )
+
+
+def _scan_opencode_vendor(binary_path: str) -> VendorInventory:
+    return _scan_opencode_like_vendor("opencode", "opencode", binary_path)
+
+
+def _scan_mimo_vendor(binary_path: str) -> VendorInventory:
+    return _scan_opencode_like_vendor("mimo", "mimo", binary_path)
 
 
 def _scan_claude_vendor(binary_path: str) -> VendorInventory:
@@ -994,6 +1036,7 @@ _SCANNERS: dict[str, Callable[[str], VendorInventory]] = {
     "claude": _scan_claude_vendor,
     "gemini": _scan_gemini_vendor,
     "opencode": _scan_opencode_vendor,
+    "mimo": _scan_mimo_vendor,
 }
 
 

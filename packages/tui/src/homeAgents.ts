@@ -40,6 +40,7 @@ const VENDOR_LABELS: Record<string, string> = {
   claude: 'Claude',
   gemini: 'Gemini',
   opencode: 'OpenCode',
+  mimo: 'MiMo Code',
 }
 const EFFORT_LABELS: Record<string, string> = {
   high: 'High',

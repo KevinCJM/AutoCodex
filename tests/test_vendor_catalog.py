@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tmux_core.runtime.vendor_catalog import (
@@ -26,7 +27,10 @@ from tmux_core.runtime.vendor_catalog import (
     parse_opencode_debug_config_output,
     parse_opencode_verbose_output,
     resolve_launch,
+    _build_opencode_like_config_models,
+    _build_opencode_like_models,
     _build_gemini_models,
+    _scan_mimo_vendor,
 )
 
 
@@ -122,6 +126,104 @@ kimi-code/kimi-for-coding
         parsed = parse_opencode_debug_config_output(payload)
         self.assertEqual(parsed["model"], "kimi-code/kimi-for-coding")
         self.assertIn("kimi-code", parsed["provider"])
+
+    def test_mimo_vendor_normalization_and_fallback_default(self):
+        self.assertEqual("mimo", normalize_vendor_id("mimo"))
+        self.assertIn("mimo", VENDOR_ORDER)
+        catalog = CatalogSnapshot(
+            schema_version="1.0",
+            generated_at="2026-06-12T00:00:00+00:00",
+            cache_path="/tmp/catalog.json",
+            vendors=(
+                VendorInventory(
+                    vendor_id="mimo",
+                    installed=True,
+                    scan_status="degraded",
+                    source_kind="legacy_fallback",
+                    confidence="low",
+                    binary_path="/usr/bin/mimo",
+                    default_model="mimo/mimo-v2.5-pro",
+                    models=(
+                        ModelInventory(
+                            vendor_id="mimo",
+                            model_id="mimo/mimo-v2.5-pro",
+                            display_name="mimo/mimo-v2.5-pro",
+                            source_kind="legacy_fallback",
+                            confidence="low",
+                            reasoning=ReasoningInventory(
+                                vendor_id="mimo",
+                                model_id="mimo/mimo-v2.5-pro",
+                                source_kind="legacy_fallback",
+                                confidence="low",
+                                reasoning_control_mode="implicit_default",
+                                supports_reasoning=True,
+                                normalized_reasoning_levels=("low", "medium", "high", "xhigh", "max"),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        self.assertEqual(get_default_model_for_vendor("mimo", catalog=catalog), "mimo/mimo-v2.5-pro")
+        resolution = resolve_launch("mimo", "default", "max", catalog=catalog)
+        self.assertEqual(resolution.resolved_model, "mimo/mimo-v2.5-pro")
+
+    def test_opencode_like_builders_write_mimo_vendor_id(self):
+        items = parse_opencode_verbose_output(
+            """
+mimo/mimo-v2.5-pro
+{
+  "id": "mimo-v2.5-pro",
+  "providerID": "mimo",
+  "name": "MiMo V2.5 Pro",
+  "capabilities": {"reasoning": true},
+  "variants": {"high": {"reasoningEffort": "high"}}
+}
+"""
+        )
+        models = _build_opencode_like_models("mimo", items)
+
+        self.assertEqual(models[0].vendor_id, "mimo")
+        self.assertEqual(models[0].reasoning.vendor_id, "mimo")
+
+        config_models = _build_opencode_like_config_models(
+            "mimo",
+            {
+                "provider": {
+                    "mimo": {
+                        "models": {
+                            "mimo-v2.5-pro": {
+                                "name": "MiMo V2.5 Pro",
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        self.assertEqual(config_models[0].vendor_id, "mimo")
+        self.assertEqual(config_models[0].reasoning.vendor_id, "mimo")
+
+    def test_scan_mimo_vendor_uses_mimo_cli_commands(self):
+        def fake_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001
+            if argv == ["mimo", "models", "--verbose"]:
+                return SimpleNamespace(
+                    ok=True,
+                    stdout="""
+mimo/mimo-v2.5-pro
+{"id":"mimo-v2.5-pro","providerID":"mimo","name":"MiMo V2.5 Pro","capabilities":{"reasoning":true},"variants":{"high":{"reasoningEffort":"high"}}}
+""",
+                )
+            if argv == ["mimo", "debug", "config"]:
+                return SimpleNamespace(ok=True, stdout='{"model":"mimo/mimo-v2.5-pro","provider":{}}')
+            return SimpleNamespace(ok=False, stdout="")
+
+        with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe) as probe:
+            inventory = _scan_mimo_vendor("/usr/bin/mimo")
+
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [["mimo", "models", "--verbose"], ["mimo", "debug", "config"]])
+        self.assertEqual(inventory.vendor_id, "mimo")
+        self.assertEqual(inventory.default_model, "mimo/mimo-v2.5-pro")
 
     def test_resolve_launch_maps_native_variant_prompt_and_boolean_modes(self):
         catalog = CatalogSnapshot(
