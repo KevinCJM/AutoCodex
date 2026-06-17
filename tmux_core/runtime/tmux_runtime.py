@@ -52,6 +52,19 @@ from tmux_core.runtime.contracts import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / ".agent_init_runtime"
 DEFAULT_COMMAND_TIMEOUT_SEC = 60 * 20
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return default
+    with contextlib.suppress(ValueError):
+        value = int(raw)
+        if value > 0:
+            return value
+    return default
+
+
 TURN_START_BUSY_PROBE_TIMEOUT_SEC = 8.0
 DEFAULT_PROXY_HOST = "127.0.0.1"
 TMUX_HISTORY_LIMIT_LINES = 10000
@@ -64,7 +77,7 @@ TASK_RESULT_POST_DONE_GRACE_SEC = 10.0
 TASK_RESULT_READY_MISSING_GRACE_SEC = 2.0
 STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX = "stale_busy_without_contract"
 TASK_CONTRACT_STALL_IDLE_SEC = 45.0
-TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS = 3
+TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS = _positive_int_env("TMUX_TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 30)
 TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC = 60.0
 FILE_CONTRACT_POLL_INTERVAL_SEC = 0.5
 ACTIVE_AGENT_PROBE_INTERVAL_SEC = 2.0
@@ -1413,7 +1426,14 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
 
     if dispatch_reason.startswith(f"{STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX}:"):
         return False
-    if note == "awaiting_reconfig" or health_status in {
+    stale_awaiting_reconfig_note = (
+        note == "awaiting_reconfig"
+        and health_status == "alive"
+        and str(state.get("agent_state", "") or "").strip().upper() == AgentRuntimeState.READY.value
+        and current_command_state
+        and current_command_state not in SHELL_COMMANDS
+    )
+    if (note == "awaiting_reconfig" and not stale_awaiting_reconfig_note) or health_status in {
         "awaiting_reconfig",
         "provider_auth_error",
         "provider_runtime_error",
@@ -4307,7 +4327,11 @@ class TmuxBatchWorker:
 
     @staticmethod
     def _a07_legacy_task_result_status_from_delta(raw_log_delta: str) -> str:
-        for line in reversed(clean_ansi(str(raw_log_delta or "")).splitlines()):
+        return TmuxBatchWorker._a07_legacy_task_result_status_from_text(raw_log_delta)
+
+    @staticmethod
+    def _a07_legacy_task_result_status_from_text(source_text: str) -> str:
+        for line in reversed(clean_ansi(str(source_text or "")).splitlines()):
             if _extract_protocol_token_from_line(line, ("准备就绪",)):
                 return TASK_RESULT_READY
             if _extract_protocol_token_from_line(line, ("阻断",)):
@@ -4326,6 +4350,61 @@ class TmuxBatchWorker:
             return target.read_text(encoding="utf-8", errors="replace").strip()
         return ""
 
+    @staticmethod
+    def _artifact_mtime_is_not_before_task(artifact_path: str | Path | None, task_status_path: Path | None) -> bool:
+        if artifact_path is None or task_status_path is None:
+            return False
+        try:
+            artifact_stat = Path(artifact_path).expanduser().resolve().stat()
+            task_stat = Path(task_status_path).expanduser().resolve().stat()
+        except OSError:
+            return False
+        return artifact_stat.st_mtime_ns >= task_stat.st_mtime_ns
+
+    def _a07_legacy_tail_status_satisfies_file_contract(
+            self,
+            *,
+            contract: TaskResultContract,
+            task_status_path: Path | None,
+            status: str,
+    ) -> bool:
+        ask_human_path = contract.optional_artifacts.get("ask_human") or contract.required_artifacts.get("ask_human")
+        ask_human_text = self._contract_artifact_text(contract, "ask_human")
+        if status == TASK_RESULT_READY:
+            if ask_human_text:
+                return False
+            return self._artifact_mtime_is_not_before_task(ask_human_path, task_status_path)
+        if status == TASK_RESULT_HITL:
+            if ask_human_path is None or not ask_human_text:
+                return False
+            return self._artifact_mtime_is_not_before_task(ask_human_path, task_status_path)
+        return False
+
+    def _a07_legacy_task_result_status_from_observation_tail(
+            self,
+            *,
+            contract: TaskResultContract,
+            task_status_path: Path | None,
+            observation: WorkerObservation,
+    ) -> str:
+        if not self._observation_indicates_ready_or_idle_surface(observation):
+            return ""
+        source_text = "\n".join(
+            part
+            for part in (observation.raw_log_tail, observation.visible_text)
+            if str(part or "").strip()
+        )
+        status = self._a07_legacy_task_result_status_from_text(source_text)
+        if not status or status not in set(contract.expected_statuses):
+            return ""
+        if not self._a07_legacy_tail_status_satisfies_file_contract(
+            contract=contract,
+            task_status_path=task_status_path,
+            status=status,
+        ):
+            return ""
+        return status
+
     def _try_finalize_a07_legacy_task_result_from_observation(
             self,
             *,
@@ -4339,6 +4418,12 @@ class TmuxBatchWorker:
         if result_path.exists():
             return None
         status = self._a07_legacy_task_result_status_from_delta(observation.raw_log_delta)
+        if not status:
+            status = self._a07_legacy_task_result_status_from_observation_tail(
+                contract=contract,
+                task_status_path=task_status_path,
+                observation=observation,
+            )
         if not status or status not in set(contract.expected_statuses):
             return None
         ask_human_path = contract.optional_artifacts.get("ask_human") or contract.required_artifacts.get("ask_human")

@@ -42,7 +42,9 @@ from tmux_core.runtime.contracts import (
     TaskResultContract,
     TurnFileContract,
     TurnFileResult,
+    finalize_task_result,
     normalize_review_status_payload,
+    validate_task_result_file,
     write_task_status,
 )
 from tmux_core.runtime.hitl import build_prefixed_sha256
@@ -62,6 +64,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_worker_death_error,
     is_turn_artifact_contract_error,
     is_provider_auth_error,
+    load_worker_from_state_path,
     list_registered_tmux_workers,
     list_tmux_session_names,
     list_occupied_tmux_session_names,
@@ -355,6 +358,8 @@ def cleanup_existing_development_artifacts(
     paths: dict[str, Path],
     requirement_name: str,
     audit_context: StageAuditRunContext | None = None,
+    *,
+    preserve_developer_output: bool = False,
 ) -> tuple[str, ...]:
     project_root = paths["project_root"]
     safe_name = sanitize_requirement_name(requirement_name)
@@ -387,15 +392,209 @@ def cleanup_existing_development_artifacts(
         if candidate.is_file():
             candidate.unlink()
             removed.append(str(candidate.resolve()))
-    for candidate in (
+    cleanup_targets = [
         paths["ask_human_path"],
-        paths["developer_output_path"],
         paths["merged_review_path"],
-    ):
+    ]
+    if not preserve_developer_output:
+        cleanup_targets.append(paths["developer_output_path"])
+    for candidate in cleanup_targets:
         if candidate.exists() and candidate.is_file():
             candidate.write_text("", encoding="utf-8")
             removed.append(str(candidate.resolve()))
     return tuple(dict.fromkeys(removed))
+
+
+@dataclass(frozen=True)
+class RecoveredDeveloperOutput:
+    task_name: str
+    code_change: str
+
+
+@dataclass(frozen=True)
+class DevelopmentRuntimeResume:
+    developer: DeveloperRuntime
+    reviewers: tuple[ReviewerRuntime, ...]
+
+
+def _recover_valid_developer_output_for_next_task(
+    paths: dict[str, Path],
+    next_task: str | None,
+) -> RecoveredDeveloperOutput | None:
+    task_name = str(next_task or "").strip()
+    if not task_name:
+        return None
+    code_change = get_markdown_content(paths["developer_output_path"]).strip()
+    if not code_change:
+        return None
+    reminder_prompt = check_develop_job(
+        paths["developer_output_path"],
+        task_name,
+        task_split_md=str(paths["task_md_path"].resolve()),
+        what_just_dev=str(paths["developer_output_path"].resolve()),
+    )
+    if reminder_prompt:
+        return None
+    return RecoveredDeveloperOutput(task_name=task_name, code_change=code_change)
+
+
+def _safe_json_mapping(path: str | Path) -> dict[str, object]:
+    try:
+        payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _same_development_scope(state: dict[str, object], *, project_dir: str | Path, requirement_name: str) -> bool:
+    project_text = str(state.get("project_dir") or state.get("work_dir") or "").strip()
+    if not project_text:
+        return False
+    try:
+        if Path(project_text).expanduser().resolve() != Path(project_dir).expanduser().resolve():
+            return False
+    except Exception:
+        return False
+    if str(state.get("requirement_name", "") or "").strip() != str(requirement_name or "").strip():
+        return False
+    return str(state.get("workflow_action", "") or "").strip() == "stage.a07.start"
+
+
+def _worker_selection_from_state(state: dict[str, object]) -> ReviewAgentSelection | None:
+    config = state.get("config", {})
+    if not isinstance(config, dict):
+        return None
+    vendor = str(config.get("vendor", "") or "").strip()
+    model = str(config.get("model", "") or config.get("resolved_model", "") or "").strip()
+    if not vendor or not model:
+        return None
+    return ReviewAgentSelection(
+        vendor=vendor,
+        model=model,
+        reasoning_effort=str(config.get("reasoning_effort", "") or "high").strip() or "high",
+        proxy_url=str(config.get("proxy_url", "") or "").strip(),
+    )
+
+
+def _iter_scoped_development_worker_states(
+    project_dir: str | Path,
+    requirement_name: str,
+) -> list[tuple[Path, dict[str, object]]]:
+    runtime_root = build_development_runtime_root(project_dir, requirement_name)
+    items: list[tuple[Path, dict[str, object]]] = []
+    for state_path in runtime_root.glob("*/worker.state.json"):
+        state = _safe_json_mapping(state_path)
+        if _same_development_scope(state, project_dir=project_dir, requirement_name=requirement_name):
+            items.append((state_path, state))
+    return sorted(items, key=lambda item: item[0].stat().st_mtime_ns if item[0].exists() else 0, reverse=True)
+
+
+def _task_result_candidates_for_worker(state_path: Path, state: dict[str, object]) -> list[Path]:
+    candidates: list[Path] = []
+    current = str(state.get("current_task_result_path", "") or "").strip()
+    if current:
+        candidates.append(Path(current).expanduser().resolve())
+    task_runtime_dir = state_path.parent / "task_runtime"
+    if task_runtime_dir.exists():
+        candidates.extend(task_runtime_dir.glob("*_result.json"))
+    unique: dict[str, Path] = {}
+    for candidate in candidates:
+        if candidate.name.startswith("._"):
+            continue
+        unique[str(candidate)] = candidate
+    return sorted(
+        unique.values(),
+        key=lambda path: path.stat().st_mtime_ns if path.exists() else 0,
+        reverse=True,
+    )
+
+
+def _developer_init_contract_is_ready(
+    worker: TmuxBatchWorker,
+    *,
+    paths: dict[str, Path],
+) -> bool:
+    if get_markdown_content(paths["ask_human_path"]).strip():
+        return False
+    state = worker.read_state()
+    state_path = Path(str(state.get("state_path", "") or worker.state_path)).expanduser().resolve()
+    for result_path in _task_result_candidates_for_worker(state_path, state):
+        for mode in ("a07_developer_init", "a07_developer_human_reply"):
+            try:
+                result = validate_task_result_file(
+                    contract=build_developer_init_result_contract(paths, mode=mode),
+                    result_path=result_path,
+                )
+            except Exception:
+                continue
+            if str(result.payload.get("status", "")).strip() == "ready":
+                return True
+    return False
+
+
+def _recover_worker_from_state(state_path: Path) -> TmuxBatchWorker | None:
+    worker = load_worker_from_state_path(state_path)
+    if worker is None:
+        return None
+    if not try_resume_worker(worker, timeout_sec=3.0):
+        return None
+    return worker
+
+
+def _recover_development_runtime_resume(
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    paths: dict[str, Path],
+    reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
+) -> DevelopmentRuntimeResume | None:
+    developer_runtime: DeveloperRuntime | None = None
+    reviewers_by_key: dict[str, ReviewerRuntime] = {}
+    for state_path, state in _iter_scoped_development_worker_states(project_dir, requirement_name):
+        selection = _worker_selection_from_state(state)
+        if selection is None:
+            continue
+        worker = _recover_worker_from_state(state_path)
+        if worker is None:
+            continue
+        agent_role = str(state.get("agent_role", "") or "").strip()
+        worker_id = str(state.get("worker_id", "") or "").strip()
+        if agent_role == "developer" or worker_id == build_developer_worker_id():
+            if developer_runtime is None and _developer_init_contract_is_ready(worker, paths=paths):
+                developer_runtime = DeveloperRuntime(
+                    selection=selection,
+                    worker=worker,
+                    role_prompt=str(state.get("role_prompt", "") or fintech_developer_role).strip(),
+                )
+            continue
+        if agent_role != "reviewer":
+            continue
+        reviewer_key = str(state.get("reviewer_key", "") or state.get("role_name", "") or "").strip()
+        reviewer_spec = reviewer_specs_by_name.get(reviewer_key)
+        if reviewer_spec is None or reviewer_key in reviewers_by_key:
+            continue
+        session_name = str(state.get("session_name", "") or worker.session_name or reviewer_key).strip()
+        review_md_path, review_json_path = build_reviewer_artifact_paths(project_dir, requirement_name, session_name)
+        ensure_review_artifacts(review_md_path, review_json_path)
+        reviewers_by_key[reviewer_key] = ReviewerRuntime(
+            reviewer_name=reviewer_key,
+            selection=selection,
+            worker=worker,
+            review_md_path=review_md_path,
+            review_json_path=review_json_path,
+            contract=build_placeholder_reviewer_contract(review_json_path),
+        )
+    if developer_runtime is None:
+        return None
+    expected_reviewer_keys = [str(item.reviewer_key or item.role_name).strip() for item in reviewer_specs_by_name.values()]
+    if any(key and key not in reviewers_by_key for key in expected_reviewer_keys):
+        return None
+    reviewers = tuple(
+        reviewers_by_key[key]
+        for key in expected_reviewer_keys
+        if key in reviewers_by_key
+    )
+    return DevelopmentRuntimeResume(developer=developer_runtime, reviewers=reviewers)
 
 
 def cleanup_stale_development_runtime_state(
@@ -1313,12 +1512,18 @@ def _run_developer_result_turn(
         task_status_path_text = str(
             getattr(worker, "current_task_status_path", "") or state.get("current_task_status_path", "") or ""
         ).strip()
-        if task_status_path_text:
-            with suppress(Exception):
-                write_task_status(Path(task_status_path_text), status=TASK_STATUS_DONE)
         result_path_text = str(
             getattr(worker, "current_task_result_path", "") or state.get("current_task_result_path", "") or ""
         ).strip()
+        task_status_path = Path(task_status_path_text).expanduser().resolve() if task_status_path_text else None
+        if result_path_text:
+            finalize_task_result(
+                contract=result_contract,
+                result_path=Path(result_path_text).expanduser().resolve(),
+                task_status_path=task_status_path,
+            )
+        elif task_status_path is not None:
+            write_task_status(task_status_path, status=TASK_STATUS_DONE)
         with suppress(Exception):
             worker.current_task_runtime_status = TASK_STATUS_DONE
         with suppress(Exception):
@@ -1372,6 +1577,10 @@ def _run_developer_result_turn(
                 turn_policy.record_turn()
             return current_developer, payload
         except Exception as error:  # noqa: BLE001
+            fallback_payload = _developer_output_fallback_payload()
+            if fallback_payload is not None and _worker_appears_live_for_reviewer_recovery(current_developer.worker):
+                _mark_developer_fallback_completed()
+                return current_developer, fallback_payload
             if not _worker_has_stale_busy_without_contract(current_developer.worker) and try_resume_worker(current_developer.worker, timeout_sec=60.0):
                 continue
             if is_agent_ready_timeout_error(error):
@@ -1397,7 +1606,6 @@ def _run_developer_result_turn(
             if is_recoverable_startup_failure(error, current_developer.worker) and replace_dead_developer is not None:
                 current_developer = replace_dead_developer(current_developer, error)
                 continue
-            fallback_payload = _developer_output_fallback_payload()
             error_text = str(error or "")
             developer_completion_delayed = (
                 is_task_result_contract_error(error)
@@ -4008,8 +4216,31 @@ def run_development_stage(
             },
         )
         paths = ensure_development_inputs(args, project_dir=project_dir, requirement_name=requirement_name)
-        cleanup_records.extend(cleanup_stale_development_runtime_state(project_dir, requirement_name))
-        cleanup_records.extend(cleanup_existing_development_artifacts(paths, requirement_name, audit_context))
+        initial_next_task = get_first_false_task(paths["task_json_path"])
+        recovered_developer_output = _recover_valid_developer_output_for_next_task(paths, initial_next_task)
+        if initial_next_task is None:
+            append_stage_audit_record(
+                audit_context,
+                event_type="stage_passed",
+                source_paths={
+                    "task_json": paths["task_json_path"],
+                    "developer_output": paths["developer_output_path"],
+                    "merged_review": paths["merged_review_path"],
+                },
+            )
+            return DevelopmentStageResult(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                task_md_path=str(paths["task_md_path"].resolve()),
+                task_json_path=str(paths["task_json_path"].resolve()),
+                merged_review_path=str(paths["merged_review_path"].resolve()),
+                completed=True,
+                cleanup_paths=(),
+                developer_handoff=None,
+                reviewer_handoff=(),
+            )
+        if not preserve_workers:
+            cleanup_records.extend(cleanup_stale_development_runtime_state(project_dir, requirement_name))
         launch_coordinator = DevelopmentStageLaunchCoordinator(build_development_runtime_root(project_dir, requirement_name))
 
         next_task = get_first_false_task(paths["task_json_path"])
@@ -4101,18 +4332,46 @@ def run_development_stage(
             stdin_is_interactive() and getattr(args, "subagent_num", None) is None,
         )
         subagent_num = resolve_subagent_num(args, progress=progress, allow_back=subagent_allow_back)
-        developer = create_developer_runtime(
-            project_dir=project_dir,
-            requirement_name=requirement_name,
-            selection=developer_plan.selection,
-            role_prompt=developer_plan.role_prompt,
-            launch_coordinator=launch_coordinator,
-        )
-        set_runtime_metadata = getattr(developer.worker, "set_runtime_metadata", None)
-        if callable(set_runtime_metadata):
-            set_runtime_metadata(project_dir=project_dir, requirement_name=requirement_name, workflow_action="stage.a07.start")
         reviewer_specs_by_name = {str(item.reviewer_key or item.role_name).strip(): item for item in reviewer_specs}
+        runtime_resume = (
+            _recover_development_runtime_resume(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                paths=paths,
+                reviewer_specs_by_name=reviewer_specs_by_name,
+            )
+            if preserve_workers
+            else None
+        )
+        if preserve_workers and runtime_resume is None:
+            cleanup_records.extend(cleanup_stale_development_runtime_state(project_dir, requirement_name))
+        cleanup_records.extend(cleanup_existing_development_artifacts(
+            paths,
+            requirement_name,
+            audit_context,
+            preserve_developer_output=recovered_developer_output is not None,
+        ))
         reviewer_label_getter = lambda reviewer, index: str(getattr(getattr(reviewer, "worker", None), "session_name", "") or getattr(reviewer, "reviewer_name", "") or f"代码审核智能体 {index}")  # noqa: E731
+        if runtime_resume is not None:
+            developer = runtime_resume.developer
+            reviewer_workers = list(runtime_resume.reviewers)
+            for reviewer in reviewer_workers:
+                ensure_review_artifacts(reviewer.review_md_path, reviewer.review_json_path)
+            message(
+                "复用已就绪的任务开发智能体: "
+                f"{developer.worker.session_name or build_developer_worker_id()} + {len(reviewer_workers)} 个审核器"
+            )
+        else:
+            developer = create_developer_runtime(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                selection=developer_plan.selection,
+                role_prompt=developer_plan.role_prompt,
+                launch_coordinator=launch_coordinator,
+            )
+            set_runtime_metadata = getattr(developer.worker, "set_runtime_metadata", None)
+            if callable(set_runtime_metadata):
+                set_runtime_metadata(project_dir=project_dir, requirement_name=requirement_name, workflow_action="stage.a07.start")
         replace_dead_developer_raw = lambda owner: _replace_dead_developer(  # noqa: E731
             owner,
             project_dir=project_dir,
@@ -4154,83 +4413,29 @@ def run_development_stage(
                 progress=progress,
                 can_skip_ready_timeout=len(reviewer_workers) > 1,
             )
-        reviewer_workers = build_reviewer_workers(
-            args,
-            project_dir=project_dir,
-            requirement_name=requirement_name,
-            reviewer_specs=reviewer_specs,
-            reviewer_selections_by_name=reviewer_selections_by_name,
-            progress=progress,
-            launch_coordinator=launch_coordinator,
-        )
-        reviewers_built = True
-        reviewers_initialized = False
-        init_result, _, developer = run_main_phase_with_death_handling(
-            developer,
-            reviewers=(),
-            run_phase=lambda current_developer: initialize_developer_with_parallel_reviewer_prelaunch(
-                current_developer,
+        if runtime_resume is None:
+            reviewer_workers = build_reviewer_workers(
+                args,
                 project_dir=project_dir,
                 requirement_name=requirement_name,
-                paths=paths,
-                reviewers=reviewer_workers,
-                reviewer_specs_by_name=reviewer_specs_by_name,
+                reviewer_specs=reviewer_specs,
+                reviewer_selections_by_name=reviewer_selections_by_name,
                 progress=progress,
-                turn_policy=developer_turn_policy,
-                replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
-                    active_developer,
-                    paths=paths,
-                    reviewer_specs_by_name=reviewer_specs_by_name,
-                    project_dir=project_dir,
-                    requirement_name=requirement_name,
-                    progress=progress,
-                    turn_policy=developer_turn_policy,
-                    launch_coordinator=launch_coordinator,
-                    error=error,
-                ),
-                replace_dead_developer_for_init=lambda active_developer, error: _replace_dead_developer(
-                    active_developer,
-                    project_dir=project_dir,
-                    requirement_name=requirement_name,
-                    progress=progress,
-                    launch_coordinator=launch_coordinator,
-                    error=error,
-                ),
-                audit_context=audit_context,
-                notify=message,
-            ),
-            owner_getter=lambda result: result[0],
-            replace_dead_main_owner=replace_dead_developer_owner,
-            main_label="开发工程师",
-            reviewer_label_getter=reviewer_label_getter,
-            notify=message,
-        )
-        developer, reviewer_workers = init_result
-        review_round_policy = ReviewRoundPolicy(review_round_limit)
-
-        while next_task is not None:
-            current_task_name = str(next_task)
-            if not reviewers_built:
-                reviewer_workers = build_reviewer_workers(
-                    args,
-                    project_dir=project_dir,
-                    requirement_name=requirement_name,
-                    reviewer_specs=reviewer_specs,
-                    reviewer_selections_by_name=reviewer_selections_by_name,
-                    progress=progress,
-                    launch_coordinator=launch_coordinator,
-                )
-                reviewers_built = True
-            if not reviewers_initialized:
-                developer, code_change, reviewer_workers = run_first_task_with_parallel_reviewer_init(
-                    developer,
-                    reviewer_workers,
+                launch_coordinator=launch_coordinator,
+            )
+        reviewers_built = True
+        reviewers_initialized = False
+        if runtime_resume is None:
+            init_result, _, developer = run_main_phase_with_death_handling(
+                developer,
+                reviewers=(),
+                run_phase=lambda current_developer: initialize_developer_with_parallel_reviewer_prelaunch(
+                    current_developer,
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     paths=paths,
+                    reviewers=reviewer_workers,
                     reviewer_specs_by_name=reviewer_specs_by_name,
-                    task_name=next_task,
-                    subagent_num=subagent_num,
                     progress=progress,
                     turn_policy=developer_turn_policy,
                     replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
@@ -4244,16 +4449,125 @@ def run_development_stage(
                         launch_coordinator=launch_coordinator,
                         error=error,
                     ),
+                    replace_dead_developer_for_init=lambda active_developer, error: _replace_dead_developer(
+                        active_developer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        progress=progress,
+                        launch_coordinator=launch_coordinator,
+                        error=error,
+                    ),
                     audit_context=audit_context,
+                    notify=message,
+                ),
+                owner_getter=lambda result: result[0],
+                replace_dead_main_owner=replace_dead_developer_owner,
+                main_label="开发工程师",
+                reviewer_label_getter=reviewer_label_getter,
+                notify=message,
+            )
+            developer, reviewer_workers = init_result
+        review_round_policy = ReviewRoundPolicy(review_round_limit)
+
+        while next_task is not None:
+            current_task_name = str(next_task)
+            recovered_code_change = (
+                recovered_developer_output.code_change
+                if recovered_developer_output is not None and recovered_developer_output.task_name == current_task_name
+                else ""
+            )
+            if not reviewers_built:
+                reviewer_workers = build_reviewer_workers(
+                    args,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    reviewer_specs=reviewer_specs,
+                    reviewer_selections_by_name=reviewer_selections_by_name,
+                    progress=progress,
+                    launch_coordinator=launch_coordinator,
                 )
+                reviewers_built = True
+            if not reviewers_initialized:
+                if recovered_code_change:
+                    if progress is not None:
+                        progress.set_phase(f"任务开发 / 复用开发产物 | {next_task}")
+                    append_stage_audit_record(
+                        audit_context,
+                        event_type="developer_output",
+                        source_paths={"developer_output": paths["developer_output_path"]},
+                        task_name=next_task,
+                        metadata={"trigger": "recovered_developer_output"},
+                    )
+                    developer, reviewer_workers = initialize_development_workers(
+                        developer,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        paths=paths,
+                        reviewers=reviewer_workers,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        initialize_developer=False,
+                        initialize_reviewers=True,
+                        progress=progress,
+                        turn_policy=developer_turn_policy,
+                        replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
+                            active_developer,
+                            paths=paths,
+                            reviewer_specs_by_name=reviewer_specs_by_name,
+                            project_dir=project_dir,
+                            requirement_name=requirement_name,
+                            progress=progress,
+                            turn_policy=developer_turn_policy,
+                            launch_coordinator=launch_coordinator,
+                            error=error,
+                        ),
+                        audit_context=audit_context,
+                    )
+                    code_change = recovered_code_change
+                else:
+                    developer, code_change, reviewer_workers = run_first_task_with_parallel_reviewer_init(
+                        developer,
+                        reviewer_workers,
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        paths=paths,
+                        reviewer_specs_by_name=reviewer_specs_by_name,
+                        task_name=next_task,
+                        subagent_num=subagent_num,
+                        progress=progress,
+                        turn_policy=developer_turn_policy,
+                        replace_dead_developer=lambda active_developer, error: _replace_dead_developer_with_bootstrap(
+                            active_developer,
+                            paths=paths,
+                            reviewer_specs_by_name=reviewer_specs_by_name,
+                            project_dir=project_dir,
+                            requirement_name=requirement_name,
+                            progress=progress,
+                            turn_policy=developer_turn_policy,
+                            launch_coordinator=launch_coordinator,
+                            error=error,
+                        ),
+                        audit_context=audit_context,
+                    )
                 reviewers_initialized = True
             else:
-                (developer, code_change), reviewer_workers, developer = run_main_phase_with_death_handling(
-                    developer,
-                    reviewers=reviewer_workers,
-                    run_phase=lambda current_developer: develop_current_task(
-                        current_developer,
-                        paths=paths,
+                if recovered_code_change:
+                    if progress is not None:
+                        progress.set_phase(f"任务开发 / 复用开发产物 | {next_task}")
+                    append_stage_audit_record(
+                        audit_context,
+                        event_type="developer_output",
+                        source_paths={"developer_output": paths["developer_output_path"]},
+                        task_name=next_task,
+                        metadata={"trigger": "recovered_developer_output"},
+                    )
+                    code_change = recovered_code_change
+                else:
+                    (developer, code_change), reviewer_workers, developer = run_main_phase_with_death_handling(
+                        developer,
+                        reviewers=reviewer_workers,
+                        run_phase=lambda current_developer: develop_current_task(
+                            current_developer,
+                            paths=paths,
                             task_name=next_task,
                             subagent_num=subagent_num,
                             progress=progress,
@@ -4272,11 +4586,11 @@ def run_development_stage(
                             audit_context=audit_context,
                         ),
                         owner_getter=lambda result: result[0],
-                    replace_dead_main_owner=replace_dead_developer_owner,
-                    main_label="开发工程师",
-                    reviewer_label_getter=reviewer_label_getter,
-                    notify=message,
-                )
+                        replace_dead_main_owner=replace_dead_developer_owner,
+                        main_label="开发工程师",
+                        reviewer_label_getter=reviewer_label_getter,
+                        notify=message,
+                    )
 
             round_index = 1
             post_hitl_continue_completed = False

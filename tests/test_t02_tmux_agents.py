@@ -11063,6 +11063,149 @@ Do you trust the files in this folder?
             self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
             self.assertTrue(result_path.exists())
 
+    def test_wait_for_task_result_finalizes_a07_ready_from_legacy_tail_when_delta_rotated(self):
+        class StaleBusyTaskResultWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def _terminal_idle_elapsed_sec(self):
+                return 60.0
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.BUSY
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Improve documentation in @filename\n  gpt-5.5 xhigh · /tmp/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=f"done\n• 准备就绪\n{surface}",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=time.time(),
+                    observed_at="2026-05-19T00:00:03",
+                    pane_title="DRL_PM",
+                )
+
+            def capture_visible(self, tail_lines=200):  # noqa: ARG002
+                return "› Improve documentation in @filename\n  gpt-5.5 xhigh · /tmp/project"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            time.sleep(0.02)
+            ask_human = root / "与人类交流.md"
+            ask_human.write_text("", encoding="utf-8")
+            result_path = root / "result.json"
+            worker = StaleBusyTaskResultWorker(
+                worker_id="stale-busy-a07-ready-legacy-tail",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_command = "node"
+            contract = TaskResultContract(
+                turn_id="a07_developer_init",
+                phase="a07_developer_init",
+                task_kind="a07_developer_init",
+                mode="a07_developer_init",
+                expected_statuses=("ready", "hitl"),
+                optional_artifacts={"ask_human": ask_human},
+                outcome_artifacts={
+                    "ready": {"forbids": ("ask_human",)},
+                    "hitl": {"requires": ("ask_human",)},
+                },
+            )
+
+            result = worker.wait_for_task_result(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                timeout_sec=0.6,
+            )
+
+            self.assertEqual(result.payload["status"], "ready")
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
+            self.assertTrue(result_path.exists())
+
+    def test_wait_for_task_result_rejects_a07_ready_tail_when_ask_human_not_fresh(self):
+        class StaleBusyTaskResultWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def _terminal_idle_elapsed_sec(self):
+                return 60.0
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.BUSY
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Improve documentation in @filename\n  gpt-5.5 xhigh · /tmp/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=f"done\n• 准备就绪\n{surface}",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=time.time(),
+                    observed_at="2026-05-19T00:00:03",
+                    pane_title="DRL_PM",
+                )
+
+            def capture_visible(self, tail_lines=200):  # noqa: ARG002
+                return "› Improve documentation in @filename\n  gpt-5.5 xhigh · /tmp/project"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            ask_human = root / "与人类交流.md"
+            ask_human.write_text("", encoding="utf-8")
+            time.sleep(0.02)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            worker = StaleBusyTaskResultWorker(
+                worker_id="stale-busy-a07-ready-legacy-tail-stale-artifact",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_command = "node"
+            contract = TaskResultContract(
+                turn_id="a07_developer_init",
+                phase="a07_developer_init",
+                task_kind="a07_developer_init",
+                mode="a07_developer_init",
+                expected_statuses=("ready", "hitl"),
+                optional_artifacts={"ask_human": ask_human},
+                outcome_artifacts={
+                    "ready": {"forbids": ("ask_human",)},
+                    "hitl": {"requires": ("ask_human",)},
+                },
+            )
+
+            with self.assertRaisesRegex(RuntimeError, TASK_RESULT_CONTRACT_ERROR_PREFIX):
+                worker.wait_for_task_result(
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    timeout_sec=0.6,
+                )
+
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "running"})
+            self.assertFalse(result_path.exists())
+
     def test_wait_for_task_result_rejects_a07_ready_delta_when_hitl_file_is_present(self):
         class StaleBusyTaskResultWorker(TmuxBatchWorker):
             def target_exists(self, target=None):  # noqa: ANN001, ARG002
