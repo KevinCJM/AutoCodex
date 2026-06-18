@@ -492,6 +492,10 @@
       "minimum_regression_selectors": [
         {
           "type": "literal",
+          "path": "tests/test_a08_overall_review.py"
+        },
+        {
+          "type": "literal",
           "path": "tests/test_stage_kernel_review_design_shared.py"
         },
         {
@@ -528,8 +532,12 @@
           "A03_RequirementsClarification.py",
           "tmux_core/stage_kernel/detailed_design.py",
           "tmux_core/stage_kernel/development.py",
-          "tests/test_a07_development.py",
-          "tmux_core/stage_kernel/overall_review.py",
+          "tmux_core/stage_kernel/agent_intervention.py",
+          "tmux_core/stage_kernel/death_orchestration.py",
+          "tmux_core/stage_kernel/shared_review.py",
+        "tests/test_a07_development.py",
+        "tests/test_a08_overall_review.py",
+        "tmux_core/stage_kernel/overall_review.py",
           "tmux_core/stage_kernel/task_split.py"
         ],
         "unsampled_paths": []
@@ -926,6 +934,10 @@
         {
           "type": "literal",
           "path": "tests/test_vendor_catalog.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_role_orchestration.py"
         }
       ],
       "read_before_edit_selectors": [
@@ -954,7 +966,8 @@
           "tmux_core/runtime/tmux_runtime.py",
           "tmux_core/runtime/vendor_catalog.py",
           "tests/test_t02_tmux_agents.py",
-          "tests/test_vendor_catalog.py"
+          "tests/test_vendor_catalog.py",
+          "tests/test_role_orchestration.py"
         ],
         "unsampled_paths": []
       }
@@ -1088,6 +1101,10 @@
         {
           "type": "literal",
           "path": "tests/test_t11_web_backend.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_tui_web_protocol_no_audit.py"
         }
       ],
       "related_config_selectors": [
@@ -1119,6 +1136,10 @@
         {
           "type": "literal",
           "path": "tests/test_t11_web_backend.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_tui_web_protocol_no_audit.py"
         }
       ],
       "read_before_edit_selectors": [
@@ -1144,7 +1165,10 @@
       "grounding": {
         "fact_status": "mixed",
         "evidence": [
-          "tests/test_t11_web_backend.py"
+          "tmux_core/bridge/backend.py",
+          "tests/test_t11_tui_backend.py",
+          "tests/test_t11_web_backend.py",
+          "tests/test_tui_web_protocol_no_audit.py"
         ],
         "unsampled_paths": []
       }

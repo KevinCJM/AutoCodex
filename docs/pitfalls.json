@@ -117,7 +117,7 @@
       "title": "bridge_protocol_crosses_python_and_frontend",
       "severity": "high",
       "confidence": "medium",
-      "symptoms": ["backend_ui_mismatch", "payload_shape_mismatch", "protocol_version_mismatch"],
+      "symptoms": ["backend_ui_mismatch", "payload_shape_mismatch", "protocol_version_mismatch", "shared_route_worker_pollution", "duplicate_runner_conflict_marked_failed"],
       "trigger_actions": ["TA05"],
       "why_risky": "protocol_helpers_backends_clients_must_sync",
       "related_selectors": [

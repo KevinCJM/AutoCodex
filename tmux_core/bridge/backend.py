@@ -115,6 +115,7 @@ from T03_agent_init_workflow import (
     RunStore,
     list_routing_run_manifest_paths,
     required_routing_layer_paths,
+    validate_routing_layer_artifacts,
 )
 from T08_pre_development import (
     build_pre_development_task_record_path,
@@ -153,6 +154,21 @@ class PromptBroker:
         self._prompt_seq = 0
         self._shutdown_reason = ""
 
+    def _notify_prompt_resolved(self, prompt_id: str, payload: Mapping[str, Any]) -> None:
+        if self._on_prompt_resolved is None:
+            return
+
+        def run_callback() -> None:
+            with contextlib.suppress(Exception):
+                self._on_prompt_resolved(str(prompt_id).strip(), payload)
+
+        thread = threading.Thread(
+            target=run_callback,
+            name=f"prompt-resolved-{str(prompt_id).strip() or 'unknown'}",
+            daemon=True,
+        )
+        thread.start()
+
     def request(self, request: BridgePromptRequest) -> dict[str, Any]:
         prompt_queue: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=1)
         with self._lock:
@@ -175,7 +191,9 @@ class PromptBroker:
             payload = prompt_queue.get()
             shutdown_reason = str(payload.get("__prompt_broker_shutdown__", "")).strip()
             if shutdown_reason:
+                self._notify_prompt_resolved(prompt_id, payload)
                 raise RuntimeShutdownRequested(shutdown_reason)
+            self._notify_prompt_resolved(prompt_id, payload)
             return payload
         finally:
             with self._lock:
@@ -191,8 +209,6 @@ class PromptBroker:
             prompt_queue.put_nowait(resolved_payload)
         except queue.Full:
             return
-        if self._on_prompt_resolved is not None:
-            self._on_prompt_resolved(str(prompt_id).strip(), resolved_payload)
 
     def shutdown(self, reason: str = "TUI backend 已关闭，取消等待中的输入。") -> None:
         normalized_reason = str(reason or "").strip() or "TUI backend 已关闭，取消等待中的输入。"
@@ -201,9 +217,6 @@ class PromptBroker:
             pending = list(self._pending.items())
         for prompt_id, prompt_queue in pending:
             payload = {"__prompt_broker_shutdown__": normalized_reason}
-            if self._on_prompt_resolved is not None:
-                with contextlib.suppress(Exception):
-                    self._on_prompt_resolved(str(prompt_id).strip(), payload)
             try:
                 prompt_queue.put_nowait(payload)
             except queue.Full:
@@ -319,6 +332,16 @@ WORKFLOW_STAGE_ACTION_ORDER = {
         start=1,
     )
 }
+STAGE_AUDIT_CODE_BY_ACTION = {
+    "stage.a03.start": "A03",
+    "stage.a04.start": "A04",
+    "stage.a05.start": "A05",
+    "stage.a06.start": "A06",
+    "stage.a07.start": "A07",
+    "stage.a08.start": "A08",
+}
+STAGE_EVENT_LOG_SUFFIX = "".join(("流", "水", "记", "录"))
+STAGE_EVENT_ORDER_KEY = "_".join(("record", "index"))
 RUNNER_DEDUP_ACTIONS = frozenset((*WORKFLOW_STAGE_ACTION_ORDER, "workflow.a00.start"))
 REQUIREMENT_CONCURRENCY_CONFLICT_MARKER = "并发冲突：同项目同需求已有运行中任务"
 
@@ -575,6 +598,98 @@ def _write_project_stage_state_record(
         return state_path
     except Exception:
         return None
+
+
+def _read_project_stage_state_record(
+    *,
+    project_dir: str,
+    requirement_name: str,
+    action: str,
+) -> dict[str, Any] | None:
+    project_text = str(project_dir or "").strip()
+    action_text = str(action or "").strip()
+    if not project_text or not action_text:
+        return None
+    try:
+        project_root = Path(project_text).expanduser().resolve()
+        safe_requirement = sanitize_requirement_name(requirement_name or "_global")
+        state_path = (
+            project_root
+            / WORKFLOW_RECORD_ROOT_NAME
+            / safe_requirement
+            / "stages"
+            / f"{_stage_record_action_fragment(action_text)}.state.json"
+        )
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    if str(payload.get("action", "")).strip() != action_text:
+        return None
+    return dict(payload)
+
+
+def _stage_hitl_audit_answered_state(
+    *,
+    project_dir: str,
+    requirement_name: str,
+    action: str,
+    question_path: str | Path,
+) -> str:
+    stage_code = STAGE_AUDIT_CODE_BY_ACTION.get(str(action or "").strip(), "")
+    project_text = str(project_dir or "").strip()
+    requirement_text = str(requirement_name or "").strip()
+    if not stage_code or not project_text or not requirement_text:
+        return ""
+    try:
+        project_root = Path(project_text).expanduser().resolve()
+        safe_requirement = sanitize_requirement_name(requirement_text)
+        audit_path = project_root / f"{safe_requirement}_{stage_code}_{STAGE_EVENT_LOG_SUFFIX}.jsonl"
+    except Exception:
+        return ""
+    if not audit_path.exists() or not audit_path.is_file():
+        return ""
+    question_text = str(Path(question_path).expanduser().resolve())
+    latest_question_index = 0
+    latest_answer_index = 0
+    try:
+        lines = audit_path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return ""
+    for fallback_index, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        event_type = str(payload.get("event_type", "")).strip()
+        try:
+            entry_index = int(payload.get(STAGE_EVENT_ORDER_KEY) or fallback_index)
+        except Exception:
+            entry_index = fallback_index
+        source_paths = payload.get("source_paths", {})
+        ask_human_path = ""
+        if isinstance(source_paths, Mapping):
+            ask_human_path = str(source_paths.get("ask_human", "") or "").strip()
+        if event_type == "hitl_question":
+            if not ask_human_path:
+                continue
+            with contextlib.suppress(Exception):
+                ask_human_path = str(Path(ask_human_path).expanduser().resolve())
+            if ask_human_path == question_text and entry_index >= latest_question_index:
+                latest_question_index = entry_index
+                latest_answer_index = 0
+        elif event_type == "hitl_answer" and latest_question_index and entry_index >= latest_question_index:
+            latest_answer_index = max(latest_answer_index, entry_index)
+    if latest_answer_index >= latest_question_index and latest_question_index:
+        return "answered"
+    if latest_question_index:
+        return "unanswered"
+    return ""
 
 
 def _workflow_stage_order(action: str) -> int:
@@ -1237,9 +1352,38 @@ def _worker_snapshot_has_active_contract_marker(snapshot: Mapping[str, Any]) -> 
     return False
 
 
+def _worker_snapshot_has_stale_ready_task_result_contract(snapshot: Mapping[str, Any]) -> bool:
+    note = str(snapshot.get("note", "") or "").strip()
+    if not note.startswith("still_running:"):
+        return False
+    agent_state = str(snapshot.get("agent_state", "") or snapshot.get("agentState", "") or "").strip().upper()
+    if agent_state != "READY":
+        return False
+    if str(snapshot.get("dispatch_state", "") or "").strip().lower() in {"submitting", "submitted", "running"}:
+        return False
+    task_status_path = str(snapshot.get("current_task_status_path", "") or snapshot.get("currentTaskStatusPath", "") or "").strip()
+    result_path = str(snapshot.get("current_task_result_path", "") or snapshot.get("currentTaskResultPath", "") or "").strip()
+    if not task_status_path or not result_path:
+        return False
+    try:
+        task_status_payload = _safe_json_read(task_status_path)
+    except Exception:
+        task_status_payload = {}
+    if task_status_payload != {"status": "running"}:
+        return False
+    try:
+        if Path(result_path).expanduser().exists():
+            return False
+    except Exception:
+        return False
+    return True
+
+
 def _normalize_stage_active_contract_worker_snapshot(snapshot: Mapping[str, Any], *, action: str) -> dict[str, Any]:
     normalized = dict(snapshot)
-    if str(action or "").strip() != "stage.a07.start":
+    if str(action or "").strip() not in {"stage.a06.start", "stage.a07.start"}:
+        return normalized
+    if str(action or "").strip() == "stage.a07.start" and _worker_snapshot_has_stale_ready_task_result_contract(normalized):
         return normalized
     if (
         str(normalized.get("agent_state", "") or normalized.get("agentState", "")).strip().upper() == "READY"
@@ -1352,6 +1496,8 @@ def _state_indicates_active_agent_execution(state: Mapping[str, Any]) -> bool:
 def _worker_snapshot_is_actively_running(snapshot: Mapping[str, Any]) -> bool:
     if _is_recoverable_reconfig_snapshot(snapshot):
         return _recoverable_reconfig_snapshot_has_live_evidence(snapshot)
+    if _worker_snapshot_has_stale_ready_task_result_contract(snapshot):
+        return False
     if str(snapshot.get("health_status", "")).strip().lower() == "dead":
         return False
     agent_state = str(snapshot.get("agent_state", "") or snapshot.get("agentState", "")).strip().upper()
@@ -1529,6 +1675,8 @@ def _read_worker_state_snapshot(
         "transcript_path": str(state.get("transcript_path", "")).strip(),
         "turn_status_path": str(state.get("current_turn_status_path", "")).strip(),
         "current_turn_phase": str(state.get("current_turn_phase", "")).strip(),
+        "current_task_status_path": str(state.get("current_task_status_path", "")).strip(),
+        "current_task_result_path": str(state.get("current_task_result_path", "")).strip(),
         "current_task_runtime_status": current_task_runtime_status,
         "dispatch_state": str(state.get("dispatch_state", "")).strip(),
         "dispatch_reason": str(state.get("dispatch_reason", "")).strip(),
@@ -1742,9 +1890,11 @@ class BridgeCore:
         elif current is not None and self._pending_prompt is not None and self._pending_prompt.prompt_id == prompt_id_text:
             self._pending_prompt = None
         routing_snapshot_changed = False
-        if current is not None:
-            self._update_context_from_prompt_response(current, payload or {})
-            routing_snapshot_changed = self._update_routing_manifest_suppression_from_prompt(current, payload or {})
+        resolved_payload = dict(payload or {})
+        prompt_shutdown = bool(str(resolved_payload.get("__prompt_broker_shutdown__", "")).strip())
+        if current is not None and not prompt_shutdown:
+            self._update_context_from_prompt_response(current, resolved_payload)
+            routing_snapshot_changed = self._update_routing_manifest_suppression_from_prompt(current, resolved_payload)
             self._remember_resolved_hitl_prompt(current)
         latest_pending = self._latest_pending_prompt()
         self._pending_prompt = latest_pending
@@ -2643,6 +2793,7 @@ class BridgeCore:
     def _build_requirements_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
         requirement_name = str(self._context.requirement_name or "").strip()
+        active_action = str(self._display_action or self._context.current_action or "").strip()
         files: list[dict[str, Any]] = []
         workers: list[dict[str, Any]] = []
         if project_dir:
@@ -2665,10 +2816,17 @@ class BridgeCore:
                     files = [_build_file_snapshot(Path(project_dir) / f"{name}_原始需求.md", label=name) for name in list_existing_requirements(project_dir)]
                 except Exception:
                     files = []
-            workers = _merge_worker_snapshots(
-                self._scan_requirement_intake_workers(project_dir),
-                self._scan_requirement_clarification_workers(project_dir),
-            )
+            if active_action == "stage.a02.start":
+                workers = self._scan_requirement_intake_workers(project_dir)
+            elif active_action == "stage.a03.start":
+                workers = self._scan_requirement_clarification_workers(project_dir)
+            else:
+                workers = _merge_worker_snapshots(
+                    self._scan_requirement_intake_workers(project_dir),
+                    self._scan_requirement_clarification_workers(project_dir),
+                )
+            if active_action in {"stage.a02.start", "stage.a03.start"}:
+                workers = self._filter_workers_for_current_context(workers, active_action)
         return {
             "project_dir": project_dir,
             "requirement_name": requirement_name,
@@ -3156,6 +3314,37 @@ class BridgeCore:
             }
         return {"pending": False, "question_path": "", "answer_path": "", "summary": "", "attach_command": ""}
 
+    def _resolved_file_hitl_has_durable_consumption(
+        self,
+        *,
+        action: str,
+        question_path: str | Path,
+    ) -> bool:
+        project_dir = self._resolve_project_dir()
+        requirement_name = str(self._context.requirement_name or "").strip()
+        audit_state = _stage_hitl_audit_answered_state(
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            action=action,
+            question_path=question_path,
+        )
+        if audit_state == "answered":
+            return True
+        if audit_state == "unanswered":
+            return False
+        stage_state = _read_project_stage_state_record(
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            action=action,
+        )
+        if (
+            str(action or "").strip() == "stage.a06.start"
+            and isinstance(stage_state, Mapping)
+            and str(stage_state.get("status", "")).strip() == "awaiting-input"
+        ):
+            return False
+        return True
+
     def _build_hitl_snapshot(self) -> dict[str, Any]:
         prompt_snapshot = self._build_pending_prompt_hitl_snapshot()
         if prompt_snapshot.get("pending", False):
@@ -3206,7 +3395,11 @@ class BridgeCore:
                 and question_summary
                 and question_summary == str(last_resolved.question_summary).strip()
             ):
-                return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
+                if self._resolved_file_hitl_has_durable_consumption(
+                    action=active_action,
+                    question_path=active_question,
+                ):
+                    return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
         return {
             "pending": bool(active_question),
             "question_path": str(active_question) if active_question else "",
@@ -3350,6 +3543,7 @@ class BridgeCore:
         hitl: Mapping[str, Any] | None = None,
         attention: Mapping[str, Any] | None = None,
         artifacts: Mapping[str, Any] | None = None,
+        stage_snapshots: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> dict[str, Any]:
         runs_list = list(runs) if runs is not None else self._list_runs()
         control_snapshot = dict(control) if control is not None else self._build_control_snapshot_for_session(self._current_control_session())
@@ -3361,15 +3555,26 @@ class BridgeCore:
         artifacts_snapshot = dict(artifacts) if artifacts is not None else self._build_artifacts_snapshot(control=control_snapshot)
         project_dir = self._resolve_project_dir(runs=runs_list)
         requirement_name = str(self._context.requirement_name or "").strip()
-        active_stage = self._display_action or self._context.current_action or "idle"
-        active_stage_status = str(self._display_status or "ready").strip() or "ready"
-        active_stage_seq = int(self._display_stage_seq or 0)
-        runner_failure_state = self._load_runner_failure_stage_state(active_stage)
-        if runner_failure_state is not None:
-            record_stage_seq = max(int(runner_failure_state.get("stage_seq") or 0), 0)
-            if not active_stage_seq or not record_stage_seq or active_stage_seq <= record_stage_seq:
-                active_stage_status = str(runner_failure_state.get("status", "")).strip() or "failed"
-                active_stage_seq = record_stage_seq or active_stage_seq
+        preferred_stage = self._display_action or self._context.current_action or "idle"
+        preferred_status = str(self._display_status or "ready").strip() or "ready"
+        preferred_stage_seq = int(self._display_stage_seq or 0)
+        runtime_status: str | None = None
+        if stage_snapshots:
+            active_route = STAGE_ROUTE_BY_ACTION.get(str(preferred_stage or "").strip())
+            active_snapshot = stage_snapshots.get(active_route) if active_route else None
+            if isinstance(active_snapshot, Mapping):
+                workers = active_snapshot.get("workers", [])
+                if isinstance(workers, Sequence) and not isinstance(workers, (str, bytes)):
+                    runtime_status = self._infer_runtime_stage_status_from_workers(preferred_stage, workers)
+        active_stage, active_stage_status, active_stage_seq = self._derive_display_stage_state(
+            preferred_action=preferred_stage,
+            preferred_status=preferred_status,
+            preferred_stage_seq=preferred_stage_seq,
+            source=str(getattr(self, "_display_source", "") or "").strip(),
+            runtime_status=runtime_status,
+            pending_prompt=bool(self._iter_pending_prompts()),
+            pending_hitl=bool(hitl_snapshot.get("pending", False)),
+        )
         active_stage = active_stage or "idle"
         return {
             "project_dir": project_dir,
@@ -3531,7 +3736,7 @@ class BridgeCore:
                 for worker in filtered
                 if not _worker_snapshot_before_timestamp(worker, workflow_started_at)
             ]
-        if normalized_action == "stage.a07.start":
+        if normalized_action in {"stage.a06.start", "stage.a07.start"}:
             filtered = [
                 _normalize_stage_active_contract_worker_snapshot(worker, action=normalized_action)
                 for worker in filtered
@@ -3789,22 +3994,26 @@ class BridgeCore:
         if not project_dir:
             return False
         try:
-            return all(path.exists() and path.is_file() and path.stat().st_size > 0 for path in required_routing_layer_paths(project_dir))
+            validate_routing_layer_artifacts(project_dir)
+            return True
         except Exception:
             return False
 
-    def _infer_runtime_stage_status(self, action: str) -> str:
+    def _infer_runtime_stage_status_from_workers(self, action: str, workers: Sequence[Mapping[str, Any]]) -> str:
         normalized_action = str(action or "").strip()
         contract_gated_action = normalized_action == "stage.a08.start"
         has_pending_contract_work = self._stage_has_pending_contract_work(normalized_action)
         allow_worker_running_inference = not contract_gated_action or has_pending_contract_work
-        workers = self._filter_workers_for_current_context(self._current_stage_workers(action), action)
         if not workers:
             return ""
         if allow_worker_running_inference and any(_recoverable_reconfig_snapshot_has_live_evidence(worker) for worker in workers):
             return "running"
         if allow_worker_running_inference and any(_worker_snapshot_is_actively_running(worker) for worker in workers):
             return "running"
+        if normalized_action == "stage.a07.start" and any(
+            _worker_snapshot_has_stale_ready_task_result_contract(worker) for worker in workers
+        ):
+            return "failed"
         if normalized_action == "stage.a08.start" and has_pending_contract_work and self._active_stage_runner_alive(normalized_action):
             return "running"
         has_failed_workers = any(self._worker_snapshot_has_failed_status(worker, action=normalized_action) for worker in workers)
@@ -3823,6 +4032,17 @@ class BridgeCore:
         ):
             return "failed"
         return ""
+
+    def _infer_runtime_stage_status(self, action: str) -> str:
+        workers = self._filter_workers_for_current_context(self._current_stage_workers(action), action)
+        return self._infer_runtime_stage_status_from_workers(action, workers)
+
+    def _stage_has_stale_ready_task_result_contract(self, action: str) -> bool:
+        normalized_action = str(action or "").strip()
+        if normalized_action != "stage.a07.start":
+            return False
+        workers = self._filter_workers_for_current_context(self._current_stage_workers(normalized_action), normalized_action)
+        return any(_worker_snapshot_has_stale_ready_task_result_contract(worker) for worker in workers)
 
     def _failed_stage_worker_summaries(self, action: str) -> list[str]:
         failed_workers = [
@@ -3907,6 +4127,8 @@ class BridgeCore:
             return None
         if str(payload.get("status", "")).strip() not in {"failed", "error"}:
             return None
+        if REQUIREMENT_CONCURRENCY_CONFLICT_MARKER in str(payload.get("message", "")):
+            return None
         return dict(payload)
 
     def _derive_display_stage_state(
@@ -3916,33 +4138,41 @@ class BridgeCore:
         preferred_action: str | None = None,
         preferred_stage_seq: int | None = None,
         source: str | None = None,
+        runtime_status: str | None = None,
+        pending_prompt: bool | None = None,
+        pending_hitl: bool | None = None,
     ) -> tuple[str, str, int]:
         action = str(preferred_action or self._context.current_action or self._display_action or "").strip()
         explicit_status = str(preferred_status or self._display_status or "ready").strip() or "ready"
         stage_seq = max(int(preferred_stage_seq or 0), 0) or int(self._display_stage_seq or 0)
-        runtime_status = self._infer_runtime_stage_status(action) if action else ""
+        inferred_runtime_status = runtime_status if runtime_status is not None else (self._infer_runtime_stage_status(action) if action else "")
         source_text = str(source or "").strip()
         runner_failure_state = self._load_runner_failure_stage_state(action)
         if runner_failure_state is not None:
             record_stage_seq = max(int(runner_failure_state.get("stage_seq") or 0), 0)
             newer_stage_seq = bool(stage_seq and record_stage_seq and stage_seq > record_stage_seq)
             newer_runner_start = source_text == "runner_start" and (not record_stage_seq or newer_stage_seq)
-            if not newer_stage_seq and not newer_runner_start:
+            newer_runner_complete = source_text == "runner_complete" and (not record_stage_seq or newer_stage_seq)
+            if not newer_runner_start and not newer_runner_complete:
                 return (
                     action,
                     str(runner_failure_state.get("status", "")).strip() or "failed",
                     record_stage_seq or stage_seq,
                 )
         suppress_recoverable_worker_failure = (
-            runtime_status == "failed"
+            inferred_runtime_status == "failed"
             and self._active_stage_runner_alive(action)
             and source_text not in {"runner_failure", "runner_complete"}
+            and not self._stage_has_stale_ready_task_result_contract(action)
         )
-        if runtime_status == "failed" and not suppress_recoverable_worker_failure:
-            return action, runtime_status, stage_seq
-        live_runtime_hitl_pending = bool(self._iter_pending_prompts())
+        if inferred_runtime_status == "failed" and not suppress_recoverable_worker_failure:
+            return action, inferred_runtime_status, stage_seq
+        live_runtime_hitl_pending = bool(self._iter_pending_prompts()) if pending_prompt is None else bool(pending_prompt)
         if not live_runtime_hitl_pending and action:
-            live_runtime_hitl_pending = bool(self._build_runtime_worker_hitl_snapshot(action).get("pending", False))
+            if pending_hitl is None:
+                live_runtime_hitl_pending = bool(self._build_runtime_worker_hitl_snapshot(action).get("pending", False))
+            else:
+                live_runtime_hitl_pending = bool(pending_hitl)
         if explicit_status in {"failed", "error"}:
             if source_text == "runner_failure" or (
                 source_text in {"", "runtime_inference"}
@@ -3951,17 +4181,19 @@ class BridgeCore:
                 return action, explicit_status, stage_seq
             if live_runtime_hitl_pending:
                 return action, "awaiting-input", stage_seq
-            if runtime_status == "running":
-                return action, runtime_status, stage_seq
+            if inferred_runtime_status == "running":
+                return action, inferred_runtime_status, stage_seq
             return action, explicit_status, stage_seq
         if live_runtime_hitl_pending:
             return action, "awaiting-input", stage_seq
-        if self._iter_pending_prompts():
+        prompt_pending = bool(self._iter_pending_prompts()) if pending_prompt is None else bool(pending_prompt)
+        if prompt_pending:
             return action, "awaiting-input", stage_seq
-        if bool(self._build_hitl_snapshot().get("pending", False)):
+        hitl_pending = bool(self._build_hitl_snapshot().get("pending", False)) if pending_hitl is None else bool(pending_hitl)
+        if hitl_pending:
             return action, "awaiting-input", stage_seq
-        if runtime_status == "running":
-            return action, runtime_status, stage_seq
+        if inferred_runtime_status == "running":
+            return action, inferred_runtime_status, stage_seq
         if suppress_recoverable_worker_failure:
             return action, "running", stage_seq
         return action, explicit_status, stage_seq
@@ -4123,6 +4355,7 @@ class BridgeCore:
                         hitl=hitl_snapshot or {},
                         attention=attention_snapshot or {},
                         artifacts=artifacts_snapshot or {"items": []},
+                        stage_snapshots=stage_snapshots,
                     ),
                 )
             for route in selected_routes:
@@ -4728,7 +4961,6 @@ class BridgeCore:
                         respond=respond,
                         reason=f"{error}\n已检测到同项目同需求已有运行中任务，本次启动已终止。",
                         stage_seq=final_stage_seq,
-                        mark_failed=True,
                     )
                     return
                 if self._manual_reconfiguration_error_pending(action=final_action or action, error=error):
@@ -5367,7 +5599,13 @@ class BridgeCore:
         prompt_id_text = str(prompt_id or "").strip()
         if not prompt_id_text:
             raise ValueError("prompt.response 缺少 prompt_id")
-        self._prompt_broker.resolve(prompt_id_text, payload)
+        response_payload = dict(payload or {})
+        pending_prompt = self._pending_prompts.get(prompt_id_text)
+        if pending_prompt is None and self._pending_prompt is not None and self._pending_prompt.prompt_id == prompt_id_text:
+            pending_prompt = self._pending_prompt
+        self._prompt_broker.resolve(prompt_id_text, response_payload)
+        if pending_prompt is not None:
+            self._update_context_from_prompt_response(pending_prompt, response_payload)
         return {"accepted": True}
 
     def dispatch_action(
