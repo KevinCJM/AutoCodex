@@ -940,9 +940,23 @@ def worker_has_provider_runtime_error(worker: TmuxBatchWorker | None) -> bool:
     )
 
 
+def worker_has_agent_config_error(worker: TmuxBatchWorker | None) -> bool:
+    if worker is None:
+        return False
+    try:
+        state = worker.read_state()
+    except Exception:
+        state = {}
+    health_status = str(state.get("health_status", "")).strip().lower()
+    return health_status in {"agent_config_error", "config_error"} or any(
+        is_agent_config_error(state.get(key, ""))
+        for key in ("health_note", "note", "last_provider_error", "dispatch_reason")
+    )
+
+
 def is_recoverable_startup_failure(error: Exception, worker: TmuxBatchWorker | None = None) -> bool:
     message_text = str(error or "").strip().lower()
-    if is_agent_config_error(error):
+    if is_agent_config_error(error) or worker_has_agent_config_error(worker):
         return True
     if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):
         return True
@@ -982,6 +996,7 @@ def prompt_agent_ready_timeout_recovery(
     reason_text: str = "",
     allow_recreate: bool = False,
     target_paths: Sequence[str | Path] = (),
+    noninteractive_default: str | None = None,
 ) -> str:
     role_text = str(role_label or "").strip() or "智能体"
     session_name = str(getattr(worker, "session_name", "") or "").strip()
@@ -998,6 +1013,7 @@ def prompt_agent_ready_timeout_recovery(
         progress=progress,
         allow_recreate=allow_recreate,
         allow_worker_dead=can_skip,
+        noninteractive_default=noninteractive_default,
     )
 
 
@@ -1061,6 +1077,24 @@ def collect_auto_review_limit_hitl_response(
         "\n\n[自动回复所依据的问题文档]\n"
         f"{question_text or '(问题文档为空)'}"
     )
+
+
+def _append_review_limit_human_response(
+    *,
+    hitl_record_file: Path,
+    stage_label: str,
+    hitl_round: int,
+    human_msg: str,
+) -> None:
+    message_text = str(human_msg or "").strip()
+    if not message_text:
+        return
+    hitl_record_file.parent.mkdir(parents=True, exist_ok=True)
+    prefix = "\n\n" if hitl_record_file.exists() and hitl_record_file.read_text(encoding="utf-8").strip() else ""
+    with hitl_record_file.open("a", encoding="utf-8") as file_obj:
+        file_obj.write(f"{prefix}## {stage_label} HITL 第 {hitl_round} 轮人类回复\n")
+        file_obj.write(message_text)
+        file_obj.write("\n")
 
 
 def parse_review_max_rounds(value: object, *, source: str, default: int = DEFAULT_STAGE_REVIEW_MAX_ROUNDS) -> int | None:
@@ -1217,7 +1251,8 @@ def run_review_limit_hitl_cycle(
                 pass
 
     for hitl_round in range(1, max_hitl_rounds + 1):
-        if not ask_human_file.read_text(encoding="utf-8").strip():
+        question_text_before = ask_human_file.read_text(encoding="utf-8")
+        if not question_text_before.strip():
             return ReviewLimitHitlResult(
                 owner=owner,
                 rounds_used=hitl_round - 1,
@@ -1234,7 +1269,25 @@ def run_review_limit_hitl_cycle(
                 answer_path=hitl_record_file,
                 progress=progress,
             )
+        human_msg = str(human_msg or "").strip()
+        if not human_msg:
+            if progress is not None:
+                progress.set_phase(f"{stage_label} / 等待 HITL")
+            continue
+        _append_review_limit_human_response(
+            hitl_record_file=hitl_record_file,
+            stage_label=stage_label,
+            hitl_round=hitl_round,
+            human_msg=human_msg,
+        )
         _invoke_callback(on_hitl_answer, "on_hitl_answer", hitl_round, human_msg, hitl_record_file)
-        owner = human_reply_turn(human_msg)
+        ask_human_file.write_text("", encoding="utf-8")
+        try:
+            owner = human_reply_turn(human_msg)
+        except Exception:
+            with suppress(Exception):
+                if not ask_human_file.read_text(encoding="utf-8").strip():
+                    ask_human_file.write_text(question_text_before, encoding="utf-8")
+            raise
         post_hitl_continue_completed = True
     raise RuntimeError(f"{stage_label} HITL 轮次超过上限: {max_hitl_rounds}")

@@ -1170,6 +1170,8 @@ _WORKER_RESULT_TERMINAL_STATUSES = _WORKER_RESULT_COMPLETED_STATUSES | _WORKER_R
 _RECOVERABLE_RECONFIG_HEALTH_STATUSES = {"awaiting_reconfig", "recoverable_startup_failure"}
 
 def _is_recoverable_reconfig_snapshot(snapshot: Mapping[str, Any]) -> bool:
+    if _snapshot_has_stale_ready_reconfig_marker(snapshot):
+        return False
     health_status = str(snapshot.get("health_status", "")).strip().lower()
     note = str(snapshot.get("note", "")).strip().lower()
     return health_status in _RECOVERABLE_RECONFIG_HEALTH_STATUSES or note == "awaiting_reconfig"
@@ -1194,6 +1196,23 @@ def _snapshot_status_triplet(snapshot: Mapping[str, Any]) -> tuple[str, str, str
         snapshot.get("current_task_runtime_status", "") or snapshot.get("currentTaskRuntimeStatus", "") or ""
     ).strip().lower()
     return status, result_status, runtime_status
+
+
+def _snapshot_has_stale_ready_reconfig_marker(snapshot: Mapping[str, Any]) -> bool:
+    note = str(snapshot.get("note", "") or "").strip().lower()
+    health_status = str(snapshot.get("health_status", "") or snapshot.get("healthStatus", "") or "").strip().lower()
+    if note != "awaiting_reconfig" and health_status not in _RECOVERABLE_RECONFIG_HEALTH_STATUSES:
+        return False
+    agent_state = str(snapshot.get("agent_state", "") or snapshot.get("agentState", "") or "").strip().upper()
+    if agent_state != "READY":
+        return False
+    if health_status not in {"", "alive", *_RECOVERABLE_RECONFIG_HEALTH_STATUSES}:
+        return False
+    runtime_status = str(
+        snapshot.get("current_task_runtime_status", "") or snapshot.get("currentTaskRuntimeStatus", "") or ""
+    ).strip().lower()
+    dispatch_state = str(snapshot.get("dispatch_state", "") or snapshot.get("dispatchState", "") or "").strip().lower()
+    return runtime_status != "running" and dispatch_state not in {"submitting", "submitted", "running"}
 
 
 def _worker_snapshot_has_terminal_status(snapshot: Mapping[str, Any]) -> bool:
@@ -1496,6 +1515,8 @@ def _state_indicates_active_agent_execution(state: Mapping[str, Any]) -> bool:
 def _worker_snapshot_is_actively_running(snapshot: Mapping[str, Any]) -> bool:
     if _is_recoverable_reconfig_snapshot(snapshot):
         return _recoverable_reconfig_snapshot_has_live_evidence(snapshot)
+    if _snapshot_has_stale_ready_reconfig_marker(snapshot):
+        return False
     if _worker_snapshot_has_stale_ready_task_result_contract(snapshot):
         return False
     if str(snapshot.get("health_status", "")).strip().lower() == "dead":
@@ -1956,11 +1977,12 @@ class BridgeCore:
             self._tui_presence_refresh_timer = None
         if timer is not None:
             timer.cancel()
+        stage_routes = self._stage_routes_for_action(self._current_snapshot_action())
         self._schedule_snapshot_update(
             sections={"app", "control"},
-            stage_routes=self._stage_routes_for_action(self._current_snapshot_action()),
+            stage_routes=stage_routes,
             delay_sec=0.0,
-            refresh_worker_health=False,
+            refresh_worker_health=bool(stage_routes),
         )
         self._arm_tui_presence_refresh_timer()
         return {
@@ -2062,11 +2084,12 @@ class BridgeCore:
         plan = self._tui_presence_refresh_plan()
         if plan is None:
             return
+        stage_routes = tuple(plan["stage_routes"])
         self._schedule_snapshot_update(
             sections=set(plan["sections"]),
-            stage_routes=tuple(plan["stage_routes"]),
+            stage_routes=stage_routes,
             delay_sec=0.0,
-            refresh_worker_health=False,
+            refresh_worker_health=bool(stage_routes),
         )
         self._arm_tui_presence_refresh_timer()
 
@@ -2658,7 +2681,7 @@ class BridgeCore:
         session_exists = bool(snapshot.get("session_exists"))
         stale_dead_with_live_session = agent_state == "DEAD" and session_exists
         should_refresh = (
-            status in {"ready", "running", "pending"}
+            status in {"running", "pending"}
             or agent_state in {"BUSY", "STARTING"}
             or stale_dead_with_live_session
         )
@@ -3302,17 +3325,42 @@ class BridgeCore:
         for pending in reversed(self._iter_pending_prompts()):
             if not _prompt_is_hitl(pending.payload):
                 continue
+            payload = pending.payload
             title = str(pending.payload.get("title", "")).strip()
             prompt_text = str(pending.payload.get("prompt_text", "")).strip()
-            summary = title or prompt_text or "存在待处理 HITL"
+            reason_text = str(payload.get("reason_text", payload.get("reasonText", "")) or "").strip()
+            raw_target_paths = payload.get("target_paths", payload.get("targetPaths", []))
+            if isinstance(raw_target_paths, Sequence) and not isinstance(raw_target_paths, (str, bytes, bytearray)):
+                target_paths = [str(item).strip() for item in raw_target_paths if str(item).strip()]
+            else:
+                target_path = str(raw_target_paths or "").strip()
+                target_paths = [target_path] if target_path else []
+            reason_summary = reason_text.splitlines()[0].strip() if reason_text else ""
+            summary = title or prompt_text or reason_summary or "存在待处理 HITL"
             return {
                 "pending": True,
-                "question_path": str(pending.payload.get("question_path", "") or "").strip(),
-                "answer_path": str(pending.payload.get("answer_path", "") or "").strip(),
+                "prompt_id": pending.prompt_id,
+                "prompt_type": pending.prompt_type,
+                "question_path": str(payload.get("question_path", "") or "").strip(),
+                "answer_path": str(payload.get("answer_path", "") or "").strip(),
                 "summary": summary,
-                "attach_command": _prompt_attach_command(pending.payload),
+                "attach_command": _prompt_attach_command(payload),
+                "recovery_kind": str(payload.get("recovery_kind", payload.get("recoveryKind", "")) or "").strip(),
+                "reason_text": reason_text,
+                "target_paths": target_paths,
             }
-        return {"pending": False, "question_path": "", "answer_path": "", "summary": "", "attach_command": ""}
+        return {
+            "pending": False,
+            "prompt_id": "",
+            "prompt_type": "",
+            "question_path": "",
+            "answer_path": "",
+            "summary": "",
+            "attach_command": "",
+            "recovery_kind": "",
+            "reason_text": "",
+            "target_paths": [],
+        }
 
     def _resolved_file_hitl_has_durable_consumption(
         self,
@@ -4388,10 +4436,11 @@ class BridgeCore:
         stage_routes: Sequence[str] | None = None,
         update_display_stage: bool = False,
     ) -> None:
+        normalized_stage_routes = tuple(str(item).strip() for item in (stage_routes or ()) if str(item).strip())
         self._schedule_snapshot_update(
             sections=sections,
-            stage_routes=stage_routes,
-            refresh_worker_health=False,
+            stage_routes=normalized_stage_routes,
+            refresh_worker_health=bool(normalized_stage_routes),
             update_display_stage=update_display_stage,
         )
 

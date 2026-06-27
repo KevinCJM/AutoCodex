@@ -13,7 +13,7 @@ from typing import Any, Callable, Sequence
 
 SCHEMA_VERSION = "1.0"
 SCAN_TIMEOUT_SEC = 12.0
-VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode", "mimo")
+VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode", "mimo", "agy")
 NORMALIZED_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 NATIVE_REASONING_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
 LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
@@ -22,6 +22,7 @@ LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
     "gemini": "auto",
     "opencode": "default",
     "mimo": "mimo/mimo-v2.5-pro",
+    "agy": "Gemini 3.5 Flash (High)",
 }
 LEGACY_MODEL_CHOICES_BY_VENDOR: dict[str, tuple[str, ...]] = {
     "codex": ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"),
@@ -29,6 +30,16 @@ LEGACY_MODEL_CHOICES_BY_VENDOR: dict[str, tuple[str, ...]] = {
     "gemini": ("auto", "flash", "pro"),
     "opencode": (),
     "mimo": ("mimo/mimo-v2.5-pro",),
+    "agy": (
+        "Gemini 3.5 Flash (Medium)",
+        "Gemini 3.5 Flash (High)",
+        "Gemini 3.5 Flash (Low)",
+        "Gemini 3.1 Pro (Low)",
+        "Gemini 3.1 Pro (High)",
+        "Claude Sonnet 4.6 (Thinking)",
+        "Claude Opus 4.6 (Thinking)",
+        "GPT-OSS 120B (Medium)",
+    ),
 }
 LEGACY_MODEL_ALIASES_BY_VENDOR: dict[str, dict[str, str]] = {
     "codex": {
@@ -378,6 +389,17 @@ def _full_normalized_levels() -> tuple[str, ...]:
     return NORMALIZED_EFFORT_LEVELS
 
 
+def _infer_agy_model_effort(model_id: str) -> str:
+    text = str(model_id or "")
+    match = re.search(r"\(([^)]+)\)\s*$", text)
+    suffix = str(match.group(1) if match else "").strip().lower()
+    if suffix in NORMALIZED_EFFORT_LEVELS:
+        return suffix
+    if suffix == "thinking":
+        return "high"
+    return "high"
+
+
 def _unsupported_reasoning(vendor_id: str, model_id: str, *, source_kind: str, confidence: str, note: str = "") -> ReasoningInventory:
     notes = (note,) if note else ()
     return ReasoningInventory(
@@ -479,6 +501,21 @@ def _fallback_reasoning_for_vendor(vendor_id: str, model_id: str, *, source_kind
             default_normalized_effort="high",
             default_native_level="",
             notes=("legacy_fallback",),
+        )
+    if vendor_id == "agy":
+        effort = _infer_agy_model_effort(model_id)
+        return ReasoningInventory(
+            vendor_id=vendor_id,
+            model_id=model_id,
+            source_kind=source_kind,
+            confidence=confidence,
+            reasoning_control_mode=REASONING_IMPLICIT_DEFAULT,
+            supports_reasoning=True,
+            native_reasoning_levels=(),
+            normalized_reasoning_levels=(effort,),
+            default_normalized_effort=effort,
+            default_native_level="",
+            notes=("legacy_fallback", "model_name_embeds_reasoning_effort"),
         )
     return _unsupported_reasoning(vendor_id, model_id, source_kind=source_kind, confidence=confidence, note="legacy_fallback")
 
@@ -683,6 +720,18 @@ def parse_opencode_debug_config_output(stdout: str) -> dict[str, Any]:
     except Exception:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def parse_agy_models_output(stdout: str) -> tuple[str, ...]:
+    models: list[str] = []
+    for line in str(stdout or "").splitlines():
+        model_id = line.strip()
+        if not model_id:
+            continue
+        if model_id.lower().startswith(("error:", "usage:")):
+            continue
+        models.append(model_id)
+    return tuple(dict.fromkeys(models))
 
 
 def _build_codex_models(items: Sequence[dict[str, Any]]) -> tuple[ModelInventory, ...]:
@@ -902,6 +951,38 @@ def _build_gemini_models(model_ids: Sequence[str]) -> tuple[ModelInventory, ...]
     return _unique_models(models)
 
 
+def _build_agy_models(model_ids: Sequence[str]) -> tuple[ModelInventory, ...]:
+    models: list[ModelInventory] = []
+    for model_id in model_ids:
+        normalized_model_id = str(model_id or "").strip()
+        if not normalized_model_id:
+            continue
+        effort = _infer_agy_model_effort(normalized_model_id)
+        models.append(
+            _build_model(
+                "agy",
+                normalized_model_id,
+                source_kind=SOURCE_DYNAMIC_CLI,
+                confidence=CONFIDENCE_HIGH,
+                reasoning=ReasoningInventory(
+                    vendor_id="agy",
+                    model_id=normalized_model_id,
+                    source_kind=SOURCE_DYNAMIC_CLI,
+                    confidence=CONFIDENCE_HIGH,
+                    reasoning_control_mode=REASONING_IMPLICIT_DEFAULT,
+                    supports_reasoning=True,
+                    native_reasoning_levels=(),
+                    normalized_reasoning_levels=(effort,),
+                    default_normalized_effort=effort,
+                    default_native_level="",
+                    notes=("model_name_embeds_reasoning_effort",),
+                ),
+                notes=("model_name_embeds_reasoning_effort",),
+            )
+        )
+    return _unique_models(models)
+
+
 def _scan_codex_vendor(binary_path: str) -> VendorInventory:
     probe = _command_probe(["codex", "debug", "models"])
     items = parse_codex_models_output(probe.stdout) if probe.ok else ()
@@ -992,6 +1073,30 @@ def _scan_mimo_vendor(binary_path: str) -> VendorInventory:
     return _scan_opencode_like_vendor("mimo", "mimo", binary_path)
 
 
+def _scan_agy_vendor(binary_path: str) -> VendorInventory:
+    probe = _command_probe(["agy", "models"], timeout_sec=15.0)
+    model_ids = parse_agy_models_output(probe.stdout) if probe.ok else ()
+    if not model_ids:
+        return _fallback_vendor("agy", binary_path=binary_path, note="agy_models_failed")
+    models = _build_agy_models(model_ids)
+    default_model = _resolve_default_model(
+        models,
+        preferred=LEGACY_DEFAULT_MODEL_BY_VENDOR["agy"],
+        fallback_vendor="agy",
+    )
+    return VendorInventory(
+        vendor_id="agy",
+        installed=True,
+        scan_status=OK_SCAN_STATUS,
+        source_kind=SOURCE_DYNAMIC_CLI,
+        confidence=CONFIDENCE_HIGH,
+        binary_path=binary_path,
+        models=_prioritize_default_model(models, default_model),
+        default_model=default_model,
+        notes=(),
+    )
+
+
 def _scan_claude_vendor(binary_path: str) -> VendorInventory:
     help_probe = _command_probe(["claude", "--help"])
     model_ids = _extract_claude_models(binary_path)
@@ -1037,6 +1142,7 @@ _SCANNERS: dict[str, Callable[[str], VendorInventory]] = {
     "gemini": _scan_gemini_vendor,
     "opencode": _scan_opencode_vendor,
     "mimo": _scan_mimo_vendor,
+    "agy": _scan_agy_vendor,
 }
 
 

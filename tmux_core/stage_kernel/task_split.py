@@ -170,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|opencode|mimo")
+    parser.add_argument("--vendor", help="需求分析师厂商: codex|claude|gemini|opencode|mimo|agy")
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
@@ -2391,6 +2391,18 @@ def run_task_split_stage(
                 review_msg = get_markdown_content(paths["merged_review_path"]).strip()
                 if not review_msg:
                     raise RuntimeError("任务拆分评审未通过，但合并后的任务单评审记录为空")
+                if progress is not None:
+                    progress.set_phase("任务拆分 / 准备需求分析师修订")
+                append_stage_audit_record(
+                    audit_context,
+                    event_type="prepare_ba_revision",
+                    source_paths={
+                        "merged_review": paths["merged_review_path"],
+                        "task_md": paths["task_md_path"],
+                    },
+                    review_round_index=round_index,
+                    metadata={"trigger": "review_failed_prepare_ba_revision"},
+                )
                 if active_ba_handoff is None or not _is_live_ba_handoff(active_ba_handoff):
                     active_ba_handoff, created_new_ba = prepare_task_split_ba_handoff(
                         args,

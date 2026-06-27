@@ -278,6 +278,44 @@ class AgentInitWorkflowTests(unittest.TestCase):
             validate_routing_layer_artifacts(root)
             self.assertTrue(has_complete_routing_layer(root))
 
+    def test_validate_routing_layer_artifacts_accepts_object_refs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_valid_routing_layer(root)
+            (root / "docs" / "task_routes.json").write_text(
+                json.dumps(
+                    {
+                        "routes": [
+                            {
+                                "id": "R01",
+                                "first_read_modules": [{"kind": "module", "ref": "M01"}],
+                                "pitfall_ids": [{"kind": "pitfall", "ref": "P01"}],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (root / "docs" / "pitfalls.json").write_text(
+                json.dumps(
+                    {
+                        "pitfalls": [
+                            {
+                                "id": "P01",
+                                "title": "risk",
+                                "affected_modules": [{"kind": "module", "ref": "M01"}],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            validate_routing_layer_artifacts(root)
+            self.assertTrue(has_complete_routing_layer(root))
+
     def test_validate_routing_layer_artifacts_rejects_empty_json_objects(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -311,6 +349,52 @@ class AgentInitWorkflowTests(unittest.TestCase):
             )
 
             with self.assertRaisesRegex(ValueError, "M99|P99"):
+                validate_routing_layer_artifacts(root)
+
+    def test_validate_routing_layer_artifacts_rejects_unresolved_object_refs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_valid_routing_layer(root)
+            (root / "docs" / "task_routes.json").write_text(
+                json.dumps(
+                    {
+                        "routes": [
+                            {
+                                "id": "R01",
+                                "first_read_modules": [{"kind": "module", "ref": "M99"}],
+                                "pitfall_ids": [{"kind": "pitfall", "ref": "P99"}],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "M99|P99"):
+                validate_routing_layer_artifacts(root)
+
+    def test_validate_routing_layer_artifacts_rejects_unresolved_pitfall_affected_modules(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_valid_routing_layer(root)
+            (root / "docs" / "pitfalls.json").write_text(
+                json.dumps(
+                    {
+                        "pitfalls": [
+                            {
+                                "id": "P01",
+                                "title": "risk",
+                                "affected_modules": [{"kind": "module", "ref": "M99"}],
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "affected_modules|M99"):
                 validate_routing_layer_artifacts(root)
 
     def test_cleanup_routing_stage_artifacts_removes_audit_files_and_runtime_dir_on_success(self):

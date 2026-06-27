@@ -626,7 +626,10 @@
         "mimo",
         "codex",
         "claude",
-        "gemini"
+        "gemini",
+        "agy",
+        "antigravity",
+        "antigravity cli"
       ],
       "negative_keywords": [],
       "route_priority": 90,

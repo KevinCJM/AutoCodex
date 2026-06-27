@@ -77,6 +77,7 @@ TASK_RESULT_POST_DONE_GRACE_SEC = 10.0
 TASK_RESULT_READY_MISSING_GRACE_SEC = 2.0
 STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX = "stale_busy_without_contract"
 TASK_CONTRACT_STALL_IDLE_SEC = 45.0
+CODEX_TRANSIENT_SHELL_START_GRACE_SEC = 15.0
 TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS = _positive_int_env("TMUX_TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 30)
 TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC = 60.0
 FILE_CONTRACT_POLL_INTERVAL_SEC = 0.5
@@ -381,6 +382,87 @@ OPENCODE_FOOTER_PATTERNS = (
     r"Build\s+·",
     r"^[╹▀]+$",
 )
+MIMO_READY_PROMPT_PATTERNS = (
+    r"输入消息",
+    r"Type your message",
+)
+MIMO_READY_FOOTER_PATTERNS = (
+    r"Build\s*·\s*MiMo",
+    r"@ ?添加文件",
+    r"@ ?attach",
+    r"\$ ?子智能体",
+    r"\$ ?subagent",
+    r"/ ?唤起命令",
+    r"/ ?commands?",
+    r"tab ?切换模式",
+    r"tab ?switch ?mode",
+    r"ctrl\+p ?设置",
+    r"ctrl\+p ?settings",
+)
+MIMO_BUSY_PATTERNS = (
+    r"\besc interrupt\b",
+)
+MIMO_TRUST_PROMPT_PATTERNS = (
+    r"访问工作区",
+    r"安全确认",
+    r"我信任此目录",
+    r"否，退出",
+)
+MIMO_STARTING_PATTERNS = OPENCODE_STARTING_PATTERNS
+MIMO_READY_PROMPT_COMPACT_PATTERNS = (
+    r"输入消息",
+    r"typeyourmessage",
+)
+MIMO_READY_FOOTER_COMPACT_PATTERNS = (
+    r"build·?mimo",
+    r"@添加文件",
+    r"@attach",
+    r"\$子智能体",
+    r"\$subagent",
+    r"/唤起命令",
+    r"/commands?",
+    r"tab切换模式",
+    r"tabswitchmode",
+    r"ctrl\+p设置",
+    r"ctrl\+psettings",
+)
+MIMO_BUSY_COMPACT_PATTERNS = (
+    r"escinterrupt",
+)
+MIMO_TRUST_PROMPT_COMPACT_PATTERNS = (
+    r"访问工作区",
+    r"安全确认",
+    r"我信任此目录",
+    r"否，退出",
+)
+MIMO_STARTING_COMPACT_PATTERNS = OPENCODE_STARTING_COMPACT_PATTERNS
+MIMO_FOOTER_PATTERNS = (
+    r"Build\s*·\s*MiMo",
+    r"tab ?切换模式",
+    r"@ ?添加文件",
+    r"\$ ?子智能体",
+    r"/ ?唤起命令",
+)
+AGY_READY_PROMPT_PATTERNS = (
+    r"^\s*>\s*$",
+)
+AGY_READY_FOOTER_PATTERNS = (
+    r"\? for shortcuts",
+)
+AGY_BUSY_PATTERNS = (
+    r"\bGenerating\.\.\.",
+    r"\besc to cancel\b",
+)
+AGY_STARTING_PATTERNS = (
+    r"Welcome to the Antigravity CLI",
+    r"currently not signed in",
+    r"\bSigning in\.\.\.",
+    r"Please sign in",
+)
+AGY_FOOTER_PATTERNS = (
+    r"\? for shortcuts",
+    r"^Antigravity CLI\b",
+)
 
 
 def _codex_effective_recent_surface(text: str, *, max_lines: int = 120) -> str:
@@ -504,7 +586,7 @@ RUNTIME_NOISE_PATTERNS = (
     r"^✗\s*Auto-update.*$",
     r"^(?:~|/)\S+\s+.+$",
     r"^(?:~|/).+\s{2,}.+$",
-    r"^(?:gemini|claude|codex|opencode|mimo)(?:[-_.a-z0-9]+)?$",
+    r"^(?:gemini|claude|codex|opencode|mimo|agy)(?:[-_.a-z0-9]+)?$",
 )
 
 _LIVE_WORKERS: "weakref.WeakSet[TmuxBatchWorker]" = weakref.WeakSet()
@@ -651,6 +733,7 @@ class Vendor(str, Enum):
     GEMINI = "gemini"
     OPENCODE = "opencode"
     MIMO = "mimo"
+    AGY = "agy"
 
 
 def _is_opencode_like_vendor(vendor: Vendor) -> bool:
@@ -1433,8 +1516,25 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
         and current_command_state
         and current_command_state not in SHELL_COMMANDS
     )
-    if (note == "awaiting_reconfig" and not stale_awaiting_reconfig_note) or health_status in {
-        "awaiting_reconfig",
+    awaiting_reconfig_state = (
+        note == "awaiting_reconfig" and not stale_awaiting_reconfig_note
+    ) or health_status == "awaiting_reconfig"
+    if awaiting_reconfig_state:
+        observation = _observe_once()
+        if observation is not None and observation.session_exists and not observation.pane_dead:
+            current_command = str(observation.current_command or "").strip()
+            if current_command and current_command not in SHELL_COMMANDS:
+                agent_state = _current_agent_state(observation)
+                idle_surface = False
+                idle_checker = getattr(worker, "_observation_indicates_ready_or_idle_surface", None)
+                if callable(idle_checker):
+                    with contextlib.suppress(Exception):
+                        idle_surface = bool(idle_checker(observation))
+                if agent_state == AgentRuntimeState.READY or idle_surface:
+                    _normalize_ready_state(observation)
+                    return True
+        return False
+    if health_status in {
         "provider_auth_error",
         "provider_runtime_error",
         "dead",
@@ -1952,6 +2052,155 @@ def _classify_opencode_surface_state(
     return AgentRuntimeState.BUSY
 
 
+def _classify_mimo_surface_state(
+        *,
+        visible_text: str,
+        recent_log: str,
+        current_command: str,
+) -> AgentRuntimeState:
+    normalized_visible = _normalize_opencode_surface(visible_text)
+    normalized_recent = _normalize_opencode_surface(recent_log)
+    compact_visible = _compact_opencode_surface(visible_text)
+    compact_recent = _compact_opencode_surface(recent_log)
+    if all(re.search(pattern, normalized_visible or normalized_recent, re.IGNORECASE) for pattern in MIMO_TRUST_PROMPT_PATTERNS) or all(
+        re.search(pattern, compact_visible or compact_recent, re.IGNORECASE) for pattern in MIMO_TRUST_PROMPT_COMPACT_PATTERNS
+    ):
+        return AgentRuntimeState.STARTING
+    if _matches_opencode_surface(
+            normalized_visible,
+            compact_visible,
+            patterns=MIMO_BUSY_PATTERNS,
+            compact_patterns=MIMO_BUSY_COMPACT_PATTERNS,
+    ):
+        return AgentRuntimeState.BUSY
+    if _matches_opencode_surface(
+            normalized_visible,
+            compact_visible,
+            patterns=(*MIMO_READY_PROMPT_PATTERNS, *OPENCODE_READY_PROMPT_PATTERNS),
+            compact_patterns=(*MIMO_READY_PROMPT_COMPACT_PATTERNS, *OPENCODE_READY_PROMPT_COMPACT_PATTERNS),
+    ):
+        return AgentRuntimeState.READY
+    if current_command and _matches_opencode_surface(
+            normalized_visible,
+            compact_visible,
+            patterns=(*MIMO_READY_FOOTER_PATTERNS, *OPENCODE_READY_FOOTER_PATTERNS),
+            compact_patterns=(*MIMO_READY_FOOTER_COMPACT_PATTERNS, *OPENCODE_READY_FOOTER_COMPACT_PATTERNS),
+    ):
+        return AgentRuntimeState.READY
+    if _matches_opencode_surface(
+            normalized_visible or normalized_recent,
+            compact_visible or compact_recent,
+            patterns=(*MIMO_STARTING_PATTERNS, *MIMO_TRUST_PROMPT_PATTERNS),
+            compact_patterns=(*MIMO_STARTING_COMPACT_PATTERNS, *MIMO_TRUST_PROMPT_COMPACT_PATTERNS),
+    ):
+        return AgentRuntimeState.STARTING
+    if _matches_opencode_surface(
+            normalized_recent,
+            compact_recent,
+            patterns=(*MIMO_BUSY_PATTERNS, *OPENCODE_BUSY_PATTERNS),
+            compact_patterns=(*MIMO_BUSY_COMPACT_PATTERNS, *OPENCODE_BUSY_COMPACT_PATTERNS),
+    ):
+        return AgentRuntimeState.BUSY
+    if _matches_opencode_surface(
+            normalized_recent,
+            compact_recent,
+            patterns=(*MIMO_READY_PROMPT_PATTERNS, *OPENCODE_READY_PROMPT_PATTERNS),
+            compact_patterns=(*MIMO_READY_PROMPT_COMPACT_PATTERNS, *OPENCODE_READY_PROMPT_COMPACT_PATTERNS),
+    ):
+        return AgentRuntimeState.READY
+    if current_command and _matches_opencode_surface(
+            normalized_recent,
+            compact_recent,
+            patterns=(*MIMO_READY_FOOTER_PATTERNS, *OPENCODE_READY_FOOTER_PATTERNS),
+            compact_patterns=(*MIMO_READY_FOOTER_COMPACT_PATTERNS, *OPENCODE_READY_FOOTER_COMPACT_PATTERNS),
+    ):
+        return AgentRuntimeState.READY
+    if not current_command:
+        return AgentRuntimeState.STARTING
+    if normalized_visible or normalized_recent or compact_visible or compact_recent:
+        return AgentRuntimeState.BUSY
+    return AgentRuntimeState.BUSY
+
+
+def _classify_opencode_like_surface_state(
+        *,
+        vendor: Vendor,
+        visible_text: str,
+        recent_log: str,
+        current_command: str,
+) -> AgentRuntimeState:
+    if vendor == Vendor.MIMO:
+        return _classify_mimo_surface_state(
+            visible_text=visible_text,
+            recent_log=recent_log,
+            current_command=current_command,
+        )
+    return _classify_opencode_surface_state(
+        visible_text=visible_text,
+        recent_log=recent_log,
+        current_command=current_command,
+    )
+
+
+def _agy_surface_indicates_ready(normalized_text: str) -> bool:
+    if not normalized_text.strip():
+        return False
+    return any(
+        re.search(pattern, normalized_text, re.IGNORECASE | re.MULTILINE)
+        for pattern in AGY_READY_FOOTER_PATTERNS
+    ) and any(
+        re.search(pattern, normalized_text, re.IGNORECASE | re.MULTILINE)
+        for pattern in AGY_READY_PROMPT_PATTERNS
+    )
+
+
+def _classify_agy_surface_state(
+        *,
+        visible_text: str,
+        recent_log: str,
+        current_command: str,
+) -> AgentRuntimeState:
+    normalized_visible = clean_ansi(visible_text or "")
+    normalized_recent = clean_ansi(recent_log or "")
+    if any(re.search(pattern, normalized_visible, re.IGNORECASE | re.MULTILINE) for pattern in AGY_BUSY_PATTERNS):
+        return AgentRuntimeState.BUSY
+    if _agy_surface_indicates_ready(normalized_visible):
+        return AgentRuntimeState.READY
+    if any(re.search(pattern, normalized_visible, re.IGNORECASE | re.MULTILINE) for pattern in AGY_STARTING_PATTERNS):
+        return AgentRuntimeState.STARTING
+    if _agy_surface_indicates_ready(normalized_recent):
+        return AgentRuntimeState.READY
+    if any(re.search(pattern, normalized_recent, re.IGNORECASE | re.MULTILINE) for pattern in AGY_BUSY_PATTERNS):
+        return AgentRuntimeState.BUSY
+    if any(re.search(pattern, normalized_recent, re.IGNORECASE | re.MULTILINE) for pattern in AGY_STARTING_PATTERNS):
+        return AgentRuntimeState.STARTING
+    if not current_command:
+        return AgentRuntimeState.STARTING
+    if normalized_visible or normalized_recent:
+        return AgentRuntimeState.BUSY
+    return AgentRuntimeState.BUSY
+
+
+def _opencode_like_surface_has_launch_signal(vendor: Vendor, surface: str) -> bool:
+    normalized = _normalize_opencode_surface(surface)
+    compact = _compact_opencode_surface(surface)
+    if vendor == Vendor.MIMO:
+        return (
+            bool(re.search(r"\bBuild\s*·\s*MiMo", normalized, re.IGNORECASE))
+            or _matches_opencode_surface(
+                normalized,
+                compact,
+                patterns=(*MIMO_READY_PROMPT_PATTERNS, *MIMO_READY_FOOTER_PATTERNS, *MIMO_BUSY_PATTERNS),
+                compact_patterns=(
+                    *MIMO_READY_PROMPT_COMPACT_PATTERNS,
+                    *MIMO_READY_FOOTER_COMPACT_PATTERNS,
+                    *MIMO_BUSY_COMPACT_PATTERNS,
+                ),
+            )
+        )
+    return bool(re.search(r"\bBuild\s*·", normalized, re.IGNORECASE))
+
+
 def read_text_tail(path: str | Path, max_lines: int = 40) -> str:
     file_path = Path(path)
     if not file_path.exists():
@@ -2113,6 +2362,8 @@ def build_reasoning_note(
         parts.append(f"{vendor.value}_model={resolved.resolved_model}")
         if resolved.resolved_variant:
             parts.append(f"{vendor.value}_variant={resolved.resolved_variant}")
+    if vendor == Vendor.AGY:
+        parts.append(f"agy_model={resolved.resolved_model}")
     return "; ".join(parts)
 
 
@@ -2363,6 +2614,56 @@ class OpenCodeOutputDetector(BaseOutputDetector):
         return super().extract_last_message("\n".join(lines))
 
 
+class MimoOutputDetector(BaseOutputDetector):
+    def classify_agent_state(self, observation: WorkerObservation) -> AgentRuntimeState:
+        base_state = super().classify_agent_state(observation)
+        if base_state != AgentRuntimeState.BUSY:
+            return base_state
+        return _classify_mimo_surface_state(
+            visible_text=self.current_visible_text(observation),
+            recent_log=self.recent_log_text(observation),
+            current_command=observation.current_command,
+        )
+
+    def extract_last_message(self, output: str) -> str:
+        clean_output = clean_ansi(output)
+        lines: list[str] = []
+        for line in clean_output.splitlines():
+            normalized = line.strip()
+            if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in MIMO_FOOTER_PATTERNS):
+                continue
+            if re.search(r"esc interrupt", normalized, re.IGNORECASE):
+                continue
+            lines.append(line)
+        return super().extract_last_message("\n".join(lines))
+
+
+class AgyOutputDetector(BaseOutputDetector):
+    def classify_agent_state(self, observation: WorkerObservation) -> AgentRuntimeState:
+        base_state = super().classify_agent_state(observation)
+        if base_state != AgentRuntimeState.BUSY:
+            return base_state
+        return _classify_agy_surface_state(
+            visible_text=self.current_visible_text(observation),
+            recent_log=self.recent_log_text(observation),
+            current_command=observation.current_command,
+        )
+
+    def extract_last_message(self, output: str) -> str:
+        clean_output = clean_ansi(output)
+        lines: list[str] = []
+        for line in clean_output.splitlines():
+            normalized = line.strip()
+            if normalized == ">" or normalized.startswith("> "):
+                continue
+            if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in AGY_FOOTER_PATTERNS):
+                continue
+            if any(re.search(pattern, normalized, re.IGNORECASE) for pattern in AGY_BUSY_PATTERNS):
+                continue
+            lines.append(line)
+        return super().extract_last_message("\n".join(lines))
+
+
 def build_output_detector(vendor: Vendor) -> BaseOutputDetector:
     if vendor == Vendor.CODEX:
         return CodexOutputDetector()
@@ -2370,8 +2671,12 @@ def build_output_detector(vendor: Vendor) -> BaseOutputDetector:
         return ClaudeOutputDetector()
     if vendor == Vendor.GEMINI:
         return GeminiOutputDetector()
-    if _is_opencode_like_vendor(vendor):
+    if vendor == Vendor.OPENCODE:
         return OpenCodeOutputDetector()
+    if vendor == Vendor.MIMO:
+        return MimoOutputDetector()
+    if vendor == Vendor.AGY:
+        return AgyOutputDetector()
     raise ValueError(f"不支持的厂商: {vendor}")
 
 
@@ -2436,10 +2741,12 @@ def classify_agent_runtime_state(
             surface = "\n".join(
                 part for part in (observation.visible_text, observation.raw_log_tail) if str(part or "").strip()
             )
-        if _is_opencode_like_vendor(context.vendor) and (
-                re.search(r"\bBuild\s*·", _normalize_opencode_surface(surface), re.IGNORECASE)
+        if _is_opencode_like_vendor(context.vendor) and _opencode_like_surface_has_launch_signal(
+                context.vendor,
+                surface,
         ):
-            surface_state = _classify_opencode_surface_state(
+            surface_state = _classify_opencode_like_surface_state(
+                vendor=context.vendor,
                 visible_text=observation.visible_text,
                 recent_log=observation.raw_log_tail,
                 current_command=current_command,
@@ -2475,7 +2782,8 @@ def classify_agent_runtime_state(
             ):
                 return AgentRuntimeState.READY
         elif _is_opencode_like_vendor(context.vendor):
-            surface_state = _classify_opencode_surface_state(
+            surface_state = _classify_opencode_like_surface_state(
+                vendor=context.vendor,
                 visible_text=observation.visible_text,
                 recent_log=observation.raw_log_tail,
                 current_command=current_command,
@@ -2561,6 +2869,7 @@ class AgentRunConfig:
             Vendor.GEMINI: ("gemini", "node"),
             Vendor.OPENCODE: ("opencode", "node"),
             Vendor.MIMO: ("mimo", "node"),
+            Vendor.AGY: ("agy", "node"),
         }[self.vendor]
 
     def submit_enter_count(self) -> int:
@@ -2609,6 +2918,13 @@ class AgentRunConfig:
                 "--pure",
                 "--model",
                 resolution.resolved_model,
+            ]
+        elif self.vendor == Vendor.AGY:
+            args = [
+                "agy",
+                "--model",
+                resolution.resolved_model,
+                "--dangerously-skip-permissions",
             ]
         else:
             raise ValueError(f"不支持的厂商: {self.vendor}")
@@ -2761,7 +3077,17 @@ class TmuxBatchWorker:
                 self.agent_state = AgentRuntimeState(existing_agent_state)
             self.agent_ready = self.agent_state == AgentRuntimeState.READY
             self.wrapper_state = WrapperState.READY if self.agent_ready else WrapperState.NOT_READY
-            for key in ("project_dir", "requirement_name", "workflow_action", "stage_seq", "run_id"):
+            for key in (
+                "project_dir",
+                "requirement_name",
+                "workflow_action",
+                "stage_seq",
+                "run_id",
+                "agent_role",
+                "role_name",
+                "reviewer_key",
+                "role_prompt",
+            ):
                 if key in existing_state and key not in self._runtime_metadata:
                     self._runtime_metadata[key] = existing_state.get(key)
         self._session_name_reserved = bool(reserved_session_name)
@@ -3390,7 +3716,17 @@ class TmuxBatchWorker:
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
             }
-            for key in ("project_dir", "requirement_name", "workflow_action", "stage_seq", "run_id"):
+            for key in (
+                "project_dir",
+                "requirement_name",
+                "workflow_action",
+                "stage_seq",
+                "run_id",
+                "agent_role",
+                "role_name",
+                "reviewer_key",
+                "role_prompt",
+            ):
                 if key in previous and key not in self._runtime_metadata:
                     self._runtime_metadata[key] = previous.get(key)
             payload.update(self._runtime_metadata)
@@ -3421,6 +3757,8 @@ class TmuxBatchWorker:
                     or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
                     or title in {"OpenCode", "MiMoCode", "MiMo Code"}
             )
+        if self.config.vendor == Vendor.AGY:
+            return not self.agent_started or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
         if self.config.vendor == Vendor.GEMINI:
             return not self.agent_started or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
         if not self.agent_started:
@@ -3555,6 +3893,18 @@ class TmuxBatchWorker:
                     or str(previous.get("dispatch_state", "")) == "submitted"
                 )
             )
+            clear_stale_reconfig_markers = (
+                snapshot.agent_state == AgentRuntimeState.READY.value
+                and not previous_completed
+                and (
+                    str(previous.get("note", "") or "").strip().lower() == "awaiting_reconfig"
+                    or str(previous.get("health_status", "") or "").strip().lower()
+                    in {"awaiting_reconfig", "recoverable_startup_failure"}
+                )
+                and str(previous.get("current_task_runtime_status", "") or "").strip().lower() != TASK_STATUS_RUNNING
+                and str(previous.get("dispatch_state", "") or "").strip().lower()
+                not in {"submitting", "submitted", "running"}
+            )
             health_changed = (
                 str(previous.get("health_status", "unknown")) != snapshot.health_status
                 or str(previous.get("health_note", "")) != snapshot.health_note
@@ -3568,7 +3918,7 @@ class TmuxBatchWorker:
                 or str(previous.get("dispatch_state", "")).strip() == "submitted"
                 or str(previous.get("current_task_runtime_status", "") or "").strip().lower() in {"", TASK_STATUS_RUNNING}
             )
-            if health_changed or clear_stale_runtime_markers or normalize_completed_runtime_markers:
+            if health_changed or clear_stale_runtime_markers or clear_stale_reconfig_markers or normalize_completed_runtime_markers:
                 payload = dict(previous)
                 payload.update(self.runtime_metadata())
                 payload.update(
@@ -3587,10 +3937,12 @@ class TmuxBatchWorker:
                         "last_heartbeat_at": snapshot.last_heartbeat_at,
                     }
                 )
-                if clear_stale_runtime_markers:
+                if clear_stale_runtime_markers or clear_stale_reconfig_markers:
                     payload["current_task_runtime_status"] = ""
                     payload["dispatch_state"] = ""
                     payload["dispatch_reason"] = ""
+                    if str(payload.get("note", "") or "").strip().lower() == "awaiting_reconfig":
+                        payload["note"] = "agent_ready"
                     if str(payload.get("result_status", "")) in {"running", "pending"}:
                         payload["result_status"] = WorkerStatus.READY.value
                     if str(payload.get("status", "")) in {"running", "pending"}:
@@ -4295,7 +4647,11 @@ class TmuxBatchWorker:
         agent_state = self.get_agent_state(observation)
         if agent_state == AgentRuntimeState.READY:
             ready_evidence = "agent_state"
-        elif decision_status == TASK_RESULT_HITL and self._observation_indicates_ready_or_idle_surface(observation):
+        elif (
+            decision_status in {TASK_RESULT_COMPLETED, TASK_RESULT_HITL}
+            and self._terminal_idle_elapsed_sec() >= TASK_CONTRACT_STALL_IDLE_SEC
+            and self._observation_indicates_ready_or_idle_surface(observation)
+        ):
             ready_evidence = "idle_surface"
         else:
             return None
@@ -4417,7 +4773,13 @@ class TmuxBatchWorker:
             return None
         if result_path.exists():
             return None
+        ask_human_path = contract.optional_artifacts.get("ask_human") or contract.required_artifacts.get("ask_human")
+        ask_human_text = self._contract_artifact_text(contract, "ask_human")
         status = self._a07_legacy_task_result_status_from_delta(observation.raw_log_delta)
+        if status == TASK_RESULT_READY and ask_human_text:
+            status = ""
+        elif status == TASK_RESULT_HITL and (ask_human_path is None or not ask_human_text):
+            status = ""
         if not status:
             status = self._a07_legacy_task_result_status_from_observation_tail(
                 contract=contract,
@@ -4426,8 +4788,6 @@ class TmuxBatchWorker:
             )
         if not status or status not in set(contract.expected_statuses):
             return None
-        ask_human_path = contract.optional_artifacts.get("ask_human") or contract.required_artifacts.get("ask_human")
-        ask_human_text = self._contract_artifact_text(contract, "ask_human")
         if status == TASK_RESULT_READY and ask_human_text:
             return None
         if status == TASK_RESULT_HITL and (ask_human_path is None or not ask_human_text):
@@ -5380,6 +5740,18 @@ class TmuxBatchWorker:
         self.send_special_key("Enter")
         return True
 
+    def _maybe_handle_mimo_boot_prompt(self, visible_text: str) -> bool:
+        if self.config.vendor != Vendor.MIMO:
+            return False
+        recent_output = "\n".join(str(visible_text or "").splitlines()[-80:])
+        if not all(re.search(pattern, recent_output, re.IGNORECASE) for pattern in MIMO_TRUST_PROMPT_PATTERNS):
+            return False
+        action_signature = f"mimo-trust:{hashlib.sha1(recent_output.encode('utf-8')).hexdigest()[:12]}"
+        if not self._boot_action_allowed(action_signature):
+            return False
+        self.send_special_key("Enter")
+        return True
+
     def _task_runtime_dir(self) -> Path:
         path = self.runtime_dir / "task_runtime"
         path.mkdir(parents=True, exist_ok=True)
@@ -5769,10 +6141,18 @@ class TmuxBatchWorker:
                 )
             )
         if _is_opencode_like_vendor(self.config.vendor):
-            state = _classify_opencode_surface_state(
+            state = _classify_opencode_like_surface_state(
+                vendor=self.config.vendor,
                 visible_text=recent_output,
                 recent_log="",
                 current_command=self.current_command or "node",
+            )
+            return state == AgentRuntimeState.STARTING
+        if self.config.vendor == Vendor.AGY:
+            state = _classify_agy_surface_state(
+                visible_text=recent_output,
+                recent_log="",
+                current_command=self.current_command or "agy",
             )
             return state == AgentRuntimeState.STARTING
         return False
@@ -5800,10 +6180,18 @@ class TmuxBatchWorker:
                 return False
             return any(re.search(pattern, recent_output, re.IGNORECASE) for pattern in GEMINI_INPUT_BOX_PATTERNS + GEMINI_READY_PATTERNS)
         if _is_opencode_like_vendor(self.config.vendor):
-            state = _classify_opencode_surface_state(
+            state = _classify_opencode_like_surface_state(
+                vendor=self.config.vendor,
                 visible_text=recent_output,
                 recent_log=raw_log_tail,
                 current_command=current_command or self.current_command or "node",
+            )
+            return state == AgentRuntimeState.READY
+        if self.config.vendor == Vendor.AGY:
+            state = _classify_agy_surface_state(
+                visible_text=recent_output,
+                recent_log=raw_log_tail,
+                current_command=current_command or self.current_command or "agy",
             )
             return state == AgentRuntimeState.READY
         return False
@@ -5923,6 +6311,12 @@ class TmuxBatchWorker:
                 current_command=current_command,
         ):
             return WrapperState.READY
+        if self.config.vendor == Vendor.AGY and self.agent_started and self._visible_indicates_agent_ready(
+                visible_text,
+                raw_log_tail,
+                current_command=current_command,
+        ):
+            return WrapperState.READY
         return WrapperState.NOT_READY
 
     def _mark_agent_ready_from_observation(
@@ -6011,6 +6405,7 @@ class TmuxBatchWorker:
         deadline = time.monotonic() + timeout_sec
         previous_ready_signature = ""
         stable_count = 0
+        shell_after_ready_since = 0.0
         while time.monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for agent ready")
             observation = self.observe(tail_lines=220)
@@ -6027,6 +6422,8 @@ class TmuxBatchWorker:
                 or self._maybe_handle_codex_boot_prompt(fallback_visible)
                 or self._maybe_handle_gemini_boot_prompt(visible)
                 or self._maybe_handle_gemini_boot_prompt(fallback_visible)
+                or self._maybe_handle_mimo_boot_prompt(visible)
+                or self._maybe_handle_mimo_boot_prompt(fallback_visible)
             ):
                 time.sleep(0.6)
                 previous_ready_signature = ""
@@ -6054,8 +6451,18 @@ class TmuxBatchWorker:
                 if stable_count >= 2 and ready_signature:
                     self._mark_agent_ready_from_observation(observation)
                     return
+                shell_after_ready_since = 0.0
             elif current_command in SHELL_COMMANDS and previous_ready_signature:
+                if self.config.vendor == Vendor.CODEX:
+                    now = time.monotonic()
+                    if not shell_after_ready_since:
+                        shell_after_ready_since = now
+                    if now - shell_after_ready_since < CODEX_TRANSIENT_SHELL_START_GRACE_SEC:
+                        time.sleep(0.5)
+                        continue
                 raise RuntimeError(f"agent exited back to shell while starting:\n{visible}")
+            else:
+                shell_after_ready_since = 0.0
 
             previous_ready_signature = ready_signature if self._agent_running(current_command) else ""
             time.sleep(0.5)

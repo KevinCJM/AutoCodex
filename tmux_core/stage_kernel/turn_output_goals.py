@@ -18,6 +18,7 @@ from tmux_core.runtime.tmux_runtime import (
     TASK_RESULT_CONTRACT_ERROR_PREFIX,
     TURN_ARTIFACT_CONTRACT_ERROR_PREFIX,
     TmuxBatchWorker,
+    is_stale_busy_without_contract_error,
     is_task_result_contract_error,
     is_turn_artifact_contract_error,
 )
@@ -348,6 +349,8 @@ def run_task_result_turn_with_repair(
             payload = parse_result_payload(result.clean_output)
         else:
             current_error = RuntimeError(result.clean_output or f"{current_label} 执行失败")
+            if is_stale_busy_without_contract_error(current_error):
+                raise current_error
 
         current_task_result_path = str(getattr(worker, "current_task_result_path", "") or "").strip()
         if not current_task_result_path:

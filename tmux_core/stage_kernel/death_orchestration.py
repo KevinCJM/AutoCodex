@@ -138,6 +138,7 @@ def drop_dead_reviewers(
                 error=_build_dead_ready_error(current_reviewer, role_label=label),
                 allow_recreate=replace_reviewer is not None,
                 allow_worker_dead=True,
+                noninteractive_default=AGENT_INTERVENTION_WORKER_DEAD,
             )
             if decision == AGENT_INTERVENTION_WORKER_DEAD:
                 _kill_worker_best_effort(current_reviewer)
@@ -217,6 +218,7 @@ def _request_ready_intervention(
     error: Exception,
     allow_recreate: bool,
     allow_worker_dead: bool,
+    noninteractive_default: str | None = None,
 ) -> str:
     return request_worker_manual_intervention(
         stage_label="阶段调度",
@@ -225,6 +227,7 @@ def _request_ready_intervention(
         reason_text=_ready_error_reason(error),
         allow_recreate=allow_recreate,
         allow_worker_dead=allow_worker_dead,
+        noninteractive_default=noninteractive_default,
     )
 
 
@@ -268,6 +271,7 @@ def _ensure_main_ready_with_replacement(
             error=error,
             allow_recreate=True,
             allow_worker_dead=False,
+            noninteractive_default=AGENT_INTERVENTION_RECREATE,
         )
         if decision == AGENT_INTERVENTION_RECREATE:
             current_main = replace_dead_main_owner(current_main)
@@ -399,6 +403,7 @@ def run_reviewer_phase_with_death_handling(
                 error=error,
                 allow_recreate=replace_dead_reviewer is not None,
                 allow_worker_dead=True,
+                noninteractive_default=AGENT_INTERVENTION_WORKER_DEAD,
             )
             if decision == AGENT_INTERVENTION_WORKER_DEAD:
                 _kill_worker_best_effort(current_reviewer)

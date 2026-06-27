@@ -26,6 +26,7 @@ _EVENT_SCOPE_BY_TYPE = {
     "hitl_answer": "hitl",
     "review_merged": "review",
     "overall_review_merged": "review",
+    "prepare_ba_revision": "review",
     "feedback_written": "review",
     "change_after_review": "task",
     "change_after_overall_review": "stage",

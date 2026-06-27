@@ -106,6 +106,7 @@ type FooterStatusHostProps = {
   status: string
   progressLine: string
   pendingHitl: boolean
+  pendingAttention: boolean
   height: number
 }
 
@@ -200,10 +201,15 @@ const EMPTY_OVERALL_REVIEW_SNAPSHOT: OverallReviewSnapshot = {
 
 const EMPTY_HITL_SNAPSHOT: HitlSnapshot = {
   pending: false,
+  promptId: '',
+  promptType: '',
   questionPath: '',
   answerPath: '',
   summary: '',
   attachCommand: '',
+  recoveryKind: '',
+  reasonText: '',
+  targetPaths: [],
 }
 
 const EMPTY_ARTIFACTS_SNAPSHOT: ArtifactsSnapshot = {
@@ -339,12 +345,18 @@ function buildPromptBackedAttentionSnapshot(active: PromptState | null, fallback
 function buildPromptBackedHitlSnapshot(active: PromptState | null, fallback: HitlSnapshot): HitlSnapshot {
   if (!isHitlPrompt(active)) return fallback
   const title = String(active?.payload.title ?? active?.payload.prompt_text ?? '').trim()
+  const targetPaths = normalizeStringList(active?.payload.target_paths ?? active?.payload.targetPaths)
   return {
     pending: true,
+    promptId: active?.id || fallback.promptId,
+    promptType: active?.promptType || fallback.promptType,
     questionPath: resolveHitlQuestionPath(active?.payload) || fallback.questionPath,
     answerPath: resolveHitlAnswerPath(active?.payload) || fallback.answerPath,
     summary: title || fallback.summary || '存在待处理 HITL',
     attachCommand: resolveAgentAttachCommand(active?.payload) || fallback.attachCommand,
+    recoveryKind: stringPromptPayloadValue(active?.payload.recovery_kind ?? active?.payload.recoveryKind) || fallback.recoveryKind,
+    reasonText: stringPromptPayloadValue(active?.payload.reason_text ?? active?.payload.reasonText) || fallback.reasonText,
+    targetPaths: targetPaths.length > 0 ? targetPaths : fallback.targetPaths,
   }
 }
 
@@ -409,7 +421,7 @@ function FooterPromptHost(props: FooterPromptHostProps) {
   const hitlHints = createMemo(() => {
     if (!isHitlPrompt(props.active)) return []
     const questionPath = resolveHitlQuestionPath(props.active.payload)
-    const lines: string[] = [...buildAgentRecoveryHintLines(props.active.payload)]
+    const lines: string[] = [...buildPromptHintLines(props.active.payload)]
     if (questionPath) lines.push(`问题文件: ${questionPath.split('/').pop() || questionPath}`)
     lines.push('Ctrl+K 查看完整问题')
     if (!questionPath) return lines
@@ -489,6 +501,12 @@ function normalizeAttachCommand(value: unknown): string {
   return stringPromptPayloadValue(value)
 }
 
+function normalizeStringList(value: unknown): string[] {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean)
+  const text = String(value ?? '').trim()
+  return text ? [text] : []
+}
+
 function promptIsAgentRecovery(payload: Record<string, unknown>): boolean {
   const recoveryKind = stringPromptPayloadValue(payload.recovery_kind ?? payload.recoveryKind)
   if (recoveryKind === 'agent_manual_intervention' || recoveryKind === 'agent_ready_timeout') return true
@@ -522,9 +540,21 @@ function buildAgentRecoveryHintLines(payload: Record<string, unknown>): string[]
   return attachCommand ? [attachCommand] : []
 }
 
+function buildPromptHintLines(payload: Record<string, unknown>): string[] {
+  const lines: string[] = [...buildAgentRecoveryHintLines(payload)]
+  const attachCommand = resolveAgentAttachCommand(payload)
+  if (attachCommand && !lines.includes(attachCommand)) lines.push(attachCommand)
+  const reasonText = stringPromptPayloadValue(payload.reason_text ?? payload.reasonText)
+  const reasonLines = reasonText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 3)
+  lines.push(...reasonLines.map((line, index) => (index === 0 ? `原因: ${line}` : line)))
+  const targetPaths = normalizeStringList(payload.target_paths ?? payload.targetPaths).slice(0, 3)
+  lines.push(...targetPaths.map((path) => `文件: ${path}`))
+  return lines
+}
+
 function DialogPromptLayer(props: { active: PromptState; dialogActive: boolean; onSubmit: (value: unknown) => void }) {
   const hasPreview = createMemo(() => Boolean(resolvePreviewPath(props.active.payload)))
-  const hintLines = createMemo(() => buildAgentRecoveryHintLines(props.active.payload))
+  const hintLines = createMemo(() => buildPromptHintLines(props.active.payload))
   const selectOptions = createMemo(() => withPromptBackOption(
     Array.isArray(props.active.payload.options) ? (props.active.payload.options as { value: string; label: string }[]) : [],
     props.active.payload,
@@ -612,16 +642,18 @@ function FooterStatusHost(props: FooterStatusHostProps) {
   const isError = createMemo(() => props.status === 'error' || props.status === 'failed')
   const isCompleted = createMemo(() => ['completed', 'succeeded', 'done'].includes(normalizedStatus()))
   const isWaitingForHitl = createMemo(() => props.pendingHitl && !isError())
+  const isWaitingForHumanInput = createMemo(() => (props.pendingHitl || props.pendingAttention) && !isError())
   const isRunning = createMemo(() => !isError() && !isCompleted() && (props.status === 'running' || Boolean(props.progressLine.trim())))
   const isBooting = createMemo(() => !isError() && !isCompleted() && props.status === 'booting')
   const title = createMemo(() => {
-    if (isWaitingForHitl()) return '等待人工输入'
+    if (isWaitingForHumanInput()) return '等待人工输入'
     if (isError()) return '运行失败'
     if (isCompleted()) return '已完成'
     return isRunning() ? '运行中' : '等待中'
   })
   const primaryLine = createMemo(() => {
     if (isWaitingForHitl()) return '存在待处理 HITL，请回复问题。'
+    if (props.pendingAttention && !isError()) return '存在待处理人工输入，请完成当前选择或输入。'
     if (isError()) return '当前阶段发生错误，请查看上方日志。'
     if (isCompleted()) return '流程已完成，可退出界面。'
     if (props.progressLine.trim()) return props.progressLine
@@ -631,6 +663,7 @@ function FooterStatusHost(props: FooterStatusHostProps) {
   })
   const secondaryLine = createMemo(() => {
     if (isWaitingForHitl()) return '请根据右侧问题文件或日志内容继续回复。'
+    if (props.pendingAttention && !isError()) return '请在输入框或弹窗中完成当前选择。'
     if (isError()) return '请查看失败日志，修正配置后重新发起当前阶段。'
     if (isCompleted()) return '所有阶段已收尾，结果文件已写入项目目录。'
     return isRunning() ? '系统执行智能体任务中，输入框会在需要人类交互时自动恢复。' : '等待下一次人类输入或阶段调度。'
@@ -826,10 +859,15 @@ function buildDevelopmentStatusLines(snapshot: DevelopmentSnapshot): string[] {
 function normalizeHitlSnapshot(payload: Record<string, unknown>): HitlSnapshot {
   return {
     pending: Boolean(payload.pending),
+    promptId: String(payload.prompt_id ?? payload.promptId ?? ''),
+    promptType: String(payload.prompt_type ?? payload.promptType ?? ''),
     questionPath: String(payload.question_path ?? payload.questionPath ?? ''),
     answerPath: String(payload.answer_path ?? payload.answerPath ?? ''),
     summary: String(payload.summary ?? ''),
     attachCommand: String(payload.attach_command ?? payload.attachCommand ?? ''),
+    recoveryKind: String(payload.recovery_kind ?? payload.recoveryKind ?? ''),
+    reasonText: String(payload.reason_text ?? payload.reasonText ?? ''),
+    targetPaths: normalizeStringList(payload.target_paths ?? payload.targetPaths),
   }
 }
 
@@ -1752,6 +1790,7 @@ export function App(props: StartupOptions) {
             status={status()}
             progressLine={footerProgressLine()}
             pendingHitl={displayAppSnapshot().pendingHitl}
+            pendingAttention={displayAppSnapshot().pendingAttention}
             height={shellHeights().footer}
           />
         }

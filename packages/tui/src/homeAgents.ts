@@ -3,6 +3,7 @@ import type { HomeAgentItem, WorkerSnapshot } from './types'
 
 const LIVE_WORKER_HEALTH_STATUSES = new Set(['alive', 'observe_error', 'provider_auth_error'])
 const RUNNING_WORKER_STATUSES = new Set(['running', 'busy', 'submitted', 'submitting'])
+const COMPLETED_WORKER_STATUSES = new Set(['done', 'succeeded', 'completed'])
 const READY_WORKER_STATUSES = new Set(['done', 'succeeded', 'completed', 'ready', 'idle'])
 const FAILED_WORKER_STATUSES = new Set(['failed', 'stale_failed', 'error'])
 const STALE_MISSING_SESSION_LIVE_EVIDENCE_MS = 300_000
@@ -41,6 +42,7 @@ const VENDOR_LABELS: Record<string, string> = {
   gemini: 'Gemini',
   opencode: 'OpenCode',
   mimo: 'MiMo Code',
+  agy: 'AGY',
 }
 const EFFORT_LABELS: Record<string, string> = {
   high: 'High',
@@ -74,16 +76,22 @@ export function resolveHomeAgentState(worker: WorkerSnapshot): string {
   const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
   if (agentState === 'DEAD') return 'DEAD'
   if (
-    READY_WORKER_STATUSES.has(runtimeStatus) ||
-    READY_WORKER_STATUSES.has(resultStatus) ||
-    READY_WORKER_STATUSES.has(status)
+    COMPLETED_WORKER_STATUSES.has(runtimeStatus) ||
+    COMPLETED_WORKER_STATUSES.has(resultStatus) ||
+    COMPLETED_WORKER_STATUSES.has(status)
   ) return 'READY'
-  if (RUNNING_WORKER_STATUSES.has(runtimeStatus) && agentState !== 'READY') return 'BUSY'
+  if (RUNNING_WORKER_STATUSES.has(runtimeStatus) && agentState === 'BUSY') return 'BUSY'
   if (FAILED_WORKER_STATUSES.has(resultStatus) || FAILED_WORKER_STATUSES.has(status)) return 'READY'
   if (agentState === 'STARTING') return 'STARTING'
   if (agentState === 'BUSY') return 'BUSY'
   if (agentState === 'READY') return 'READY'
   if (healthStatus === 'dead') return 'DEAD'
+  if (
+    READY_WORKER_STATUSES.has(runtimeStatus) ||
+    READY_WORKER_STATUSES.has(resultStatus) ||
+    READY_WORKER_STATUSES.has(status)
+  ) return 'READY'
+  if (RUNNING_WORKER_STATUSES.has(runtimeStatus)) return 'BUSY'
   if (RUNNING_WORKER_STATUSES.has(resultStatus)) return 'BUSY'
   if (RUNNING_WORKER_STATUSES.has(status)) return 'BUSY'
   return 'UNKNOWN'

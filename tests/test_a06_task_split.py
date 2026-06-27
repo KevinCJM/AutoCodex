@@ -28,9 +28,11 @@ from A06_TaskSplit import (
     initialize_task_split_workers,
     resolve_review_max_rounds,
     run_ba_modify_loop,
+    run_task_split_review_limit_hitl_loop,
     run_task_split_stage,
 )
 from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
+from tmux_core.stage_kernel.stage_audit import begin_stage_audit_run
 from tmux_core.stage_kernel.shared_review import ReviewerRuntime
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 from T08_pre_development import build_pre_development_task_record_path
@@ -1324,6 +1326,103 @@ class A06TaskSplitTests(unittest.TestCase):
         self.assertEqual(turn_mock.call_count, 2)
         hitl_input_mock.assert_called_once()
 
+    def test_review_limit_hitl_consumes_human_reply_before_followup_turn(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_task_split_paths(project_dir, "需求A")
+            paths["task_md_path"].write_text("任务单\n", encoding="utf-8")
+            paths["merged_review_path"].write_text("评审未通过\n", encoding="utf-8")
+            handoff = RequirementsAnalystHandoff(
+                worker=_FakeWorker(session_name="需求分析师-天机星"),
+                vendor="codex",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            audit_context = begin_stage_audit_run(project_dir, "需求A", "A06")
+            turn_labels: list[str] = []
+            ask_human_seen_by_followup: list[str] = []
+
+            def fake_run_ba_turn_with_recovery(current_handoff, **kwargs):  # noqa: ANN001
+                label = str(kwargs["label"])
+                turn_labels.append(label)
+                if label == "task_split_review_limit_hitl":
+                    paths["ask_human_path"].write_text("请选择任务拆分粒度\n", encoding="utf-8")
+                    return current_handoff, {"status": "hitl"}
+                ask_human_seen_by_followup.append(paths["ask_human_path"].read_text(encoding="utf-8"))
+                paths["ba_feedback_path"].write_text("已按人类回复修订\n", encoding="utf-8")
+                return current_handoff, {"status": "completed"}
+
+            with patch("A06_TaskSplit.run_ba_turn_with_recovery", side_effect=fake_run_ba_turn_with_recovery):
+                result = run_task_split_review_limit_hitl_loop(
+                    handoff,
+                    project_dir=project_dir,
+                    paths=paths,
+                    review_msg="评审意见",
+                    review_limit=5,
+                    review_rounds_used=5,
+                    human_input_provider=lambda _question_path, _hitl_round: "按方案 A 继续",
+                    audit_context=audit_context,
+                )
+            hitl_record_text = paths["hitl_record_path"].read_text(encoding="utf-8")
+            audit_events = [
+                json.loads(line)
+                for line in audit_context.audit_log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertEqual(turn_labels, ["task_split_review_limit_hitl", "task_split_review_limit_human_reply"])
+        self.assertEqual(ask_human_seen_by_followup, [""])
+        self.assertTrue(result.post_hitl_continue_completed)
+        self.assertIn("按方案 A 继续", hitl_record_text)
+        self.assertTrue(any(event["event_type"] == "hitl_question" for event in audit_events))
+        answer_events = [event for event in audit_events if event["event_type"] == "hitl_answer"]
+        self.assertEqual(len(answer_events), 1)
+        self.assertEqual(answer_events[0]["snapshots"]["human_answer"], "按方案 A 继续")
+
+    def test_review_limit_hitl_provider_failure_keeps_question_pending(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_task_split_paths(project_dir, "需求A")
+            paths["task_md_path"].write_text("任务单\n", encoding="utf-8")
+            paths["merged_review_path"].write_text("评审未通过\n", encoding="utf-8")
+            handoff = RequirementsAnalystHandoff(
+                worker=_FakeWorker(session_name="需求分析师-天机星"),
+                vendor="codex",
+                model="gpt-5.5",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            audit_context = begin_stage_audit_run(project_dir, "需求A", "A06")
+
+            def fake_run_ba_turn_with_recovery(current_handoff, **_kwargs):  # noqa: ANN001
+                paths["ask_human_path"].write_text("请选择任务拆分粒度\n", encoding="utf-8")
+                return current_handoff, {"status": "hitl"}
+
+            def failing_provider(_question_path, _hitl_round):  # noqa: ANN001
+                raise RuntimeError("prompt requester disconnected")
+
+            with patch("A06_TaskSplit.run_ba_turn_with_recovery", side_effect=fake_run_ba_turn_with_recovery):
+                with self.assertRaisesRegex(RuntimeError, "requester disconnected"):
+                    run_task_split_review_limit_hitl_loop(
+                        handoff,
+                        project_dir=project_dir,
+                        paths=paths,
+                        review_msg="评审意见",
+                        review_limit=5,
+                        review_rounds_used=5,
+                        human_input_provider=failing_provider,
+                        audit_context=audit_context,
+                    )
+            ask_human_text = paths["ask_human_path"].read_text(encoding="utf-8")
+            audit_events = [
+                json.loads(line)
+                for line in audit_context.audit_log_path.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+        self.assertEqual(ask_human_text, "请选择任务拆分粒度\n")
+        self.assertTrue(any(event["event_type"] == "hitl_question" for event in audit_events))
+        self.assertFalse(any(event["event_type"] == "hitl_answer" for event in audit_events))
+
     def test_run_task_split_stage_round_two_reuses_reviewers_and_generates_task_json(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -1434,12 +1533,21 @@ class A06TaskSplitTests(unittest.TestCase):
                     ba_handoff=ba_handoff,
                     reviewer_handoff=reviewer_handoff,
                 )
+            audit_events = [
+                json.loads(line)
+                for line in (project_dir / "需求A_A06_流水记录.jsonl").read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
 
         self.assertIsInstance(result, TaskSplitStageResult)
         self.assertTrue(result.passed)
         self.assertEqual(parallel_reviewers.call_count, 2)
         modify_loop.assert_called_once()
         generate_json.assert_called_once()
+        prepare_events = [event for event in audit_events if event["event_type"] == "prepare_ba_revision"]
+        self.assertEqual(len(prepare_events), 1)
+        self.assertEqual(prepare_events[0]["review_round_index"], 2)
+        self.assertEqual(prepare_events[0]["metadata"]["trigger"], "review_failed_prepare_ba_revision")
 
     def test_generate_task_split_json_retries_with_repair_prompt_and_clears_stale_json(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

@@ -225,6 +225,18 @@ def _load_routing_json(path: Path) -> dict[str, object]:
     return payload
 
 
+def _routing_ref_text(value: object, *, expected_kind: str, field_name: str) -> tuple[str, str]:
+    if isinstance(value, dict):
+        ref_text = str(value.get("ref", "")).strip()
+        kind_text = str(value.get("kind", "")).strip()
+        if not ref_text:
+            return "", f"{field_name} 引用缺少 ref: {value}"
+        if kind_text and kind_text != expected_kind:
+            return "", f"{field_name} 引用 kind 非预期: {kind_text!r} != {expected_kind!r}: {value}"
+        return ref_text, ""
+    return str(value).strip(), ""
+
+
 def routing_layer_artifact_errors(work_dir: str | Path) -> list[str]:
     root = resolve_existing_directory(work_dir)
     missing = missing_routing_layer_files(root)
@@ -277,13 +289,43 @@ def routing_layer_artifact_errors(work_dir: str | Path) -> list[str]:
             continue
         route_id = str(route.get("id", "")).strip() or "unknown_route"
         for module_id in route.get("first_read_modules", ()) or ():
-            module_id_text = str(module_id).strip()
+            module_id_text, ref_error = _routing_ref_text(
+                module_id,
+                expected_kind="module",
+                field_name=f"route {route_id} first_read_modules",
+            )
+            if ref_error:
+                errors.append(ref_error)
+                continue
             if module_id_text and module_id_text not in module_ids:
                 errors.append(f"route {route_id} first_read_modules 引用不存在模块: {module_id_text}")
         for pitfall_id in route.get("pitfall_ids", ()) or ():
-            pitfall_id_text = str(pitfall_id).strip()
+            pitfall_id_text, ref_error = _routing_ref_text(
+                pitfall_id,
+                expected_kind="pitfall",
+                field_name=f"route {route_id} pitfall_ids",
+            )
+            if ref_error:
+                errors.append(ref_error)
+                continue
             if pitfall_id_text and pitfall_id_text not in pitfall_ids:
                 errors.append(f"route {route_id} pitfall_ids 引用不存在风险: {pitfall_id_text}")
+    for pitfall in (pitfall_items if isinstance(pitfall_items, list) else ()):
+        if not isinstance(pitfall, dict):
+            errors.append("docs/pitfalls.json pitfalls[] 项必须是 object")
+            continue
+        pitfall_id = str(pitfall.get("id", "")).strip() or "unknown_pitfall"
+        for module_id in pitfall.get("affected_modules", ()) or ():
+            module_id_text, ref_error = _routing_ref_text(
+                module_id,
+                expected_kind="module",
+                field_name=f"pitfall {pitfall_id} affected_modules",
+            )
+            if ref_error:
+                errors.append(ref_error)
+                continue
+            if module_id_text and module_id_text not in module_ids:
+                errors.append(f"pitfall {pitfall_id} affected_modules 引用不存在模块: {module_id_text}")
     return errors
 
 

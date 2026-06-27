@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -33,10 +34,12 @@ from A08_OverallReview import (
     run_overall_review_stage,
     run_overall_review_turn_with_recreation,
     build_reviewer_workers,
+    _runtime_payload_reusable_for_handoff,
     _run_overall_review_developer_turn,
     _shutdown_workers as shutdown_overall_review_workers,
 )
 from tmux_core.runtime.contracts import TaskResultContract, resolve_task_result_decision
+from tmux_core.runtime.tmux_runtime import TASK_RESULT_CONTRACT_ERROR_PREFIX
 from tmux_core.stage_kernel.shared_review import ReviewAgentHandoff, ReviewAgentSelection, ReviewerRuntime
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
@@ -582,6 +585,67 @@ class A08OverallReviewTests(unittest.TestCase):
         self.assertEqual(calls[0]["repair_result_contract"].mode, "a08_developer_refine_all_code")
         self.assertEqual(calls[0]["result_contract"].expected_statuses, ("completed",))
         self.assertEqual(calls[0]["repair_result_contract"].expected_statuses, ("completed",))
+
+    def test_overall_review_refine_turn_finalizes_fresh_output_after_stale_busy_contract_error(self):
+        class RecordingWorker(_FakeWorker):
+            def __init__(self, **kwargs):  # noqa: ANN003
+                super().__init__(**kwargs)
+                self.write_state_calls: list[tuple[str, str, dict[str, object]]] = []
+
+            def _write_state(self, status, *, note, extra=None):  # noqa: ANN001
+                status_text = str(getattr(status, "value", status))
+                extra_payload = dict(extra or {})
+                self.write_state_calls.append((status_text, note, extra_payload))
+                self._state_payload.update({"status": status_text, "note": note, **extra_payload})
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            paths = build_overall_review_paths(root, "需求A")
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            time.sleep(0.02)
+            paths["developer_output_path"].write_text("- **完成任务**: `全面复核修订`\n", encoding="utf-8")
+            result_path = root / "task_result.json"
+            worker = RecordingWorker(
+                session_name="开发工程师-地暴星",
+                state_payload={
+                    "health_status": "alive",
+                    "agent_state": "BUSY",
+                    "current_task_status_path": str(task_status_path),
+                    "current_task_result_path": str(result_path),
+                },
+            )
+            worker.current_task_status_path = str(task_status_path)
+            worker.current_task_result_path = str(result_path)
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.5", "xhigh", ""),
+                worker=worker,
+                role_prompt="实现视角",
+            )
+
+            with patch(
+                "A08_OverallReview.run_task_result_turn_with_repair",
+                side_effect=RuntimeError(
+                    f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: stale_busy_without_contract:"
+                    f"phase=a08_developer_refine_all_code artifact_path={result_path}"
+                ),
+            ) as run_turn:
+                returned = _run_overall_review_developer_turn(
+                    developer,
+                    project_dir=root,
+                    requirement_name="需求A",
+                    label="overall_review_refine_all_code",
+                    prompt="请修订",
+                    result_contract=build_overall_review_refine_result_contract(paths),
+                    paths=paths,
+                )
+
+            self.assertIs(returned, developer)
+            run_turn.assert_called_once()
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertEqual(json.loads(result_path.read_text(encoding="utf-8"))["status"], "completed")
+            self.assertEqual(worker.write_state_calls[-1][0], "succeeded")
+            self.assertEqual(worker.write_state_calls[-1][1], "done:overall_review_refine_all_code")
 
     def test_ensure_overall_review_inputs_requires_all_tasks_completed(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1213,6 +1277,72 @@ class A08OverallReviewTests(unittest.TestCase):
         self.assertEqual(developer_handoff.worker.session_name, "开发工程师-地默星")
         self.assertEqual(developer_handoff.selection.vendor, "codex")
         self.assertEqual(reviewer_handoff, ())
+
+    def test_discover_live_development_handoffs_reuses_failed_ready_developer_after_contract_stall(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            resolved_project_dir = str(project_dir.resolve())
+            runtime_root = project_dir / ".development_runtime"
+            developer_state_path = runtime_root / "development-developer-31501633" / "worker.state.json"
+            payload = {
+                "worker_id": "development-developer",
+                "session_name": "开发工程师-地默星",
+                "work_dir": resolved_project_dir,
+                "project_dir": resolved_project_dir,
+                "requirement_name": "需求A",
+                "workflow_action": "stage.a08.start",
+                "role_prompt": "A08 实现视角",
+                "updated_at": "2026-06-18T07:09:01+08:00",
+                "status": "failed",
+                "result_status": "failed",
+                "note": "error:overall_review_refine_all_code",
+                "health_status": "alive",
+                "agent_state": "READY",
+                "current_command": "node",
+                "dispatch_state": "delayed",
+                "dispatch_reason": "stale_busy_without_contract:phase=a08_developer_refine_all_code",
+                "current_task_runtime_status": "",
+                "config": {
+                    "vendor": "codex",
+                    "model": "gpt-5.5",
+                    "reasoning_effort": "xhigh",
+                    "proxy_url": "",
+                },
+            }
+            developer_state_path.parent.mkdir(parents=True, exist_ok=True)
+            developer_state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            fake_developer_worker = _FakeWorker(
+                session_name="开发工程师-地默星",
+                runtime_metadata_payload={
+                    "workflow_action": payload["workflow_action"],
+                    "updated_at": payload["updated_at"],
+                },
+                state_payload=payload,
+            )
+
+            with patch(
+                "A08_OverallReview.load_worker_from_state_path",
+                return_value=fake_developer_worker,
+            ):
+                developer_handoff, reviewer_handoff = discover_live_development_handoffs(project_dir, "需求A")
+
+        self.assertIsNotNone(developer_handoff)
+        self.assertEqual(developer_handoff.worker.session_name, "开发工程师-地默星")
+        self.assertEqual(developer_handoff.selection.vendor, "codex")
+        self.assertEqual(reviewer_handoff, ())
+
+    def test_runtime_payload_reuses_ready_worker_with_stale_reconfig_note(self):
+        payload = {
+            "status": "running",
+            "result_status": "running",
+            "note": "awaiting_reconfig",
+            "health_status": "alive",
+            "agent_state": "READY",
+            "current_command": "opencode.exe",
+            "current_task_runtime_status": "",
+        }
+
+        self.assertTrue(_runtime_payload_reusable_for_handoff(payload))
 
     def test_discover_live_development_handoffs_reuses_awaiting_reconfig_but_active_reviewer_state(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

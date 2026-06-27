@@ -120,10 +120,15 @@ export type OverallReviewSnapshot = {
 
 export type HitlSnapshot = {
   pending: boolean
+  promptId?: string
+  promptType?: string
   questionPath: string
   answerPath: string
   summary: string
   attachCommand: string
+  recoveryKind?: string
+  reasonText?: string
+  targetPaths?: string[]
 }
 
 export type ArtifactItem = {

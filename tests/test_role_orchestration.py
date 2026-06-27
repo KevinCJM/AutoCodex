@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -14,6 +15,8 @@ from tmux_core.stage_kernel.agent_intervention import (
     AGENT_INTERVENTION_RECHECK,
     AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
+    request_file_noncompliance_intervention,
+    request_worker_manual_intervention,
 )
 from tmux_core.stage_kernel.role_orchestration import (
     WorkerReadyCheckFailed,
@@ -47,6 +50,19 @@ class _HealthAwareWorker(_FakeWorker):
 
     def observe(self, tail_lines: int = 120):  # noqa: ARG002
         return SimpleNamespace()
+
+
+class _ManualMarkerWorker:
+    session_name = "测试工程师-参水猿"
+
+    def __init__(self) -> None:
+        self.marked_reconfig = False
+
+    def read_state(self):
+        return {"status": "ready", "agent_state": "READY", "health_status": "alive"}
+
+    def mark_awaiting_reconfiguration(self, *, reason_text: str) -> None:  # noqa: ARG002
+        self.marked_reconfig = True
 
 
 class _LaggingRefreshWorker(_FakeWorker):
@@ -158,6 +174,92 @@ class _ReadyDeathWorker(_DeathAwareFakeWorker):
 
 
 class RoleOrchestrationTests(unittest.TestCase):
+    def test_manual_intervention_noninteractive_uses_explicit_default_without_prompt(self):
+        with mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+            return_value=False,
+        ), mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+        ) as prompt:
+            decision = request_worker_manual_intervention(
+                stage_label="任务开发",
+                role_label="开发工程师",
+                worker=None,
+                reason_text="tmux pane exited",
+                allow_recreate=True,
+                noninteractive_default=AGENT_INTERVENTION_RECREATE,
+            )
+
+        self.assertEqual(decision, AGENT_INTERVENTION_RECREATE)
+        prompt.assert_not_called()
+
+    def test_manual_intervention_noninteractive_without_default_fails_clearly(self):
+        with mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+            return_value=False,
+        ), mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+        ) as prompt:
+            with self.assertRaisesRegex(RuntimeError, "当前环境不可交互"):
+                request_worker_manual_intervention(
+                    stage_label="任务开发",
+                    role_label="开发工程师",
+                    worker=None,
+                    reason_text="tmux pane exited",
+                    allow_recreate=True,
+                )
+
+        prompt.assert_not_called()
+
+    def test_manual_intervention_interactive_still_prompts(self):
+        with mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+            return_value=True,
+        ), mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            return_value=AGENT_INTERVENTION_RECHECK,
+        ) as prompt:
+            decision = request_worker_manual_intervention(
+                stage_label="任务开发",
+                role_label="开发工程师",
+                worker=None,
+                reason_text="tmux pane exited",
+                allow_recreate=True,
+                noninteractive_default=AGENT_INTERVENTION_RECREATE,
+            )
+
+        self.assertEqual(decision, AGENT_INTERVENTION_RECHECK)
+        prompt.assert_called_once()
+
+    def test_file_noncompliance_intervention_does_not_mark_ready_worker_as_reconfiguring(self):
+        worker = _ManualMarkerWorker()
+        with mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+            return_value=True,
+        ), mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            return_value=AGENT_INTERVENTION_RECHECK,
+        ) as prompt:
+            decision = request_file_noncompliance_intervention(
+                stage_label="详细设计",
+                role_label="测试工程师",
+                worker=worker,
+                reason_text="review_pass=false 但评审 markdown 为空",
+                attempts_used=2,
+                target_paths=("/tmp/review.md", "/tmp/review.json"),
+                allow_recreate=True,
+            )
+
+        self.assertEqual(decision, AGENT_INTERVENTION_RECHECK)
+        self.assertFalse(worker.marked_reconfig)
+        extra_payload = prompt.call_args.kwargs["extra_payload"]
+        self.assertEqual(extra_payload["recovery_kind"], "file_noncompliance")
+        self.assertEqual(extra_payload["session_name"], "测试工程师-参水猿")
+        self.assertEqual(
+            extra_payload["target_paths"],
+            [str(Path("/tmp/review.md").resolve()), str(Path("/tmp/review.json").resolve())],
+        )
+
     def test_ensure_main_ready_prefers_refresh_health_state(self):
         main = SimpleNamespace(worker=_HealthAwareWorker("BUSY", health_state="READY"))
 
@@ -389,6 +491,31 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(main.worker.ensure_calls, 1)
         prompt.assert_called_once()
 
+    def test_run_main_phase_noninteractive_recreates_main_without_prompt(self):
+        main = SimpleNamespace(worker=_ReadyDeathWorker(session_name="开发工程师-柳土獐"))
+        replacement = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        replace_calls: list[object] = []
+
+        with mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+            return_value=False,
+        ), mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+        ) as prompt:
+            result, reviewers, current_main = run_main_phase_with_death_handling(
+                main,
+                reviewers=(),
+                run_phase=lambda owner: owner,
+                replace_dead_main_owner=lambda owner: replace_calls.append(owner) or replacement,
+                main_label="开发工程师",
+            )
+
+        self.assertIs(result, replacement)
+        self.assertEqual(reviewers, [])
+        self.assertIs(current_main, replacement)
+        self.assertEqual(replace_calls, [main])
+        prompt.assert_not_called()
+
     def test_run_main_phase_with_death_handling_rechecks_ready_failure(self):
         main = SimpleNamespace(worker=_LaggingRefreshWorker(["BUSY", "BUSY", "BUSY", "BUSY", "READY"]))
         replace_calls: list[object] = []
@@ -522,6 +649,34 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(updated, [])
         self.assertEqual(notices, ["测试工程师 已按死亡处理，后续将忽略该审核智能体。"])
         prompt.assert_called_once()
+
+    def test_run_reviewer_phase_noninteractive_drops_unready_reviewer_without_prompt(self):
+        main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
+        reviewer = SimpleNamespace(worker=_LaggingRefreshWorker(["BUSY", "BUSY", "BUSY"]), reviewer_name="测试工程师")
+        notices: list[str] = []
+
+        with mock.patch(
+            "tmux_core.stage_kernel.role_orchestration.time.monotonic",
+            side_effect=[0.0, 0.0, 61.0],
+        ), mock.patch("tmux_core.stage_kernel.role_orchestration.time.sleep", return_value=None), mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+            return_value=False,
+        ), mock.patch(
+            "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+        ) as prompt:
+            updated, current_main = run_reviewer_phase_with_death_handling(
+                main,
+                [reviewer],
+                run_phase=lambda reviewers: list(reviewers),
+                replace_dead_main_owner=lambda owner: owner,
+                reviewer_label_getter=lambda item, _index: item.reviewer_name,
+                notify=notices.append,
+            )
+
+        self.assertIs(current_main, main)
+        self.assertEqual(updated, [])
+        self.assertEqual(notices, ["测试工程师 已按死亡处理，后续将忽略该审核智能体。"])
+        prompt.assert_not_called()
 
     def test_run_reviewer_phase_with_death_handling_recreates_reviewer_after_manual_choice(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))

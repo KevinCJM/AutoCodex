@@ -23,13 +23,16 @@ from tmux_core.runtime.vendor_catalog import (
     get_model_choices,
     get_vendor_inventory,
     normalize_vendor_id,
+    parse_agy_models_output,
     parse_codex_models_output,
     parse_opencode_debug_config_output,
     parse_opencode_verbose_output,
     resolve_launch,
+    _build_agy_models,
     _build_opencode_like_config_models,
     _build_opencode_like_models,
     _build_gemini_models,
+    _scan_agy_vendor,
     _scan_mimo_vendor,
 )
 
@@ -168,6 +171,48 @@ kimi-code/kimi-for-coding
         self.assertEqual(get_default_model_for_vendor("mimo", catalog=catalog), "mimo/mimo-v2.5-pro")
         resolution = resolve_launch("mimo", "default", "max", catalog=catalog)
         self.assertEqual(resolution.resolved_model, "mimo/mimo-v2.5-pro")
+
+    def test_agy_vendor_models_keep_cli_display_names_and_effort_suffixes(self):
+        self.assertEqual("agy", normalize_vendor_id("agy"))
+        self.assertIn("agy", VENDOR_ORDER)
+        model_ids = parse_agy_models_output(
+            """
+Gemini 3.5 Flash (Medium)
+Gemini 3.5 Flash (High)
+Claude Sonnet 4.6 (Thinking)
+"""
+        )
+        models = _build_agy_models(model_ids)
+
+        self.assertEqual(
+            [item.model_id for item in models],
+            ["Gemini 3.5 Flash (Medium)", "Gemini 3.5 Flash (High)", "Claude Sonnet 4.6 (Thinking)"],
+        )
+        self.assertEqual(models[0].reasoning.normalized_reasoning_levels, ("medium",))
+        self.assertEqual(models[1].reasoning.normalized_reasoning_levels, ("high",))
+        self.assertEqual(models[2].reasoning.normalized_reasoning_levels, ("high",))
+
+    def test_scan_agy_vendor_uses_agy_models_command_and_default(self):
+        def fake_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001
+            if argv == ["agy", "models"]:
+                return SimpleNamespace(
+                    ok=True,
+                    stdout="\n".join(
+                        [
+                            "Gemini 3.5 Flash (Medium)",
+                            "Gemini 3.5 Flash (High)",
+                            "Gemini 3.5 Flash (Low)",
+                        ]
+                    ),
+                )
+            return SimpleNamespace(ok=False, stdout="")
+
+        with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe) as probe:
+            inventory = _scan_agy_vendor("/usr/bin/agy")
+
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [["agy", "models"]])
+        self.assertEqual(inventory.vendor_id, "agy")
+        self.assertEqual(inventory.default_model, "Gemini 3.5 Flash (High)")
 
     def test_opencode_like_builders_write_mimo_vendor_id(self):
         items = parse_opencode_verbose_output(

@@ -223,6 +223,11 @@ test('buildAgentConfigLabel formats vendor model and effort for home display', (
     model: 'mimo/mimo-v2.5-pro',
     reasoningEffort: 'max',
   }))).toBe('MiMo Code | mimo/mimo-v2.5-pro, Max')
+  expect(buildAgentConfigLabel(worker({
+    vendor: 'agy',
+    model: 'Gemini 3.5 Flash (Low)',
+    reasoningEffort: 'low',
+  }))).toBe('AGY | Gemini 3.5 Flash (Low), Low')
 })
 
 test('buildHomeAgents omits config label when worker config is missing', () => {
@@ -463,6 +468,12 @@ test('resolveHomeAgentState preserves READY when backend already reports ready',
   expect(resolveHomeAgentState(worker({ agentState: 'READY', status: 'ready', currentTaskRuntimeStatus: 'running' }))).toBe('READY')
   expect(resolveHomeAgentState(worker({ agentState: 'STARTING', status: 'running' }))).toBe('STARTING')
   expect(resolveHomeAgentState(worker({ agentState: '', status: 'running' }))).toBe('BUSY')
+})
+
+test('resolveHomeAgentState keeps explicit live BUSY over idle ready statuses', () => {
+  expect(resolveHomeAgentState(worker({ agentState: 'BUSY', status: 'ready', resultStatus: 'ready' }))).toBe('BUSY')
+  expect(resolveHomeAgentState(worker({ agentState: 'STARTING', status: 'ready', resultStatus: 'ready' }))).toBe('STARTING')
+  expect(resolveHomeAgentState(worker({ agentState: 'BUSY', status: 'succeeded', resultStatus: 'succeeded' }))).toBe('READY')
 })
 
 test('resolveHomeAgentState promotes running snapshots to BUSY and terminal snapshots to READY', () => {

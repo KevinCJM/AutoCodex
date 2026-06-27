@@ -90,8 +90,11 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertEqual("claude", normalize_vendor_choice("claude code"))
         self.assertEqual("opencode", normalize_vendor_choice("4"))
         self.assertEqual("mimo", normalize_vendor_choice("5"))
+        self.assertEqual("agy", normalize_vendor_choice("6"))
         self.assertEqual("mimo", normalize_vendor_choice("mimo code"))
         self.assertEqual("mimo", normalize_vendor_choice("mimocode"))
+        self.assertEqual("agy", normalize_vendor_choice("antigravity"))
+        self.assertEqual("agy", normalize_vendor_choice("agy cli"))
         self.assertEqual("codex", normalize_vendor_choice("codex"))
         with self.assertRaises(ValueError):
             normalize_vendor_choice("qwen")
@@ -138,6 +141,23 @@ class RoutingLayerCliTests(unittest.TestCase):
             self.assertEqual("mimo/mimo-v2.5-pro", normalize_model_choice("mimo", "default"))
             self.assertEqual("mimo/mimo-v2.5-pro", normalize_model_choice("mimo", "1"))
             self.assertEqual("medium", normalize_effort_choice("mimo", "mimo/mimo-v2.5-pro", "2"))
+
+    def test_agy_model_and_effort_normalization_use_catalog(self):
+        agy_model = SimpleNamespace(model_id="Gemini 3.5 Flash (Low)")
+        agy_inventory = SimpleNamespace(installed=True)
+        with patch("A01_Routing_LayerPlanning.get_vendor_inventory", return_value=agy_inventory), patch(
+            "A01_Routing_LayerPlanning.get_model_choices",
+            return_value=(agy_model,),
+        ), patch(
+            "A01_Routing_LayerPlanning.get_default_model_for_vendor",
+            return_value="Gemini 3.5 Flash (Low)",
+        ), patch(
+            "A01_Routing_LayerPlanning.get_normalized_effort_choices",
+            return_value=("low",),
+        ):
+            self.assertEqual("Gemini 3.5 Flash (Low)", normalize_model_choice("agy", "default"))
+            self.assertEqual("Gemini 3.5 Flash (Low)", normalize_model_choice("agy", "1"))
+            self.assertEqual("low", normalize_effort_choice("agy", "Gemini 3.5 Flash (Low)", "1"))
 
     def test_collect_cli_request_normalizes_opencode_model_and_effort_in_parameter_mode(self):
         parser = build_parser()

@@ -471,10 +471,10 @@ if __name__ == '__main__':
     from T04_common_prompt import check_reviewer_job
     from T01_tools import create_empty_json_files, is_standard_task_initial_json, task_done, get_markdown_content
 
-    requirement_name = 'TimeFrequencyExtension'
-    the_dir = '/Users/chenjunming/Desktop/v3_dev/tmux-api-v3'
+    requirement_name = '相关论文算法复现'
+    the_dir = '/Users/chenjunming/Desktop/DRL_PM'
     t_name = "任务拆分"
-    agent_n_list = ['C1', 'C2']
+    agent_n_list = ['开发工程师-天贵星', '测试工程师-亢金龙', '架构师-地速星', '审核员-地奇星']
 
     # 1) 生成任务单
     # print(task_split(task_md=f'{requirement_name}_任务单.md', detail_design_md=f'{requirement_name}_详细设计.md',
@@ -516,11 +516,13 @@ if __name__ == '__main__':
 
     if pass_bool:
         print(f"{t_name}阶段, 全部评审通过", '\n', '-' * 100, '\n')
-        print(task_md_to_json(task_md=f'{requirement_name}_任务单.md', task_json=f'{requirement_name}_任务单.json'))
+        # print(task_md_to_json(task_md=f'{requirement_name}_任务单.md', task_json=f'{requirement_name}_任务单.json'))
 
         '''判断 xx_任务单.json 是否符合要求 '''
-        # if not is_standard_task_initial_json(f'{the_dir}/{requirement_name}_任务单.json'):
-        #     print(re_task_md_to_json(f'{requirement_name}_任务单.md', f'{requirement_name}_任务单.json'))
+        if not is_standard_task_initial_json(f'{the_dir}/{requirement_name}_任务单.json'):
+            print(re_task_md_to_json(f'{requirement_name}_任务单.md', f'{requirement_name}_任务单.json'))
+        else:
+            print(f"ok")
     else:
         print(f"{t_name}阶段, 评审未通过", '\n', '-' * 100, '\n')
 
@@ -531,7 +533,7 @@ if __name__ == '__main__':
         #                   what_just_change=f'{requirement_name}_需求分析师反馈.md'))
 
         # 读取改造总结, 让审核员再次审核
-        # m_summary = get_markdown_content(f'{the_dir}/{requirement_name}_需求分析师反馈.md')
-        # print(again_review_task(m_summary, task_md=f'{requirement_name}_任务单.md',
-        #                         task_review_md=f'{requirement_name}_任务单评审记录_C2.md',
-        #                         task_review_json=f'{requirement_name}_评审记录_C2.json'))
+        m_summary = get_markdown_content(f'{the_dir}/{requirement_name}_需求分析师反馈.md')
+        print(again_review_task(m_summary, task_md=f'{requirement_name}_任务单.md',
+                                task_review_md=f'{requirement_name}_任务单评审记录_开发工程师-天贵星.md',
+                                task_review_json=f'{requirement_name}_评审记录_开发工程师-天贵星.json'))

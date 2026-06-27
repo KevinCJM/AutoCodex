@@ -64,6 +64,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_worker_death_error,
     is_turn_artifact_contract_error,
     is_provider_auth_error,
+    is_provider_runtime_error,
     load_worker_from_state_path,
     list_registered_tmux_workers,
     list_tmux_session_names,
@@ -112,6 +113,7 @@ from tmux_core.stage_kernel.shared_review import (
     collect_auto_review_limit_hitl_response,
     ensure_empty_file,
     ensure_review_artifacts,
+    is_agent_config_error,
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
     note_reviewer_failure,
@@ -130,6 +132,7 @@ from tmux_core.stage_kernel.shared_review import (
     resolve_stage_agent_config,
     reviewer_requires_manual_model_reconfiguration,
     run_review_limit_hitl_cycle,
+    worker_has_agent_config_error,
     worker_has_provider_auth_error,
     worker_has_provider_runtime_error,
 )
@@ -285,7 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode|mimo")
+    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode|mimo|agy")
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")
@@ -518,7 +521,43 @@ def _developer_init_contract_is_ready(
         return False
     state = worker.read_state()
     state_path = Path(str(state.get("state_path", "") or worker.state_path)).expanduser().resolve()
-    for result_path in _task_result_candidates_for_worker(state_path, state):
+    task_status_path_text = str(
+        state.get("current_task_status_path", "") or getattr(worker, "current_task_status_path", "") or ""
+    ).strip()
+    result_path_text = str(
+        state.get("current_task_result_path", "") or getattr(worker, "current_task_result_path", "") or ""
+    ).strip()
+
+    def _mark_ready_from_init_contract() -> None:
+        with suppress(Exception):
+            worker.current_task_runtime_status = TASK_STATUS_DONE
+        with suppress(Exception):
+            worker.agent_ready = True
+        with suppress(Exception):
+            worker.agent_started = True
+        with suppress(Exception):
+            worker.agent_state = AgentRuntimeState.READY
+        write_state = getattr(worker, "_write_state", None)
+        if not callable(write_state):
+            return
+        extra: dict[str, object] = {
+            "dispatch_state": "",
+            "dispatch_reason": "",
+            "agent_ready": True,
+            "agent_started": True,
+            "agent_state": AgentRuntimeState.READY.value,
+            "status": WorkerStatus.READY.value,
+            "result_status": "ready",
+            "current_task_runtime_status": TASK_STATUS_DONE,
+        }
+        if task_status_path_text:
+            extra["current_task_status_path"] = task_status_path_text
+        if result_path_text:
+            extra["current_task_result_path"] = result_path_text
+        with suppress(Exception):
+            write_state(WorkerStatus.READY, note="auto_resume_ready_from_developer_init_contract", extra=extra)
+
+    def _is_ready_result(result_path: Path) -> bool:
         for mode in ("a07_developer_init", "a07_developer_human_reply"):
             try:
                 result = validate_task_result_file(
@@ -529,15 +568,65 @@ def _developer_init_contract_is_ready(
                 continue
             if str(result.payload.get("status", "")).strip() == "ready":
                 return True
+        return False
+
+    for result_path in _task_result_candidates_for_worker(state_path, state):
+        if _is_ready_result(result_path):
+            _mark_ready_from_init_contract()
+            return True
+
+    if not result_path_text:
+        return False
+    result_path = Path(result_path_text).expanduser().resolve()
+    task_status_path = Path(task_status_path_text).expanduser().resolve() if task_status_path_text else None
+    observe = getattr(worker, "observe", None)
+    finalizer = getattr(worker, "_try_finalize_a07_legacy_task_result_from_observation", None)
+    if not callable(observe) or not callable(finalizer):
+        return False
+    observation = None
+    with suppress(Exception):
+        observation = observe(tail_lines=200, tail_bytes=24000)
+    if observation is None:
+        return False
+    for mode in ("a07_developer_init", "a07_developer_human_reply"):
+        contract = build_developer_init_result_contract(paths, mode=mode)
+        with suppress(Exception):
+            result_file = finalizer(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                observation=observation,
+            )
+            if result_file is not None and str(result_file.payload.get("status", "")).strip() == "ready":
+                _mark_ready_from_init_contract()
+                return True
+        if _is_ready_result(result_path):
+            _mark_ready_from_init_contract()
+            return True
     return False
 
 
-def _recover_worker_from_state(state_path: Path) -> TmuxBatchWorker | None:
+def _recover_worker_from_state(
+    state_path: Path,
+    *,
+    allow_stale_busy_without_contract: bool = False,
+) -> TmuxBatchWorker | None:
     worker = load_worker_from_state_path(state_path)
     if worker is None:
         return None
     if not try_resume_worker(worker, timeout_sec=3.0):
-        return None
+        if not allow_stale_busy_without_contract or not _worker_has_stale_busy_without_contract(worker):
+            return None
+        session_exists = getattr(worker, "session_exists", None)
+        target_exists = getattr(worker, "target_exists", None)
+        if callable(session_exists):
+            with suppress(Exception):
+                if not session_exists():
+                    return None
+        if callable(target_exists):
+            with suppress(Exception):
+                if not target_exists():
+                    return None
     return worker
 
 
@@ -554,11 +643,15 @@ def _recover_development_runtime_resume(
         selection = _worker_selection_from_state(state)
         if selection is None:
             continue
-        worker = _recover_worker_from_state(state_path)
-        if worker is None:
-            continue
         agent_role = str(state.get("agent_role", "") or "").strip()
         worker_id = str(state.get("worker_id", "") or "").strip()
+        allow_stale_busy = agent_role == "developer" or worker_id == build_developer_worker_id()
+        worker = _recover_worker_from_state(
+            state_path,
+            allow_stale_busy_without_contract=allow_stale_busy,
+        )
+        if worker is None:
+            continue
         if agent_role == "developer" or worker_id == build_developer_worker_id():
             if developer_runtime is None and _developer_init_contract_is_ready(worker, paths=paths):
                 developer_runtime = DeveloperRuntime(
@@ -1500,7 +1593,7 @@ def _run_developer_result_turn(
             "summary": "developer_output materialized without stable task result contract",
         }
 
-    def _mark_developer_fallback_completed() -> None:
+    def _current_task_contract_paths() -> tuple[str, str, Path | None, Path | None]:
         worker = current_developer.worker
         state: dict[str, object] = {}
         read_state = getattr(worker, "read_state", None)
@@ -1516,10 +1609,16 @@ def _run_developer_result_turn(
             getattr(worker, "current_task_result_path", "") or state.get("current_task_result_path", "") or ""
         ).strip()
         task_status_path = Path(task_status_path_text).expanduser().resolve() if task_status_path_text else None
+        result_path = Path(result_path_text).expanduser().resolve() if result_path_text else None
+        return task_status_path_text, result_path_text, task_status_path, result_path
+
+    def _mark_developer_fallback_completed() -> None:
+        worker = current_developer.worker
+        task_status_path_text, result_path_text, task_status_path, result_path = _current_task_contract_paths()
         if result_path_text:
             finalize_task_result(
                 contract=result_contract,
-                result_path=Path(result_path_text).expanduser().resolve(),
+                result_path=result_path,
                 task_status_path=task_status_path,
             )
         elif task_status_path is not None:
@@ -1551,6 +1650,69 @@ def _run_developer_result_turn(
             with suppress(Exception):
                 write_state(WorkerStatus.SUCCEEDED, note=f"done:{label}", extra=extra)
 
+    def _developer_init_legacy_fallback_payload(error: BaseException) -> dict[str, object] | None:
+        if result_contract.mode not in {"a07_developer_init", "a07_developer_human_reply"}:
+            return None
+        if not is_task_result_contract_error(error):
+            return None
+        worker = current_developer.worker
+        task_status_path_text, result_path_text, task_status_path, result_path = _current_task_contract_paths()
+        if result_path is None:
+            return None
+
+        result_file = None
+        if result_path.exists():
+            with suppress(Exception):
+                result_file = validate_task_result_file(contract=result_contract, result_path=result_path)
+
+        if result_file is None:
+            observation = None
+            observe = getattr(worker, "observe", None)
+            if callable(observe):
+                with suppress(Exception):
+                    observation = observe(tail_lines=200, tail_bytes=24000)
+            finalizer = getattr(worker, "_try_finalize_a07_legacy_task_result_from_observation", None)
+            if observation is not None and callable(finalizer):
+                with suppress(Exception):
+                    result_file = finalizer(
+                        contract=result_contract,
+                        task_status_path=task_status_path,
+                        result_path=result_path,
+                        observation=observation,
+                    )
+
+        if result_file is None:
+            return None
+
+        with suppress(Exception):
+            worker.current_task_runtime_status = TASK_STATUS_DONE
+        with suppress(Exception):
+            worker.agent_ready = True
+        with suppress(Exception):
+            worker.agent_started = True
+        with suppress(Exception):
+            worker.agent_state = AgentRuntimeState.READY
+        write_state = getattr(worker, "_write_state", None)
+        if callable(write_state):
+            extra: dict[str, object] = {
+                "label": label,
+                "result_status": "succeeded",
+                "current_task_runtime_status": TASK_STATUS_DONE,
+                "dispatch_state": "",
+                "dispatch_reason": "",
+                "agent_ready": True,
+                "agent_started": True,
+                "agent_state": AgentRuntimeState.READY.value,
+            }
+            if task_status_path_text:
+                extra["current_task_status_path"] = task_status_path_text
+            if result_path_text:
+                extra["current_task_result_path"] = result_path_text
+            with suppress(Exception):
+                write_state(WorkerStatus.SUCCEEDED, note=f"done:{label}", extra=extra)
+        payload = result_file.payload
+        return dict(payload) if isinstance(payload, dict) else None
+
     current_developer = developer
     while True:
         try:
@@ -1577,6 +1739,11 @@ def _run_developer_result_turn(
                 turn_policy.record_turn()
             return current_developer, payload
         except Exception as error:  # noqa: BLE001
+            init_fallback_payload = _developer_init_legacy_fallback_payload(error)
+            if init_fallback_payload is not None:
+                if turn_policy is not None:
+                    turn_policy.record_turn()
+                return current_developer, init_fallback_payload
             fallback_payload = _developer_output_fallback_payload()
             if fallback_payload is not None and _worker_appears_live_for_reviewer_recovery(current_developer.worker):
                 _mark_developer_fallback_completed()
@@ -2159,6 +2326,31 @@ def _development_developer_display_name(developer: DeveloperRuntime) -> str:
     return str(developer.worker.session_name or "开发工程师").strip() or "开发工程师"
 
 
+def _reviewer_requires_reconfiguration_from_error(error: Exception | BaseException | str, worker: object | None) -> bool:
+    return bool(
+        is_agent_config_error(error)
+        or worker_has_agent_config_error(worker)
+        or is_provider_auth_error(error)
+        or worker_has_provider_auth_error(worker)
+        or is_provider_runtime_error(error)
+        or worker_has_provider_runtime_error(worker)
+    )
+
+
+def _reviewer_reconfiguration_reason(
+    reviewer_display_name: str,
+    error: Exception | BaseException | str,
+    worker: object | None,
+) -> str:
+    if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):
+        return f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
+    if is_provider_runtime_error(error) or worker_has_provider_runtime_error(worker):
+        return f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
+    if is_agent_config_error(error) or worker_has_agent_config_error(worker):
+        return f"{reviewer_display_name}模型配置不可用。\n需要更换模型后继续当前阶段。"
+    return f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
+
+
 def _kill_development_reviewer_best_effort(reviewer: ReviewerRuntime) -> None:
     with suppress(Exception):
         reviewer.worker.request_kill()
@@ -2170,6 +2362,7 @@ def _prompt_development_reviewer_recovery(
     reason_text: str,
     paths: dict[str, Path] | None = None,
     progress: ReviewStageProgress | None = None,
+    noninteractive_default: str = AGENT_INTERVENTION_WORKER_DEAD,
 ) -> str:
     return request_worker_manual_intervention(
         stage_label="任务开发",
@@ -2180,6 +2373,7 @@ def _prompt_development_reviewer_recovery(
         progress=progress,
         allow_recreate=True,
         allow_worker_dead=True,
+        noninteractive_default=noninteractive_default,
     )
 
 
@@ -2250,6 +2444,38 @@ def _run_single_reviewer_initialization(
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
             if not _worker_has_stale_busy_without_contract(current_reviewer.worker) and try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
                 continue
+            if is_worker_death_error(error) and _reviewer_requires_reconfiguration_from_error(error, current_reviewer.worker):
+                reason_text = _reviewer_reconfiguration_reason(reviewer_display_name, error, current_reviewer.worker)
+                decision = _prompt_development_reviewer_recovery(
+                    current_reviewer,
+                    reason_text=reason_text,
+                    paths=paths,
+                    progress=progress,
+                    noninteractive_default=AGENT_INTERVENTION_RECREATE,
+                )
+                if decision == AGENT_INTERVENTION_RECHECK:
+                    current_reviewer = _clear_reviewer_manual_recheck_state(current_reviewer)
+                    continue
+                if decision == AGENT_INTERVENTION_WORKER_DEAD:
+                    _kill_development_reviewer_best_effort(current_reviewer)
+                    message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                    return None
+                if decision == AGENT_INTERVENTION_RECREATE:
+                    mark_worker_awaiting_reconfiguration(current_reviewer.worker, reason_text=reason_text)
+                    replacement = _recreate_development_reviewer_from_hitl(
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        reviewer=current_reviewer,
+                        reviewer_spec=reviewer_spec,
+                        progress=progress,
+                        force_model_change=True,
+                        required_reconfiguration=True,
+                        reason_text=reason_text,
+                    )
+                    if replacement is not None:
+                        current_reviewer = replacement
+                    continue
+                continue
             if is_worker_death_error(error):
                 failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
                 failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
@@ -2295,9 +2521,10 @@ def _run_single_reviewer_initialization(
                     continue
                 continue
             if is_agent_ready_timeout_error(error):
-                effective_can_skip = bool(can_skip_ready_timeout)
+                requires_reconfiguration = _reviewer_requires_reconfiguration_from_error(error, current_reviewer.worker)
+                effective_can_skip = bool(can_skip_ready_timeout) and not requires_reconfiguration
                 reserved_skip = False
-                if ready_timeout_skip_budget is not None:
+                if ready_timeout_skip_budget is not None and not requires_reconfiguration:
                     effective_can_skip = ready_timeout_skip_budget.reserve()
                     reserved_skip = effective_can_skip
                 try:
@@ -2307,11 +2534,21 @@ def _run_single_reviewer_initialization(
                         can_skip=effective_can_skip,
                         progress=progress,
                         reason_text=(
-                            f"{reviewer_display_name}启动超时，未能进入可输入状态。\n"
+                            _reviewer_reconfiguration_reason(
+                                reviewer_display_name,
+                                error,
+                                current_reviewer.worker,
+                            )
+                            if requires_reconfiguration
+                            else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n"
                             + ("请检查、重建，或按死亡处理该审核智能体。" if effective_can_skip else "请检查或重建该审核智能体后继续。")
                         ),
                         allow_recreate=True,
                         target_paths=_development_reviewer_target_paths(current_reviewer, paths),
+                        noninteractive_default=(
+                            AGENT_INTERVENTION_WORKER_DEAD
+                            if effective_can_skip else AGENT_INTERVENTION_RECREATE
+                        ),
                     )
                 except Exception:
                     if reserved_skip:
@@ -2341,18 +2578,13 @@ def _run_single_reviewer_initialization(
                     continue
                 continue
             if is_recoverable_startup_failure(error, current_reviewer.worker):
-                reason_text = (
-                    f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
-                    if is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
-                    else f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
-                    if worker_has_provider_runtime_error(current_reviewer.worker)
-                    else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n需要更换模型后继续当前阶段。"
-                )
+                reason_text = _reviewer_reconfiguration_reason(reviewer_display_name, error, current_reviewer.worker)
                 decision = _prompt_development_reviewer_recovery(
                     current_reviewer,
                     reason_text=reason_text,
                     paths=paths,
                     progress=progress,
+                    noninteractive_default=AGENT_INTERVENTION_RECREATE,
                 )
                 if decision == AGENT_INTERVENTION_RECHECK:
                     current_reviewer = _clear_reviewer_manual_recheck_state(current_reviewer)
@@ -3108,12 +3340,14 @@ def run_reviewer_turn_with_recreation(
                 message(f"{current_reviewer.worker.session_name or current_reviewer.reviewer_name} 审核输出未及时稳定，继续检查智能体状态。")
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
-            provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
+            provider_runtime_error = is_provider_runtime_error(error) or worker_has_provider_runtime_error(current_reviewer.worker)
+            config_error = is_agent_config_error(error) or worker_has_agent_config_error(current_reviewer.worker)
             ready_timeout_error = is_agent_ready_timeout_error(error)
             if ready_timeout_error:
-                effective_can_skip = bool(can_skip_ready_timeout)
+                requires_reconfiguration = auth_error or provider_runtime_error or config_error
+                effective_can_skip = bool(can_skip_ready_timeout) and not requires_reconfiguration
                 reserved_skip = False
-                if ready_timeout_skip_budget is not None:
+                if ready_timeout_skip_budget is not None and not requires_reconfiguration:
                     effective_can_skip = ready_timeout_skip_budget.reserve()
                     reserved_skip = effective_can_skip
                 try:
@@ -3123,11 +3357,21 @@ def run_reviewer_turn_with_recreation(
                         can_skip=effective_can_skip,
                         progress=progress,
                         reason_text=(
-                            f"{reviewer_display_name}启动超时，未能进入可输入状态。\n"
+                            _reviewer_reconfiguration_reason(
+                                reviewer_display_name,
+                                error,
+                                current_reviewer.worker,
+                            )
+                            if requires_reconfiguration
+                            else f"{reviewer_display_name}启动超时，未能进入可输入状态。\n"
                             + ("请检查、重建，或按死亡处理该审核智能体。" if effective_can_skip else "请检查或重建该审核智能体后继续。")
                         ),
                         allow_recreate=True,
                         target_paths=_development_reviewer_target_paths(current_reviewer, paths),
+                        noninteractive_default=(
+                            AGENT_INTERVENTION_WORKER_DEAD
+                            if effective_can_skip else AGENT_INTERVENTION_RECREATE
+                        ),
                     )
                 except Exception:
                     if reserved_skip:
@@ -3169,17 +3413,14 @@ def run_reviewer_turn_with_recreation(
                     current_reviewer = initialized
                     continue
                 continue
-            if auth_error or provider_runtime_error:
-                reason_text = (
-                    f"检测到{reviewer_display_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
-                    if auth_error
-                    else f"检测到{reviewer_display_name}的模型服务出现临时运行错误。\n需要更换或重启模型后继续当前阶段。"
-                )
+            if auth_error or provider_runtime_error or config_error:
+                reason_text = _reviewer_reconfiguration_reason(reviewer_display_name, error, current_reviewer.worker)
                 decision = _prompt_development_reviewer_recovery(
                     current_reviewer,
                     reason_text=reason_text,
                     paths=paths,
                     progress=progress,
+                    noninteractive_default=AGENT_INTERVENTION_RECREATE,
                 )
                 if decision == AGENT_INTERVENTION_RECHECK:
                     current_reviewer = _clear_reviewer_manual_recheck_state(current_reviewer)
@@ -3609,6 +3850,7 @@ def _replace_dead_developer(
 ) -> DeveloperRuntime:
     developer_name = _development_developer_display_name(developer)
     ready_timeout_recreate_requested = False
+    ready_timeout_error = bool(error is not None and is_agent_ready_timeout_error(error))
     if error is not None and is_agent_ready_timeout_error(error):
         reason_text = (
             f"{developer_name}启动超时，未能进入可输入状态。\n"
@@ -3621,13 +3863,29 @@ def _replace_dead_developer(
             progress=progress,
             reason_text=reason_text,
             allow_recreate=True,
+            noninteractive_default=AGENT_INTERVENTION_RECREATE,
         )
         if decision == AGENT_INTERVENTION_RECHECK:
             return _clear_developer_manual_recheck_state(developer)
         if decision != AGENT_INTERVENTION_RECREATE:
             return developer
         ready_timeout_recreate_requested = True
-    startup_reconfigure = bool(error is not None and is_recoverable_startup_failure(error, developer.worker))
+    reconfiguration_blocker = bool(
+        error is not None
+        and (
+            is_agent_config_error(error)
+            or worker_has_agent_config_error(developer.worker)
+            or is_provider_auth_error(error)
+            or is_provider_runtime_error(error)
+            or worker_has_provider_auth_error(developer.worker)
+            or worker_has_provider_runtime_error(developer.worker)
+        )
+    )
+    startup_reconfigure = bool(
+        error is not None
+        and is_recoverable_startup_failure(error, developer.worker)
+        and (not ready_timeout_error or reconfiguration_blocker)
+    )
     if startup_reconfigure:
         reason_text = (
             f"检测到{developer_name}仍在 agent 界面，但模型认证已失效。\n需要更换模型后继续当前阶段。"
@@ -3645,6 +3903,7 @@ def _replace_dead_developer(
                 progress=progress,
                 allow_recreate=True,
                 allow_worker_dead=False,
+                noninteractive_default=AGENT_INTERVENTION_RECREATE,
             )
             if decision == AGENT_INTERVENTION_RECHECK:
                 return _clear_developer_manual_recheck_state(developer)
@@ -3665,6 +3924,7 @@ def _replace_dead_developer(
             progress=progress,
             allow_recreate=True,
             allow_worker_dead=False,
+            noninteractive_default=AGENT_INTERVENTION_RECREATE,
         )
         if decision == AGENT_INTERVENTION_RECHECK:
             return _clear_developer_manual_recheck_state(developer)

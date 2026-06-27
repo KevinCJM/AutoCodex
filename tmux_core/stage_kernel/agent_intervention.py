@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from T09_terminal_ops import message, prompt_select_option
+from T09_terminal_ops import message, prompt_select_option, terminal_ui_is_interactive
 
 AGENT_INTERVENTION_RECHECK = "recheck_after_manual_intervention"
 AGENT_INTERVENTION_RECREATE = "recreate_after_manual_intervention"
@@ -95,6 +95,9 @@ def request_worker_manual_intervention(
     progress: object | None = None,
     allow_recreate: bool = False,
     allow_worker_dead: bool = True,
+    noninteractive_default: str | None = None,
+    recovery_kind: str = "agent_manual_intervention",
+    mark_worker_state: bool = True,
 ) -> str:
     role_text = str(role_label or "").strip() or "智能体"
     stage_text = str(stage_label or "").strip() or "当前阶段"
@@ -105,7 +108,8 @@ def request_worker_manual_intervention(
         reason_text=reason_text,
         target_paths=target_paths,
     )
-    _mark_awaiting_manual(worker, reason_text=summary)
+    if mark_worker_state:
+        _mark_awaiting_manual(worker, reason_text=summary)
     message(summary)
     set_phase = getattr(progress, "set_phase", None)
     if callable(set_phase):
@@ -119,6 +123,13 @@ def request_worker_manual_intervention(
         options.append((AGENT_INTERVENTION_RECREATE, "重新创建该智能体"))
     if allow_worker_dead:
         options.append((AGENT_INTERVENTION_WORKER_DEAD, "智能体已死亡或已关闭，按死亡处理"))
+    option_values = {value for value, _ in options}
+    if not terminal_ui_is_interactive():
+        default_value = str(noninteractive_default or "").strip()
+        if default_value and default_value in option_values:
+            message(f"{stage_text} / {role_text}: 非交互环境，自动选择恢复动作: {default_value}")
+            return default_value
+        raise RuntimeError(f"需要人工介入但当前环境不可交互:\n{summary}")
     with context:
         return prompt_select_option(
             title=f"HITL: {role_text} 需要人工介入",
@@ -127,7 +138,7 @@ def request_worker_manual_intervention(
             prompt_text="请选择恢复方式",
             is_hitl=True,
             extra_payload={
-                "recovery_kind": "agent_manual_intervention",
+                "recovery_kind": str(recovery_kind or "").strip() or "agent_manual_intervention",
                 "stage_label": stage_text,
                 "role_label": role_text,
                 "session_name": _session_name(worker),
@@ -149,6 +160,7 @@ def request_file_noncompliance_intervention(
     target_paths: Sequence[str | Path] = (),
     progress: object | None = None,
     allow_recreate: bool = False,
+    noninteractive_default: str | None = None,
 ) -> str:
     reason = (
         f"指定文件连续 {attempts_used} 次修复后仍不符合要求。\n"
@@ -162,4 +174,7 @@ def request_file_noncompliance_intervention(
         target_paths=target_paths,
         progress=progress,
         allow_recreate=allow_recreate,
+        noninteractive_default=noninteractive_default,
+        recovery_kind="file_noncompliance",
+        mark_worker_state=False,
     )

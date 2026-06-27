@@ -657,6 +657,103 @@ class A07DevelopmentTests(unittest.TestCase):
         prompt_recovery.assert_called_once()
         self.assertIsNone(result)
 
+    def test_reviewer_turn_provider_runtime_blocker_noninteractive_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=RuntimeError("provider runtime error: SSE read timed out"),
+            ), patch("A07_Development._wait_for_reviewer_materialized_outputs", return_value=False), patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.stdin_is_interactive", return_value=False):
+                with self.assertRaises(RuntimeError) as caught:
+                    run_reviewer_turn_with_recreation(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        task_name="M3-T1",
+                        reviewer_spec=reviewer_spec,
+                        paths=paths,
+                        reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                        label="development_review_M3-T1_测试工程师",
+                        allow_existing_outputs=False,
+                    )
+
+        error_text = str(caught.exception)
+        self.assertIn("当前环境无法交互选择厂商/模型", error_text)
+        self.assertNotIn("EOF", error_text)
+        self.assertFalse(reviewer.worker.killed)
+        self.assertIn("模型服务", reviewer.worker.reconfig_reason)
+        prompt_select.assert_not_called()
+
+    def test_reviewer_turn_ready_timeout_with_runtime_blocker_noninteractive_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=RuntimeError("Timed out waiting for agent ready.\nSSE read timed out"),
+            ), patch("A07_Development._wait_for_reviewer_materialized_outputs", return_value=False), patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.stdin_is_interactive", return_value=False):
+                with self.assertRaises(RuntimeError) as caught:
+                    run_reviewer_turn_with_recreation(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        task_name="M3-T1",
+                        reviewer_spec=reviewer_spec,
+                        paths=paths,
+                        reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                        label="development_review_M3-T1_测试工程师",
+                        allow_existing_outputs=False,
+                        can_skip_ready_timeout=True,
+                    )
+
+        error_text = str(caught.exception)
+        self.assertIn("当前环境无法交互选择厂商/模型", error_text)
+        self.assertNotIn("EOF", error_text)
+        self.assertFalse(reviewer.worker.killed)
+        self.assertIn("模型服务", reviewer.worker.reconfig_reason)
+        prompt_select.assert_not_called()
+
     def test_live_reviewer_initialization_failure_prompts_before_ignore(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -1894,6 +1991,145 @@ class A07DevelopmentTests(unittest.TestCase):
             self.assertTrue(resume.reviewers[0].review_md_path.exists())
             self.assertTrue(resume.reviewers[0].review_json_path.exists())
 
+    def test_recover_development_runtime_resume_materializes_legacy_ready_init_result(self):
+        class FakeResumeWorker:
+            def __init__(self, state_path: Path):
+                self.state_path = state_path
+                self.state = json.loads(state_path.read_text(encoding="utf-8"))
+                self.session_name = self.state["session_name"]
+                self.observe_called = False
+                self.finalizer_called = False
+
+            def read_state(self):
+                return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+            def _write_state(self, status, note="", extra=None):  # noqa: ANN001
+                payload = self.read_state()
+                payload.update(extra or {})
+                payload["status"] = getattr(status, "value", str(status))
+                payload["note"] = note
+                self.state_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            def observe(self, *, tail_lines=200, tail_bytes=24000):  # noqa: ANN001, ARG002
+                self.observe_called = True
+                return SimpleNamespace(
+                    visible_text="• 准备就绪\n› Implement {feature}",
+                    raw_log_tail="",
+                    raw_log_delta="",
+                    current_command="node",
+                    current_path=str(self.state_path.parent),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-06-17T15:10:00",
+                    pane_title="DRL_PM",
+                )
+
+            def _try_finalize_a07_legacy_task_result_from_observation(  # noqa: ANN001
+                self,
+                *,
+                contract,
+                task_status_path,
+                result_path,
+                observation,
+            ):
+                self.finalizer_called = True
+                if "准备就绪" not in observation.visible_text:
+                    return None
+                return finalize_task_result(
+                    contract=contract,
+                    result_path=result_path,
+                    task_status_path=task_status_path,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            requirement_name = "需求A"
+            paths = build_development_paths(project_dir, requirement_name)
+            _write_required_inputs(paths)
+            paths["ask_human_path"].write_text("", encoding="utf-8")
+            runtime_root = build_development_runtime_root(project_dir, requirement_name)
+            developer_dir = runtime_root / "development-developer-abc"
+            reviewer_dir = runtime_root / "development-review-def"
+            developer_dir.mkdir(parents=True)
+            reviewer_dir.mkdir(parents=True)
+            task_runtime = developer_dir / "task_runtime"
+            task_runtime.mkdir()
+            task_status_path = task_runtime / "developer_init.json"
+            task_status_path.write_text('{"status":"running"}', encoding="utf-8")
+            result_path = task_runtime / "developer_init_result.json"
+            developer_state_path = developer_dir / "worker.state.json"
+            reviewer_state_path = reviewer_dir / "worker.state.json"
+            common_state = {
+                "project_dir": str(project_dir.resolve()),
+                "requirement_name": requirement_name,
+                "workflow_action": "stage.a07.start",
+                "work_dir": str(project_dir.resolve()),
+                "pane_id": "%1",
+                "config": {"vendor": "codex", "model": "gpt-test", "reasoning_effort": "high", "proxy_url": ""},
+            }
+            developer_state_path.write_text(
+                json.dumps(
+                    {
+                        **common_state,
+                        "worker_id": "development-developer",
+                        "session_name": "开发工程师-天魁星",
+                        "agent_role": "developer",
+                        "role_prompt": "dev-role",
+                        "current_task_status_path": str(task_status_path),
+                        "current_task_result_path": str(result_path),
+                        "dispatch_state": "delayed",
+                        "dispatch_reason": "stale_busy_without_contract:phase=a07_developer_init",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            reviewer_state_path.write_text(
+                json.dumps(
+                    {
+                        **common_state,
+                        "worker_id": "development-review-测试工程师",
+                        "session_name": "测试工程师-天罡星",
+                        "agent_role": "reviewer",
+                        "role_name": "测试工程师",
+                        "reviewer_key": "测试工程师",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            reviewer_specs = {"测试工程师": DevelopmentReviewerSpec("测试工程师", "review-role")}
+            loaded_workers: dict[str, FakeResumeWorker] = {}
+
+            def fake_load_worker(state_path):  # noqa: ANN001
+                worker = FakeResumeWorker(Path(state_path))
+                loaded_workers[worker.session_name] = worker
+                return worker
+
+            with patch("A07_Development.load_worker_from_state_path", side_effect=fake_load_worker), patch(
+                "A07_Development.try_resume_worker",
+                side_effect=lambda worker, timeout_sec=3.0: worker.session_name != "开发工程师-天魁星",
+            ):
+                resume = _recover_development_runtime_resume(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    paths=paths,
+                    reviewer_specs_by_name=reviewer_specs,
+                )
+
+            self.assertIsNotNone(resume)
+            assert resume is not None
+            developer_worker = loaded_workers["开发工程师-天魁星"]
+            self.assertIs(resume.developer.worker, developer_worker)
+            self.assertTrue(developer_worker.observe_called)
+            self.assertTrue(developer_worker.finalizer_called)
+            self.assertTrue(result_path.exists())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            updated_state = json.loads(developer_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_state["dispatch_reason"], "")
+            self.assertEqual(updated_state["status"], "ready")
+
     def test_build_development_paths_migrates_legacy_question_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -2287,6 +2523,54 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertTrue(prompt_recovery.call_args.kwargs["allow_recreate"])
         recreate_runtime.assert_not_called()
 
+    def test_run_single_reviewer_initialization_noninteractive_skips_after_ready_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=RuntimeError("Timed out waiting for agent ready.\nmock screen"),
+            ), patch("A07_Development.try_resume_worker", return_value=False), patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.recreate_development_reviewer_runtime") as recreate_runtime:
+                result = _run_single_reviewer_initialization(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={
+                        "测试工程师": DevelopmentReviewerSpec(
+                            role_name="测试工程师",
+                            role_prompt="测试视角",
+                            reviewer_key="测试工程师",
+                        ),
+                    },
+                    can_skip_ready_timeout=True,
+                )
+
+        self.assertIsNone(result)
+        self.assertTrue(reviewer.worker.killed)
+        prompt_select.assert_not_called()
+        recreate_runtime.assert_not_called()
+
     def test_run_single_reviewer_initialization_last_reviewer_ready_timeout_only_retries(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -2342,6 +2626,232 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertFalse(prompt_recovery.call_args.kwargs["can_skip"])
         self.assertTrue(prompt_recovery.call_args.kwargs["allow_recreate"])
         recreate_runtime.assert_not_called()
+
+    def test_run_single_reviewer_initialization_noninteractive_recreates_required_reviewer_after_ready_timeout(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+            replacement = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=reviewer.selection,
+                worker=_ReconfigurableWorker(session_name="测试工程师-天罡星"),
+                review_md_path=reviewer.review_md_path,
+                review_json_path=reviewer.review_json_path,
+                contract=_dummy_contract(),
+            )
+            attempts = {"count": 0}
+
+            def timeout_then_success(**kwargs):  # noqa: ANN001
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise RuntimeError("Timed out waiting for agent ready.\nmock screen")
+                self.assertIs(kwargs["worker"], replacement.worker)
+                return {}
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=timeout_then_success,
+            ), patch("A07_Development.try_resume_worker", return_value=False), patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch(
+                "A07_Development._recreate_development_reviewer_from_hitl",
+                return_value=replacement,
+            ) as recreate_from_hitl:
+                result = _run_single_reviewer_initialization(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={
+                        "测试工程师": DevelopmentReviewerSpec(
+                            role_name="测试工程师",
+                            role_prompt="测试视角",
+                            reviewer_key="测试工程师",
+                        ),
+                    },
+                    can_skip_ready_timeout=False,
+                )
+
+        self.assertIs(result, replacement)
+        self.assertEqual(attempts["count"], 2)
+        prompt_select.assert_not_called()
+        recreate_from_hitl.assert_called_once()
+        self.assertTrue(recreate_from_hitl.call_args.kwargs["force_model_change"])
+        self.assertTrue(recreate_from_hitl.call_args.kwargs["required_reconfiguration"])
+
+    def test_run_single_reviewer_initialization_config_blocker_noninteractive_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=RuntimeError("model unavailable in scanned catalog: missing-model"),
+            ), patch("A07_Development.try_resume_worker", return_value=False), patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.stdin_is_interactive", return_value=False):
+                with self.assertRaises(RuntimeError) as caught:
+                    _run_single_reviewer_initialization(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        paths=paths,
+                        reviewer_specs_by_name={
+                            "测试工程师": DevelopmentReviewerSpec(
+                                role_name="测试工程师",
+                                role_prompt="测试视角",
+                                reviewer_key="测试工程师",
+                            ),
+                        },
+                        can_skip_ready_timeout=True,
+                    )
+
+        error_text = str(caught.exception)
+        self.assertIn("当前环境无法交互选择厂商/模型", error_text)
+        self.assertNotIn("EOF", error_text)
+        self.assertFalse(reviewer.worker.killed)
+        self.assertIn("模型配置不可用", reviewer.worker.reconfig_reason)
+        prompt_select.assert_not_called()
+
+    def test_run_single_reviewer_initialization_ready_timeout_with_config_blocker_noninteractive_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=RuntimeError(
+                    "Timed out waiting for agent ready.\nmodel unavailable in scanned catalog: missing-model"
+                ),
+            ), patch("A07_Development.try_resume_worker", return_value=False), patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.stdin_is_interactive", return_value=False):
+                with self.assertRaises(RuntimeError) as caught:
+                    _run_single_reviewer_initialization(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        paths=paths,
+                        reviewer_specs_by_name={
+                            "测试工程师": DevelopmentReviewerSpec(
+                                role_name="测试工程师",
+                                role_prompt="测试视角",
+                                reviewer_key="测试工程师",
+                            ),
+                        },
+                        can_skip_ready_timeout=True,
+                    )
+
+        error_text = str(caught.exception)
+        self.assertIn("当前环境无法交互选择厂商/模型", error_text)
+        self.assertNotIn("EOF", error_text)
+        self.assertFalse(reviewer.worker.killed)
+        self.assertIn("模型配置不可用", reviewer.worker.reconfig_reason)
+        prompt_select.assert_not_called()
+
+    def test_run_single_reviewer_initialization_death_with_config_blocker_noninteractive_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text(
+                json.dumps({"M1": {"M1-T1": False}}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=RuntimeError(
+                    "agent exited back to shell while starting\nmodel unavailable in scanned catalog: missing-model"
+                ),
+            ), patch("A07_Development.try_resume_worker", return_value=False), patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.stdin_is_interactive", return_value=False):
+                with self.assertRaises(RuntimeError) as caught:
+                    _run_single_reviewer_initialization(
+                        reviewer,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        paths=paths,
+                        reviewer_specs_by_name={
+                            "测试工程师": DevelopmentReviewerSpec(
+                                role_name="测试工程师",
+                                role_prompt="测试视角",
+                                reviewer_key="测试工程师",
+                            ),
+                        },
+                        can_skip_ready_timeout=True,
+                    )
+
+        error_text = str(caught.exception)
+        self.assertIn("当前环境无法交互选择厂商/模型", error_text)
+        self.assertNotIn("EOF", error_text)
+        self.assertFalse(reviewer.worker.killed)
+        self.assertIn("模型配置不可用", reviewer.worker.reconfig_reason)
+        prompt_select.assert_not_called()
 
     def test_run_single_reviewer_initialization_escalates_repeated_death_to_manual_reconfiguration(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2880,6 +3390,93 @@ class A07DevelopmentTests(unittest.TestCase):
             self.assertEqual(worker.recorded_extra["agent_state"], "READY")
             self.assertTrue(worker.recorded_extra["agent_ready"])
 
+    def test_developer_init_accepts_legacy_ready_after_stale_busy_contract(self):
+        class LegacyReadyWorker(_RecordingStateWorker):
+            def __init__(self, *, session_name: str, task_status_path: Path):
+                super().__init__(session_name=session_name, task_status_path=task_status_path)
+                self.observe_called = False
+                self.finalizer_called = False
+
+            def observe(self, *, tail_lines=200, tail_bytes=24000):  # noqa: ANN001, ARG002
+                self.observe_called = True
+                return SimpleNamespace(
+                    visible_text="• 准备就绪\n› Implement {feature}",
+                    raw_log_tail="",
+                    raw_log_delta="",
+                    current_command="node",
+                    current_path=str(Path(self.task_status_path).parent),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-06-17T14:40:00",
+                    pane_title="DRL_PM",
+                )
+
+            def _try_finalize_a07_legacy_task_result_from_observation(  # noqa: ANN001
+                self,
+                *,
+                contract,
+                task_status_path,
+                result_path,
+                observation,
+            ):
+                self.finalizer_called = True
+                if "准备就绪" not in observation.visible_text:
+                    return None
+                return finalize_task_result(
+                    contract=contract,
+                    result_path=result_path,
+                    task_status_path=task_status_path,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            paths = build_development_paths(tmp_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+            paths["task_json_path"].write_text('{"M1":{"M1-T1":false}}', encoding="utf-8")
+            task_status_path = Path(tmp_dir) / "developer_init_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            paths["ask_human_path"].write_text("", encoding="utf-8")
+            result_path = Path(tmp_dir) / "developer_init_result.json"
+            worker = LegacyReadyWorker(
+                session_name="开发工程师-地暴星",
+                task_status_path=task_status_path,
+            )
+            worker.state_payload["current_task_result_path"] = str(result_path)
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.5", "xhigh", ""),
+                worker=worker,
+                role_prompt="实现视角",
+            )
+            contract = build_developer_init_result_contract(paths, mode="a07_developer_init")
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=RuntimeError(
+                    f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: stale_busy_without_contract:"
+                    f"phase=a07_developer_init result_path={result_path}"
+                ),
+            ) as run_turn, patch("A07_Development.try_resume_worker") as try_resume:
+                returned, payload = _run_developer_result_turn(
+                    developer,
+                    label="development_developer_init",
+                    prompt="请预研",
+                    result_contract=contract,
+                    paths=paths,
+                )
+
+            self.assertIs(returned, developer)
+            self.assertEqual(payload["status"], "ready")
+            self.assertTrue(result_path.exists())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertTrue(worker.observe_called)
+            self.assertTrue(worker.finalizer_called)
+            self.assertEqual(worker.recorded_status, "succeeded")
+            self.assertEqual(worker.recorded_note, "done:development_developer_init")
+            self.assertEqual(worker.recorded_extra["dispatch_state"], "")
+            run_turn.assert_called_once()
+            try_resume.assert_not_called()
+
     def test_developer_result_turn_accepts_valid_output_after_provider_runtime_error(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             paths = build_development_paths(tmp_dir, "需求A")
@@ -3071,6 +3668,74 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertTrue(prompt_recovery.call_args.kwargs["allow_recreate"])
         recreate_runtime.assert_called_once()
 
+    def test_replace_dead_developer_ready_timeout_noninteractive_recreates_without_model_change(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            replacement = DeveloperRuntime(
+                selection=developer.selection,
+                worker=_ReconfigurableWorker(session_name="开发工程师-天罡星"),
+                role_prompt="实现视角",
+            )
+
+            with patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch(
+                "A07_Development.recreate_developer_runtime",
+                return_value=replacement,
+            ) as recreate_runtime:
+                result = _replace_dead_developer(
+                    developer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    error=RuntimeError("Timed out waiting for agent ready.\nmock screen"),
+                )
+
+        self.assertIs(result, replacement)
+        prompt_select.assert_not_called()
+        recreate_runtime.assert_called_once()
+        self.assertFalse(recreate_runtime.call_args.kwargs["force_model_change"])
+        self.assertFalse(recreate_runtime.call_args.kwargs["required_reconfiguration"])
+        self.assertTrue(recreate_runtime.call_args.kwargs["reuse_existing_selection"])
+
+    def test_replace_dead_developer_ready_timeout_with_config_blocker_noninteractive_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+
+            with patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.stdin_is_interactive", return_value=False):
+                with self.assertRaises(RuntimeError) as caught:
+                    _replace_dead_developer(
+                        developer,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        error=RuntimeError(
+                            "Timed out waiting for agent ready.\n"
+                            "model unavailable in scanned catalog: gpt-missing"
+                        ),
+                    )
+
+        error_text = str(caught.exception)
+        self.assertIn("当前环境无法交互选择厂商/模型", error_text)
+        self.assertNotIn("EOF", error_text)
+        prompt_select.assert_not_called()
+
     def test_replace_dead_developer_manual_recheck_keeps_existing_worker(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -3141,6 +3806,73 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertFalse(recreate_runtime.call_args.kwargs["force_model_change"])
         self.assertFalse(recreate_runtime.call_args.kwargs["required_reconfiguration"])
         self.assertTrue(recreate_runtime.call_args.kwargs["reuse_existing_selection"])
+
+    def test_replace_dead_developer_noninteractive_recreates_dead_worker_without_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+            replacement = DeveloperRuntime(
+                selection=developer.selection,
+                worker=_ReconfigurableWorker(session_name="开发工程师-天罡星"),
+                role_prompt="实现视角",
+            )
+
+            with patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch(
+                "A07_Development.recreate_developer_runtime",
+                return_value=replacement,
+            ) as recreate_runtime:
+                result = _replace_dead_developer(
+                    developer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    error=RuntimeError("tmux pane died"),
+                )
+
+        self.assertIs(result, replacement)
+        prompt_select.assert_not_called()
+        recreate_runtime.assert_called_once()
+        self.assertFalse(recreate_runtime.call_args.kwargs["force_model_change"])
+        self.assertTrue(recreate_runtime.call_args.kwargs["reuse_existing_selection"])
+
+    def test_replace_dead_developer_provider_auth_noninteractive_fails_clearly_without_eof(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_ReconfigurableWorker(session_name="开发工程师-天魁星"),
+                role_prompt="实现视角",
+            )
+
+            with patch(
+                "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
+                return_value=False,
+            ), patch(
+                "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
+            ) as prompt_select, patch("A07_Development.stdin_is_interactive", return_value=False), patch(
+                "A07_Development.is_recoverable_startup_failure",
+                return_value=True,
+            ), patch("A07_Development.worker_has_provider_auth_error", return_value=True):
+                with self.assertRaises(RuntimeError) as caught:
+                    _replace_dead_developer(
+                        developer,
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        error=RuntimeError("401 invalid access token"),
+                    )
+
+        error_text = str(caught.exception)
+        self.assertIn("当前环境无法交互选择厂商/模型", error_text)
+        self.assertNotIn("EOF", error_text)
+        prompt_select.assert_not_called()
 
     def test_replace_dead_developer_startup_reconfigure_allows_manual_recheck(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

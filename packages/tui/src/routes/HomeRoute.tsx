@@ -51,27 +51,35 @@ export function HomeRoute(props: Props) {
         <text fg="#888888">{`需求名称: ${props.snapshot.requirementName}`}</text>
       </Show>
       <box borderStyle="single" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
-        <text>待处理 HITL</text>
-        <text fg={props.hitl.pending ? '#f7c948' : '#888888'}>{props.hitl.pending ? '存在待处理 HITL' : '当前没有待处理 HITL'}</text>
+        <text>待处理人工输入</text>
+        <text fg={props.hitl.pending || props.snapshot.pendingAttention ? '#f7c948' : '#888888'}>
+          {props.hitl.pending ? '存在待处理 HITL' : props.snapshot.pendingAttention ? '存在待处理人工输入' : '当前没有待处理人工输入'}
+        </text>
+        <Show when={props.hitl.summary}>
+          <text fg="#f7c948">{props.hitl.summary}</text>
+        </Show>
+        <Show when={props.hitl.reasonText}>
+          <text fg="#888888">reason: {props.hitl.reasonText}</text>
+        </Show>
         <Show when={props.hitl.questionPath}>
           <text fg="#888888">question: {props.hitl.questionPath}</text>
         </Show>
+        <For each={props.hitl.targetPaths ?? []}>
+          {(path) => <text fg="#888888">target: {path}</text>}
+        </For>
         <Show when={props.hitl.attachCommand}>
           <text fg="#f7c948">{props.hitl.attachCommand}</text>
+        </Show>
+        <Show when={props.snapshot.pendingAttention}>
+          <text fg="#f7c948">{`attention: ${props.snapshot.pendingAttentionReason || '待处理人工输入'}`}</text>
+          <Show when={props.snapshot.pendingAttentionSince}>
+            <text fg="#888888">{`since: ${props.snapshot.pendingAttentionSince}`}</text>
+          </Show>
         </Show>
         <Show when={props.hitl.pending}>
           <text fg="#888888">Ctrl+L 查看完整日志</text>
         </Show>
       </box>
-      <Show when={props.snapshot.pendingAttention}>
-        <box borderStyle="single" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
-          <text>人工提醒</text>
-          <text fg="#f7c948">{`macOS 提醒中: ${props.snapshot.pendingAttentionReason || '待处理人工输入'}`}</text>
-          <Show when={props.snapshot.pendingAttentionSince}>
-            <text fg="#888888">{`since: ${props.snapshot.pendingAttentionSince}`}</text>
-          </Show>
-        </box>
-      </Show>
       <box borderStyle="single" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
         <text>智能体状态</text>
         <Show when={props.agents.length > 0} fallback={<text fg="#888888">当前没有可显示的智能体状态。</text>}>

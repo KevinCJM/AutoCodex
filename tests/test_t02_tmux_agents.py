@@ -16,8 +16,10 @@ from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor, get_m
 from T02_tmux_agents import (
     AgentRuntimeState,
     AgentRunConfig,
+    AgyOutputDetector,
     GeminiOutputDetector,
     HealthSupervisor,
+    MimoOutputDetector,
     OpenCodeOutputDetector,
     CodexOutputDetector,
     ClaudeOutputDetector,
@@ -481,7 +483,7 @@ a07.developer.refine_code
             worker = TmuxBatchWorker(
                 worker_id="codex-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.3-codex"),
+                config=AgentRunConfig(vendor="codex", model="default"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             visible = """
@@ -591,7 +593,7 @@ s
             self.assertFalse(worker._visible_indicates_agent_ready(busy_visible))
             self.assertFalse(worker._visible_indicates_agent_ready(extreme_wrapped_busy_visible))
 
-    def test_mimo_reuses_opencode_like_ready_detection(self):
+    def test_mimo_ready_detection_accepts_chinese_prompt_and_completed_footer(self):
         def fake_resolve_launch(vendor_id, requested_model, requested_effort):
             return SimpleNamespace(
                 resolved_model=str(requested_model or "mimo/mimo-v2.5-pro"),
@@ -615,10 +617,44 @@ s
                 config=AgentRunConfig(vendor="mimo", model="mimo/mimo-v2.5-pro"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
+            waiting_visible = (
+                "Xiaomi输入消息...(输入/唤起命令)"
+                "Build·MiMo-V2.5-Pro"
+                "tab切换模式ctrl+p设置@添加文件$子智能体/唤起命令"
+            )
+            english_waiting_visible = (
+                "Xiaomi\n"
+                "┃  Type your message... (type / for commands)\n"
+                "┃  Build · MiMo-V2.5-Pro MiMo\n"
+                "tab switch modectrl+p settings @ attach file$ subagent / commands"
+            )
+            completed_visible = """
+MIMO_STATE_TEST_DONE
+
+▣ Build · MiMo-V2.5-Pro · 3.8s ⎘ copy
+36.0K (3%) · $0.03tab 切换模式 ctrl+p 设置 @ 添加文件 $ 子智能体 / 唤起命令
+"""
+            busy_visible = """
+正在处理请求。
+esc interrupt
+36.0K (3%) · tab 切换模式 ctrl+p 设置 @ 添加文件 $ 子智能体 / 唤起命令
+"""
+            trust_visible = """
+●  访问工作区：
+│  安全确认：这是你自己创建或信任的项目吗？
+│  MiMo Code 将能够读取、编辑和执行此目录中的文件。
+◆
+│  ● 是的，我信任此目录
+│  ○ 否，退出
+"""
 
             self.assertTrue(worker._visible_indicates_agent_starting("Performing one time database migration..."))
-            self.assertTrue(worker._visible_indicates_agent_ready('Ask anything... "Fix a TODO"\nctrl+p commands'))
-            self.assertFalse(worker._visible_indicates_agent_ready("Thinking...\nesc interrupt"))
+            self.assertTrue(worker._visible_indicates_agent_starting(trust_visible))
+            self.assertFalse(worker._visible_indicates_agent_ready(trust_visible))
+            self.assertTrue(worker._visible_indicates_agent_ready(waiting_visible))
+            self.assertTrue(worker._visible_indicates_agent_ready(english_waiting_visible))
+            self.assertTrue(worker._visible_indicates_agent_ready(completed_visible))
+            self.assertFalse(worker._visible_indicates_agent_ready(busy_visible))
             self.assertEqual(worker.config.expected_current_commands(), ("mimo", "node"))
 
     def test_supported_vendor_state_classification_is_deterministic(self):
@@ -665,8 +701,35 @@ s
                 "mimo",
                 "mimo/mimo-v2.5-pro",
                 "",
-                {"visible_text": "Ask anything...\nctrl+p commands", "raw_log_tail": "Ask anything...\nctrl+p commands", "current_command": "node", "pane_title": "MiMoCode"},
-                {"visible_text": "esc interrupt", "raw_log_tail": "esc interrupt", "current_command": "node", "pane_title": "MiMoCode"},
+                {
+                    "visible_text": "Xiaomi\nType your message... (type / for commands)\nBuild · MiMo-V2.5-Pro MiMo\ntab switch modectrl+p settings @ attach file$ subagent / commands",
+                    "raw_log_tail": "Xiaomi\nType your message... (type / for commands)\nBuild · MiMo-V2.5-Pro MiMo\ntab switch modectrl+p settings @ attach file$ subagent / commands",
+                    "current_command": "node",
+                    "pane_title": "MiMoCode",
+                },
+                {
+                    "visible_text": "正在处理请求。\nesc interrupt",
+                    "raw_log_tail": "正在处理请求。\nesc interrupt",
+                    "current_command": "node",
+                    "pane_title": "MiMoCode",
+                },
+            ),
+            (
+                "agy",
+                "Gemini 3.5 Flash (Low)",
+                "10900",
+                {
+                    "visible_text": "Antigravity CLI 1.0.9\n>\n? for shortcuts                                           Gemini 3.5 Flash (Low)",
+                    "raw_log_tail": "Antigravity CLI 1.0.9\n>\n? for shortcuts                                           Gemini 3.5 Flash (Low)",
+                    "current_command": "agy",
+                    "pane_title": "ip-172-16-181-165.ap-southeast-1.compute.internal",
+                },
+                {
+                    "visible_text": "> Count from 1 to 50\nGenerating...\nesc to cancel                                             Gemini 3.5 Flash (Low)",
+                    "raw_log_tail": "> Count from 1 to 50\nGenerating...\nesc to cancel                                             Gemini 3.5 Flash (Low)",
+                    "current_command": "agy",
+                    "pane_title": "ip-172-16-181-165.ap-southeast-1.compute.internal",
+                },
             ),
         )
         def fake_resolve_launch(vendor_id, requested_model, requested_effort):
@@ -727,7 +790,7 @@ s
                     worker.agent_started = False
                     expected_unstarted_ready_state = (
                         AgentRuntimeState.READY
-                        if vendor in {"codex", "claude", "gemini"}
+                        if vendor in {"codex", "claude", "gemini", "mimo"}
                         else AgentRuntimeState.STARTING
                     )
                     self.assertEqual(worker.get_agent_state(ready_observation), expected_unstarted_ready_state)
@@ -1536,6 +1599,31 @@ workspace (/directory)                                                     branc
         self.assertNotIn("--dangerously-skip-permissions", command)
         self.assertIn("vendor: mimo", header)
         self.assertIn("mimo_model=mimo/mimo-v2.5-pro", header)
+
+    def test_agy_launch_command_and_prompt_header_use_agy_vendor(self):
+        def fake_resolve_launch(vendor_id, requested_model, requested_effort):
+            return SimpleNamespace(
+                resolved_model=str(requested_model or "Gemini 3.5 Flash (Low)"),
+                resolved_variant="",
+                reasoning_control_mode="implicit_default",
+                catalog_source_kind="test",
+                confidence="high",
+                native_reasoning_level="",
+                normalized_effort=str(requested_effort or "high"),
+                supports_reasoning=True,
+                notes=(),
+            )
+
+        with mock.patch("tmux_core.runtime.tmux_runtime.resolve_launch", side_effect=fake_resolve_launch):
+            config = AgentRunConfig(vendor=Vendor.AGY, model="Gemini 3.5 Flash (Low)", reasoning_effort="low")
+            command = config.build_launch_command(Path("/tmp/project"))
+            header = build_prompt_header(Vendor.AGY, "Gemini 3.5 Flash (Low)", "low")
+
+        self.assertIn("agy --model 'Gemini 3.5 Flash (Low)' --dangerously-skip-permissions", command)
+        self.assertNotIn("/tmp/project", command)
+        self.assertEqual(config.expected_current_commands(), ("agy", "node"))
+        self.assertIn("vendor: agy", header)
+        self.assertIn("agy_model=Gemini 3.5 Flash (Low)", header)
 
     def test_build_session_name_is_stable_and_bounded(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -7723,6 +7811,63 @@ workspace (/directory)                                                     branc
             self.assertEqual(worker.last_pane_title, "WF")
             self.assertEqual(worker.observe_count, 2)
 
+    def test_wait_for_agent_ready_tolerates_transient_codex_shell_during_startup(self):
+        class TransientShellWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_count = 0
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                self.observe_count += 1
+                ready_surface = "› Run /review on my current changes\n  gpt-5.4 high · /tmp/DRL_PM"
+                if self.observe_count == 2:
+                    return WorkerObservation(
+                        visible_text="codex --model gpt-5.4\nuser@host DRL_PM %",
+                        raw_log_delta="",
+                        raw_log_tail="codex --model gpt-5.4\nuser@host DRL_PM %",
+                        current_command="zsh",
+                        current_path=str(self.work_dir),
+                        pane_dead=False,
+                        session_exists=True,
+                        log_mtime=0.0,
+                        observed_at="2026-06-18T10:29:09",
+                        pane_title="DRL_PM",
+                    )
+                return WorkerObservation(
+                    visible_text=ready_surface,
+                    raw_log_delta="",
+                    raw_log_tail=ready_surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at=f"2026-06-18T10:29:0{min(self.observe_count, 9)}",
+                    pane_title="DRL_PM",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="codex-transient-shell-") as tmp_dir:
+            work_dir = Path(tmp_dir) / "DRL_PM"
+            work_dir.mkdir()
+            worker = TransientShellWorker(
+                worker_id="codex-transient-shell-worker",
+                work_dir=work_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+
+            with mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                worker._wait_for_agent_ready(timeout_sec=1.0)
+
+            self.assertTrue(worker.agent_ready)
+            self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
+            self.assertEqual(worker.current_command, "node")
+            self.assertEqual(worker.observe_count, 3)
+
     def test_ensure_agent_ready_syncs_codex_ready_title_to_state_file(self):
         class FastReadyWorker(TmuxBatchWorker):
             def session_exists(self):
@@ -7878,6 +8023,50 @@ Do you trust the files in this folder?
 """
             self.assertTrue(worker._maybe_handle_gemini_boot_prompt(trust_prompt))
             self.assertFalse(worker._maybe_handle_gemini_boot_prompt(trust_prompt))
+            self.assertEqual(worker.keys, ["Enter"])
+
+    def test_mimo_boot_prompt_handler_accepts_workspace_trust_prompt(self):
+        class MimoBootWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.keys: list[str] = []
+
+            def send_special_key(self, key: str) -> None:
+                self.keys.append(key)
+
+        def fake_resolve_launch(vendor_id, requested_model, requested_effort):
+            return SimpleNamespace(
+                resolved_model=str(requested_model or "xiaomi/mimo-v2.5-pro"),
+                resolved_variant="",
+                reasoning_control_mode="implicit_default",
+                catalog_source_kind="test",
+                confidence="high",
+                native_reasoning_level="",
+                normalized_effort=str(requested_effort or "high"),
+                supports_reasoning=True,
+                notes=(),
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            side_effect=fake_resolve_launch,
+        ):
+            worker = MimoBootWorker(
+                worker_id="boot-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="mimo", model="xiaomi/mimo-v2.5-pro"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            trust_prompt = """
+●  访问工作区：
+│  安全确认：这是你自己创建或信任的项目吗？
+│  MiMo Code 将能够读取、编辑和执行此目录中的文件。
+◆
+│  ● 是的，我信任此目录
+│  ○ 否，退出
+"""
+            self.assertTrue(worker._maybe_handle_mimo_boot_prompt(trust_prompt))
+            self.assertFalse(worker._maybe_handle_mimo_boot_prompt(trust_prompt))
             self.assertEqual(worker.keys, ["Enter"])
 
     def test_wait_for_turn_reply_does_not_require_full_pane_stability_after_token(self):
@@ -9160,6 +9349,151 @@ Do you trust the files in this folder?
         )
         self.assertEqual(narrow_processing_phase, AgentRuntimeState.BUSY)
         self.assertEqual(extreme_wrapped_footer_ready_state, AgentRuntimeState.READY)
+
+    def test_mimo_output_detector_classifies_ready_busy_and_completed_surfaces(self):
+        detector = MimoOutputDetector()
+        waiting_surface = (
+            "Xiaomi输入消息...(输入/唤起命令)"
+            "Build·MiMo-V2.5-Pro"
+            "tab切换模式ctrl+p设置@添加文件$子智能体/唤起命令"
+        )
+        english_waiting_surface = """
+Xiaomi
+┃  Type your message... (type / for commands)
+┃  Build · MiMo-V2.5-Pro MiMo
+tab switch modectrl+p settings @ attach file$ subagent / commands
+"""
+        completed_surface = """
+MIMO_STATE_TEST_DONE
+
+▣ Build · MiMo-V2.5-Pro · 3.8s ⎘ copy
+36.0K (3%) · $0.03tab 切换模式 ctrl+p 设置 @ 添加文件 $ 子智能体 / 唤起命令
+"""
+        busy_surface = """
+正在处理请求。
+esc interrupt
+36.0K (3%) · tab 切换模式 ctrl+p 设置 @ 添加文件 $ 子智能体 / 唤起命令
+"""
+
+        waiting_phase = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=waiting_surface,
+                raw_log_delta="",
+                raw_log_tail=waiting_surface,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-06-17T00:00:00",
+                pane_title="MiMoCode",
+            )
+        )
+        completed_phase = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=completed_surface,
+                raw_log_delta="",
+                raw_log_tail=completed_surface,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-06-17T00:00:01",
+                pane_title="MiMoCode",
+            )
+        )
+        english_waiting_phase = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=english_waiting_surface,
+                raw_log_delta="",
+                raw_log_tail=english_waiting_surface,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-06-17T00:00:01",
+                pane_title="MiMoCode",
+            )
+        )
+        busy_phase = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=busy_surface,
+                raw_log_delta="",
+                raw_log_tail=busy_surface,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-06-17T00:00:02",
+                pane_title="MiMoCode",
+            )
+        )
+
+        self.assertEqual(waiting_phase, AgentRuntimeState.READY)
+        self.assertEqual(english_waiting_phase, AgentRuntimeState.READY)
+        self.assertEqual(completed_phase, AgentRuntimeState.READY)
+        self.assertEqual(busy_phase, AgentRuntimeState.BUSY)
+
+    def test_agy_output_detector_classifies_starting_ready_busy_and_completed_surfaces(self):
+        detector = AgyOutputDetector()
+        starting_surface = """
+ Welcome to the Antigravity CLI. You are currently not signed in.
+
+ ⣷  Signing in...
+"""
+        ready_surface = """
+      Antigravity CLI 1.0.9
+
+────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                           Gemini 3.5 Flash (Low)
+"""
+        busy_surface = """
+────────────────────────────────────────────────────────────
+> Count from 1 to 50
+⣷  Generating...
+────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────
+esc to cancel                                             Gemini 3.5 Flash (Low)
+"""
+        completed_surface = """
+────────────────────────────────────────────────────────────
+> Reply exactly: AGY_OK
+
+  AGY_OK
+
+────────────────────────────────────────────────────────────────────────────────
+>
+────────────────────────────────────────────────────────────────────────────────
+? for shortcuts                                           Gemini 3.5 Flash (Low)
+"""
+
+        def classify(surface: str) -> AgentRuntimeState:
+            return detector.classify_agent_state(
+                WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="agy",
+                    current_path="/tmp/project",
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-06-18T00:00:00",
+                    pane_title="ip-172-16-181-165.ap-southeast-1.compute.internal",
+                )
+            )
+
+        self.assertEqual(classify(starting_surface), AgentRuntimeState.STARTING)
+        self.assertEqual(classify(ready_surface), AgentRuntimeState.READY)
+        self.assertEqual(classify(busy_surface), AgentRuntimeState.BUSY)
+        self.assertEqual(classify(completed_surface), AgentRuntimeState.READY)
+        self.assertEqual(detector.extract_last_message(completed_surface).strip(), "AGY_OK")
 
     def test_wait_for_agent_ready_supports_opencode_visible_ready_without_title_ready(self):
         class OpenCodeReadyWorker(TmuxBatchWorker):
@@ -10897,6 +11231,20 @@ Do you trust the files in this folder?
             def target_exists(self, target=None):  # noqa: ANN001, ARG002
                 return True
 
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="zsh",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-12T00:00:00",
+                    pane_title="shell",
+                )
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             worker = ResumeBlockedWorker(
                 worker_id="resume-blocked-worker",
@@ -10932,6 +11280,71 @@ Do you trust the files in this folder?
 
         self.assertFalse(awaiting_reconfig_resumed)
         self.assertFalse(stale_busy_resumed)
+
+    def test_try_resume_worker_recovers_awaiting_reconfig_when_agent_is_ready(self):
+        class ResumeReadyMimoWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = (
+                    "Type your message... (type / for commands)\n"
+                    "Build · MiMo-V2.5-Pro MiMo"
+                )
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-05-12T00:00:00",
+                    pane_title="MiMoCode",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = ResumeReadyMimoWorker(
+                worker_id="resume-ready-awaiting-reconfig-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="mimo", model="xiaomi/mimo-v2.5-pro"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_command = "node"
+            worker._write_state(  # noqa: SLF001
+                WorkerStatus.RUNNING,
+                note="awaiting_reconfig",
+                extra={
+                    "dispatch_state": "delayed",
+                    "dispatch_reason": "prompt_confirm_timeout:slow prompt echo",
+                    "health_status": "awaiting_reconfig",
+                    "agent_state": "BUSY",
+                    "current_command": "node",
+                    "agent_role": "reviewer",
+                    "role_name": "审核员",
+                    "reviewer_key": "审核员",
+                    "role_prompt": "审核角色",
+                },
+            )
+
+            resumed = try_resume_worker(worker, timeout_sec=0.1)
+            state = worker.read_state()
+
+        self.assertTrue(resumed)
+        self.assertEqual(state["note"], "auto_resume_ready")
+        self.assertEqual(state["status"], "ready")
+        self.assertEqual(state["health_status"], "alive")
+        self.assertEqual(state["agent_state"], "READY")
+        self.assertEqual(state["agent_role"], "reviewer")
+        self.assertEqual(state["role_name"], "审核员")
+        self.assertEqual(state["reviewer_key"], "审核员")
+        self.assertEqual(state["role_prompt"], "审核角色")
 
     def test_wait_for_task_result_does_not_finalize_ready_contract_when_tmux_title_is_stale_busy(self):
         class StaleBusyTaskResultWorker(TmuxBatchWorker):
@@ -11115,6 +11528,83 @@ Do you trust the files in this folder?
                 phase="a07_developer_init",
                 task_kind="a07_developer_init",
                 mode="a07_developer_init",
+                expected_statuses=("ready", "hitl"),
+                optional_artifacts={"ask_human": ask_human},
+                outcome_artifacts={
+                    "ready": {"forbids": ("ask_human",)},
+                    "hitl": {"requires": ("ask_human",)},
+                },
+            )
+
+            result = worker.wait_for_task_result(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                timeout_sec=0.6,
+            )
+
+            self.assertEqual(result.payload["status"], "ready")
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
+            self.assertTrue(result_path.exists())
+
+    def test_wait_for_task_result_finalizes_a07_human_reply_ready_when_delta_has_stale_hitl(self):
+        class StaleBusyTaskResultWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def _terminal_idle_elapsed_sec(self):
+                return 60.0
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.BUSY
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = (
+                    "准备就绪\n"
+                    "Build · MiMo-V2.5-Pro · 56.6s\n"
+                    "开始开发，先按任务单逐个实现  (Tab to accept)\n"
+                    "Build · MiMo-V2.5-Pro MiMo"
+                )
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="• 阻断\n",
+                    raw_log_tail=f"previous HITL\n• 阻断\nlater completed\n准备就绪\n{surface}",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=time.time(),
+                    observed_at="2026-05-19T00:00:03",
+                    pane_title="MC | VarContribution任务预研审计",
+                )
+
+            def capture_visible(self, tail_lines=200):  # noqa: ARG002
+                return "准备就绪\nBuild · MiMo-V2.5-Pro MiMo"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            time.sleep(0.02)
+            ask_human = root / "与人类交流.md"
+            ask_human.write_text("", encoding="utf-8")
+            result_path = root / "result.json"
+            worker = StaleBusyTaskResultWorker(
+                worker_id="stale-busy-a07-human-reply-ready-legacy-tail",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="mimo", model="xiaomi/mimo-v2.5-pro"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_command = "node"
+            contract = TaskResultContract(
+                turn_id="a07_developer_human_reply",
+                phase="a07_developer_human_reply",
+                task_kind="a07_developer_human_reply",
+                mode="a07_developer_human_reply",
                 expected_statuses=("ready", "hitl"),
                 optional_artifacts={"ask_human": ask_human},
                 outcome_artifacts={
@@ -11339,6 +11829,72 @@ Do you trust the files in this folder?
 
             self.assertEqual(result.payload["status"], "hitl")
             self.assertEqual(result.payload["artifacts"]["ask_human"], str(ask_human.resolve()))
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+            self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
+            self.assertTrue(result_path.exists())
+
+    def test_wait_for_task_result_finalizes_completed_contract_when_tmux_title_is_stale_busy(self):
+        class StaleBusyTaskResultWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def _terminal_idle_elapsed_sec(self):
+                return 60.0
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Summarize recent commits\n  gpt-5.5 xhigh · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-06-18T00:00:03",
+                    pane_title="DRL_PM",
+                )
+
+            def capture_visible(self, tail_lines=200):  # noqa: ARG002
+                return "› Summarize recent commits\n  gpt-5.5 xhigh · ~/project"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            time.sleep(0.02)
+            developer_output = root / "工程师开发内容.md"
+            developer_output.write_text("- **完成任务**: `全面复核修订`\n", encoding="utf-8")
+            result_path = root / "result.json"
+            worker = StaleBusyTaskResultWorker(
+                worker_id="stale-busy-task-result-completed",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_command = "node"
+            contract = TaskResultContract(
+                turn_id="a08_developer_refine_all_code",
+                phase="a08_developer_refine_all_code",
+                task_kind="a08_developer_refine_all_code",
+                mode="a08_developer_refine_all_code",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": developer_output},
+            )
+
+            result = worker.wait_for_task_result(
+                contract=contract,
+                task_status_path=task_status_path,
+                result_path=result_path,
+                timeout_sec=0.6,
+            )
+
+            self.assertEqual(result.payload["status"], "completed")
+            self.assertEqual(result.payload["artifacts"]["developer_output"], str(developer_output.resolve()))
             self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
             self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
             self.assertTrue(result_path.exists())

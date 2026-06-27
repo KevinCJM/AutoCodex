@@ -226,6 +226,62 @@ class TurnOutputGoalsTests(unittest.TestCase):
 
             self.assertEqual(len(worker.prompts), 1)
 
+    def test_run_task_result_turn_with_repair_preserves_stale_busy_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            result_path = (
+                root
+                / ".development_runtime"
+                / "twr"
+                / "task_runtime"
+                / "开发工程师_development-developer-init_attempt_1_result.json"
+            )
+            ask_human = root / "与人类交流.md"
+            ask_human.write_text("", encoding="utf-8")
+            contract = TaskResultContract(
+                turn_id="a07_developer_init",
+                phase="a07_developer_init",
+                task_kind="a07_developer_init",
+                mode="a07_developer_init",
+                expected_statuses=("ready", "hitl"),
+                optional_artifacts={"ask_human": ask_human},
+                outcome_artifacts={
+                    "ready": {"forbids": ("ask_human",)},
+                    "hitl": {"requires": ("ask_human",)},
+                },
+            )
+
+            def response(*, result_contract=None, completion_contract=None):  # noqa: ANN001, ARG001
+                worker.current_task_result_path = str(result_path)
+                return SimpleNamespace(
+                    ok=False,
+                    clean_output=(
+                        f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: stale_busy_without_contract:"
+                        f"phase=a07_developer_init result_path={result_path} busy_extensions_exhausted=30"
+                    ),
+                )
+
+            worker = _FakeTaskWorker([response])
+            with self.assertRaisesRegex(RuntimeError, "stale_busy_without_contract"):
+                run_task_result_turn_with_repair(
+                    worker=worker,
+                    label="development_developer_init",
+                    prompt="原始 prompt",
+                    result_contract=contract,
+                    parse_result_payload=json.loads,
+                    turn_goal=TaskTurnGoal(
+                        goal_id="a07_developer_init",
+                        outcomes={
+                            "ready": OutcomeGoal(status="ready"),
+                            "hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",)),
+                        },
+                    ),
+                    stage_label="任务开发",
+                    role_label="开发工程师",
+                )
+
+            self.assertEqual(len(worker.prompts), 1)
+
     def test_run_task_result_turn_with_repair_uses_repair_result_contract_on_retry(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             root = Path(tmp_dir)

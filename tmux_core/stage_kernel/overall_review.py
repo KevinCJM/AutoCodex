@@ -23,9 +23,18 @@ from tmux_core.prompt_contracts.overall_review import (
     review_all_code,
     review_all_code_again,
 )
-from tmux_core.runtime.contracts import TaskResultContract, TurnFileContract
+from tmux_core.runtime.contracts import (
+    TASK_STATUS_DONE,
+    TaskResultContract,
+    TurnFileContract,
+    finalize_task_result,
+    write_task_status,
+)
 from tmux_core.runtime.tmux_runtime import (
+    AgentRuntimeState,
     DEFAULT_COMMAND_TIMEOUT_SEC,
+    SHELL_COMMANDS,
+    WorkerStatus,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
     is_provider_auth_error,
@@ -141,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode|mimo")
+    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode|mimo|agy")
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")
@@ -405,10 +414,21 @@ def _runtime_payload_reusable_for_handoff(payload: dict[str, object]) -> bool:
     note = str(payload.get("note", "")).strip().lower()
     agent_state = str(payload.get("agent_state", "")).strip().upper()
     task_runtime_status = str(payload.get("current_task_runtime_status", "")).strip().lower()
+    current_command = str(payload.get("current_command", "") or "").strip()
     active_execution = agent_state == "BUSY" or task_runtime_status == "running"
-    if (note == "awaiting_reconfig" or health_status == "awaiting_reconfig") and not active_execution:
+    ready_after_failure = (
+        agent_state == "READY"
+        and health_status in {"", "alive"}
+        and bool(current_command)
+        and current_command not in SHELL_COMMANDS
+    )
+    if (
+        (note == "awaiting_reconfig" or health_status == "awaiting_reconfig")
+        and not active_execution
+        and not ready_after_failure
+    ):
         return False
-    if status in {"failed", "stale_failed", "error"} and not active_execution:
+    if status in {"failed", "stale_failed", "error"} and not active_execution and not ready_after_failure:
         return False
     if health_status in {"provider_auth_error", "provider_runtime_error", "missing_session", "pane_dead", "dead"}:
         return False
@@ -1290,6 +1310,98 @@ def _run_overall_review_developer_turn(
     progress: ReviewStageProgress | None = None,
 ) -> DeveloperRuntime:
     current_developer = developer
+
+    def _current_task_contract_paths() -> tuple[str, str, Path | None, Path | None]:
+        worker = current_developer.worker
+        state: dict[str, object] = {}
+        read_state = getattr(worker, "read_state", None)
+        if callable(read_state):
+            with contextlib.suppress(Exception):
+                raw_state = read_state()
+                if isinstance(raw_state, dict):
+                    state = raw_state
+        task_status_path_text = str(
+            getattr(worker, "current_task_status_path", "") or state.get("current_task_status_path", "") or ""
+        ).strip()
+        result_path_text = str(
+            getattr(worker, "current_task_result_path", "") or state.get("current_task_result_path", "") or ""
+        ).strip()
+        task_status_path = Path(task_status_path_text).expanduser().resolve() if task_status_path_text else None
+        result_path = Path(result_path_text).expanduser().resolve() if result_path_text else None
+        return task_status_path_text, result_path_text, task_status_path, result_path
+
+    def _worker_appears_live() -> bool:
+        worker = current_developer.worker
+        session_exists = getattr(worker, "session_exists", None)
+        if callable(session_exists):
+            with contextlib.suppress(Exception):
+                if not session_exists():
+                    return False
+        read_state = getattr(worker, "read_state", None)
+        if callable(read_state):
+            with contextlib.suppress(Exception):
+                state = read_state()
+                if isinstance(state, dict):
+                    health_status = str(state.get("health_status", "") or "").strip().lower()
+                    agent_state = str(state.get("agent_state", "") or "").strip().upper()
+                    if health_status in {"dead", "missing_session", "pane_dead"}:
+                        return False
+                    if agent_state in {"READY", "BUSY", "STARTING"}:
+                        return True
+        get_agent_state = getattr(worker, "get_agent_state", None)
+        if callable(get_agent_state):
+            with contextlib.suppress(Exception):
+                state = get_agent_state()
+                return str(getattr(state, "value", state) or "").strip().upper() in {"READY", "BUSY", "STARTING"}
+        return True
+
+    def _mark_developer_fallback_completed() -> None:
+        worker = current_developer.worker
+        task_status_path_text, result_path_text, task_status_path, result_path = _current_task_contract_paths()
+        if result_path_text and result_path is not None:
+            finalize_task_result(
+                contract=result_contract,
+                result_path=result_path,
+                task_status_path=task_status_path,
+            )
+        elif task_status_path is not None:
+            write_task_status(task_status_path, status=TASK_STATUS_DONE)
+        with contextlib.suppress(Exception):
+            worker.current_task_runtime_status = TASK_STATUS_DONE
+        with contextlib.suppress(Exception):
+            worker.agent_ready = True
+        with contextlib.suppress(Exception):
+            worker.agent_started = True
+        with contextlib.suppress(Exception):
+            worker.agent_state = AgentRuntimeState.READY
+        write_state = getattr(worker, "_write_state", None)
+        if callable(write_state):
+            extra: dict[str, object] = {
+                "label": label,
+                "result_status": "succeeded",
+                "current_task_runtime_status": TASK_STATUS_DONE,
+                "dispatch_state": "",
+                "dispatch_reason": "",
+                "agent_ready": True,
+                "agent_started": True,
+                "agent_state": AgentRuntimeState.READY.value,
+            }
+            if task_status_path_text:
+                extra["current_task_status_path"] = task_status_path_text
+            if result_path_text:
+                extra["current_task_result_path"] = result_path_text
+            with contextlib.suppress(Exception):
+                write_state(WorkerStatus.SUCCEEDED, note=f"done:{label}", extra=extra)
+
+    def _developer_output_fallback_ready(error: BaseException) -> bool:
+        if result_contract.mode != "a08_developer_refine_all_code":
+            return False
+        if not is_task_result_contract_error(error):
+            return False
+        if not get_markdown_content(paths["developer_output_path"]).strip():
+            return False
+        return _worker_appears_live()
+
     while True:
         try:
             run_task_result_turn_with_repair(
@@ -1312,6 +1424,9 @@ def _run_overall_review_developer_turn(
             )
             return current_developer
         except Exception as error:  # noqa: BLE001
+            if _developer_output_fallback_ready(error):
+                _mark_developer_fallback_completed()
+                return current_developer
             if is_worker_death_error(error) or is_recoverable_startup_failure(error, current_developer.worker):
                 current_developer = _replace_dead_overall_review_developer(
                     current_developer,
