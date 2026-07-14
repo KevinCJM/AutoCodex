@@ -23,7 +23,9 @@ import tempfile
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import asdict, dataclass, is_dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TextIO
 
@@ -47,6 +49,7 @@ from tmux_core.runtime.tmux_runtime import (
     load_worker_from_state_path,
     _backend_show_option,
     request_runtime_shutdown,
+    stage_runner_context,
     try_resume_worker,
     worker_state_is_prelaunch_active,
 )
@@ -253,6 +256,22 @@ class PendingPromptState:
 class ResolvedHitlState:
     question_path: str = ""
     question_summary: str = ""
+
+
+class ShutdownPolicy(str, Enum):
+    CLEANUP = "CLEANUP"
+    PRESERVE_ORPHANS = "PRESERVE_ORPHANS"
+
+
+@dataclass
+class RunnerExecutionState:
+    runner_id: str
+    action: str
+    stage_seq: int
+    project_dir: str
+    requirement_name: str
+    terminal_source: str = ""
+    terminal_at: str = ""
 
 
 @dataclass
@@ -494,6 +513,21 @@ def _stage_record_action_fragment(action: str) -> str:
     return re.sub(r"[^0-9A-Za-z._-]+", "_", text).replace(".", "_").strip("._") or "unknown"
 
 
+def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary_path.open("w", encoding="utf-8") as handle:
+            json.dump(dict(payload), handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            temporary_path.unlink()
+
+
 def _write_project_stage_failure_record(
     *,
     project_dir: str,
@@ -501,6 +535,10 @@ def _write_project_stage_failure_record(
     action: str,
     error: BaseException,
     traceback_text: str,
+    runner_id: str = "",
+    stage_seq: int = 0,
+    failure_kind: str = "runner_failure",
+    orphaned_workers: Sequence[Mapping[str, Any]] = (),
 ) -> Path | None:
     project_text = str(project_dir or "").strip()
     if not project_text:
@@ -517,12 +555,16 @@ def _write_project_stage_failure_record(
             "requirement_name": str(requirement_name or "").strip(),
             "error": str(error),
             "traceback": str(traceback_text or ""),
+            "runner_id": str(runner_id or "").strip(),
+            "stage_seq": int(stage_seq or 0),
+            "failure_kind": str(failure_kind or "runner_failure").strip() or "runner_failure",
+            "orphaned_workers": [dict(item) for item in orphaned_workers],
             "updated_at": _iso_now(),
         }
         failure_path = record_dir / f"{_stage_record_action_fragment(action)}.failure.json"
-        failure_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(failure_path, payload)
         latest_path = record_dir / "latest_failure.json"
-        latest_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(latest_path, payload)
         return failure_path
     except Exception:
         return None
@@ -554,8 +596,11 @@ def _write_project_stage_state_record(
     status: str,
     stage_seq: int,
     source: str,
+    runner_id: str = "",
     failure_path: str = "",
+    failure_kind: str = "",
     message: str = "",
+    orphaned_workers: Sequence[Mapping[str, Any]] = (),
 ) -> Path | None:
     project_text = str(project_dir or "").strip()
     action_text = str(action or "").strip()
@@ -569,21 +614,17 @@ def _write_project_stage_state_record(
         safe_requirement = sanitize_requirement_name(requirement_name or "_global")
         record_dir = project_root / WORKFLOW_RECORD_ROOT_NAME / safe_requirement / "stages"
         record_dir.mkdir(parents=True, exist_ok=True)
-        if action_text == "workflow.a00.start" and normalized_source == "runner_start":
-            for stale_state_path in record_dir.glob("*.state.json"):
-                with contextlib.suppress(Exception):
-                    stale_state_path.unlink()
-        if str(status or "").strip() in {"running", "awaiting-input"} and normalized_source != "runner_failure":
-            _clear_project_stage_failure_record(record_dir=record_dir, action=action_text)
         state_path = record_dir / f"{_stage_record_action_fragment(action_text)}.state.json"
-        if str(status or "").strip() in {"running", "awaiting-input"} and normalized_source == "runtime_inference":
+        if normalized_source == "runtime_inference":
             with contextlib.suppress(Exception):
                 previous_payload = json.loads(state_path.read_text(encoding="utf-8"))
                 if (
                     isinstance(previous_payload, Mapping)
                     and str(previous_payload.get("action", "")).strip() == action_text
-                    and str(previous_payload.get("status", "")).strip() in {"failed", "error"}
-                    and str(previous_payload.get("source", "")).strip() == "runner_failure"
+                    and str(previous_payload.get("status", "")).strip()
+                    in {"completed", "failed", "error", "superseded"}
+                    and str(previous_payload.get("source", "")).strip()
+                    in {"runner_complete", "runner_failure"}
                 ):
                     return state_path
         payload = {
@@ -592,12 +633,23 @@ def _write_project_stage_state_record(
             "project_dir": str(project_root),
             "requirement_name": str(requirement_name or "").strip(),
             "stage_seq": int(stage_seq or 0),
+            "runner_id": str(runner_id or "").strip(),
             "source": normalized_source,
             "updated_at": _iso_now(),
             "failure_path": str(Path(failure_path).expanduser().resolve()) if str(failure_path).strip() else "",
+            "failure_kind": str(failure_kind or "").strip(),
             "message": str(message or "").strip(),
+            "orphaned_workers": [dict(item) for item in orphaned_workers],
         }
-        state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        _atomic_write_json(state_path, payload)
+        if action_text == "workflow.a00.start" and normalized_source == "runner_start":
+            for stale_state_path in record_dir.glob("*.state.json"):
+                if stale_state_path == state_path:
+                    continue
+                with contextlib.suppress(Exception):
+                    stale_state_path.unlink()
+        if str(status or "").strip() in {"running", "awaiting-input"} and normalized_source == "runner_start":
+            _clear_project_stage_failure_record(record_dir=record_dir, action=action_text)
         return state_path
     except Exception:
         return None
@@ -631,6 +683,29 @@ def _read_project_stage_state_record(
     if str(payload.get("action", "")).strip() != action_text:
         return None
     return dict(payload)
+
+
+def _max_project_stage_seq(*, project_dir: str, requirement_name: str) -> int:
+    project_text = str(project_dir or "").strip()
+    if not project_text:
+        return 0
+    try:
+        record_dir = (
+            Path(project_text).expanduser().resolve()
+            / WORKFLOW_RECORD_ROOT_NAME
+            / sanitize_requirement_name(requirement_name or "_global")
+            / "stages"
+        )
+    except Exception:
+        return 0
+    maximum = 0
+    for state_path in record_dir.glob("*.state.json") if record_dir.is_dir() else ():
+        payload = _safe_json_read(state_path)
+        try:
+            maximum = max(maximum, int(payload.get("stage_seq") or 0))
+        except Exception:
+            continue
+    return maximum
 
 
 def _stage_hitl_audit_answered_state(
@@ -1658,15 +1733,6 @@ def _read_worker_state_snapshot(
         health_note=health_note,
     )
     current_task_runtime_status = str(state.get("current_task_runtime_status", "")).strip()
-    if (
-        agent_state == "READY"
-        and raw_status == "ready"
-        and status in {"running", "pending"}
-        and current_task_runtime_status == "running"
-        and note == "agent_ready"
-    ):
-        status = raw_status
-        current_task_runtime_status = ""
     if agent_state in {"BUSY", "STARTING"} and _worker_snapshot_has_completed_status(
         {
             **state,
@@ -1705,6 +1771,13 @@ def _read_worker_state_snapshot(
         "current_task_runtime_status": current_task_runtime_status,
         "dispatch_state": str(state.get("dispatch_state", "")).strip(),
         "dispatch_reason": str(state.get("dispatch_reason", "")).strip(),
+        "turn_state": str(state.get("turn_state", "")).strip(),
+        "orphaned_at": str(state.get("orphaned_at", "")).strip(),
+        "orphaned_reason": str(state.get("orphaned_reason", "")).strip(),
+        "stage_runner_id": str(state.get("stage_runner_id", "")).strip(),
+        "tmux_control_status": str(state.get("tmux_control_status", "")).strip(),
+        "tmux_control_error": str(state.get("tmux_control_error", "")).strip(),
+        "tmux_control_unavailable_since": str(state.get("tmux_control_unavailable_since", "")).strip(),
         "question_path": str(turn_bundle.get("question_path") or "").strip(),
         "answer_path": str(turn_bundle.get("answer_path") or "").strip(),
         "artifact_paths": artifact_paths,
@@ -1757,13 +1830,20 @@ class BridgeCore:
             progress_context_provider=self._current_progress_context,
         )
         self._workers: dict[str, threading.Thread] = {}
-        self._worker_registry_lock = threading.Lock()
+        self._worker_registry_lock = threading.RLock()
         self._running_action_keys: dict[str, str] = {}
+        self._runner_executions: dict[str, RunnerExecutionState] = {}
+        self._runner_local = threading.local()
         self._controls: dict[str, ControlSessionState] = {}
         self._controls_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
         self._shutdown_tmux_cleanup_done = False
+        self._shutdown_policy: ShutdownPolicy | None = None
+        self._shutdown_policy_reason = ""
+        self._shutdown_policy_recoverable_interruption = False
+        self._shutdown_policy_generation_reset_allowed = False
+        self._shutdown_policy_failure_scopes: set[tuple[str, str, str]] = set()
         self._context = AppContext()
         self._presence_ttl_sec = 15.0
         self._tui_presence_refresh_interval_sec = 0.75
@@ -1776,6 +1856,9 @@ class BridgeCore:
         self._display_action = ""
         self._display_stage_seq = 0
         self._display_source = ""
+        self._display_runner_id = ""
+        self._display_failure: dict[str, Any] = {}
+        self._display_state_lock = threading.RLock()
         self._stage_seq_counter = 0
         self._stage_seq_lock = threading.Lock()
         self._snapshot_debounce_sec = 0.15
@@ -1871,7 +1954,7 @@ class BridgeCore:
             stage_label=self._resolve_stage_label(
                 action=self._display_action or self._context.current_action,
                 project_dir=self._resolve_project_dir(),
-                requirement_name=str(self._context.requirement_name or "").strip(),
+                requirement_name=self._resolve_requirement_name(),
             ),
         )
         self._emit_hitl_prompt_log(request)
@@ -2212,11 +2295,12 @@ class BridgeCore:
         exit_status = "completed" if next_index > previous_index else "superseded"
         _write_project_stage_state_record(
             project_dir=self._resolve_project_dir(),
-            requirement_name=str(self._context.requirement_name or "").strip(),
+            requirement_name=self._resolve_requirement_name(),
             action=previous_action,
             status=exit_status,
             stage_seq=int(self._display_stage_seq or 0),
-            source="runtime_inference",
+            runner_id=str(self._display_runner_id or "").strip(),
+            source="runner_complete",
             message=f"stage switched to {next_action}",
         )
 
@@ -2224,14 +2308,26 @@ class BridgeCore:
         normalized = str(action or "").strip()
         if not normalized:
             return
-        stage_seq = self._allocate_stage_seq()
+        runner_id = str(getattr(self._runner_local, "runner_id", "") or self._display_runner_id or "").strip()
+        if self._runner_generation_is_superseded(runner_id):
+            return
+        with self._worker_registry_lock:
+            stage_seq = self._allocate_stage_seq()
         self._persist_previous_runtime_stage_exit(normalized)
         self._set_context(action=normalized)
         self._emit_display_stage_state(
             preferred_status="running",
             preferred_action=normalized,
             preferred_stage_seq=stage_seq,
+            preferred_runner_id=runner_id,
+            source="runner_start",
             force=True,
+        )
+        self._cleanup_stage_orphans_before_runner_start(normalized, runner_id=runner_id)
+        self._reset_preserve_policy_for_new_generation(
+            action=normalized,
+            runner_id=runner_id,
+            stage_seq=stage_seq,
         )
         self._schedule_flow_snapshot_update(
             sections={"app"},
@@ -2249,18 +2345,170 @@ class BridgeCore:
         normalized = str(action or "").strip()
         if not normalized:
             return False
-        for thread in list(self._workers.values()):
+        with self._display_state_lock:
+            display_action = str(self._display_action or "").strip()
+            display_runner_id = str(self._display_runner_id or "").strip()
+        with self._worker_registry_lock:
+            active_workers = [
+                (worker_key, thread, self._runner_executions.get(worker_key))
+                for worker_key, thread in self._workers.items()
+            ]
+        for _worker_key, thread, execution in active_workers:
             try:
-                if normalized in str(getattr(thread, "name", "")) and thread.is_alive():
+                if not thread.is_alive():
+                    continue
+                execution_action = str(getattr(execution, "action", "") or "").strip()
+                execution_runner_id = str(getattr(execution, "runner_id", "") or "").strip()
+                if execution_action == normalized:
+                    return True
+                if (
+                    display_runner_id
+                    and execution_runner_id == display_runner_id
+                    and display_action == normalized
+                    and execution_action == "workflow.a00.start"
+                ):
+                    return True
+                if normalized in str(getattr(thread, "name", "")):
                     return True
             except Exception:
                 continue
         return False
 
-    def _allocate_stage_seq(self) -> int:
+    def _runner_generation_is_superseded(self, runner_id: str) -> bool:
+        normalized_runner_id = str(runner_id or "").strip()
+        if not normalized_runner_id:
+            return False
+        with self._worker_registry_lock:
+            executions = list(self._runner_executions.values())
+        current = next(
+            (
+                execution
+                for execution in executions
+                if str(getattr(execution, "runner_id", "") or "").strip() == normalized_runner_id
+            ),
+            None,
+        )
+        if current is None:
+            return False
+        current_seq = int(getattr(current, "stage_seq", 0) or 0)
+        current_project = str(getattr(current, "project_dir", "") or "").strip()
+        current_requirement = str(getattr(current, "requirement_name", "") or "").strip()
+        for execution in executions:
+            candidate_runner_id = str(getattr(execution, "runner_id", "") or "").strip()
+            if not candidate_runner_id or candidate_runner_id == normalized_runner_id:
+                continue
+            if int(getattr(execution, "stage_seq", 0) or 0) <= current_seq:
+                continue
+            candidate_project = str(getattr(execution, "project_dir", "") or "").strip()
+            candidate_requirement = str(getattr(execution, "requirement_name", "") or "").strip()
+            if current_project and candidate_project and current_project != candidate_project:
+                continue
+            if current_requirement and candidate_requirement and current_requirement != candidate_requirement:
+                continue
+            return True
+        with self._display_state_lock:
+            display_runner_id = str(self._display_runner_id or "").strip()
+            display_stage_seq = int(self._display_stage_seq or 0)
+        return bool(
+            display_runner_id
+            and display_runner_id != normalized_runner_id
+            and display_stage_seq
+            and display_stage_seq >= current_seq
+        )
+
+    def _allocate_stage_seq(
+        self,
+        *,
+        project_dir: str | None = None,
+        requirement_name: str | None = None,
+    ) -> int:
         with self._stage_seq_lock:
-            self._stage_seq_counter += 1
+            persisted_maximum = _max_project_stage_seq(
+                project_dir=str(project_dir or self._resolve_project_dir()).strip(),
+                requirement_name=(
+                    self._resolve_requirement_name()
+                    if requirement_name is None
+                    else str(requirement_name or "").strip()
+                ),
+            )
+            self._stage_seq_counter = max(self._stage_seq_counter, persisted_maximum) + 1
             return self._stage_seq_counter
+
+    def _has_explicit_runner_generation(
+        self,
+        *,
+        action: str,
+        project_dir: str,
+        requirement_name: str,
+    ) -> bool:
+        normalized_action = str(action or "").strip()
+        normalized_project = self._normalize_action_scope_project(project_dir)
+        normalized_requirement = str(requirement_name or "").strip()
+        with self._worker_registry_lock:
+            executions = [
+                (worker_key, execution)
+                for worker_key, execution in self._runner_executions.items()
+                if worker_key in self._workers
+            ]
+        for _worker_key, execution in executions:
+            execution_action = str(execution.action or "").strip()
+            if execution_action not in {normalized_action, "workflow.a00.start"}:
+                continue
+            execution_project = self._normalize_action_scope_project(execution.project_dir)
+            if normalized_project and execution_project and execution_project != normalized_project:
+                continue
+            execution_requirement = str(execution.requirement_name or "").strip()
+            if (
+                normalized_requirement
+                and execution_requirement
+                and execution_requirement != normalized_requirement
+            ):
+                continue
+            return True
+        return False
+
+    def _reconcile_persisted_running_runner(self, action: str) -> bool:
+        normalized_action = str(action or "").strip()
+        project_dir = str(self._resolve_project_dir() or "").strip()
+        requirement_name = self._resolve_requirement_name()
+        if not normalized_action or not project_dir:
+            return False
+        persisted_state = _read_project_stage_state_record(
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            action=normalized_action,
+        )
+        if not persisted_state:
+            return False
+        if str(persisted_state.get("source", "") or "").strip() != "runner_start":
+            return False
+        if str(persisted_state.get("status", "") or "").strip() != "running":
+            return False
+        if self._has_explicit_runner_generation(
+            action=normalized_action,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        ):
+            return False
+        stage_seq = int(persisted_state.get("stage_seq") or 0)
+        runner_id = str(persisted_state.get("runner_id", "") or "").strip()
+        _failure_path, _orphaned_workers, accepted = self._commit_runner_failure(
+            action=normalized_action,
+            stage_seq=stage_seq,
+            runner_id=runner_id,
+            error=RuntimeShutdownRequested(
+                "检测到上一个 backend 已退出，但持久化 runner 仍为 running；已收敛为 runner_interrupted。"
+            ),
+            traceback_text="",
+            failure_kind="runner_interrupted",
+        )
+        if accepted:
+            with self._shutdown_lock:
+                self._shutdown_policy_recoverable_interruption = (
+                    self._shutdown_policy == ShutdownPolicy.PRESERVE_ORPHANS
+                    and not self._shutdown_started
+                )
+        return accepted
 
     def _current_progress_context(self) -> dict[str, Any]:
         return {
@@ -2278,6 +2526,37 @@ class BridgeCore:
             ]
         ).strip()
 
+    def _update_runner_execution_scope_if_unset(
+        self,
+        *,
+        project_dir: str | None = None,
+        requirement_name: str | None = None,
+    ) -> None:
+        thread_runner_id = str(getattr(self._runner_local, "runner_id", "") or "").strip()
+        with self._display_state_lock:
+            display_runner_id = str(self._display_runner_id or "").strip()
+        target_runner_id = thread_runner_id or display_runner_id
+        normalized_project = self._normalize_action_scope_project(str(project_dir or ""))
+        normalized_requirement = str(requirement_name or "").strip()
+        with self._worker_registry_lock:
+            executions = list(self._runner_executions.values())
+            if target_runner_id:
+                executions = [
+                    execution
+                    for execution in executions
+                    if str(getattr(execution, "runner_id", "") or "").strip() == target_runner_id
+                ]
+            elif len(executions) != 1:
+                return
+            for execution in executions:
+                if normalized_project and not str(getattr(execution, "project_dir", "") or "").strip():
+                    execution.project_dir = normalized_project
+                if (
+                    normalized_requirement
+                    and not str(getattr(execution, "requirement_name", "") or "").strip()
+                ):
+                    execution.requirement_name = normalized_requirement
+
     def _update_context_from_prompt_response(
         self,
         prompt: PendingPromptState,
@@ -2288,6 +2567,7 @@ class BridgeCore:
             return
         value = str(payload.get("value", "")).strip()
         if "项目工作目录" in marker and value:
+            self._update_runner_execution_scope_if_unset(project_dir=value)
             self._set_context(project_dir=value, requirement_name="")
             return
         requirement_name = resolve_requirement_name_from_prompt_response(
@@ -2296,9 +2576,14 @@ class BridgeCore:
             options=prompt.payload.get("options", ()),
         )
         if requirement_name:
+            self._update_runner_execution_scope_if_unset(requirement_name=requirement_name)
             self._set_context(requirement_name=requirement_name)
 
     def _resolve_project_dir(self, *, runs: Sequence[Mapping[str, Any]] | None = None) -> str:
+        runner_execution = getattr(self._runner_local, "execution", None)
+        if runner_execution is not None:
+            runner_project_dir = str(getattr(runner_execution, "project_dir", "") or "").strip()
+            return self._normalize_action_scope_project(runner_project_dir)
         if self._context.project_dir:
             return self._context.project_dir
         session = self._current_control_session()
@@ -2313,10 +2598,20 @@ class BridgeCore:
                 return str(Path(project_dir).expanduser().resolve())
         return ""
 
+    def _resolve_requirement_name(self) -> str:
+        runner_execution = getattr(self._runner_local, "execution", None)
+        if runner_execution is not None:
+            return str(getattr(runner_execution, "requirement_name", "") or "").strip()
+        return str(self._context.requirement_name or "").strip()
+
     def _resolve_routing_project_dir(self, payload: Mapping[str, Any] | None = None) -> str:
         payload_value = str((payload or {}).get("project_dir", "")).strip()
         if payload_value:
             return str(Path(payload_value).expanduser().resolve())
+        runner_execution = getattr(self._runner_local, "execution", None)
+        if runner_execution is not None:
+            runner_project_dir = str(getattr(runner_execution, "project_dir", "") or "").strip()
+            return self._normalize_action_scope_project(runner_project_dir)
         if self._context.project_dir:
             return self._context.project_dir
         session = self._current_control_session()
@@ -2576,12 +2871,20 @@ class BridgeCore:
             if current_action and current_action != action:
                 resolved_action = current_action
         if isinstance(result, Mapping):
+            self._update_runner_execution_scope_if_unset(
+                project_dir=str(result.get("project_dir", "")).strip() or None,
+                requirement_name=str(result.get("requirement_name", "")).strip() or None,
+            )
             self._set_context(
                 project_dir=str(result.get("project_dir", "")).strip() or None,
                 requirement_name=str(result.get("requirement_name", "")).strip() or None,
                 action=resolved_action,
             )
             return
+        self._update_runner_execution_scope_if_unset(
+            project_dir=str(getattr(result, "project_dir", "") or "").strip() or None,
+            requirement_name=str(getattr(result, "requirement_name", "") or "").strip() or None,
+        )
         self._set_context(
             project_dir=str(getattr(result, "project_dir", "") or "").strip() or None,
             requirement_name=str(getattr(result, "requirement_name", "") or "").strip() or None,
@@ -2821,7 +3124,7 @@ class BridgeCore:
 
     def _build_requirements_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         active_action = str(self._display_action or self._context.current_action or "").strip()
         files: list[dict[str, Any]] = []
         workers: list[dict[str, Any]] = []
@@ -3101,7 +3404,7 @@ class BridgeCore:
         return False
 
     def _scan_current_overall_review_workers(self, project_dir: str | Path) -> list[dict[str, Any]]:
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         project_text = str(Path(project_dir).expanduser().resolve())
         workers = self._scan_current_development_workers(project_dir)
         scoped = self._filter_workers_for_current_context(workers, "stage.a08.start")
@@ -3123,7 +3426,7 @@ class BridgeCore:
 
     def _build_review_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         files: list[dict[str, Any]] = []
         workers: list[dict[str, Any]] = []
         blockers: list[str] = []
@@ -3162,7 +3465,7 @@ class BridgeCore:
 
     def _build_design_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         files: list[dict[str, Any]] = []
         workers: list[dict[str, Any]] = []
         blockers: list[str] = []
@@ -3199,7 +3502,7 @@ class BridgeCore:
 
     def _build_task_split_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         files: list[dict[str, Any]] = []
         workers: list[dict[str, Any]] = []
         blockers: list[str] = []
@@ -3238,7 +3541,7 @@ class BridgeCore:
 
     def _build_development_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         files: list[dict[str, Any]] = []
         workers: list[dict[str, Any]] = []
         blockers: list[str] = []
@@ -3285,7 +3588,7 @@ class BridgeCore:
 
     def _build_overall_review_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         files: list[dict[str, Any]] = []
         workers: list[dict[str, Any]] = []
         blockers: list[str] = []
@@ -3375,7 +3678,7 @@ class BridgeCore:
         question_path: str | Path,
     ) -> bool:
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         audit_state = _stage_hitl_audit_answered_state(
             project_dir=project_dir,
             requirement_name=requirement_name,
@@ -3408,7 +3711,7 @@ class BridgeCore:
         if runtime_snapshot.get("pending", False):
             return runtime_snapshot
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         if not project_dir or not requirement_name:
             return {"pending": False, "question_path": "", "answer_path": "", "summary": ""}
         try:
@@ -3608,10 +3911,17 @@ class BridgeCore:
             attention_snapshot = prompt_attention_snapshot
         artifacts_snapshot = dict(artifacts) if artifacts is not None else self._build_artifacts_snapshot(control=control_snapshot)
         project_dir = self._resolve_project_dir(runs=runs_list)
-        requirement_name = str(self._context.requirement_name or "").strip()
-        preferred_stage = self._display_action or self._context.current_action or "idle"
-        preferred_status = str(self._display_status or "ready").strip() or "ready"
-        preferred_stage_seq = int(self._display_stage_seq or 0)
+        requirement_name = self._resolve_requirement_name()
+        with self._display_state_lock:
+            reconcile_action = str(self._display_action or self._context.current_action or "").strip()
+        self._reconcile_persisted_running_runner(reconcile_action)
+        with self._display_state_lock:
+            preferred_stage = self._display_action or self._context.current_action or "idle"
+            preferred_status = str(self._display_status or "ready").strip() or "ready"
+            preferred_stage_seq = int(self._display_stage_seq or 0)
+            preferred_source = str(self._display_source or "").strip()
+            preferred_runner_id = str(self._display_runner_id or "").strip()
+            display_failure = dict(self._display_failure)
         runtime_status: str | None = None
         if stage_snapshots:
             active_route = STAGE_ROUTE_BY_ACTION.get(str(preferred_stage or "").strip())
@@ -3624,12 +3934,75 @@ class BridgeCore:
             preferred_action=preferred_stage,
             preferred_status=preferred_status,
             preferred_stage_seq=preferred_stage_seq,
-            source=str(getattr(self, "_display_source", "") or "").strip(),
+            source=preferred_source,
             runtime_status=runtime_status,
             pending_prompt=bool(self._iter_pending_prompts()),
             pending_hitl=bool(hitl_snapshot.get("pending", False)),
         )
         active_stage = active_stage or "idle"
+        stage_state = _read_project_stage_state_record(
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            action=active_stage,
+        )
+        if stage_state is not None and int(stage_state.get("stage_seq") or 0) == int(active_stage_seq or 0):
+            preferred_source = str(stage_state.get("source", "") or preferred_source).strip()
+            preferred_runner_id = str(stage_state.get("runner_id", "") or preferred_runner_id).strip()
+            if active_stage_status in {"failed", "error"}:
+                failure_path = str(stage_state.get("failure_path", "") or "").strip()
+                persisted_failure = _safe_json_read(failure_path) if failure_path else {}
+                display_failure = {
+                    "kind": str(
+                        persisted_failure.get("failure_kind")
+                        or stage_state.get("failure_kind")
+                        or "runner_failure"
+                    ).strip(),
+                    "message": str(persisted_failure.get("error") or stage_state.get("message") or "").strip(),
+                    "path": failure_path,
+                    "runner_id": str(persisted_failure.get("runner_id") or preferred_runner_id).strip(),
+                    "stage_seq": int(persisted_failure.get("stage_seq") or active_stage_seq or 0),
+                    "updated_at": str(persisted_failure.get("updated_at") or stage_state.get("updated_at") or "").strip(),
+                    "orphaned_workers": list(
+                        persisted_failure.get("orphaned_workers")
+                        or stage_state.get("orphaned_workers")
+                        or []
+                    ),
+                }
+        if active_stage_status in {"failed", "error"} and (
+            display_failure or preferred_source == "runner_failure"
+        ):
+            stage_label = self._resolve_stage_label(
+                action=active_stage,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+            )
+            failure_path = str(
+                display_failure.get("failure_path")
+                or display_failure.get("path")
+                or ""
+            ).strip()
+            failure_kind = str(
+                display_failure.get("failure_kind")
+                or display_failure.get("kind")
+                or "runner_failure"
+            ).strip() or "runner_failure"
+            display_failure = {
+                **display_failure,
+                "action": active_stage,
+                "status": "failed",
+                "source": "runner_failure",
+                "failure_path": failure_path,
+                "failure_kind": failure_kind,
+                "stage_label": stage_label,
+                # Keep the original aliases for additive compatibility.
+                "path": failure_path,
+                "kind": failure_kind,
+                "runner_id": str(display_failure.get("runner_id") or preferred_runner_id).strip(),
+                "stage_seq": int(display_failure.get("stage_seq") or active_stage_seq or 0),
+                "orphaned_workers": list(display_failure.get("orphaned_workers") or []),
+            }
+        else:
+            display_failure = {}
         return {
             "project_dir": project_dir,
             "requirement_name": requirement_name,
@@ -3638,6 +4011,9 @@ class BridgeCore:
             "active_stage": active_stage,
             "active_stage_status": active_stage_status,
             "active_stage_seq": active_stage_seq,
+            "active_stage_runner_id": preferred_runner_id,
+            "active_stage_source": preferred_source,
+            "active_stage_failure": display_failure,
             "active_stage_label": self._resolve_stage_label(
                 action=active_stage,
                 project_dir=project_dir,
@@ -3696,6 +4072,8 @@ class BridgeCore:
         if not project_dir:
             return []
         project_root = Path(project_dir)
+        if normalized in {"control.b01.open", "stage.a01.start"}:
+            return self._scan_runtime_workers_without_runtime_io(project_root / ROUTING_RUNTIME_ROOT_NAME)
         if normalized == "stage.a02.start":
             return self._scan_runtime_workers_without_runtime_io(project_root / NOTION_RUNTIME_ROOT_NAME)
         if normalized == "stage.a03.start":
@@ -3704,14 +4082,25 @@ class BridgeCore:
                 self._scan_runtime_workers_without_runtime_io(project_root / LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
             )
         if normalized == "stage.a04.start":
-            return self._scan_runtime_workers_without_runtime_io(project_root / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME)
+            return _merge_worker_snapshots(
+                self._scan_runtime_workers_without_runtime_io(project_root / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers_without_runtime_io(project_root / REQUIREMENTS_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers_without_runtime_io(project_root / LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
+            )
         if normalized == "stage.a05.start":
-            return self._scan_runtime_workers_without_runtime_io(project_root / DETAILED_DESIGN_RUNTIME_ROOT_NAME)
+            return _merge_worker_snapshots(
+                self._scan_runtime_workers_without_runtime_io(project_root / DETAILED_DESIGN_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers_without_runtime_io(project_root / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers_without_runtime_io(project_root / REQUIREMENTS_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers_without_runtime_io(project_root / LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
+            )
         if normalized == "stage.a06.start":
             return _merge_worker_snapshots(
                 self._scan_runtime_workers_without_runtime_io(project_root / TASK_SPLIT_RUNTIME_ROOT_NAME),
                 self._scan_runtime_workers_without_runtime_io(project_root / DETAILED_DESIGN_RUNTIME_ROOT_NAME),
                 self._scan_runtime_workers_without_runtime_io(project_root / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers_without_runtime_io(project_root / REQUIREMENTS_RUNTIME_ROOT_NAME),
+                self._scan_runtime_workers_without_runtime_io(project_root / LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
             )
         if normalized == "stage.a07.start":
             return self._scan_runtime_workers_without_runtime_io(project_root / DEVELOPMENT_RUNTIME_ROOT_NAME)
@@ -3719,9 +4108,198 @@ class BridgeCore:
             return self._scan_runtime_workers_without_runtime_io(project_root / DEVELOPMENT_RUNTIME_ROOT_NAME)
         return []
 
+    def _current_stage_worker_states_without_runtime_io(self, action: str) -> list[tuple[Path, dict[str, Any]]]:
+        normalized = str(action or "").strip()
+        project_dir = str(self._resolve_project_dir() or "").strip()
+        if not project_dir or not normalized:
+            return []
+        project_root = Path(project_dir).expanduser().resolve()
+        roots_by_action: dict[str, tuple[str, ...]] = {
+            "control.b01.open": (ROUTING_RUNTIME_ROOT_NAME,),
+            "stage.a01.start": (ROUTING_RUNTIME_ROOT_NAME,),
+            "stage.a02.start": (NOTION_RUNTIME_ROOT_NAME,),
+            "stage.a03.start": (REQUIREMENTS_RUNTIME_ROOT_NAME, LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME),
+            "stage.a04.start": (
+                REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+                REQUIREMENTS_RUNTIME_ROOT_NAME,
+                LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME,
+            ),
+            "stage.a05.start": (
+                DETAILED_DESIGN_RUNTIME_ROOT_NAME,
+                REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+                REQUIREMENTS_RUNTIME_ROOT_NAME,
+                LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME,
+            ),
+            "stage.a06.start": (
+                TASK_SPLIT_RUNTIME_ROOT_NAME,
+                DETAILED_DESIGN_RUNTIME_ROOT_NAME,
+                REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+                REQUIREMENTS_RUNTIME_ROOT_NAME,
+                LEGACY_REQUIREMENTS_RUNTIME_ROOT_NAME,
+            ),
+            "stage.a07.start": (DEVELOPMENT_RUNTIME_ROOT_NAME,),
+            "stage.a08.start": (DEVELOPMENT_RUNTIME_ROOT_NAME,),
+        }
+        requirement_name = self._resolve_requirement_name()
+        result: list[tuple[Path, dict[str, Any]]] = []
+        for root_name in roots_by_action.get(normalized, ()):
+            runtime_root = project_root / root_name
+            if not runtime_root.is_dir():
+                continue
+            for state_path in self._iter_worker_state_paths(runtime_root):
+                payload = _safe_json_read(state_path)
+                if not payload:
+                    continue
+                state_action = str(payload.get("workflow_action", "") or "").strip()
+                if state_action != normalized:
+                    continue
+                state_requirement = str(payload.get("requirement_name", "") or "").strip()
+                if requirement_name and state_requirement != requirement_name:
+                    continue
+                state_project = str(payload.get("project_dir") or payload.get("work_dir") or "").strip()
+                if state_project:
+                    with contextlib.suppress(Exception):
+                        if Path(state_project).expanduser().resolve() != project_root:
+                            continue
+                result.append((state_path, payload))
+        return result
+
+    @staticmethod
+    def _worker_can_be_orphaned(worker: Mapping[str, Any]) -> bool:
+        session_name = str(worker.get("session_name", "") or "").strip()
+        if not session_name:
+            return False
+        agent_state = str(worker.get("agent_state", "") or "").strip().upper()
+        health_status = str(worker.get("health_status", "") or "").strip().lower()
+        return agent_state != "DEAD" and health_status != "dead"
+
+    def _update_worker_orphan_marker(
+        self,
+        state_path_value: str,
+        *,
+        runner_id: str,
+        orphaned: bool,
+        reason: str = "",
+        stage_action: str = "",
+    ) -> bool:
+        state_path_text = str(state_path_value or "").strip()
+        if not state_path_text:
+            return False
+        state_path = Path(state_path_text).expanduser().resolve()
+        payload = _safe_json_read(state_path)
+        if not payload:
+            return False
+        payload["stage_runner_id"] = str(runner_id or "").strip()
+        if orphaned:
+            payload["turn_state"] = "orphaned"
+            payload["orphaned_at"] = _iso_now()
+            payload["orphaned_reason"] = str(reason or "runner_failure").strip() or "runner_failure"
+            payload["orphaned_stage_action"] = str(stage_action or "").strip()
+        else:
+            payload["turn_state"] = ""
+            payload["orphaned_at"] = ""
+            payload["orphaned_reason"] = ""
+            payload["orphaned_stage_action"] = ""
+        try:
+            _atomic_write_json(state_path, payload)
+            return True
+        except Exception:
+            return False
+
+    def _mark_stage_workers_orphaned(self, action: str, *, runner_id: str, reason: str) -> list[dict[str, str]]:
+        orphaned_workers: list[dict[str, str]] = []
+        seen_state_paths: set[str] = set()
+        normalized_runner_id = str(runner_id or "").strip()
+        for state_path_value, raw_state in self._current_stage_worker_states_without_runtime_io(action):
+            state_path = str(state_path_value)
+            if not state_path or state_path in seen_state_paths:
+                continue
+            seen_state_paths.add(state_path)
+            if str(raw_state.get("stage_runner_id", "") or "").strip() != normalized_runner_id:
+                continue
+            if not self._worker_can_be_orphaned(raw_state):
+                continue
+            if not self._update_worker_orphan_marker(
+                state_path,
+                runner_id=runner_id,
+                orphaned=True,
+                reason=reason,
+                stage_action=action,
+            ):
+                continue
+            session_name = str(raw_state.get("session_name", "") or "").strip()
+            worker_id = str(raw_state.get("worker_id", "") or "").strip()
+            role = session_name.split("-", 1)[0] if session_name else worker_id
+            orphaned_workers.append(
+                {
+                    "session_name": session_name,
+                    "role": role,
+                    "worker_id": worker_id,
+                    "attach_command": f"tmux attach -t {session_name}" if session_name else "",
+                }
+            )
+        return orphaned_workers
+
+    def _cleanup_stage_orphans_before_runner_start(self, action: str, *, runner_id: str) -> None:
+        normalized_action = str(action or "").strip()
+        seen_state_paths: set[str] = set()
+        for state_path_value, state_payload in self._current_stage_worker_states_without_runtime_io(action):
+            state_path = str(state_path_value)
+            if not state_path or state_path in seen_state_paths:
+                continue
+            seen_state_paths.add(state_path)
+            is_orphaned = str(state_payload.get("turn_state", "") or "").strip().lower() == "orphaned"
+            is_dead = (
+                str(state_payload.get("agent_state", "") or "").strip().upper() == "DEAD"
+                or str(state_payload.get("health_status", "") or "").strip().lower() == "dead"
+            )
+            if not is_orphaned and not is_dead:
+                continue
+            orphaned_action = str(
+                state_payload.get("orphaned_stage_action")
+                or state_payload.get("workflow_action")
+                or ""
+            ).strip()
+            if orphaned_action != normalized_action:
+                continue
+            session_name = str(state_payload.get("session_name") or "").strip()
+            if session_name:
+                identity_resolver = getattr(self._tmux_runtime, "session_matches_worker_state", None)
+                if not callable(identity_resolver):
+                    raise RuntimeError(
+                        "清理上一轮孤儿 tmux 会话前无法验证 ownership，保留运行目录并终止新 runner: "
+                        f"session={session_name}; runner_id={runner_id}"
+                    )
+                try:
+                    identity_matches = bool(identity_resolver(session_name, state_payload, state_path_value))
+                except Exception as error:
+                    raise RuntimeError(
+                        f"清理上一轮孤儿 tmux 会话前 ownership 验证失败，保留运行目录并终止新 runner: "
+                        f"session={session_name}; runner_id={runner_id}; error={error}"
+                    ) from error
+                if identity_matches:
+                    try:
+                        self._tmux_runtime.kill_session(session_name, missing_ok=True)
+                    except Exception as error:
+                        raise RuntimeError(
+                            f"清理上一轮孤儿 tmux 会话失败，保留运行目录并终止新 runner: "
+                            f"session={session_name}; runner_id={runner_id}; error={error}"
+                        ) from error
+            runtime_dir = Path(state_path).expanduser().resolve().parent
+            project_dir = str(self._resolve_project_dir() or "").strip()
+            if not project_dir:
+                continue
+            project_root = Path(project_dir).expanduser().resolve()
+            if runtime_dir == project_root or not self._path_is_within_project(str(runtime_dir), project_root):
+                continue
+            try:
+                shutil.rmtree(runtime_dir)
+            except FileNotFoundError:
+                continue
+
     def _filter_workers_for_current_context(self, workers: Sequence[Mapping[str, Any]], action: str) -> list[dict[str, Any]]:
         project_dir = str(self._resolve_project_dir() or "").strip()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         normalized_action = str(action or "").strip()
         filtered = [dict(worker) for worker in workers]
         context_known = bool(project_dir or requirement_name or normalized_action)
@@ -3799,7 +4377,7 @@ class BridgeCore:
 
     def _current_workflow_started_at(self) -> float | None:
         project_dir = str(self._resolve_project_dir() or "").strip()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         if not project_dir or not requirement_name:
             return None
         try:
@@ -3913,7 +4491,7 @@ class BridgeCore:
         if agent_state == "DEAD" or health_status in {"dead", "missing_session", "pane_dead"} or not has_live_evidence:
             return False
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         if not project_dir or not requirement_name:
             return False
         session_name = str(worker.get("session_name", "")).strip()
@@ -3952,7 +4530,7 @@ class BridgeCore:
         if not self._worker_snapshot_has_live_session(worker):
             return False
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         if not project_dir or not requirement_name:
             return False
         try:
@@ -4021,7 +4599,7 @@ class BridgeCore:
     def _stage_has_pending_contract_work(self, action: str) -> bool:
         normalized_action = str(action or "").strip()
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         if not project_dir or not requirement_name:
             return False
         try:
@@ -4126,11 +4704,11 @@ class BridgeCore:
         if normalized_action not in {"stage.a07.start", "stage.a08.start"}:
             return
         if isinstance(result, Mapping):
-            project_dir = str(result.get("project_dir", "")).strip() or str(self._context.project_dir or "").strip()
-            requirement_name = str(result.get("requirement_name", "")).strip() or str(self._context.requirement_name or "").strip()
+            project_dir = str(result.get("project_dir", "")).strip() or self._resolve_project_dir()
+            requirement_name = str(result.get("requirement_name", "")).strip() or self._resolve_requirement_name()
         else:
-            project_dir = str(getattr(result, "project_dir", "") or "").strip() or str(self._context.project_dir or "").strip()
-            requirement_name = str(getattr(result, "requirement_name", "") or "").strip() or str(self._context.requirement_name or "").strip()
+            project_dir = str(getattr(result, "project_dir", "") or "").strip() or self._resolve_project_dir()
+            requirement_name = str(getattr(result, "requirement_name", "") or "").strip() or self._resolve_requirement_name()
         if not project_dir or not requirement_name:
             stage_label = "任务开发阶段" if normalized_action == "stage.a07.start" else "复核阶段"
             raise RuntimeError(f"{stage_label}返回 completed，但缺少项目或需求上下文，无法校验阶段产物")
@@ -4156,10 +4734,10 @@ class BridgeCore:
                 f"{failed_worker_text}"
             )
 
-    def _load_runner_failure_stage_state(self, action: str) -> dict[str, Any] | None:
+    def _load_authoritative_runner_terminal_stage_state(self, action: str) -> dict[str, Any] | None:
         action_text = str(action or "").strip()
         project_dir = self._resolve_project_dir()
-        requirement_name = str(self._context.requirement_name or "").strip()
+        requirement_name = self._resolve_requirement_name()
         if not action_text or not project_dir or not requirement_name:
             return None
         try:
@@ -4177,13 +4755,23 @@ class BridgeCore:
             return None
         if str(payload.get("action", "")).strip() != action_text:
             return None
-        if str(payload.get("source", "")).strip() != "runner_failure":
+        if str(payload.get("source", "")).strip() not in {"runner_complete", "runner_failure"}:
             return None
-        if str(payload.get("status", "")).strip() not in {"failed", "error"}:
+        if str(payload.get("status", "")).strip() not in {"completed", "failed", "error", "superseded"}:
             return None
         if REQUIREMENT_CONCURRENCY_CONFLICT_MARKER in str(payload.get("message", "")):
             return None
         return dict(payload)
+
+    def _load_runner_failure_stage_state(self, action: str) -> dict[str, Any] | None:
+        payload = self._load_authoritative_runner_terminal_stage_state(action)
+        if payload is None:
+            return None
+        if str(payload.get("source", "")).strip() != "runner_failure":
+            return None
+        if str(payload.get("status", "")).strip() not in {"failed", "error"}:
+            return None
+        return payload
 
     def _derive_display_stage_state(
         self,
@@ -4199,20 +4787,20 @@ class BridgeCore:
         action = str(preferred_action or self._context.current_action or self._display_action or "").strip()
         explicit_status = str(preferred_status or self._display_status or "ready").strip() or "ready"
         stage_seq = max(int(preferred_stage_seq or 0), 0) or int(self._display_stage_seq or 0)
-        inferred_runtime_status = runtime_status if runtime_status is not None else (self._infer_runtime_stage_status(action) if action else "")
         source_text = str(source or "").strip()
-        runner_failure_state = self._load_runner_failure_stage_state(action)
-        if runner_failure_state is not None:
-            record_stage_seq = max(int(runner_failure_state.get("stage_seq") or 0), 0)
-            newer_stage_seq = bool(stage_seq and record_stage_seq and stage_seq > record_stage_seq)
-            newer_runner_start = source_text == "runner_start" and (not record_stage_seq or newer_stage_seq)
-            newer_runner_complete = source_text == "runner_complete" and (not record_stage_seq or newer_stage_seq)
-            if not newer_runner_start and not newer_runner_complete:
-                return (
-                    action,
-                    str(runner_failure_state.get("status", "")).strip() or "failed",
-                    record_stage_seq or stage_seq,
-                )
+        if source_text in {"runner_start", "runner_complete", "runner_failure"}:
+            return action, explicit_status, stage_seq
+        authoritative_terminal = self._load_authoritative_runner_terminal_stage_state(action)
+        if authoritative_terminal is not None:
+            record_stage_seq = max(int(authoritative_terminal.get("stage_seq") or 0), 0)
+            return (
+                action,
+                str(authoritative_terminal.get("status", "")).strip() or explicit_status,
+                record_stage_seq or stage_seq,
+            )
+        if explicit_status == "awaiting-input" and self._iter_pending_prompts():
+            return action, "awaiting-input", stage_seq
+        inferred_runtime_status = runtime_status if runtime_status is not None else (self._infer_runtime_stage_status(action) if action else "")
         suppress_recoverable_worker_failure = (
             inferred_runtime_status == "failed"
             and self._active_stage_runner_alive(action)
@@ -4258,51 +4846,154 @@ class BridgeCore:
         preferred_status: str | None = None,
         preferred_action: str | None = None,
         preferred_stage_seq: int | None = None,
+        preferred_runner_id: str | None = None,
         source: str | None = None,
         failure_path: str = "",
+        failure_kind: str = "",
         message: str = "",
+        orphaned_workers: Sequence[Mapping[str, Any]] = (),
+        emit_transition: bool = True,
         force: bool = False,
-    ) -> None:
-        previous_action = self._display_action
-        previous_status = self._display_status
-        previous_stage_seq = self._display_stage_seq
+    ) -> bool:
+        source_text = str(source or "runtime_inference").strip() or "runtime_inference"
+        runner_id = str(
+            preferred_runner_id
+            or getattr(self._runner_local, "runner_id", "")
+            or self._display_runner_id
+            or ""
+        ).strip()
+        if source_text in {"runner_start", "runner_complete", "runner_failure"} and self._runner_generation_is_superseded(
+            runner_id
+        ):
+            return False
         action, status, stage_seq = self._derive_display_stage_state(
             preferred_status=preferred_status,
             preferred_action=preferred_action,
             preferred_stage_seq=preferred_stage_seq,
-            source=source,
+            source=source_text,
         )
-        if (
-            action
-            and action == previous_action
-            and previous_status in {"failed", "error"}
-            and status in {"running", "awaiting-input"}
-            and stage_seq <= previous_stage_seq
-        ):
-            stage_seq = self._allocate_stage_seq()
-        if not action and status in {"ready", "booting"} and not force:
+        with self._display_state_lock:
+            previous_action = self._display_action
+            previous_status = self._display_status
+            previous_stage_seq = self._display_stage_seq
+            if stage_seq and previous_stage_seq and stage_seq < previous_stage_seq:
+                return False
+            persisted_state = _read_project_stage_state_record(
+                project_dir=self._resolve_project_dir(),
+                requirement_name=self._resolve_requirement_name(),
+                action=action,
+            )
+            if persisted_state is not None:
+                persisted_seq = int(persisted_state.get("stage_seq") or 0)
+                persisted_runner_id = str(persisted_state.get("runner_id", "") or "").strip()
+                persisted_source = str(persisted_state.get("source", "") or "").strip()
+                persisted_status = str(persisted_state.get("status", "") or "").strip()
+                same_generation = (
+                    persisted_seq == int(stage_seq or 0)
+                    and persisted_runner_id
+                    and runner_id
+                    and persisted_runner_id == runner_id
+                )
+                persisted_is_terminal = (
+                    persisted_source in {"runner_complete", "runner_failure"}
+                    and persisted_status in {"completed", "failed", "error", "superseded"}
+                )
+                if same_generation and persisted_is_terminal and source_text in {"runner_complete", "runner_failure"}:
+                    if source_text != persisted_source or status != persisted_status:
+                        return False
+                    if source_text == "runner_failure":
+                        persisted_failure_kind = str(persisted_state.get("failure_kind", "") or "").strip()
+                        persisted_message = str(persisted_state.get("message", "") or "").strip()
+                        if persisted_failure_kind and failure_kind and persisted_failure_kind != failure_kind:
+                            return False
+                        if persisted_message and message and persisted_message != message:
+                            return False
+                if (
+                    source_text == "runtime_inference"
+                    and persisted_source in {"runner_complete", "runner_failure"}
+                    and persisted_status in {"completed", "failed", "error", "superseded"}
+                ):
+                    source_text = persisted_source
+                    status = persisted_status
+                    stage_seq = persisted_seq or stage_seq
+                    runner_id = persisted_runner_id or runner_id
+                    failure_path = str(failure_path or persisted_state.get("failure_path") or "").strip()
+                    failure_kind = str(failure_kind or persisted_state.get("failure_kind") or "").strip()
+                    message = str(message or persisted_state.get("message") or "").strip()
+                    orphaned_workers = list(orphaned_workers or persisted_state.get("orphaned_workers") or [])
+                if persisted_seq and stage_seq and persisted_seq > stage_seq:
+                    return False
+                if (
+                    persisted_seq
+                    and persisted_seq == stage_seq
+                    and persisted_runner_id
+                    and runner_id
+                    and persisted_runner_id != runner_id
+                ):
+                    return False
+            if (
+                action
+                and action == previous_action
+                and previous_status in {"failed", "error"}
+                and status in {"running", "awaiting-input"}
+                and stage_seq <= previous_stage_seq
+                and source_text == "runtime_inference"
+            ):
+                return False
+            if not action and status in {"ready", "booting"} and not force:
+                self._display_action = action
+                self._display_status = status
+                self._display_stage_seq = stage_seq
+                self._display_source = source_text
+                self._display_runner_id = runner_id
+                return True
+            if not force and action == previous_action and status == previous_status and stage_seq == previous_stage_seq:
+                return False
+            failure_payload = {
+                "kind": str(failure_kind or "").strip(),
+                "message": str(message or "").strip(),
+                "path": str(Path(failure_path).expanduser().resolve()) if str(failure_path).strip() else "",
+                "runner_id": runner_id,
+                "stage_seq": int(stage_seq or 0),
+                "updated_at": _iso_now(),
+                "orphaned_workers": [dict(item) for item in orphaned_workers],
+            }
+            state_record_path = _write_project_stage_state_record(
+                project_dir=self._resolve_project_dir(),
+                requirement_name=self._resolve_requirement_name(),
+                action=action,
+                status=status,
+                stage_seq=stage_seq,
+                runner_id=runner_id,
+                source=source_text,
+                failure_path=failure_path,
+                failure_kind=failure_kind,
+                message=message,
+                orphaned_workers=orphaned_workers,
+            )
+            if action and self._resolve_project_dir() and state_record_path is None:
+                return False
             self._display_action = action
             self._display_status = status
             self._display_stage_seq = stage_seq
-            self._display_source = str(source or "runtime_inference").strip() or "runtime_inference"
-            return
-        if not force and action == previous_action and status == previous_status and stage_seq == previous_stage_seq:
-            return
-        self._display_action = action
-        self._display_status = status
-        self._display_stage_seq = stage_seq
-        self._display_source = str(source or "runtime_inference").strip() or "runtime_inference"
-        self.emit_event("stage.changed", {"action": action or "idle", "status": status, "stage_seq": stage_seq})
-        _write_project_stage_state_record(
-            project_dir=self._resolve_project_dir(),
-            requirement_name=str(self._context.requirement_name or "").strip(),
-            action=action,
-            status=status,
-            stage_seq=stage_seq,
-            source=str(source or "runtime_inference").strip() or "runtime_inference",
-            failure_path=failure_path,
-            message=message,
-        )
+            self._display_source = source_text
+            self._display_runner_id = runner_id
+            self._display_failure = failure_payload if status in {"failed", "error"} else {}
+            event_payload = {
+                "action": action or "idle",
+                "status": status,
+                "stage_seq": stage_seq,
+                "runner_id": runner_id,
+                "source": source_text,
+                "message": str(message or "").strip(),
+                "failure_path": failure_payload["path"],
+                "failure_kind": str(failure_kind or "").strip(),
+                "orphaned_workers": failure_payload["orphaned_workers"],
+            }
+        if emit_transition:
+            with contextlib.suppress(Exception):
+                self.emit_event("stage.changed", event_payload)
+        return True
 
     def _emit_snapshot_payload(self, event_type: str, payload_builder: Callable[[], Mapping[str, Any]]) -> None:
         try:
@@ -4441,12 +5132,17 @@ class BridgeCore:
         sections: set[str],
         stage_routes: Sequence[str] | None = None,
         update_display_stage: bool = False,
+        refresh_worker_health: bool | None = None,
     ) -> None:
         normalized_stage_routes = tuple(str(item).strip() for item in (stage_routes or ()) if str(item).strip())
         self._schedule_snapshot_update(
             sections=sections,
             stage_routes=normalized_stage_routes,
-            refresh_worker_health=bool(normalized_stage_routes),
+            refresh_worker_health=(
+                bool(normalized_stage_routes)
+                if refresh_worker_health is None
+                else bool(refresh_worker_health)
+            ),
             update_display_stage=update_display_stage,
         )
 
@@ -4569,10 +5265,16 @@ class BridgeCore:
         fallback_action: str,
         fallback_stage_seq: int,
     ) -> tuple[str, int]:
-        current_display_action = str(self._display_action or "").strip()
+        runner_id = str(getattr(self._runner_local, "runner_id", "") or "").strip()
+        with self._display_state_lock:
+            current_display_action = str(self._display_action or "").strip()
+            current_display_runner_id = str(self._display_runner_id or "").strip()
+            current_display_stage_seq = int(self._display_stage_seq or 0)
+        if runner_id and current_display_runner_id and current_display_runner_id != runner_id:
+            return str(fallback_action or "").strip(), int(fallback_stage_seq or 0)
         current_context_action = str(self._context.current_action or "").strip()
         action = current_display_action or current_context_action or str(fallback_action or "").strip()
-        stage_seq = int(self._display_stage_seq or 0) or int(fallback_stage_seq or 0)
+        stage_seq = current_display_stage_seq or int(fallback_stage_seq or 0)
         return action, stage_seq
 
     def _raise_for_nonzero_exit_code(
@@ -4613,7 +5315,7 @@ class BridgeCore:
         if not project_dir and parsed is not None:
             project_dir = str(getattr(parsed, "project_dir", "") or "").strip()
         if not project_dir:
-            project_dir = str(self._context.project_dir or "").strip()
+            project_dir = self._resolve_project_dir()
         if not project_dir:
             return []
         argv = ["--project-dir", project_dir]
@@ -4656,7 +5358,6 @@ class BridgeCore:
         if not followup_argv:
             return
         self.emit_event("log.append", {"text": "自动进入需求录入阶段\n"})
-        self._update_context_from_stage_args("stage.a02.start", followup_argv)
         self._run_in_thread(
             "",
             "stage.a02.start",
@@ -4819,6 +5520,73 @@ class BridgeCore:
             requirement_name = str(getattr(args, "requirement_name", "") or "").strip()
         return "\0".join((normalized_action, project_dir, requirement_name))
 
+    def _runner_scope_from_argv(
+        self,
+        action: str,
+        argv: Sequence[str] | None,
+    ) -> tuple[str, str]:
+        if argv is None:
+            return (
+                self._normalize_action_scope_project(str(self._context.project_dir or "")),
+                str(self._context.requirement_name or "").strip(),
+            )
+        try:
+            args = self._parse_stage_args_for_action(str(action or "").strip(), list(argv or []))
+        except Exception:
+            args = None
+        if args is None:
+            return (
+                self._normalize_action_scope_project(str(self._context.project_dir or "")),
+                str(self._context.requirement_name or "").strip(),
+            )
+        requested_project = self._normalize_action_scope_project(
+            str(getattr(args, "project_dir", "") or self._context.project_dir or "")
+        )
+        requested_requirement = str(getattr(args, "requirement_name", "") or "").strip()
+        return requested_project, requested_requirement
+
+    def _assert_no_active_cross_scope_runner_locked(
+        self,
+        *,
+        requested_project: str,
+        requested_requirement: str,
+        requesting_runner_id: str = "",
+    ) -> None:
+        normalized_requesting_runner_id = str(requesting_runner_id or "").strip()
+        for worker_key, execution in self._runner_executions.items():
+            thread = self._workers.get(worker_key)
+            if thread is None or execution is None:
+                continue
+            if (
+                normalized_requesting_runner_id
+                and str(getattr(execution, "runner_id", "") or "").strip()
+                == normalized_requesting_runner_id
+            ):
+                continue
+            try:
+                if not thread.is_alive():
+                    continue
+            except Exception:
+                pass
+            active_project = self._normalize_action_scope_project(
+                str(getattr(execution, "project_dir", "") or "")
+            )
+            active_requirement = str(getattr(execution, "requirement_name", "") or "").strip()
+            if requested_project == active_project and requested_requirement == active_requirement:
+                continue
+            raise RuntimeError(
+                "当前 Backend 已有其他项目或需求的 runner 在执行；为避免阶段状态串写，本次启动已拒绝。"
+            )
+
+    def _assert_no_active_cross_scope_runner(self, action: str, argv: Sequence[str]) -> None:
+        requested_project, requested_requirement = self._runner_scope_from_argv(action, argv)
+        with self._worker_registry_lock:
+            self._assert_no_active_cross_scope_runner_locked(
+                requested_project=requested_project,
+                requested_requirement=requested_requirement,
+                requesting_runner_id=str(getattr(self._runner_local, "runner_id", "") or ""),
+            )
+
     def _emit_duplicate_runner_response(
         self,
         *,
@@ -4842,7 +5610,7 @@ class BridgeCore:
         if mark_failed:
             failure_record_path = _write_project_stage_failure_record(
                 project_dir=self._resolve_project_dir(),
-                requirement_name=str(self._context.requirement_name or "").strip(),
+                requirement_name=self._resolve_requirement_name(),
                 action=action,
                 error=RuntimeError(message_text),
                 traceback_text="",
@@ -4964,6 +5732,149 @@ class BridgeCore:
             stage_routes=self._stage_routes_for_action(action),
         )
 
+    def _runner_transition_is_current(self, action: str, *, stage_seq: int, runner_id: str) -> bool:
+        if self._runner_generation_is_superseded(runner_id):
+            return False
+        with self._display_state_lock:
+            if self._display_stage_seq and stage_seq and stage_seq < self._display_stage_seq:
+                return False
+            persisted_state = _read_project_stage_state_record(
+                project_dir=self._resolve_project_dir(),
+                requirement_name=self._resolve_requirement_name(),
+                action=action,
+            )
+            if persisted_state is None:
+                return True
+            persisted_seq = int(persisted_state.get("stage_seq") or 0)
+            persisted_runner_id = str(persisted_state.get("runner_id", "") or "").strip()
+            persisted_source = str(persisted_state.get("source", "") or "").strip()
+            persisted_status = str(persisted_state.get("status", "") or "").strip()
+            if persisted_seq and stage_seq and persisted_seq > stage_seq:
+                return False
+            if (
+                persisted_seq == int(stage_seq or 0)
+                and persisted_runner_id
+                and runner_id
+                and persisted_runner_id != runner_id
+            ):
+                return False
+            if (
+                persisted_seq == int(stage_seq or 0)
+                and persisted_runner_id
+                and runner_id
+                and persisted_runner_id == runner_id
+                and persisted_source in {"runner_complete", "runner_failure"}
+                and persisted_status in {"completed", "failed", "error", "superseded"}
+            ):
+                return False
+            return True
+
+    def _commit_runner_failure(
+        self,
+        *,
+        action: str,
+        stage_seq: int,
+        runner_id: str,
+        error: BaseException,
+        traceback_text: str,
+        failure_kind: str,
+    ) -> tuple[Path | None, list[dict[str, str]], bool]:
+        normalized_action = str(action or "").strip()
+        normalized_runner_id = str(runner_id or "").strip()
+        with self._display_state_lock:
+            if not self._runner_transition_is_current(
+                normalized_action,
+                stage_seq=stage_seq,
+                runner_id=normalized_runner_id,
+            ):
+                return None, [], False
+            policy = self._latch_runner_failure_shutdown_policy(
+                action=normalized_action,
+                failure_kind=failure_kind,
+            )
+            with self._shutdown_lock:
+                self._shutdown_policy_recoverable_interruption = False
+            failure_record_path = _write_project_stage_failure_record(
+                project_dir=self._resolve_project_dir(),
+                requirement_name=self._resolve_requirement_name(),
+                action=normalized_action,
+                error=error,
+                traceback_text=traceback_text,
+                runner_id=normalized_runner_id,
+                stage_seq=stage_seq,
+                failure_kind=failure_kind,
+                orphaned_workers=(),
+            )
+            if self._resolve_project_dir() and failure_record_path is None:
+                return None, [], False
+            accepted = self._emit_display_stage_state(
+                preferred_status="failed",
+                preferred_action=normalized_action,
+                preferred_stage_seq=stage_seq,
+                preferred_runner_id=normalized_runner_id,
+                source="runner_failure",
+                failure_path=str(failure_record_path or ""),
+                failure_kind=failure_kind,
+                message=str(error),
+                orphaned_workers=(),
+                emit_transition=False,
+                force=True,
+            )
+            if accepted:
+                self._mark_runner_execution_terminal(
+                    normalized_runner_id,
+                    source="runner_failure",
+                )
+            orphaned_workers: list[dict[str, str]] = []
+            if policy == ShutdownPolicy.PRESERVE_ORPHANS:
+                with contextlib.suppress(Exception):
+                    orphaned_workers = self._mark_stage_workers_orphaned(
+                        normalized_action,
+                        runner_id=normalized_runner_id,
+                        reason=failure_kind,
+                    )
+            if orphaned_workers:
+                _write_project_stage_failure_record(
+                    project_dir=self._resolve_project_dir(),
+                    requirement_name=self._resolve_requirement_name(),
+                    action=normalized_action,
+                    error=error,
+                    traceback_text=traceback_text,
+                    runner_id=normalized_runner_id,
+                    stage_seq=stage_seq,
+                    failure_kind=failure_kind,
+                    orphaned_workers=orphaned_workers,
+                )
+            accepted = self._emit_display_stage_state(
+                preferred_status="failed",
+                preferred_action=normalized_action,
+                preferred_stage_seq=stage_seq,
+                preferred_runner_id=normalized_runner_id,
+                source="runner_failure",
+                failure_path=str(failure_record_path or ""),
+                failure_kind=failure_kind,
+                message=str(error),
+                orphaned_workers=orphaned_workers,
+                emit_transition=True,
+                force=True,
+            ) and accepted
+        return failure_record_path, orphaned_workers, accepted
+
+    def _best_effort_emit_response(
+        self,
+        request_id: str,
+        *,
+        ok: bool,
+        payload: Mapping[str, Any] | None = None,
+        error: str = "",
+    ) -> None:
+        with contextlib.suppress(Exception):
+            self.emit_response(request_id, ok=ok, payload=payload, error=error)
+
+    def _best_effort_emit_event(self, event_type: str, payload: Mapping[str, Any] | None = None) -> None:
+        with contextlib.suppress(Exception):
+            self.emit_event(event_type, payload)
+
     def _run_in_thread(
         self,
         request_id: str,
@@ -4975,67 +5886,125 @@ class BridgeCore:
     ) -> None:
         worker_key = str(request_id).strip() or f"auto-{action}-{dt.datetime.now().timestamp()}"
         dedup_key = self._runner_dedup_key(action, argv)
-        duplicate_running = False
-        if dedup_key:
-            with self._worker_registry_lock:
-                existing_worker_key = self._running_action_keys.get(dedup_key, "")
-                existing_worker = self._workers.get(existing_worker_key)
-                if existing_worker is not None and existing_worker.is_alive():
-                    duplicate_running = True
-                if existing_worker_key and not duplicate_running:
-                    self._running_action_keys.pop(dedup_key, None)
-        if duplicate_running:
-            self._emit_duplicate_runner_response(
-                request_id=request_id,
-                action=action,
-                respond=respond,
-                reason="已有同一任务在运行，本次重复启动已忽略。",
-            )
-            return
+        runner_id = f"runner_{uuid.uuid4().hex}"
+        stage_seq = 0
+        runner_execution: RunnerExecutionState | None = None
 
         def target() -> None:
-            stage_seq = self._allocate_stage_seq()
+            execution = runner_execution
+            if execution is None:
+                return
+            self._runner_local.runner_id = runner_id
+            self._runner_local.execution = execution
             try:
-                with use_terminal_ui(self._bridge_ui), contextlib.redirect_stdout(self._protocol_log_sink):
-                    self._emit_display_stage_state(
+                with (
+                    stage_runner_context(runner_id),
+                    use_terminal_ui(self._bridge_ui),
+                    contextlib.redirect_stdout(self._protocol_log_sink),
+                ):
+                    runner_start_accepted = self._emit_display_stage_state(
                         preferred_status="running",
                         preferred_action=action,
                         preferred_stage_seq=stage_seq,
+                        preferred_runner_id=runner_id,
                         source="runner_start",
                         force=True,
                     )
+                    if not runner_start_accepted:
+                        if respond and request_id:
+                            self._best_effort_emit_response(
+                                request_id,
+                                ok=False,
+                                error="runner generation was superseded or its start state could not be persisted",
+                            )
+                        return
+                    self._cleanup_stage_orphans_before_runner_start(action, runner_id=runner_id)
+                    self._reset_preserve_policy_for_new_generation(
+                        action=action,
+                        runner_id=runner_id,
+                        stage_seq=stage_seq,
+                    )
                     result = runner()
+                if self._runner_generation_is_superseded(runner_id):
+                    if respond and request_id:
+                        self._best_effort_emit_response(
+                            request_id,
+                            ok=False,
+                            error="runner generation was superseded by a newer explicit run",
+                        )
+                    return
                 self._update_context_from_result(result, action=action)
                 if action == "stage.a01.start":
                     self._update_routing_manifest_suppression_from_result(result)
                 self._raise_for_nonzero_exit_code(action=action, stage_seq=stage_seq, result=result)
                 self._validate_stage_success_before_completed(action=action, result=result)
-                if respond and request_id:
-                    self.emit_response(request_id, ok=True, payload={"result": _serialize(result)})
                 final_action, final_stage_seq = self._resolve_terminal_stage_target(
                     fallback_action=action,
                     fallback_stage_seq=stage_seq,
                 )
-                self._emit_display_stage_state(
-                    preferred_status="completed",
+                terminal_status = "completed"
+                with contextlib.suppress(Exception):
+                    if bool(self._build_hitl_snapshot().get("pending", False)):
+                        terminal_status = "awaiting-input"
+                terminal_transition_accepted = self._emit_display_stage_state(
+                    preferred_status=terminal_status,
                     preferred_action=final_action,
                     preferred_stage_seq=final_stage_seq,
+                    preferred_runner_id=runner_id,
                     source="runner_complete",
                     force=True,
                 )
-                self._schedule_flow_snapshot_update(
-                    sections={"app", "artifacts"},
-                    stage_routes=self._stage_routes_for_action(final_action),
-                )
+                if terminal_transition_accepted:
+                    self._mark_runner_execution_terminal(
+                        runner_id,
+                        source="runner_complete",
+                    )
+                else:
+                    return
+                if respond and request_id:
+                    self._best_effort_emit_response(request_id, ok=True, payload={"result": _serialize(result)})
+                with contextlib.suppress(Exception):
+                    self._schedule_flow_snapshot_update(
+                        sections={"app", "artifacts"},
+                        stage_routes=self._stage_routes_for_action(final_action),
+                    )
                 if argv is not None:
                     self._maybe_chain_after_stage_success(action=action, argv=argv, result=result)
             except Exception as error:  # noqa: BLE001
+                if self._runner_generation_is_superseded(runner_id):
+                    if respond and request_id:
+                        self._best_effort_emit_response(
+                            request_id,
+                            ok=False,
+                            error="runner generation was superseded by a newer explicit run",
+                        )
+                    return
                 trace = traceback.format_exc()
                 final_action, final_stage_seq = self._resolve_terminal_stage_target(
                     fallback_action=action,
                     fallback_stage_seq=stage_seq,
                 )
                 if is_runtime_shutdown_error(error):
+                    failure_record_path, _orphaned_workers, accepted = self._commit_runner_failure(
+                        action=final_action or action,
+                        stage_seq=final_stage_seq,
+                        runner_id=runner_id,
+                        error=error,
+                        traceback_text=trace,
+                        failure_kind="runner_interrupted",
+                    )
+                    if accepted and failure_record_path is not None:
+                        self._best_effort_emit_event(
+                            "log.append",
+                            {"text": f"阶段中断记录: {failure_record_path}\n"},
+                        )
+                    if accepted:
+                        with contextlib.suppress(Exception):
+                            self._schedule_flow_snapshot_update(
+                                sections={"app", "artifacts"},
+                                stage_routes=self._stage_routes_for_action(final_action or action),
+                                refresh_worker_health=False,
+                            )
                     return
                 if is_agent_startup_intervention_error(error):
                     self._await_agent_ready_timeout_recovery(
@@ -5073,60 +6042,121 @@ class BridgeCore:
                         respond=respond,
                     )
                     return
-                failure_record_path = _write_project_stage_failure_record(
-                    project_dir=self._resolve_project_dir(),
-                    requirement_name=str(self._context.requirement_name or "").strip(),
+                failure_record_path, orphaned_workers, accepted = self._commit_runner_failure(
                     action=final_action or action,
+                    stage_seq=final_stage_seq,
+                    runner_id=runner_id,
                     error=error,
                     traceback_text=trace,
+                    failure_kind="runner_failure",
                 )
-                self._emit_log_error(
-                    action=final_action or action,
-                    title="stage execution failed",
-                    error=error,
-                    traceback_text=trace,
-                )
+                if not accepted:
+                    return
+                with contextlib.suppress(Exception):
+                    self._emit_log_error(
+                        action=final_action or action,
+                        title="stage execution failed",
+                        error=error,
+                        traceback_text=trace,
+                    )
                 if failure_record_path is not None:
-                    self.emit_event("log.append", {"text": f"阶段失败记录: {failure_record_path}\n"})
+                    self._best_effort_emit_event("log.append", {"text": f"阶段失败记录: {failure_record_path}\n"})
                 if respond and request_id:
-                    self.emit_response(
+                    self._best_effort_emit_response(
                         request_id,
                         ok=False,
                         error=str(error),
                         payload={"traceback": trace},
                     )
-                self.emit_event(
+                self._best_effort_emit_event(
                     "error",
-                    {"action": final_action or action, "message": str(error), "traceback": trace},
+                    {
+                        "action": final_action or action,
+                        "message": str(error),
+                        "traceback": trace,
+                        "runner_id": runner_id,
+                        "stage_seq": final_stage_seq,
+                        "source": "runner_failure",
+                        "failure_path": str(failure_record_path or ""),
+                        "failure_kind": "runner_failure",
+                        "orphaned_workers": orphaned_workers,
+                    },
                 )
-                self._emit_display_stage_state(
-                    preferred_status="failed",
-                    preferred_action=final_action,
-                    preferred_stage_seq=final_stage_seq,
-                    source="runner_failure",
-                    failure_path=str(failure_record_path or ""),
-                    message=str(error),
-                    force=True,
-                )
-                self._schedule_flow_snapshot_update(
-                    sections={"app", "artifacts"},
-                    stage_routes=self._stage_routes_for_action(final_action or action),
-                )
+                with contextlib.suppress(Exception):
+                    self._schedule_flow_snapshot_update(
+                        sections={"app", "artifacts"},
+                        stage_routes=self._stage_routes_for_action(final_action or action),
+                        refresh_worker_health=False,
+                    )
             finally:
+                self._runner_local.runner_id = ""
+                self._runner_local.execution = None
                 with self._worker_registry_lock:
                     self._workers.pop(worker_key, None)
+                    self._runner_executions.pop(worker_key, None)
                     if dedup_key and self._running_action_keys.get(dedup_key) == worker_key:
                         self._running_action_keys.pop(dedup_key, None)
 
         # Runner cleanup is still attempted during shutdown, but interpreter exit must not be
         # blocked by a stuck workflow thread. Process teardown releases flock locks, and tmux
         # cleanup is already handled explicitly by backend shutdown.
-        thread = threading.Thread(target=target, name=f"tui-backend-{action}-{request_id}", daemon=True)
+        duplicate_running = False
         with self._worker_registry_lock:
-            self._workers[worker_key] = thread
+            requested_project, requested_requirement = self._runner_scope_from_argv(action, argv)
+            self._assert_no_active_cross_scope_runner_locked(
+                requested_project=requested_project,
+                requested_requirement=requested_requirement,
+                requesting_runner_id=str(getattr(self._runner_local, "runner_id", "") or ""),
+            )
             if dedup_key:
-                self._running_action_keys[dedup_key] = worker_key
-        thread.start()
+                existing_worker_key = self._running_action_keys.get(dedup_key, "")
+                existing_worker = self._workers.get(existing_worker_key)
+                if existing_worker is not None and existing_worker.is_alive():
+                    duplicate_running = True
+                if existing_worker_key and not duplicate_running:
+                    self._running_action_keys.pop(dedup_key, None)
+            if not duplicate_running:
+                if str(action or "").strip() in RUNNER_DEDUP_ACTIONS:
+                    self._set_context(
+                        project_dir=requested_project or None,
+                        requirement_name=requested_requirement,
+                        action=action,
+                    )
+                stage_seq = self._allocate_stage_seq(
+                    project_dir=requested_project,
+                    requirement_name=requested_requirement,
+                )
+                runner_execution = RunnerExecutionState(
+                    runner_id=runner_id,
+                    action=str(action or "").strip(),
+                    stage_seq=stage_seq,
+                    project_dir=requested_project,
+                    requirement_name=requested_requirement,
+                )
+                thread = threading.Thread(
+                    target=target,
+                    name=f"tui-backend-{action}-{request_id}",
+                    daemon=True,
+                )
+                self._workers[worker_key] = thread
+                self._runner_executions[worker_key] = runner_execution
+                if dedup_key:
+                    self._running_action_keys[dedup_key] = worker_key
+                try:
+                    thread.start()
+                except Exception:
+                    self._workers.pop(worker_key, None)
+                    self._runner_executions.pop(worker_key, None)
+                    if dedup_key and self._running_action_keys.get(dedup_key) == worker_key:
+                        self._running_action_keys.pop(dedup_key, None)
+                    raise
+        if duplicate_running:
+            self._emit_duplicate_runner_response(
+                request_id=request_id,
+                action=action,
+                respond=respond,
+                reason="已有同一任务在运行，本次重复启动已忽略。",
+            )
 
     def _get_control_session(self, control_id: str) -> ControlSessionState:
         key = str(control_id or "").strip()
@@ -5343,8 +6373,181 @@ class BridgeCore:
             except Exception:
                 continue
 
+    def _mark_runner_execution_terminal(self, runner_id: str, *, source: str) -> None:
+        normalized_runner_id = str(runner_id or "").strip()
+        if not normalized_runner_id:
+            return
+        with self._worker_registry_lock:
+            for execution in self._runner_executions.values():
+                if str(getattr(execution, "runner_id", "") or "").strip() != normalized_runner_id:
+                    continue
+                execution.terminal_source = str(source or "").strip()
+                execution.terminal_at = _iso_now()
+
+    def _runner_generation_has_persisted_terminal(
+        self,
+        *,
+        execution: RunnerExecutionState,
+        action: str,
+        stage_seq: int,
+    ) -> bool:
+        runner_id = str(getattr(execution, "runner_id", "") or "").strip()
+        if not runner_id:
+            return False
+        persisted_state = _read_project_stage_state_record(
+            project_dir=str(getattr(execution, "project_dir", "") or self._resolve_project_dir()),
+            requirement_name=str(
+                getattr(execution, "requirement_name", "")
+                or self._context.requirement_name
+                or ""
+            ).strip(),
+            action=action,
+        )
+        if not persisted_state:
+            return False
+        if str(persisted_state.get("runner_id", "") or "").strip() != runner_id:
+            return False
+        if int(persisted_state.get("stage_seq") or 0) != int(stage_seq or 0):
+            return False
+        source = str(persisted_state.get("source", "") or "").strip()
+        status = str(persisted_state.get("status", "") or "").strip()
+        return source in {"runner_failure", "runner_complete"} and status in {
+            "completed",
+            "failed",
+            "error",
+            "superseded",
+        }
+
+    def _mark_active_runners_interrupted(self, *, reason: str) -> None:
+        with self._worker_registry_lock:
+            active = [
+                (worker_key, thread, self._runner_executions.get(worker_key))
+                for worker_key, thread in self._workers.items()
+            ]
+        for _worker_key, thread, execution in active:
+            if execution is None:
+                continue
+            with contextlib.suppress(Exception):
+                if not thread.is_alive():
+                    continue
+            if str(getattr(execution, "terminal_source", "") or "").strip():
+                continue
+            action = execution.action
+            stage_seq = execution.stage_seq
+            with self._display_state_lock:
+                if self._display_runner_id == execution.runner_id:
+                    action = str(self._display_action or action).strip()
+                    stage_seq = int(self._display_stage_seq or stage_seq)
+            if self._runner_generation_has_persisted_terminal(
+                execution=execution,
+                action=action,
+                stage_seq=stage_seq,
+            ):
+                self._mark_runner_execution_terminal(execution.runner_id, source="persisted_terminal")
+                continue
+            self._commit_runner_failure(
+                action=action,
+                stage_seq=stage_seq,
+                runner_id=execution.runner_id,
+                error=RuntimeShutdownRequested(reason),
+                traceback_text="",
+                failure_kind="runner_interrupted",
+            )
+
+    def _latch_shutdown_policy(self, policy: ShutdownPolicy, *, reason: str = "") -> ShutdownPolicy:
+        with self._shutdown_lock:
+            if self._shutdown_policy is None:
+                self._shutdown_policy = policy
+                self._shutdown_policy_reason = str(reason or "").strip()
+            return self._shutdown_policy
+
+    def _runner_failure_shutdown_scope(self, action: str) -> tuple[str, str, str]:
+        return (
+            self._normalize_action_scope_project(str(self._resolve_project_dir() or "")),
+            self._resolve_requirement_name(),
+            str(action or "").strip(),
+        )
+
+    def _latch_runner_failure_shutdown_policy(
+        self,
+        *,
+        action: str,
+        failure_kind: str,
+    ) -> ShutdownPolicy:
+        scope = self._runner_failure_shutdown_scope(action)
+        with self._shutdown_lock:
+            if self._shutdown_policy is None:
+                self._shutdown_policy = ShutdownPolicy.PRESERVE_ORPHANS
+                self._shutdown_policy_reason = str(failure_kind or "runner_failure").strip() or "runner_failure"
+                self._shutdown_policy_generation_reset_allowed = True
+            if (
+                self._shutdown_policy == ShutdownPolicy.PRESERVE_ORPHANS
+                and self._shutdown_policy_generation_reset_allowed
+                and scope[2]
+            ):
+                self._shutdown_policy_failure_scopes.add(scope)
+            return self._shutdown_policy
+
+    def _disable_shutdown_policy_generation_reset(self) -> None:
+        with self._shutdown_lock:
+            self._shutdown_policy_generation_reset_allowed = False
+            self._shutdown_policy_failure_scopes.clear()
+            self._shutdown_policy_recoverable_interruption = False
+
+    def _reset_preserve_policy_for_new_generation(
+        self,
+        *,
+        action: str,
+        runner_id: str,
+        stage_seq: int,
+    ) -> bool:
+        normalized_action = str(action or "").strip()
+        normalized_runner_id = str(runner_id or "").strip()
+        if not normalized_action or not normalized_runner_id:
+            return False
+        persisted_state = _read_project_stage_state_record(
+            project_dir=self._resolve_project_dir(),
+            requirement_name=self._resolve_requirement_name(),
+            action=normalized_action,
+        )
+        if not persisted_state:
+            return False
+        if str(persisted_state.get("source", "") or "").strip() != "runner_start":
+            return False
+        if str(persisted_state.get("status", "") or "").strip() != "running":
+            return False
+        if str(persisted_state.get("runner_id", "") or "").strip() != normalized_runner_id:
+            return False
+        if int(persisted_state.get("stage_seq") or 0) != int(stage_seq or 0):
+            return False
+        scope = self._runner_failure_shutdown_scope(normalized_action)
+        with self._shutdown_lock:
+            if (
+                self._shutdown_started
+                or self._shutdown_policy != ShutdownPolicy.PRESERVE_ORPHANS
+                or not self._shutdown_policy_generation_reset_allowed
+                or scope not in self._shutdown_policy_failure_scopes
+            ):
+                return False
+            self._shutdown_policy_failure_scopes.discard(scope)
+            if self._shutdown_policy_failure_scopes:
+                return False
+            self._shutdown_policy = None
+            self._shutdown_policy_reason = ""
+            self._shutdown_policy_recoverable_interruption = False
+            self._shutdown_policy_generation_reset_allowed = False
+            return True
+
+    def _current_shutdown_policy(self) -> ShutdownPolicy | None:
+        with self._shutdown_lock:
+            return self._shutdown_policy
+
     def shutdown(self, *, cleanup_tmux: bool) -> list[str]:
         request_runtime_shutdown("tui_backend_shutdown")
+        self._disable_shutdown_policy_generation_reset()
+        requested_policy = ShutdownPolicy.CLEANUP if cleanup_tmux else ShutdownPolicy.PRESERVE_ORPHANS
+        effective_policy = self._latch_shutdown_policy(requested_policy, reason="tui_backend_shutdown")
+        cleanup_tmux = effective_policy == ShutdownPolicy.CLEANUP
         first_shutdown = False
         with self._shutdown_lock:
             if not self._shutdown_started:
@@ -5369,6 +6572,7 @@ class BridgeCore:
                 presence_timer.cancel()
             self._prompt_broker.shutdown()
             self._attention_manager.shutdown()
+            self._mark_active_runners_interrupted(reason="tui_backend_shutdown")
             with self._controls_lock:
                 sessions = list(self._controls.values())
                 self._controls.clear()
@@ -5397,7 +6601,7 @@ class BridgeCore:
                 )
             )
             if cleaned_sessions:
-                self.emit_event(
+                self._best_effort_emit_event(
                     "log.append",
                     {"text": f"已清理 tmux 会话: {', '.join(cleaned_sessions)}\n"},
                 )
@@ -5412,10 +6616,11 @@ class BridgeCore:
                     lines.append(
                         f"- {session_name} | {work_dir} | {requirement_name} | {workflow_action}"
                     )
-                self.emit_event("log.append", {"text": "\n".join(lines) + "\n"})
+                self._best_effort_emit_event("log.append", {"text": "\n".join(lines) + "\n"})
             with self._shutdown_lock:
                 self._shutdown_tmux_cleanup_done = True
-        self._protocol_log_sink.flush()
+        with contextlib.suppress(Exception):
+            self._protocol_log_sink.flush()
         return cleaned_sessions
 
     def _snapshot_control_session(self, session: ControlSessionState) -> dict[str, Any]:
@@ -5626,6 +6831,23 @@ class BridgeCore:
         for artifact in artifacts_snapshot.get("items", []):
             if isinstance(artifact, Mapping):
                 self._add_preview_path(allowed, artifact.get("path", ""))
+        with self._display_state_lock:
+            active_failure = dict(self._display_failure)
+            active_action = str(self._display_action or self._context.current_action or "").strip()
+        self._add_preview_path(
+            allowed,
+            active_failure.get("failure_path") or active_failure.get("path") or "",
+        )
+        persisted_state = _read_project_stage_state_record(
+            project_dir=self._resolve_project_dir(),
+            requirement_name=self._resolve_requirement_name(),
+            action=active_action,
+        )
+        if (
+            isinstance(persisted_state, Mapping)
+            and str(persisted_state.get("source", "") or "").strip() == "runner_failure"
+        ):
+            self._add_preview_path(allowed, persisted_state.get("failure_path", ""))
         return allowed
 
     def build_file_preview(self, path_value: str | Path, *, max_bytes: int = WEB_FILE_PREVIEW_MAX_BYTES) -> dict[str, Any]:
@@ -5636,6 +6858,9 @@ class BridgeCore:
         return _preview_path_text(requested, max_bytes=max_bytes)
 
     def build_snapshots(self) -> dict[str, Any]:
+        with self._display_state_lock:
+            reconcile_action = str(self._display_action or self._context.current_action or "").strip()
+        self._reconcile_persisted_running_runner(reconcile_action)
         stages = self._build_stage_snapshots()
         control = self._build_control_snapshot_for_session(self._current_control_session())
         hitl = self._build_hitl_snapshot()
@@ -5665,6 +6890,7 @@ class BridgeCore:
             "routes": ["home", "routing", "requirements", "review", "design", "task-split", "development", "overall-review", "control"],
             "commands": [
                 "app.bootstrap",
+                "app.shutdown",
                 "workflow.a00.start",
                 "stage.a01.start",
                 "stage.a02.start",
@@ -5721,6 +6947,26 @@ class BridgeCore:
         normalized_request_id = str(request_id or "").strip()
         request_payload = dict(payload or {})
 
+        if normalized_action == "app.shutdown":
+            requested_policy_text = str(request_payload.get("policy", "cleanup") or "cleanup").strip().lower()
+            if requested_policy_text not in {"cleanup", "preserve_orphans"}:
+                raise ValueError("app.shutdown policy 仅支持 cleanup 或 preserve_orphans")
+            requested_policy = (
+                ShutdownPolicy.PRESERVE_ORPHANS
+                if requested_policy_text == "preserve_orphans"
+                else ShutdownPolicy.CLEANUP
+            )
+            reason = str(request_payload.get("reason", "app.shutdown") or "app.shutdown").strip()
+            effective_policy = self._latch_shutdown_policy(requested_policy, reason=reason)
+            self._disable_shutdown_policy_generation_reset()
+            response_payload = {
+                "accepted": True,
+                "policy": effective_policy.value.lower(),
+                "reason": self._shutdown_policy_reason or reason,
+            }
+            if respond and normalized_request_id:
+                self.emit_response(normalized_request_id, ok=True, payload=response_payload)
+            return response_payload
         if normalized_action == "app.bootstrap":
             bootstrap_payload = self.bootstrap()
             if respond and normalized_request_id:
@@ -5746,62 +6992,85 @@ class BridgeCore:
         if normalized_action == "workflow.a00.start":
             argv = self._argv_from_payload(request_payload)
             argv = self._argv_with_payload_agent_config(argv, request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
-            self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: a00_main(argv), respond=respond)
+            self._run_in_thread(
+                normalized_request_id if respond else "",
+                normalized_action,
+                lambda: a00_main(argv),
+                argv=argv,
+                respond=respond,
+            )
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a01.start":
             argv = self._argv_from_payload(request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
             self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: run_routing_stage(argv), argv=argv, respond=respond)
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a02.start":
             argv = self._argv_from_payload(request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
-            self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: run_requirement_intake_stage(argv), respond=respond)
+            self._run_in_thread(
+                normalized_request_id if respond else "",
+                normalized_action,
+                lambda: run_requirement_intake_stage(argv),
+                argv=argv,
+                respond=respond,
+            )
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a03.start":
             argv = self._argv_from_payload(request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
             preserve = bool(request_payload.get("preserve_ba_worker", False))
             self._run_in_thread(
                 normalized_request_id if respond else "",
                 normalized_action,
                 lambda: run_requirements_clarification_stage(argv, preserve_ba_worker=preserve),
+                argv=argv,
                 respond=respond,
             )
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a04.start":
             argv = self._argv_from_payload(request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
-            self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: run_requirements_review_stage(argv), respond=respond)
+            self._run_in_thread(
+                normalized_request_id if respond else "",
+                normalized_action,
+                lambda: run_requirements_review_stage(argv),
+                argv=argv,
+                respond=respond,
+            )
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a05.start":
             argv = self._argv_from_payload(request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
-            self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: run_detailed_design_stage(argv), respond=respond)
+            self._run_in_thread(
+                normalized_request_id if respond else "",
+                normalized_action,
+                lambda: run_detailed_design_stage(argv),
+                argv=argv,
+                respond=respond,
+            )
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a06.start":
             argv = self._argv_from_payload(request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
-            self._run_in_thread(normalized_request_id if respond else "", normalized_action, lambda: run_task_split_stage(argv), respond=respond)
+            self._run_in_thread(
+                normalized_request_id if respond else "",
+                normalized_action,
+                lambda: run_task_split_stage(argv),
+                argv=argv,
+                respond=respond,
+            )
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a07.start":
             argv = self._argv_from_payload(request_payload)
-            self._update_context_from_stage_args(normalized_action, argv)
             self._run_in_thread(
                 normalized_request_id if respond else "",
                 normalized_action,
                 lambda: run_development_stage(argv, preserve_workers=True),
+                argv=argv,
                 respond=respond,
             )
             return {"accepted": True, "deferred": True}
         if normalized_action == "stage.a08.start":
             argv = self._argv_with_default_a08_review_max_rounds(self._argv_from_payload(request_payload))
-            self._update_context_from_stage_args(normalized_action, argv)
             self._run_in_thread(
                 normalized_request_id if respond else "",
                 normalized_action,
-                lambda: run_overall_review_stage(argv),
+                lambda: run_overall_review_stage(argv, preserve_workers=True),
                 argv=argv,
                 respond=respond,
             )

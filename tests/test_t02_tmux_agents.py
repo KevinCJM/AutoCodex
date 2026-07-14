@@ -35,6 +35,7 @@ from T02_tmux_agents import (
     TaskResultContract,
     TmuxBackend,
     TmuxBatchWorker,
+    TmuxMutationOutcomeUnknown,
     TurnFileContract,
     TurnFileResult,
     TmuxRuntimeController,
@@ -59,7 +60,13 @@ from T02_tmux_agents import (
     try_resume_worker,
     _session_name_lease_lock,
 )
-from tmux_core.runtime.contracts import TASK_STATUS_DONE, TaskResultFile, finalize_task_result, write_task_status
+from tmux_core.runtime.contracts import (
+    TASK_STATUS_DONE,
+    TASK_STATUS_RUNNING,
+    TaskResultFile,
+    finalize_task_result,
+    write_task_status,
+)
 from tmux_core.runtime.tmux_runtime import (
     is_worker_death_error,
     worker_state_has_launch_evidence,
@@ -2070,7 +2077,7 @@ workspace (/directory)                                                     branc
                 worker._write_state(WorkerStatus.RUNNING, note="test")  # noqa: SLF001
         notifier.assert_called_once_with()
 
-    def test_write_ready_state_clears_stale_running_runtime_fields(self):
+    def test_write_ready_state_preserves_unresolved_running_contract_fields(self):
         class ReadyStateWorker(TmuxBatchWorker):
             def is_agent_alive(self, observation=None):  # noqa: ANN001, ARG002
                 return True
@@ -2082,7 +2089,7 @@ workspace (/directory)                                                     branc
             worker = ReadyStateWorker(
                 worker_id="reviewer-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="gemini", model="flash"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.agent_started = True
@@ -2101,9 +2108,9 @@ workspace (/directory)                                                     branc
             state = worker.read_state()
 
         self.assertEqual(state["status"], WorkerStatus.READY.value)
-        self.assertEqual(state["result_status"], WorkerStatus.READY.value)
+        self.assertEqual(state["result_status"], WorkerStatus.RUNNING.value)
         self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
-        self.assertEqual(state["current_task_runtime_status"], "")
+        self.assertEqual(state["current_task_runtime_status"], TASK_STATUS_RUNNING)
 
     def test_read_state_recovers_from_trailing_json_garbage(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2887,7 +2894,7 @@ workspace (/directory)                                                     branc
         self.assertEqual(len(worker.sent_prompts), 1)
         self.assertNotIn("系统不会自动重启该智能体", result.clean_output)
 
-    def test_run_turn_failure_does_not_leave_runtime_status_running(self):
+    def test_run_turn_failure_preserves_unresolved_runtime_status_evidence(self):
         class FailingTurnWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -2928,7 +2935,8 @@ workspace (/directory)                                                     branc
 
         self.assertFalse(result.ok)
         self.assertEqual(worker.state_updates[-1][0], "failed")
-        self.assertEqual(worker.state_updates[-1][2]["current_task_runtime_status"], "")
+        self.assertEqual(worker.state_updates[-1][2]["current_task_runtime_status"], TASK_STATUS_RUNNING)
+        self.assertEqual(worker.state_updates[-1][2]["turn_state"], "failed")
 
     def test_ensure_reviewers_ready_blocks_failed_busy_worker_without_restart(self):
         class FailedBusyWorker:
@@ -7942,6 +7950,9 @@ workspace (/directory)                                                     branc
             def pane_current_command(self):
                 return "codex"
 
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "Working (esc to interrupt)"
+
             def _wait_for_agent_ready(self, timeout_sec=60.0):
                 self.wait_called += 1
                 self.agent_ready = True
@@ -9272,6 +9283,28 @@ Do you trust the files in this folder?
                 )
             )
 
+    def test_runtime_controller_rejects_live_session_without_identity_evidence(self):
+        class FakeBackend:
+            def has_session(self, session_name):
+                return session_name == "shared-session"
+
+            def show_option(self, target, option_name):  # noqa: ARG002
+                return ""
+
+            def display_message(self, target, expression):  # noqa: ARG002
+                return ""
+
+        controller = TmuxRuntimeController(FakeBackend())
+        self.assertFalse(
+            controller.session_matches_context(
+                "shared-session",
+                runtime_dir="/tmp/project/.runtime/worker",
+                work_dir="/tmp/project",
+                requirement_name="需求A",
+                workflow_action="stage.a06.start",
+            )
+        )
+
     def test_runtime_controller_recovers_worker_identity_by_runtime_dir(self):
         class FakeBackend:
             def __init__(self, runtime_dir: str):
@@ -10397,12 +10430,15 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             def session_exists(self):
                 return False
 
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return False
+
         class MissingTargetWorker(TmuxBatchWorker):
             def session_exists(self):
                 return True
 
             def target_exists(self, target=None):
-                raise subprocess.CalledProcessError(1, "tmux")
+                return False
 
         class DisplayFailureWorker(TmuxBatchWorker):
             def session_exists(self):
@@ -10726,9 +10762,9 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
 
         self.assertEqual(snapshot.agent_state, AgentRuntimeState.READY.value)
         self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
-        self.assertEqual(state["current_task_runtime_status"], "")
-        self.assertEqual(state["dispatch_state"], "")
-        self.assertEqual(state["dispatch_reason"], "")
+        self.assertEqual(state["current_task_runtime_status"], TASK_STATUS_RUNNING)
+        self.assertEqual(state["dispatch_state"], "submitted")
+        self.assertEqual(state["dispatch_reason"], "prompt_sent")
         self.assertEqual(worker.capture_calls, 1)
         self.assertEqual(worker.last_log_offset, 99)
 
@@ -11067,6 +11103,22 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
                 self.agent_ready = True
                 self.agent_state = AgentRuntimeState.READY
                 self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Explain this codebase\n  gpt-5 high · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-14T00:00:00",
+                    pane_title="TmuxCodingTeam",
+                )
 
             def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
                 return None
@@ -11122,6 +11174,21 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
                 self.current_command = "codex"
                 self.current_path = str(self.work_dir)
                 self.last_pane_title = "TmuxCodingTeam"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = "› Explain this codebase\n  gpt-5 high · ~/project"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-14T00:00:00",
+                    pane_title="TmuxCodingTeam",
+                )
 
             def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
                 self.sent_prompts.append(text)
@@ -11458,7 +11525,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
         self.assertEqual(calls[2][1]["timeout_sec"], 15.0)
         delete_buffer.assert_called_once()
 
-    def test_run_turn_retries_after_prompt_dispatch_timeout(self):
+    def test_run_turn_never_retries_after_prompt_submission_outcome_unknown(self):
         class DispatchTimeoutWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
@@ -11486,9 +11553,27 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
 
             def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
                 self.send_attempts += 1
-                if self.send_attempts == 1:
-                    raise subprocess.TimeoutExpired(cmd=["tmux", "load-buffer", "-b", "acx_test"], timeout=10.0)
-                write_task_status(self.current_task_status_path, status=TASK_STATUS_DONE)
+                raise TmuxMutationOutcomeUnknown(
+                    operation="paste-buffer",
+                    error=subprocess.TimeoutExpired(cmd=["tmux", "paste-buffer"], timeout=10.0),
+                )
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="Ask anything...\nctrl+p commands",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="opencode",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-14T00:00:00",
+                    pane_title="OpenCode",
+                )
+
+            def _wait_for_prompt_submission(self, **kwargs):  # noqa: ANN003
+                raise TimeoutError("no prompt evidence")
 
             def _wait_for_turn_reply(self, **kwargs):  # noqa: ARG002
                 return "ok"
@@ -11509,14 +11594,16 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
                 turn_start_timeout_sec=8.0,
                 prompt_submit_timeout_sec=2.0,
             )
+            final_state = worker.read_state()
 
-        self.assertTrue(result.ok)
-        self.assertEqual(worker.send_attempts, 2)
-        self.assertTrue(any(note.startswith("dispatch_delayed:") for _, note, _ in worker.state_notes))
-        delayed_entries = [extra for _, note, extra in worker.state_notes if note.startswith("dispatch_delayed:")]
-        self.assertTrue(any(str(extra.get("dispatch_reason", "")).startswith("prompt_dispatch_timeout:") for extra in delayed_entries))
+        self.assertFalse(result.ok)
+        self.assertEqual(worker.send_attempts, 1)
+        unknown_entries = [extra for _, note, extra in worker.state_notes if note.startswith("submission_unknown:")]
+        self.assertTrue(unknown_entries)
+        self.assertEqual(unknown_entries[-1]["turn_state"], "submission_unknown")
+        self.assertEqual(final_state["turn_state"], "failed")
 
-    def test_try_resume_worker_returns_true_for_live_ready_prompt_confirm_timeout_worker(self):
+    def test_try_resume_worker_preserves_unresolved_prompt_confirm_timeout_worker(self):
         class ResumeReadyWorker(TmuxBatchWorker):
             def session_exists(self):
                 return True
@@ -11567,13 +11654,12 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             resumed = try_resume_worker(worker, timeout_sec=0.2)
             state = worker.read_state()
 
-        self.assertTrue(resumed)
-        self.assertEqual(state["note"], "auto_resume_ready")
-        self.assertEqual(state["dispatch_state"], "")
-        self.assertEqual(state["dispatch_reason"], "")
-        self.assertEqual(state["agent_state"], "READY")
+        self.assertFalse(resumed)
+        self.assertEqual(state["note"], "dispatch_delayed:review")
+        self.assertEqual(state["dispatch_state"], "delayed")
+        self.assertEqual(state["current_task_runtime_status"], TASK_STATUS_RUNNING)
 
-    def test_try_resume_worker_returns_true_for_live_ready_worker_without_dispatch_delay(self):
+    def test_try_resume_worker_preserves_unresolved_live_ready_worker(self):
         class ResumeReadyWorker(TmuxBatchWorker):
             def session_exists(self):
                 return True
@@ -11622,11 +11708,9 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             resumed = try_resume_worker(worker, timeout_sec=0.2)
             state = worker.read_state()
 
-        self.assertTrue(resumed)
-        self.assertEqual(state["note"], "auto_resume_ready")
-        self.assertEqual(state["dispatch_state"], "")
-        self.assertEqual(state["dispatch_reason"], "")
-        self.assertEqual(state["agent_state"], "READY")
+        self.assertFalse(resumed)
+        self.assertEqual(state["note"], "turn_failed")
+        self.assertEqual(state["current_task_runtime_status"], TASK_STATUS_RUNNING)
 
     def test_try_resume_worker_returns_false_for_awaiting_reconfig_or_stale_busy(self):
         class ResumeBlockedWorker(TmuxBatchWorker):

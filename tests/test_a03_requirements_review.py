@@ -55,6 +55,8 @@ class _FakeWorker:
         self.prompts: list[tuple[str, str]] = []
         self.killed = False
         self.session_name = "demo-session"
+        self.metadata_updates: list[dict[str, object]] = []
+        self._runtime_metadata: dict[str, object] = {}
 
     def run_turn(self, *, label, prompt, **kwargs):  # noqa: ANN001
         self.prompts.append((label, prompt))
@@ -63,6 +65,16 @@ class _FakeWorker:
     def request_kill(self):
         self.killed = True
         return self.session_name
+
+    def set_runtime_metadata(self, **metadata):  # noqa: ANN003
+        self.metadata_updates.append(dict(metadata))
+        self._runtime_metadata.update(metadata)
+
+    def runtime_metadata(self):
+        return dict(self._runtime_metadata)
+
+    def read_state(self):
+        return dict(self._runtime_metadata)
 
 
 class A03RequirementsReviewTests(unittest.TestCase):
@@ -623,6 +635,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
             def __init__(self, *, runtime_root, **kwargs):  # noqa: ANN001
                 super().__init__(runtime_root=runtime_root, runtime_dir=Path(runtime_root) / "ba-worker")
                 self.session_name = "需求分析师-天佑星"
+                self.constructor_metadata = dict(kwargs.get("runtime_metadata") or {})
 
         def fake_prompt_review_agent_selection(default_vendor, default_model="", default_reasoning_effort="high", default_proxy_url="", *, role_label="", progress=None, **kwargs):  # noqa: ANN001
             observed["role_label"] = role_label
@@ -649,11 +662,14 @@ class A03RequirementsReviewTests(unittest.TestCase):
         ):
             handoff = review_module._create_review_ba_handoff(
                 project_dir=tmpdir,
+                requirement_name="需求A",
                 selection_title="进入需求评审阶段（需求分析师）",
             )
 
         self.assertEqual(observed["role_label"], "需求分析师-天佑星")
         self.assertEqual(handoff.worker.session_name, "需求分析师-天佑星")
+        self.assertEqual(handoff.worker.constructor_metadata["requirement_name"], "需求A")
+        self.assertEqual(handoff.worker.constructor_metadata["workflow_action"], "stage.a04.start")
         self.assertTrue(any("需求分析师-天佑星 已创建" in item for item in rendered_messages))
 
     def test_build_reviewer_workers_uses_predicted_constellation_role_labels(self):
@@ -760,7 +776,8 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 super().__init__(runtime_root=runtime_root, runtime_dir=Path(runtime_root) / "ba-worker")
                 created_workers.append(self)
 
-        def fake_run_ba_turn_with_recreation(handoff, *, project_dir, label, prompt, result_contract):  # noqa: ANN001
+        def fake_run_ba_turn_with_recreation(handoff, *, project_dir, requirement_name="", label, prompt, result_contract):  # noqa: ANN001
+            self.assertEqual(requirement_name, "需求A")
             observed.append((label, prompt))
             self.assertEqual(result_contract.mode, "a03_ba_resume")
             return handoff, {"status": "ready"}
@@ -815,8 +832,9 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 call_order.append("prompt")
                 return next(prompt_answers)
 
-            def fake_create(*, project_dir, selection_title, progress=None):  # noqa: ANN001
+            def fake_create(*, project_dir, requirement_name="", selection_title, progress=None):  # noqa: ANN001
                 call_order.append("create")
+                observed["requirement_name"] = requirement_name
                 observed["selection_title"] = selection_title
                 return created_handoff
 
@@ -848,6 +866,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
             self.assertIs(result, created_handoff)
             self.assertEqual(call_order, ["prompt", "create", "continuation", "prompt", "prompt"])
             self.assertEqual(observed["selection_title"], "按人类建议启动需求分析师")
+            self.assertEqual(observed["requirement_name"], "需求A")
             self.assertIs(observed["handoff"], created_handoff)
             self.assertEqual(observed["label_prefix"], "requirements_review_human_audit")
             self.assertEqual(observed["initial_prompt"], "RESUME_WITH_HUMAN_MSG")
@@ -919,9 +938,10 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 return_value=False,
             ), patch(
                 "A03_RequirementsReview._create_review_ba_handoff",
-                side_effect=lambda *, project_dir, selection_title, progress=None: observed.update(
+                side_effect=lambda *, project_dir, requirement_name="", selection_title, progress=None: observed.update(
                     {
                         "project_dir": Path(project_dir).resolve(),
+                        "requirement_name": requirement_name,
                         "selection_title": selection_title,
                     }
                 ) or created_handoff,
@@ -930,6 +950,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
 
             self.assertIs(result, created_handoff)
             self.assertEqual(observed["project_dir"], Path(tmpdir).resolve())
+            self.assertEqual(observed["requirement_name"], "需求A")
             self.assertEqual(observed["selection_title"], "进入需求评审阶段（需求分析师）")
 
     def test_run_review_clarification_continuation_uses_initial_prompt_then_hitl_bck(self):
@@ -1412,9 +1433,10 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 return_value=False,
             ), patch(
                 "A03_RequirementsReview._create_review_ba_handoff",
-                side_effect=lambda *, project_dir, selection_title, progress=None: observed.update(
+                side_effect=lambda *, project_dir, requirement_name="", selection_title, progress=None: observed.update(
                     {
                         "project_dir": Path(project_dir).resolve(),
+                        "requirement_name": requirement_name,
                         "selection_title": selection_title,
                     }
                 ) or created_handoff,
@@ -1669,6 +1691,8 @@ class A03RequirementsReviewTests(unittest.TestCase):
             self.assertTrue(result.passed)
             self.assertEqual(result.rounds_used, 2)
             self.assertEqual(round_counter["count"], 1)
+            self.assertEqual(active_handoff.worker.metadata_updates[0]["requirement_name"], "需求A")
+            self.assertEqual(active_handoff.worker.metadata_updates[0]["workflow_action"], "stage.a04.start")
 
     def test_run_requirements_review_stage_preserves_ba_handoff_after_first_feedback_round(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1911,6 +1935,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                         "project_dir": str(root.resolve()),
                         "requirement_name": "需求A",
                         "workflow_action": "stage.a04.start",
+                        "agent_state": "DEAD",
                     },
                     ensure_ascii=False,
                 ),
@@ -1962,7 +1987,10 @@ class A03RequirementsReviewTests(unittest.TestCase):
 
             class FakeTmuxRuntimeController:
                 def session_exists(self, session_name: str) -> bool:
-                    return session_name in {"遗留-存活会话", "审核器-R4-天牢星", "需求分析师-天佑星"}
+                    return session_name in {"审核器-R3-天哭星", "遗留-存活会话", "审核器-R4-天牢星", "需求分析师-天佑星"}
+
+                def session_matches_worker_state(self, session_name, state, state_path):  # noqa: ANN001, ARG002
+                    return session_name == "审核器-R3-天哭星"
 
                 def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
                     killed_sessions.append(session_name)
@@ -1972,14 +2000,14 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 removed = cleanup_stale_review_runtime_state(root, "需求A", preserve_workers=(preserved_worker,))
 
             self.assertFalse(target_dir.exists())
-            self.assertFalse(legacy_dead_dir.exists())
+            self.assertTrue(legacy_dead_dir.exists())
             self.assertTrue(other_requirement_dir.exists())
             self.assertTrue(legacy_live_dir.exists())
             self.assertTrue(preserved_dir.exists())
             self.assertIn("审核器-R3-天哭星", killed_sessions)
-            self.assertIn("遗留-死亡会话", killed_sessions)
+            self.assertNotIn("遗留-死亡会话", killed_sessions)
             self.assertIn(str(target_dir.resolve()), removed)
-            self.assertIn(str(legacy_dead_dir.resolve()), removed)
+            self.assertNotIn(str(legacy_dead_dir.resolve()), removed)
 
     def test_run_reviewer_turn_with_recreation_drops_dead_reviewer(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2298,10 +2326,11 @@ class A03RequirementsReviewTests(unittest.TestCase):
             ), patch(
                 "A03_RequirementsReview.TmuxBatchWorker",
                 return_value=recreated_worker,
-            ), patch("sys.stdout", io.StringIO()):
+            ) as worker_constructor, patch("sys.stdout", io.StringIO()):
                 handoff, payload = run_ba_turn_with_recreation(
                     original,
                     project_dir=root,
+                    requirement_name="需求A",
                     label="resume_ba",
                     prompt="resume",
                     result_contract=build_ba_human_feedback_result_contract(
@@ -2312,6 +2341,9 @@ class A03RequirementsReviewTests(unittest.TestCase):
             self.assertEqual(payload["status"], "completed")
             self.assertEqual(handoff.model, "gpt-5.4-mini")
             self.assertEqual(call_counter["count"], 2)
+            replacement_metadata = worker_constructor.call_args.kwargs["runtime_metadata"]
+            self.assertEqual(replacement_metadata["requirement_name"], "需求A")
+            self.assertEqual(replacement_metadata["workflow_action"], "stage.a04.start")
 
     def test_run_reviewer_turn_with_recreation_rebuilds_reviewer_after_agent_ready_timeout(self):
         with tempfile.TemporaryDirectory() as tmpdir:

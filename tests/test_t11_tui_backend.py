@@ -35,6 +35,7 @@ from T11_tui_backend import (
     PendingPromptState,
     PromptBroker,
     TuiBackendServer,
+    _write_project_stage_state_record,
     main as backend_main,
 )
 from T10_tui_protocol import build_request
@@ -42,6 +43,7 @@ from T09_terminal_ops import BridgePromptRequest
 from tmux_core.runtime.tmux_runtime import (
     AgentStartupInterventionRequired,
     clear_runtime_shutdown_request,
+    get_current_stage_runner_id,
     runtime_shutdown_requested,
 )
 
@@ -3907,7 +3909,12 @@ class T11TuiBackendTests(unittest.TestCase):
                 file_path.write_text(content, encoding="utf-8")
             writer = io.StringIO()
             server = TuiBackendServer(reader=io.StringIO(), writer=writer)
-            with patch("T11_tui_backend.run_overall_review_stage", return_value=SimpleNamespace(project_dir=str(project_dir), requirement_name="需求A", completed=True)):
+
+            def fake_run_overall_review_stage(argv, preserve_workers=False):  # noqa: ANN001
+                self.assertTrue(preserve_workers)
+                return SimpleNamespace(project_dir=str(project_dir), requirement_name="需求A", completed=True)
+
+            with patch("T11_tui_backend.run_overall_review_stage", side_effect=fake_run_overall_review_stage):
                 server.handle_request(
                     build_request(
                         "stage.a08.start",
@@ -4564,7 +4571,8 @@ class T11TuiBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
 
-            def fake_run(argv):  # noqa: ANN001
+            def fake_run(argv, *, preserve_workers=False):  # noqa: ANN001
+                self.assertTrue(preserve_workers)
                 captured_argv.append(list(argv))
                 started.set()
                 release.wait(timeout=2.0)
@@ -4600,7 +4608,8 @@ class T11TuiBackendTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
 
-            def fake_run(argv):  # noqa: ANN001
+            def fake_run(argv, *, preserve_workers=False):  # noqa: ANN001
+                self.assertTrue(preserve_workers)
                 captured_argv.append(list(argv))
                 started.set()
                 release.wait(timeout=2.0)
@@ -4858,7 +4867,7 @@ class T11TuiBackendTests(unittest.TestCase):
             )
             self.assertFalse(any(item.get("kind") == "event" and item.get("type") == "error" for item in messages))
 
-    def test_prompt_shutdown_does_not_mark_stage_failed(self):
+    def test_prompt_shutdown_marks_runner_interrupted_without_generic_error(self):
         clear_runtime_shutdown_request()
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -4906,14 +4915,22 @@ class T11TuiBackendTests(unittest.TestCase):
                     / "stage_a07_start.failure.json"
                 )
                 failure_exists = failure_path.exists()
+                failure_payload = json.loads(failure_path.read_text(encoding="utf-8")) if failure_exists else {}
+                state_path = failure_path.with_name("stage_a07_start.state.json")
+                state_payload = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
 
-            self.assertFalse(failure_exists)
+            self.assertTrue(failure_exists)
+            self.assertEqual(failure_payload["failure_kind"], "runner_interrupted")
+            self.assertEqual(state_payload["status"], "failed")
+            self.assertEqual(state_payload["source"], "runner_failure")
+            self.assertEqual(state_payload["failure_kind"], "runner_interrupted")
             self.assertFalse(any(item.get("kind") == "event" and item.get("type") == "error" for item in messages))
-            self.assertFalse(
+            self.assertTrue(
                 any(
                     item.get("kind") == "event"
                     and item.get("type") == "stage.changed"
                     and item.get("payload", {}).get("status") == "failed"
+                    and item.get("payload", {}).get("failure_kind") == "runner_interrupted"
                     for item in messages
                 )
             )
@@ -4939,6 +4956,77 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertGreaterEqual(len(review_events), 2)
         self.assertEqual(review_events[-1]["payload"]["status"], "failed")
         self.assertEqual(review_events[-1]["payload"]["stage_seq"], review_events[0]["payload"]["stage_seq"])
+
+    def test_a00_child_stage_persists_runner_start_before_orphan_cleanup_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            runtime_dir = project_dir / ".requirements_clarification_runtime" / "analyst"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "requirements-analyst",
+                        "session_name": "需求分析师-天哭星",
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a04.start",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "turn_state": "orphaned",
+                        "orphaned_stage_action": "stage.a04.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="workflow.a00.start")  # noqa: SLF001
+
+            def fail_kill(_session_name, *, missing_ok=True):  # noqa: ANN001, ARG001
+                raise TimeoutError("tmux mutation timed out")
+
+            server._tmux_runtime = SimpleNamespace(  # noqa: SLF001
+                session_matches_worker_state=lambda *_args: True,
+                kill_session=fail_kill,
+            )
+
+            def root_runner():
+                server._handle_runtime_stage_change("stage.a04.start")  # noqa: SLF001
+
+            with patch.object(server, "_schedule_flow_snapshot_update"):
+                server._run_in_thread(  # noqa: SLF001
+                    "req-a00-cleanup-failure",
+                    "workflow.a00.start",
+                    root_runner,
+                    respond=False,
+                )
+                for thread in list(server._workers.values()):  # noqa: SLF001
+                    thread.join(timeout=2.0)
+
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            failure_path = record_dir / "stage_a04_start.failure.json"
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            state = json.loads((record_dir / "stage_a04_start.state.json").read_text(encoding="utf-8"))
+            messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+
+        child_events = [
+            item["payload"]
+            for item in messages
+            if item.get("kind") == "event"
+            and item.get("type") == "stage.changed"
+            and item.get("payload", {}).get("action") == "stage.a04.start"
+        ]
+        self.assertGreaterEqual(len(child_events), 2)
+        self.assertEqual(child_events[0]["source"], "runner_start")
+        self.assertEqual(child_events[-1]["source"], "runner_failure")
+        self.assertEqual(child_events[-1]["stage_seq"], child_events[0]["stage_seq"])
+        self.assertEqual(failure["action"], "stage.a04.start")
+        self.assertEqual(failure["stage_seq"], child_events[0]["stage_seq"])
+        self.assertEqual(failure["runner_id"], child_events[0]["runner_id"])
+        self.assertIn("保留运行目录并终止新 runner", failure["error"])
+        self.assertEqual(state["source"], "runner_failure")
+        self.assertEqual(state["stage_seq"], failure["stage_seq"])
 
     def test_requirement_concurrency_conflict_is_reported_as_error(self):
         writer = io.StringIO()
@@ -5336,7 +5424,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertFalse(stale_exists)
         self.assertTrue(workflow_exists)
 
-    def test_running_stage_state_clears_same_action_stale_failure_record(self):
+    def test_new_runner_start_clears_same_action_stale_failure_record(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
@@ -5359,7 +5447,8 @@ class T11TuiBackendTests(unittest.TestCase):
                 preferred_status="running",
                 preferred_action="stage.a07.start",
                 preferred_stage_seq=12,
-                source="runtime_inference",
+                preferred_runner_id="runner-new",
+                source="runner_start",
                 force=True,
             )
             failure_exists = failure_path.exists()
@@ -5367,6 +5456,1203 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertFalse(failure_exists)
         self.assertFalse(latest_exists)
+
+    def test_runtime_inference_never_deletes_authoritative_failure_record(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            record_dir.mkdir(parents=True)
+            failure_payload = {
+                "action": "stage.a07.start",
+                "status": "failed",
+                "project_dir": str(project_dir),
+                "requirement_name": "需求A",
+                "error": "runner crashed",
+            }
+            failure_path = record_dir / "stage_a07_start.failure.json"
+            latest_path = record_dir / "latest_failure.json"
+            failure_path.write_text(json.dumps(failure_payload, ensure_ascii=False), encoding="utf-8")
+            latest_path.write_text(json.dumps(failure_payload, ensure_ascii=False), encoding="utf-8")
+            state_path = record_dir / "stage_a07_start.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "action": "stage.a07.start",
+                        "status": "failed",
+                        "source": "runner_failure",
+                        "stage_seq": 7,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a07.start")  # noqa: SLF001
+
+            server._emit_display_stage_state(  # noqa: SLF001
+                preferred_status="running",
+                preferred_action="stage.a07.start",
+                preferred_stage_seq=7,
+                source="runtime_inference",
+                force=True,
+            )
+            persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+            failure_exists = failure_path.exists()
+            latest_exists = latest_path.exists()
+
+        self.assertTrue(failure_exists)
+        self.assertTrue(latest_exists)
+        self.assertEqual(persisted_state["status"], "failed")
+        self.assertEqual(persisted_state["source"], "runner_failure")
+
+    def test_runtime_inference_cannot_override_authoritative_runner_complete(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name="需求A",
+                action="stage.a06.start",
+            )
+            self.assertTrue(
+                server._emit_display_stage_state(  # noqa: SLF001
+                    preferred_status="completed",
+                    preferred_action="stage.a06.start",
+                    preferred_stage_seq=7,
+                    preferred_runner_id="runner-complete",
+                    source="runner_complete",
+                    force=True,
+                )
+            )
+
+            with patch.object(server, "_infer_runtime_stage_status", return_value="failed"):
+                accepted = server._emit_display_stage_state(  # noqa: SLF001
+                    preferred_status="running",
+                    preferred_action="stage.a06.start",
+                    preferred_stage_seq=7,
+                    source="runtime_inference",
+                    force=True,
+                )
+            state_path = (
+                project_dir
+                / ".tmux_workflow"
+                / "需求A"
+                / "stages"
+                / "stage_a06_start.state.json"
+            )
+            persisted_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(accepted)
+        self.assertEqual(persisted_state["status"], "completed")
+        self.assertEqual(persisted_state["source"], "runner_complete")
+        self.assertEqual(server._display_status, "completed")  # noqa: SLF001
+        self.assertEqual(server._display_source, "runner_complete")  # noqa: SLF001
+
+    def test_runner_failure_is_persisted_before_orphan_scan_and_broken_event_emit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            observed_initial_records: list[tuple[dict[str, object], dict[str, object]]] = []
+
+            def fake_orphan_scan(action, *, runner_id, reason):  # noqa: ANN001
+                self.assertEqual((action, runner_id, reason), ("stage.a06.start", "runner-old", "runner_failure"))
+                failure = json.loads((record_dir / "stage_a06_start.failure.json").read_text(encoding="utf-8"))
+                state = json.loads((record_dir / "stage_a06_start.state.json").read_text(encoding="utf-8"))
+                observed_initial_records.append((failure, state))
+                self.assertEqual(failure["orphaned_workers"], [])
+                self.assertEqual(state["orphaned_workers"], [])
+                return [{"session_name": "需求分析师-天哭星", "role": "需求分析师", "attach_command": "tmux attach -t 需求分析师-天哭星"}]
+
+            with patch.object(server, "_infer_runtime_stage_status", side_effect=AssertionError("runner failure must not infer tmux")), patch.object(
+                server,
+                "_mark_stage_workers_orphaned",
+                side_effect=fake_orphan_scan,
+            ), patch.object(server, "emit_event", side_effect=BrokenPipeError("frontend exited")):
+                failure_path, orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                    action="stage.a06.start",
+                    stage_seq=4,
+                    runner_id="runner-old",
+                    error=RuntimeError("boom"),
+                    traceback_text="trace",
+                    failure_kind="runner_failure",
+                )
+
+            failure = json.loads(Path(failure_path).read_text(encoding="utf-8"))
+            state = json.loads((record_dir / "stage_a06_start.state.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(accepted)
+        self.assertTrue(observed_initial_records)
+        self.assertEqual(failure["orphaned_workers"], orphaned_workers)
+        self.assertEqual(state["orphaned_workers"], orphaned_workers)
+        self.assertEqual(state["source"], "runner_failure")
+
+    def test_shutdown_does_not_overwrite_same_generation_runner_failure_as_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+            runner_started = threading.Event()
+            release_runner = threading.Event()
+
+            def active_runner():
+                runner_started.set()
+                release_runner.wait(timeout=2.0)
+
+            thread = threading.Thread(target=active_runner, name="tui-backend-stage.a06.start", daemon=True)
+            thread.start()
+            self.assertTrue(runner_started.wait(timeout=1.0))
+            execution = SimpleNamespace(
+                runner_id="runner-failed",
+                action="stage.a06.start",
+                stage_seq=4,
+                project_dir=str(project_dir),
+                requirement_name="需求A",
+                terminal_source="",
+                terminal_at="",
+            )
+            server._workers["runner"] = thread  # noqa: SLF001
+            server._runner_executions["runner"] = execution  # noqa: SLF001
+
+            try:
+                failure_path, _orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                    action="stage.a06.start",
+                    stage_seq=4,
+                    runner_id="runner-failed",
+                    error=RuntimeError("original runner failure"),
+                    traceback_text="trace",
+                    failure_kind="runner_failure",
+                )
+                self.assertTrue(accepted)
+                self.assertEqual(execution.terminal_source, "runner_failure")
+                # Force the persisted-generation guard to cover the SIGTERM race even if
+                # the in-memory terminal marker has not become visible yet.
+                execution.terminal_source = ""
+                with patch.object(
+                    server,
+                    "_commit_runner_failure",
+                    side_effect=AssertionError("terminal generation must not be rewritten"),
+                ):
+                    server._mark_active_runners_interrupted(reason="tui_backend_shutdown")  # noqa: SLF001
+                failure = json.loads(Path(failure_path).read_text(encoding="utf-8"))
+                state = json.loads(
+                    Path(failure_path).with_name("stage_a06_start.state.json").read_text(encoding="utf-8")
+                )
+            finally:
+                release_runner.set()
+                thread.join(timeout=1.0)
+
+        self.assertEqual(failure["failure_kind"], "runner_failure")
+        self.assertEqual(failure["error"], "original runner failure")
+        self.assertEqual(state["failure_kind"], "runner_failure")
+        self.assertEqual(state["message"], "original runner failure")
+
+    def test_runner_failure_marks_worker_orphaned_and_exposes_authoritative_app_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            runtime_dir = project_dir / TASK_SPLIT_RUNTIME_ROOT_NAME / "需求A" / "analyst"
+            runtime_dir.mkdir(parents=True)
+            worker_state_path = runtime_dir / "worker.state.json"
+            worker_state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "task-split-analyst",
+                        "session_name": "需求分析师-天哭星",
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a06.start",
+                        "stage_runner_id": "runner-a06",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+
+            failure_path, orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                action="stage.a06.start",
+                stage_seq=9,
+                runner_id="runner-a06",
+                error=RuntimeError("task split runner crashed"),
+                traceback_text="trace",
+                failure_kind="runner_failure",
+            )
+            app = server._build_app_snapshot(  # noqa: SLF001
+                runs=[],
+                control={},
+                hitl={"pending": False},
+                attention={"pending": False},
+                artifacts={"items": []},
+            )
+            worker_state = json.loads(worker_state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(accepted)
+        self.assertEqual(worker_state["turn_state"], "orphaned")
+        self.assertEqual(worker_state["orphaned_reason"], "runner_failure")
+        self.assertEqual(worker_state["stage_runner_id"], "runner-a06")
+        self.assertEqual(orphaned_workers[0]["attach_command"], "tmux attach -t 需求分析师-天哭星")
+        active_failure = app["active_stage_failure"]
+        self.assertEqual(active_failure["action"], "stage.a06.start")
+        self.assertEqual(active_failure["status"], "failed")
+        self.assertEqual(active_failure["source"], "runner_failure")
+        self.assertEqual(active_failure["failure_kind"], "runner_failure")
+        self.assertEqual(active_failure["failure_path"], str(Path(failure_path).resolve()))
+        self.assertEqual(active_failure["stage_label"], "任务拆分")
+
+    def test_runner_failure_finds_a03_to_a06_workers_in_cross_stage_handoff_roots(self):
+        scenarios = (
+            ("stage.a03.start", ".requirements_analysis_runtime"),
+            ("stage.a04.start", ".requirements_clarification_runtime"),
+            ("stage.a05.start", REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME),
+            ("stage.a06.start", DETAILED_DESIGN_RUNTIME_ROOT_NAME),
+        )
+        for action, root_name in scenarios:
+            with self.subTest(action=action, root_name=root_name), tempfile.TemporaryDirectory() as tmpdir:
+                project_dir = Path(tmpdir).resolve()
+                runtime_dir = project_dir / root_name / "需求A" / "handoff"
+                runtime_dir.mkdir(parents=True)
+                state_path = runtime_dir / "worker.state.json"
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "worker_id": "cross-stage-handoff",
+                            "session_name": f"需求分析师-{action}",
+                            "project_dir": str(project_dir),
+                            "requirement_name": "需求A",
+                            "workflow_action": action,
+                            "stage_runner_id": f"runner-{action}",
+                            "agent_state": "READY",
+                            "health_status": "alive",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+                server._set_context(project_dir=str(project_dir), requirement_name="需求A", action=action)  # noqa: SLF001
+
+                _failure_path, orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                    action=action,
+                    stage_seq=1,
+                    runner_id=f"runner-{action}",
+                    error=RuntimeError("runner crashed"),
+                    traceback_text="trace",
+                    failure_kind="runner_failure",
+                )
+                worker_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+                self.assertTrue(accepted)
+                self.assertEqual(worker_state["turn_state"], "orphaned")
+                self.assertEqual(worker_state["orphaned_stage_action"], action)
+                self.assertEqual(len(orphaned_workers), 1)
+
+    def test_runner_failure_only_orphans_workers_owned_by_same_runner_generation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+
+            def write_worker(directory: str, runner_id: str, session_name: str) -> Path:
+                runtime_dir = project_dir / TASK_SPLIT_RUNTIME_ROOT_NAME / "需求A" / directory
+                runtime_dir.mkdir(parents=True)
+                state_path = runtime_dir / "worker.state.json"
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "worker_id": directory,
+                            "session_name": session_name,
+                            "project_dir": str(project_dir),
+                            "requirement_name": "需求A",
+                            "workflow_action": "stage.a06.start",
+                            "stage_runner_id": runner_id,
+                            "agent_state": "READY",
+                            "health_status": "alive",
+                            "turn_state": "waiting_result",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                return state_path
+
+            current_path = write_worker("current", "runner-current", "需求分析师-本代")
+            old_path = write_worker("old", "runner-old", "需求分析师-旧代")
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name="需求A",
+                action="stage.a06.start",
+            )
+
+            _failure_path, orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                action="stage.a06.start",
+                stage_seq=2,
+                runner_id="runner-current",
+                error=RuntimeError("current generation failed"),
+                traceback_text="trace",
+                failure_kind="runner_failure",
+            )
+            current_state = json.loads(current_path.read_text(encoding="utf-8"))
+            old_state = json.loads(old_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(accepted)
+        self.assertEqual(current_state["turn_state"], "orphaned")
+        self.assertEqual(old_state["turn_state"], "waiting_result")
+        self.assertEqual([item["session_name"] for item in orphaned_workers], ["需求分析师-本代"])
+
+    def test_older_runner_failure_cannot_overwrite_new_generation(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a07.start")  # noqa: SLF001
+            server._emit_display_stage_state(  # noqa: SLF001
+                preferred_status="running",
+                preferred_action="stage.a07.start",
+                preferred_stage_seq=8,
+                preferred_runner_id="runner-new",
+                source="runner_start",
+                force=True,
+            )
+
+            failure_path, _orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                action="stage.a07.start",
+                stage_seq=7,
+                runner_id="runner-old",
+                error=RuntimeError("late failure"),
+                traceback_text="trace",
+                failure_kind="runner_failure",
+            )
+            state_path = project_dir / ".tmux_workflow" / "需求A" / "stages" / "stage_a07_start.state.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(accepted)
+        self.assertIsNone(failure_path)
+        self.assertEqual(state["status"], "running")
+        self.assertEqual(state["runner_id"], "runner-new")
+        self.assertEqual(state["stage_seq"], 8)
+
+    def test_same_runner_failure_cannot_be_overwritten_by_late_complete(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name="需求A",
+                action="stage.a06.start",
+            )
+            failure_path, _workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                action="stage.a06.start",
+                stage_seq=1,
+                runner_id="runner-same",
+                error=RuntimeError("original failure"),
+                traceback_text="trace",
+                failure_kind="runner_failure",
+            )
+            late_complete = server._emit_display_stage_state(  # noqa: SLF001
+                preferred_status="completed",
+                preferred_action="stage.a06.start",
+                preferred_stage_seq=1,
+                preferred_runner_id="runner-same",
+                source="runner_complete",
+                force=True,
+            )
+            state = json.loads(Path(failure_path).with_name("stage_a06_start.state.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(accepted)
+        self.assertFalse(late_complete)
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["source"], "runner_failure")
+        self.assertEqual(state["message"], "original failure")
+
+    def test_same_runner_complete_cannot_be_overwritten_by_late_interruption(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name="需求A",
+                action="stage.a06.start",
+            )
+            self.assertTrue(
+                server._emit_display_stage_state(  # noqa: SLF001
+                    preferred_status="completed",
+                    preferred_action="stage.a06.start",
+                    preferred_stage_seq=1,
+                    preferred_runner_id="runner-same",
+                    source="runner_complete",
+                    force=True,
+                )
+            )
+            failure_path, orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                action="stage.a06.start",
+                stage_seq=1,
+                runner_id="runner-same",
+                error=RuntimeError("late shutdown"),
+                traceback_text="trace",
+                failure_kind="runner_interrupted",
+            )
+            state_path = (
+                project_dir / ".tmux_workflow" / "需求A" / "stages" / "stage_a06_start.state.json"
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(accepted)
+        self.assertIsNone(failure_path)
+        self.assertEqual(orphaned_workers, [])
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["source"], "runner_complete")
+
+    def test_superseded_runner_runtime_stage_change_is_rejected_before_allocating_sequence(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._set_context(project_dir="/tmp/project", requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+        server._display_action = "stage.a06.start"  # noqa: SLF001
+        server._display_status = "running"  # noqa: SLF001
+        server._display_stage_seq = 12  # noqa: SLF001
+        server._display_runner_id = "runner-new"  # noqa: SLF001
+        server._runner_local.runner_id = "runner-old"  # noqa: SLF001
+        server._runner_executions = {  # noqa: SLF001
+            "old": SimpleNamespace(
+                runner_id="runner-old",
+                stage_seq=11,
+                project_dir="/tmp/project",
+                requirement_name="需求A",
+            ),
+            "new": SimpleNamespace(
+                runner_id="runner-new",
+                stage_seq=12,
+                project_dir="/tmp/project",
+                requirement_name="需求A",
+            ),
+        }
+
+        with patch.object(server, "_allocate_stage_seq", side_effect=AssertionError("late event must be rejected")):
+            server._handle_runtime_stage_change("stage.a07.start")  # noqa: SLF001
+
+        self.assertEqual(server._context.current_action, "stage.a06.start")  # noqa: SLF001
+        self.assertEqual(server._display_runner_id, "runner-new")  # noqa: SLF001
+
+    def test_superseded_runner_stays_rejected_after_new_runner_leaves_registry(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._set_context(project_dir="/tmp/project", requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+        server._display_action = "stage.a06.start"  # noqa: SLF001
+        server._display_status = "completed"  # noqa: SLF001
+        server._display_stage_seq = 12  # noqa: SLF001
+        server._display_runner_id = "runner-new"  # noqa: SLF001
+        server._runner_local.runner_id = "runner-old"  # noqa: SLF001
+        server._runner_executions = {  # noqa: SLF001
+            "old": SimpleNamespace(
+                runner_id="runner-old",
+                stage_seq=11,
+                project_dir="/tmp/project",
+                requirement_name="需求A",
+            )
+        }
+
+        with patch.object(server, "_allocate_stage_seq", side_effect=AssertionError("old runner must stay superseded")):
+            server._handle_runtime_stage_change("stage.a07.start")  # noqa: SLF001
+
+        self.assertEqual(server._context.current_action, "stage.a06.start")  # noqa: SLF001
+        self.assertEqual(server._display_runner_id, "runner-new")  # noqa: SLF001
+
+    def test_a00_stage_sequence_allocation_cannot_overtake_explicit_runner_registration(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = str(Path(tmpdir).resolve())
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=project_dir,
+                requirement_name="需求A",
+                action="stage.a06.start",
+            )
+            server._display_action = "stage.a06.start"  # noqa: SLF001
+            server._display_status = "running"  # noqa: SLF001
+            server._display_stage_seq = 1  # noqa: SLF001
+            server._display_runner_id = "runner-old"  # noqa: SLF001
+            old_execution = SimpleNamespace(
+                runner_id="runner-old",
+                action="workflow.a00.start",
+                stage_seq=1,
+                project_dir=project_dir,
+                requirement_name="需求A",
+            )
+            server._workers["old"] = SimpleNamespace(is_alive=lambda: True)  # noqa: SLF001
+            server._runner_executions["old"] = old_execution  # noqa: SLF001
+            allocation_entered = threading.Event()
+            release_allocation = threading.Event()
+            new_runner_started = threading.Event()
+            release_new_runner = threading.Event()
+            allocation_count = 0
+            allocation_lock = threading.Lock()
+
+            def controlled_allocate(**_kwargs):  # noqa: ANN003
+                nonlocal allocation_count
+                with allocation_lock:
+                    allocation_count += 1
+                    current = allocation_count
+                if current == 1:
+                    allocation_entered.set()
+                    release_allocation.wait(timeout=2.0)
+                return current + 1
+
+            def transition() -> None:
+                server._runner_local.runner_id = "runner-old"  # noqa: SLF001
+                server._runner_local.execution = old_execution  # noqa: SLF001
+                try:
+                    server._handle_runtime_stage_change("stage.a07.start")  # noqa: SLF001
+                finally:
+                    server._runner_local.runner_id = ""  # noqa: SLF001
+                    server._runner_local.execution = None  # noqa: SLF001
+
+            def explicit_runner() -> int:
+                new_runner_started.set()
+                release_new_runner.wait(timeout=2.0)
+                return 0
+
+            argv = ["--project-dir", project_dir, "--requirement-name", "需求A"]
+            with patch.object(server, "_allocate_stage_seq", side_effect=controlled_allocate):
+                transition_thread = threading.Thread(target=transition)
+                transition_thread.start()
+                self.assertTrue(allocation_entered.wait(timeout=1.0))
+                launch_thread = threading.Thread(
+                    target=lambda: server._run_in_thread(  # noqa: SLF001
+                        "req-new",
+                        "stage.a06.start",
+                        explicit_runner,
+                        argv=argv,
+                        respond=False,
+                    )
+                )
+                launch_thread.start()
+                self.assertFalse(new_runner_started.wait(timeout=0.05))
+                release_allocation.set()
+                transition_thread.join(timeout=2.0)
+                launch_thread.join(timeout=2.0)
+                self.assertTrue(new_runner_started.wait(timeout=1.0))
+                self.assertEqual(allocation_count, 2)
+                self.assertNotEqual(server._display_runner_id, "runner-old")  # noqa: SLF001
+                self.assertEqual(server._display_stage_seq, 3)  # noqa: SLF001
+                release_new_runner.set()
+                for worker_key, thread in list(server._workers.items()):  # noqa: SLF001
+                    if worker_key != "old":
+                        thread.join(timeout=2.0)
+
+    def test_cross_scope_start_is_rejected_before_global_context_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_a = Path(tmpdir, "project-a").resolve()
+            project_b = Path(tmpdir, "project-b").resolve()
+            project_a.mkdir()
+            project_b.mkdir()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_a),
+                requirement_name="需求A",
+                action="stage.a06.start",
+            )
+            started = threading.Event()
+            release = threading.Event()
+
+            def active_runner():
+                started.set()
+                release.wait(timeout=2.0)
+                return 0
+
+            argv_a = ["--project-dir", str(project_a), "--requirement-name", "需求A"]
+            server._run_in_thread("req-a", "stage.a06.start", active_runner, argv=argv_a, respond=False)  # noqa: SLF001
+            self.assertTrue(started.wait(timeout=1.0))
+            argv_b = ["--project-dir", str(project_b), "--requirement-name", "需求B"]
+            try:
+                with patch("T11_tui_backend.run_task_split_stage") as run_project_b:
+                    with self.assertRaisesRegex(RuntimeError, "避免阶段状态串写"):
+                        server.dispatch_action(
+                            "stage.a06.start",
+                            {"argv": argv_b},
+                            request_id="req-b",
+                            respond=False,
+                        )
+                    run_project_b.assert_not_called()
+                self.assertEqual(server._context.project_dir, str(project_a))  # noqa: SLF001
+                self.assertEqual(server._context.requirement_name, "需求A")  # noqa: SLF001
+            finally:
+                release.set()
+                for thread in list(server._workers.values()):  # noqa: SLF001
+                    thread.join(timeout=2.0)
+
+    def test_concurrent_cross_scope_starts_atomically_register_only_one_runner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_a = Path(tmpdir, "project-a").resolve()
+            project_b = Path(tmpdir, "project-b").resolve()
+            project_a.mkdir()
+            project_b.mkdir()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            start_barrier = threading.Barrier(3)
+            release_runner = threading.Event()
+            outcomes: list[tuple[str, str]] = []
+            outcomes_lock = threading.Lock()
+
+            def launch(label: str, project_dir: Path, requirement_name: str) -> None:
+                argv = [
+                    "--project-dir",
+                    str(project_dir),
+                    "--requirement-name",
+                    requirement_name,
+                ]
+                def waiting_runner() -> int:
+                    release_runner.wait(timeout=2.0)
+                    return 0
+
+                start_barrier.wait(timeout=2.0)
+                try:
+                    server._run_in_thread(  # noqa: SLF001
+                        f"req-{label}",
+                        "stage.a06.start",
+                        waiting_runner,
+                        argv=argv,
+                        respond=False,
+                    )
+                except RuntimeError as error:
+                    outcome = (label, str(error))
+                else:
+                    outcome = (label, "accepted")
+                with outcomes_lock:
+                    outcomes.append(outcome)
+
+            launch_a = threading.Thread(target=launch, args=("a", project_a, "需求A"))
+            launch_b = threading.Thread(target=launch, args=("b", project_b, "需求B"))
+            launch_a.start()
+            launch_b.start()
+            start_barrier.wait(timeout=2.0)
+            launch_a.join(timeout=2.0)
+            launch_b.join(timeout=2.0)
+            try:
+                accepted = [label for label, result in outcomes if result == "accepted"]
+                rejected = [result for _label, result in outcomes if result != "accepted"]
+                self.assertEqual(len(accepted), 1)
+                self.assertEqual(len(rejected), 1)
+                self.assertIn("避免阶段状态串写", rejected[0])
+                with server._worker_registry_lock:  # noqa: SLF001
+                    executions = list(server._runner_executions.values())  # noqa: SLF001
+                self.assertEqual(len(executions), 1)
+                execution = executions[0]
+                expected_project = project_a if accepted[0] == "a" else project_b
+                expected_requirement = "需求A" if accepted[0] == "a" else "需求B"
+                self.assertEqual(execution.project_dir, str(expected_project))
+                self.assertEqual(execution.requirement_name, expected_requirement)
+                self.assertEqual(server._context.project_dir, str(expected_project))  # noqa: SLF001
+                self.assertEqual(server._context.requirement_name, expected_requirement)  # noqa: SLF001
+            finally:
+                release_runner.set()
+                for thread in list(server._workers.values()):  # noqa: SLF001
+                    thread.join(timeout=2.0)
+
+    def test_runner_failure_persists_to_execution_scope_after_global_context_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_a = Path(tmpdir, "project-a").resolve()
+            project_b = Path(tmpdir, "project-b").resolve()
+            project_a.mkdir()
+            project_b.mkdir()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            runner_started = threading.Event()
+            release_runner = threading.Event()
+
+            def failing_runner() -> int:
+                runner_started.set()
+                release_runner.wait(timeout=2.0)
+                raise RuntimeError("execution scoped failure")
+
+            argv = ["--project-dir", str(project_a), "--requirement-name", "需求A"]
+            server._run_in_thread(  # noqa: SLF001
+                "req-scoped-failure",
+                "stage.a06.start",
+                failing_runner,
+                argv=argv,
+                respond=False,
+            )
+            self.assertTrue(runner_started.wait(timeout=1.0))
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_b),
+                requirement_name="需求B",
+                action="control.b01.open",
+            )
+            release_runner.set()
+            for thread in list(server._workers.values()):  # noqa: SLF001
+                thread.join(timeout=2.0)
+
+            failure_a = (
+                project_a
+                / ".tmux_workflow"
+                / "需求A"
+                / "stages"
+                / "stage_a06_start.failure.json"
+            )
+            failure_b = (
+                project_b
+                / ".tmux_workflow"
+                / "需求B"
+                / "stages"
+                / "stage_a06_start.failure.json"
+            )
+            self.assertTrue(failure_a.is_file())
+            self.assertFalse(failure_b.exists())
+            failure_payload = json.loads(failure_a.read_text(encoding="utf-8"))
+            self.assertEqual(failure_payload["requirement_name"], "需求A")
+            self.assertEqual(failure_payload["project_dir"], str(project_a))
+
+    def test_a00_state_cleanup_happens_only_after_new_generation_is_persisted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            record_dir.mkdir(parents=True)
+            child_state = record_dir / "stage_a06_start.state.json"
+            child_state.write_text('{"source":"runner_failure","status":"failed"}', encoding="utf-8")
+            latest_failure = record_dir / "latest_failure.json"
+            latest_failure.write_text('{"action":"workflow.a00.start"}', encoding="utf-8")
+
+            with patch("T11_tui_backend._atomic_write_json", side_effect=OSError("disk full")):
+                result = _write_project_stage_state_record(
+                    project_dir=str(project_dir),
+                    requirement_name="需求A",
+                    action="workflow.a00.start",
+                    status="running",
+                    stage_seq=2,
+                    runner_id="runner-new",
+                    source="runner_start",
+                )
+
+            self.assertIsNone(result)
+            self.assertTrue(child_state.exists())
+            self.assertTrue(latest_failure.exists())
+
+    def test_stage_sequence_continues_from_persisted_maximum_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            record_dir.mkdir(parents=True)
+            (record_dir / "stage_a06_start.state.json").write_text(
+                json.dumps({"action": "stage.a06.start", "stage_seq": 13}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a07.start")  # noqa: SLF001
+            next_sequence = server._allocate_stage_seq()  # noqa: SLF001
+
+        self.assertEqual(next_sequence, 14)
+
+    def test_snapshot_reconciles_unowned_persisted_running_runner_as_interrupted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            record_dir.mkdir(parents=True)
+            state_path = record_dir / "stage_a06_start.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "action": "stage.a06.start",
+                        "status": "running",
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "stage_seq": 5,
+                        "runner_id": "runner-from-dead-backend",
+                        "source": "runner_start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+
+            app = server._build_app_snapshot(  # noqa: SLF001
+                runs=[],
+                control={},
+                hitl={"pending": False},
+                attention={"pending": False},
+                artifacts={"items": []},
+            )
+            reconciled_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(reconciled_state["status"], "failed")
+        self.assertEqual(reconciled_state["source"], "runner_failure")
+        self.assertEqual(reconciled_state["failure_kind"], "runner_interrupted")
+        self.assertEqual(reconciled_state["runner_id"], "runner-from-dead-backend")
+        self.assertEqual(app["active_stage_status"], "failed")
+        self.assertEqual(app["active_stage_failure"]["failure_kind"], "runner_interrupted")
+
+    def test_explicit_new_generation_prevents_restart_reconciliation_of_old_running_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            record_dir.mkdir(parents=True)
+            state_path = record_dir / "stage_a06_start.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "action": "stage.a06.start",
+                        "status": "running",
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "stage_seq": 5,
+                        "runner_id": "runner-old",
+                        "source": "runner_start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+            server._workers["new"] = object()  # type: ignore[assignment]  # noqa: SLF001
+            server._runner_executions["new"] = SimpleNamespace(  # noqa: SLF001
+                runner_id="runner-new",
+                action="stage.a06.start",
+                stage_seq=6,
+                project_dir=str(project_dir),
+                requirement_name="需求A",
+            )
+
+            reconciled = server._reconcile_persisted_running_runner("stage.a06.start")  # noqa: SLF001
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertFalse(reconciled)
+        self.assertEqual(persisted["status"], "running")
+        self.assertEqual(persisted["runner_id"], "runner-old")
+
+    def test_successful_explicit_rerun_resets_only_reconciled_interruption_policy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            record_dir = project_dir / ".tmux_workflow" / "需求A" / "stages"
+            record_dir.mkdir(parents=True)
+            (record_dir / "stage_a06_start.state.json").write_text(
+                json.dumps(
+                    {
+                        "action": "stage.a06.start",
+                        "status": "running",
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "stage_seq": 5,
+                        "runner_id": "runner-old",
+                        "source": "runner_start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+            self.assertTrue(server._reconcile_persisted_running_runner("stage.a06.start"))  # noqa: SLF001
+            self.assertEqual(server._current_shutdown_policy().value, "PRESERVE_ORPHANS")  # noqa: SLF001
+            runner_started = threading.Event()
+            release_runner = threading.Event()
+
+            def successful_rerun():
+                runner_started.set()
+                release_runner.wait(timeout=2.0)
+                return 0
+
+            server._run_in_thread("req-rerun", "stage.a06.start", successful_rerun, respond=False)  # noqa: SLF001
+            self.assertTrue(runner_started.wait(timeout=2.0))
+            policy_during_rerun = server._current_shutdown_policy()  # noqa: SLF001
+            release_runner.set()
+            for thread in list(server._workers.values()):  # noqa: SLF001
+                thread.join(timeout=2.0)
+            with patch("T11_tui_backend.cleanup_registered_tmux_workers", return_value=["sess-cleaned"]), patch.object(
+                server,
+                "_cleanup_visible_tmux_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_cleanup_project_runtime_tmux_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_cleanup_current_project_tmux_sessions",
+                return_value=[],
+            ), patch.object(server, "_list_foreign_project_tmux_sessions", return_value=[]):
+                cleaned = server.shutdown(cleanup_tmux=True)
+
+        self.assertIsNone(policy_during_rerun)
+        self.assertEqual(cleaned, ["sess-cleaned"])
+
+    def test_successful_explicit_rerun_resets_ordinary_failure_policy_after_orphan_cleanup(self):
+        clear_runtime_shutdown_request()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                project_dir = Path(tmpdir).resolve()
+                runtime_dir = project_dir / TASK_SPLIT_RUNTIME_ROOT_NAME / "需求A" / "analyst"
+                runtime_dir.mkdir(parents=True)
+                state_path = runtime_dir / "worker.state.json"
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "worker_id": "task-split-analyst",
+                            "session_name": "需求分析师-天哭星",
+                            "project_dir": str(project_dir),
+                            "requirement_name": "需求A",
+                            "workflow_action": "stage.a06.start",
+                            "stage_runner_id": "runner-old",
+                            "agent_state": "READY",
+                            "health_status": "alive",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+                server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+                _failure_path, orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                    action="stage.a06.start",
+                    stage_seq=1,
+                    runner_id="runner-old",
+                    error=RuntimeError("ordinary failure"),
+                    traceback_text="trace",
+                    failure_kind="runner_failure",
+                )
+                self.assertTrue(accepted)
+                self.assertTrue(orphaned_workers)
+                self.assertEqual(server._current_shutdown_policy().value, "PRESERVE_ORPHANS")  # noqa: SLF001
+
+                killed: list[str] = []
+                server._tmux_runtime = SimpleNamespace(  # noqa: SLF001
+                    session_matches_worker_state=lambda *_args: True,
+                    kill_session=lambda session_name, *, missing_ok=True: killed.append(session_name) or session_name,
+                )
+                observed_policy: list[object] = []
+                runner_called = threading.Event()
+
+                def successful_rerun():
+                    observed_policy.append(server._current_shutdown_policy())  # noqa: SLF001
+                    runner_called.set()
+                    return 0
+
+                with patch.object(server, "_schedule_flow_snapshot_update"):
+                    server._run_in_thread(  # noqa: SLF001
+                        "req-ordinary-rerun",
+                        "stage.a06.start",
+                        successful_rerun,
+                        respond=False,
+                    )
+                    for thread in list(server._workers.values()):  # noqa: SLF001
+                        thread.join(timeout=2.0)
+
+                with patch("T11_tui_backend.cleanup_registered_tmux_workers", return_value=["sess-cleaned"]), patch.object(
+                    server,
+                    "_cleanup_visible_tmux_workers",
+                    return_value=[],
+                ), patch.object(
+                    server,
+                    "_cleanup_project_runtime_tmux_workers",
+                    return_value=[],
+                ), patch.object(
+                    server,
+                    "_cleanup_current_project_tmux_sessions",
+                    return_value=[],
+                ), patch.object(server, "_list_foreign_project_tmux_sessions", return_value=[]):
+                    cleaned = server.shutdown(cleanup_tmux=True)
+
+                runtime_exists = runtime_dir.exists()
+
+            self.assertTrue(runner_called.is_set())
+            self.assertEqual(killed, ["需求分析师-天哭星"])
+            self.assertFalse(runtime_exists)
+            self.assertEqual(observed_policy, [None])
+            self.assertEqual(cleaned, ["sess-cleaned"])
+        finally:
+            clear_runtime_shutdown_request()
+
+    def test_new_runner_cleanup_removes_only_matching_orphan_or_dead_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            runtime_root = project_dir / TASK_SPLIT_RUNTIME_ROOT_NAME / "需求A"
+
+            def write_worker(name: str, **extra: object) -> Path:
+                worker_dir = runtime_root / name
+                worker_dir.mkdir(parents=True)
+                payload: dict[str, object] = {
+                    "worker_id": name,
+                    "session_name": f"session-{name}",
+                    "project_dir": str(project_dir),
+                    "requirement_name": "需求A",
+                    "workflow_action": "stage.a06.start",
+                    "agent_state": "READY",
+                    "health_status": "alive",
+                }
+                payload.update(extra)
+                (worker_dir / "worker.state.json").write_text(
+                    json.dumps(payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                return worker_dir
+
+            orphan_dir = write_worker("orphan", turn_state="orphaned", orphaned_stage_action="stage.a06.start")
+            dead_dir = write_worker("dead", agent_state="DEAD")
+            live_dir = write_worker("live")
+            killed: list[str] = []
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+            server._tmux_runtime = SimpleNamespace(  # noqa: SLF001
+                session_matches_worker_state=lambda *_args: True,
+                kill_session=lambda session_name, *, missing_ok=True: killed.append(session_name) or session_name,
+            )
+
+            server._cleanup_stage_orphans_before_runner_start("stage.a06.start", runner_id="runner-new")  # noqa: SLF001
+            orphan_exists = orphan_dir.exists()
+            dead_exists = dead_dir.exists()
+            live_exists = live_dir.exists()
+
+        self.assertEqual(sorted(killed), ["session-dead", "session-orphan"])
+        self.assertFalse(orphan_exists)
+        self.assertFalse(dead_exists)
+        self.assertTrue(live_exists)
+
+    def test_new_runner_cleanup_never_kills_reused_foreign_session_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            runtime_dir = project_dir / TASK_SPLIT_RUNTIME_ROOT_NAME / "需求A" / "orphan"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "task-split-analyst",
+                        "session_name": "shared-session",
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a06.start",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "turn_state": "orphaned",
+                        "orphaned_stage_action": "stage.a06.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            killed: list[str] = []
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+            server._tmux_runtime = SimpleNamespace(  # noqa: SLF001
+                session_matches_worker_state=lambda *_args: False,
+                kill_session=lambda session_name, *, missing_ok=True: killed.append(session_name) or session_name,
+            )
+
+            server._cleanup_stage_orphans_before_runner_start("stage.a06.start", runner_id="runner-new")  # noqa: SLF001
+
+            runtime_exists = runtime_dir.exists()
+
+        self.assertFalse(runtime_exists)
+        self.assertEqual(killed, [])
+
+    def test_tmux_cleanup_timeout_preserves_orphan_runtime_and_fails_new_runner(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            runtime_dir = project_dir / TASK_SPLIT_RUNTIME_ROOT_NAME / "需求A" / "orphan"
+            runtime_dir.mkdir(parents=True)
+            (runtime_dir / "worker.state.json").write_text(
+                json.dumps(
+                    {
+                        "worker_id": "task-split-analyst",
+                        "session_name": "需求分析师-天哭星",
+                        "project_dir": str(project_dir),
+                        "requirement_name": "需求A",
+                        "workflow_action": "stage.a06.start",
+                        "agent_state": "READY",
+                        "health_status": "alive",
+                        "turn_state": "orphaned",
+                        "orphaned_stage_action": "stage.a06.start",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+
+            def fail_kill(_session_name, *, missing_ok=True):  # noqa: ANN001, ARG001
+                raise TimeoutError("tmux mutation timed out")
+
+            server._tmux_runtime = SimpleNamespace(  # noqa: SLF001
+                session_matches_worker_state=lambda *_args: True,
+                kill_session=fail_kill,
+            )
+            runner_called = threading.Event()
+            with patch.object(server, "_schedule_flow_snapshot_update"):
+                server._run_in_thread(  # noqa: SLF001
+                    "req-cleanup-timeout",
+                    "stage.a06.start",
+                    lambda: runner_called.set(),
+                    respond=False,
+                )
+                for thread in list(server._workers.values()):  # noqa: SLF001
+                    thread.join(timeout=2.0)
+            failure_path = project_dir / ".tmux_workflow" / "需求A" / "stages" / "stage_a06_start.failure.json"
+            failure = json.loads(failure_path.read_text(encoding="utf-8"))
+            stage_state = json.loads(
+                failure_path.with_name("stage_a06_start.state.json").read_text(encoding="utf-8")
+            )
+            runtime_exists = runtime_dir.exists()
+
+        self.assertFalse(runner_called.is_set())
+        self.assertTrue(runtime_exists)
+        self.assertIn("保留运行目录并终止新 runner", failure["error"])
+        self.assertEqual(failure["failure_kind"], "runner_failure")
+        self.assertTrue(failure["runner_id"].startswith("runner_"))
+        self.assertEqual(stage_state["runner_id"], failure["runner_id"])
+        self.assertEqual(stage_state["stage_seq"], failure["stage_seq"])
+        self.assertEqual(stage_state["source"], "runner_failure")
+        self.assertEqual(server._current_shutdown_policy().value, "PRESERVE_ORPHANS")  # noqa: SLF001
+
+    def test_worker_snapshot_exposes_tmux_control_diagnostics(self):
+        from tmux_core.bridge.backend import _read_worker_state_snapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "worker-1",
+                        "tmux_control_status": "unavailable",
+                        "tmux_control_error": "list-panes timeout",
+                        "tmux_control_unavailable_since": "2026-07-14T10:00:00+08:00",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            snapshot = _read_worker_state_snapshot(state_path)
+
+        self.assertEqual(snapshot["tmux_control_status"], "unavailable")
+        self.assertEqual(snapshot["tmux_control_error"], "list-panes timeout")
+        self.assertEqual(snapshot["tmux_control_unavailable_since"], "2026-07-14T10:00:00+08:00")
+
+    def test_ready_agent_health_does_not_erase_running_turn_contract(self):
+        from tmux_core.bridge.backend import _read_worker_state_snapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "worker-1",
+                        "session_name": "需求分析师-天哭星",
+                        "status": "ready",
+                        "result_status": "running",
+                        "current_task_runtime_status": "running",
+                        "agent_state": "READY",
+                        "agent_started": True,
+                        "health_status": "alive",
+                        "note": "agent_ready",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            snapshot = _read_worker_state_snapshot(
+                state_path,
+                session_exists_resolver=lambda _session_name: True,
+            )
+
+        self.assertEqual(snapshot["agent_state"], "READY")
+        self.assertEqual(snapshot["status"], "running")
+        self.assertEqual(snapshot["current_task_runtime_status"], "running")
 
     def test_runtime_stage_change_marks_previous_forward_stage_completed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5384,10 +6670,58 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertEqual(previous_payload["action"], "stage.a03.start")
         self.assertEqual(previous_payload["status"], "completed")
-        self.assertEqual(previous_payload["source"], "runtime_inference")
+        self.assertEqual(previous_payload["source"], "runner_complete")
         self.assertIn("stage.a04.start", previous_payload["message"])
         self.assertEqual(current_payload["action"], "stage.a04.start")
         self.assertEqual(current_payload["status"], "running")
+
+    def test_a00_root_runner_is_alive_for_current_child_stage_runtime_inference(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        runner_started = threading.Event()
+        release_runner = threading.Event()
+
+        def root_runner():
+            runner_started.set()
+            release_runner.wait(timeout=2.0)
+
+        thread = threading.Thread(
+            target=root_runner,
+            name="tui-backend-workflow.a00.start-root",
+            daemon=True,
+        )
+        thread.start()
+        self.assertTrue(runner_started.wait(timeout=1.0))
+        server._workers["root"] = thread  # noqa: SLF001
+        server._runner_executions["root"] = SimpleNamespace(  # noqa: SLF001
+            runner_id="runner-root",
+            action="workflow.a00.start",
+            stage_seq=1,
+            project_dir="/tmp/project",
+            requirement_name="需求A",
+            terminal_source="",
+        )
+        server._display_action = "stage.a06.start"  # noqa: SLF001
+        server._display_status = "running"  # noqa: SLF001
+        server._display_stage_seq = 6  # noqa: SLF001
+        server._display_runner_id = "runner-root"  # noqa: SLF001
+
+        try:
+            action, status, stage_seq = server._derive_display_stage_state(  # noqa: SLF001
+                preferred_status="running",
+                preferred_action="stage.a06.start",
+                preferred_stage_seq=6,
+                source="runtime_inference",
+                runtime_status="failed",
+                pending_prompt=False,
+                pending_hitl=False,
+            )
+        finally:
+            release_runner.set()
+            thread.join(timeout=1.0)
+
+        self.assertEqual(action, "stage.a06.start")
+        self.assertEqual(status, "running")
+        self.assertEqual(stage_seq, 6)
 
     def test_runtime_stage_change_marks_previous_backward_stage_superseded(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5404,7 +6738,7 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertEqual(previous_payload["action"], "stage.a05.start")
         self.assertEqual(previous_payload["status"], "superseded")
-        self.assertEqual(previous_payload["source"], "runtime_inference")
+        self.assertEqual(previous_payload["source"], "runner_complete")
         self.assertIn("stage.a04.start", previous_payload["message"])
         self.assertEqual(current_payload["action"], "stage.a04.start")
         self.assertEqual(current_payload["status"], "running")
@@ -5621,11 +6955,11 @@ class T11TuiBackendTests(unittest.TestCase):
         finally:
             clear_runtime_shutdown_request()
 
-    def test_shutdown_cleanup_can_run_after_initial_non_cleanup_shutdown(self):
+    def test_shutdown_preserve_policy_latches_against_late_cleanup(self):
         writer = io.StringIO()
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)
         first_cleaned = server.shutdown(cleanup_tmux=False)
-        with patch("T11_tui_backend.cleanup_registered_tmux_workers", return_value=["sess-late"]), patch.object(
+        with patch("T11_tui_backend.cleanup_registered_tmux_workers", return_value=["sess-late"]) as cleanup, patch.object(
             server,
             "_cleanup_visible_tmux_workers",
             return_value=[],
@@ -5636,7 +6970,65 @@ class T11TuiBackendTests(unittest.TestCase):
         ):
             second_cleaned = server.shutdown(cleanup_tmux=True)
         self.assertEqual(first_cleaned, [])
-        self.assertEqual(second_cleaned, ["sess-late"])
+        self.assertEqual(second_cleaned, [])
+        cleanup.assert_not_called()
+
+    def test_app_shutdown_preserve_orphans_action_latches_cleanup_policy(self):
+        writer = io.StringIO()
+        server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+        result = server.dispatch_action(  # noqa: SLF001
+            "app.shutdown",
+            {"policy": "preserve_orphans", "reason": "runner_failure"},
+            request_id="req-shutdown",
+        )
+        with patch("T11_tui_backend.cleanup_registered_tmux_workers") as cleanup:
+            cleaned = server.shutdown(cleanup_tmux=True)
+
+        self.assertEqual(result["policy"], "preserve_orphans")
+        self.assertEqual(result["reason"], "runner_failure")
+        self.assertEqual(cleaned, [])
+        cleanup.assert_not_called()
+        messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+        responses = [item for item in messages if item.get("kind") == "response" and item.get("id") == "req-shutdown"]
+        self.assertTrue(responses)
+        self.assertTrue(responses[-1]["ok"])
+
+    def test_explicit_preserve_shutdown_cannot_be_reset_by_later_runner_start(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a06.start")  # noqa: SLF001
+            _failure_path, _orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                action="stage.a06.start",
+                stage_seq=1,
+                runner_id="runner-old",
+                error=RuntimeError("ordinary failure"),
+                traceback_text="trace",
+                failure_kind="runner_failure",
+            )
+            self.assertTrue(accepted)
+            server.dispatch_action(  # noqa: SLF001
+                "app.shutdown",
+                {"policy": "preserve_orphans", "reason": "runner_failure"},
+                respond=False,
+            )
+            server._emit_display_stage_state(  # noqa: SLF001
+                preferred_status="running",
+                preferred_action="stage.a06.start",
+                preferred_stage_seq=2,
+                preferred_runner_id="runner-new",
+                source="runner_start",
+                force=True,
+            )
+
+            reset = server._reset_preserve_policy_for_new_generation(  # noqa: SLF001
+                action="stage.a06.start",
+                runner_id="runner-new",
+                stage_seq=2,
+            )
+
+        self.assertFalse(reset)
+        self.assertEqual(server._current_shutdown_policy().value, "PRESERVE_ORPHANS")  # noqa: SLF001
 
     def test_shutdown_waits_for_runner_threads_before_tmux_cleanup(self):
         clear_runtime_shutdown_request()
@@ -5681,8 +7073,10 @@ class T11TuiBackendTests(unittest.TestCase):
         server = TuiBackendServer(reader=io.StringIO(), writer=writer)
         runner_started = threading.Event()
         release_runner = threading.Event()
+        observed_runner_ids: list[str] = []
 
         def runner():
+            observed_runner_ids.append(get_current_stage_runner_id())
             runner_started.set()
             release_runner.wait(timeout=1.0)
             return 0
@@ -5693,6 +7087,8 @@ class T11TuiBackendTests(unittest.TestCase):
         thread = worker_threads[0]
         self.assertTrue(runner_started.wait(timeout=1.0))
         self.assertTrue(thread.daemon)
+        self.assertEqual(len(observed_runner_ids), 1)
+        self.assertTrue(observed_runner_ids[0].startswith("runner_"))
         release_runner.set()
         thread.join(timeout=1.0)
 
@@ -6899,7 +8295,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(workers[0]["agent_state"], "READY")
         self.assertEqual(workers[0]["health_note"], "alive")
 
-    def test_runtime_scanned_worker_snapshot_normalizes_stale_running_when_agent_ready(self):
+    def test_runtime_scanned_worker_snapshot_preserves_running_turn_when_agent_ready(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             runtime_root = Path(tmpdir)
             worker_root = runtime_root / "worker-1"
@@ -6931,9 +8327,9 @@ class T11TuiBackendTests(unittest.TestCase):
             server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
             server._tmux_runtime = SimpleNamespace(session_exists=lambda name: name == "sess-reviewer", backend=None)  # noqa: SLF001
             workers = server._scan_runtime_workers(runtime_root)  # noqa: SLF001
-        self.assertEqual(workers[0]["status"], "ready")
+        self.assertEqual(workers[0]["status"], "running")
         self.assertEqual(workers[0]["agent_state"], "READY")
-        self.assertEqual(workers[0]["current_task_runtime_status"], "")
+        self.assertEqual(workers[0]["current_task_runtime_status"], "running")
 
     def test_runtime_scanned_worker_snapshots_prefer_fresher_alive_health_note_while_turn_is_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:

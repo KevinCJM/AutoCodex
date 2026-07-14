@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import A01_Routing_LayerPlanning as routing_stage
 from tmux_core.stage_kernel import detailed_design, requirements_review, reviewer_orchestration, shared_review
+from tmux_core.runtime.tmux_runtime import TmuxControlUnavailable, TmuxMutationOutcomeUnknown
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 from T09_terminal_ops import PromptBackRequested
 
@@ -17,6 +18,78 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class StageKernelSharedTests(unittest.TestCase):
+    def test_parallel_reviewer_helpers_preserve_tmux_control_exception_type(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="capture-pane",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="send-keys", error="timeout"),
+        )
+        reviewer = SimpleNamespace(reviewer_name="测试工程师", worker=SimpleNamespace())
+        for error in errors:
+            with self.subTest(helper="round", error=type(error).__name__):
+                with self.assertRaises(type(error)):
+                    reviewer_orchestration.run_parallel_reviewer_round(
+                        [reviewer],
+                        key_func=lambda item: item.reviewer_name,
+                        run_turn=lambda _item: (_ for _ in ()).throw(error),
+                        error_prefix="review failed",
+                    )
+            with self.subTest(helper="repair", error=type(error).__name__):
+                with self.assertRaises(type(error)):
+                    reviewer_orchestration.repair_reviewer_round_outputs(
+                        [reviewer],
+                        key_func=lambda item: item.reviewer_name,
+                        artifact_name_func=lambda item: item.reviewer_name,
+                        check_job=lambda _names: {"测试工程师": "repair"},
+                        run_fix_turn=lambda _item, _prompt, _attempt: (_ for _ in ()).throw(error),
+                        max_attempts=1,
+                        error_prefix="repair failed",
+                        final_error="repair failed",
+                    )
+
+    def test_shutdown_preserves_runtime_when_tmux_kill_outcome_is_uncertain(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="has-session",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="kill-session", error="timeout"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmpdir:
+                runtime_root = Path(tmpdir) / ".runtime"
+                runtime_dir = runtime_root / "reviewer"
+                runtime_dir.mkdir(parents=True)
+
+                class _Worker:
+                    def __init__(self) -> None:
+                        self.runtime_root = runtime_root
+                        self.runtime_dir = runtime_dir
+
+                    def request_kill(self):
+                        raise error
+
+                reviewer = SimpleNamespace(
+                    reviewer_name="测试工程师",
+                    worker=_Worker(),
+                )
+
+                with self.assertRaises(type(error)):
+                    reviewer_orchestration.shutdown_stage_workers(
+                        None,
+                        [reviewer],
+                        cleanup_runtime=True,
+                        runtime_root_filter=runtime_root,
+                    )
+
+                self.assertTrue(runtime_dir.exists())
+
     def test_a04_a05_share_review_support_types(self):
         self.assertIs(requirements_review.ReviewAgentSelection, shared_review.ReviewAgentSelection)
         self.assertIs(detailed_design.ReviewAgentSelection, shared_review.ReviewAgentSelection)

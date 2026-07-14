@@ -220,6 +220,36 @@ class WebBackendTests(unittest.TestCase):
         self.assertEqual(preview['payload']['text'], 'hello web preview\n')
         self.assertEqual(unauthorized.exception.code, 403)
 
+    def test_web_backend_allows_authoritative_stage_failure_preview(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            server, thread = self._start_server()
+            try:
+                server._set_context(  # noqa: SLF001
+                    project_dir=str(project_dir),
+                    requirement_name='需求A',
+                    action='stage.a06.start',
+                )
+                failure_path, _orphaned_workers, accepted = server._commit_runner_failure(  # noqa: SLF001
+                    action='stage.a06.start',
+                    stage_seq=3,
+                    runner_id='runner-web-failure',
+                    error=RuntimeError('task split failed'),
+                    traceback_text='traceback details',
+                    failure_kind='runner_failure',
+                )
+                preview = self._get_json(
+                    server,
+                    '/api/file-preview?path=' + urllib.parse.quote(str(failure_path)),
+                )
+            finally:
+                self._stop_server(server, thread)
+
+        self.assertTrue(accepted)
+        self.assertTrue(preview['ok'])
+        self.assertEqual(preview['payload']['path'], str(Path(failure_path).resolve()))
+        self.assertIn('task split failed', preview['payload']['text'])
+
     def test_web_backend_request_returns_immediate_ack_for_background_stage(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)

@@ -16,6 +16,8 @@ import type {
   RunOption,
   SnapshotsPayload,
   StageRoute,
+  StageFailureSnapshot,
+  StageFailureWorker,
   StageSnapshot,
   WorkerSnapshot,
 } from './types'
@@ -54,7 +56,12 @@ export const EMPTY_APP: AppSnapshot = {
   currentAction: '',
   activeRunId: '',
   activeStage: 'idle',
+  activeStageStatus: 'ready',
+  activeStageSeq: 0,
+  activeStageRunnerId: '',
+  activeStageSource: '',
   activeStageLabel: '等待中',
+  activeStageFailure: null,
   pendingHitl: false,
   pendingAttention: false,
   pendingAttentionReason: '',
@@ -104,6 +111,52 @@ function artifact(value: unknown): ArtifactItem {
   }
 }
 
+function shellQuote(value: string): string {
+  if (value && !/[\s'"`$;&|<>(){}\[\]*?!\\]/u.test(value)) return value
+  return `'${value.replaceAll("'", `'"'"'`)}'`
+}
+
+function normalizeFailureWorker(value: unknown): StageFailureWorker | null {
+  if (typeof value === 'string') {
+    const text = value.trim()
+    if (!text) return null
+    if (text.startsWith('tmux ')) return { workerId: '', sessionName: '', attachCommand: text, workDir: '' }
+    return { workerId: '', sessionName: text, attachCommand: `tmux attach -t ${shellQuote(text)}`, workDir: '' }
+  }
+  const item = objectOf(value)
+  const sessionName = str(item.session_name ?? item.sessionName).trim()
+  const rawAttach = item.attach_command ?? item.attachCommand
+  const attachCommand = (Array.isArray(rawAttach) ? rawAttach.map((item) => shellQuote(str(item))).join(' ') : str(rawAttach)).trim()
+    || (sessionName ? `tmux attach -t ${shellQuote(sessionName)}` : '')
+  if (!sessionName && !attachCommand) return null
+  return {
+    workerId: str(item.worker_id ?? item.workerId).trim(),
+    sessionName,
+    attachCommand,
+    workDir: str(item.work_dir ?? item.workDir).trim(),
+  }
+}
+
+export function normalizeStageFailure(value: unknown): StageFailureSnapshot | null {
+  const item = objectOf(value)
+  if (Object.keys(item).length === 0) return null
+  const workers = item.orphaned_workers ?? item.orphanedWorkers
+  return {
+    action: str(item.action).trim(),
+    stageLabel: str(item.stage_label ?? item.stageLabel).trim(),
+    status: str(item.status || 'failed').trim().toLowerCase(),
+    source: str(item.source).trim().toLowerCase(),
+    runnerId: str(item.runner_id ?? item.runnerId).trim(),
+    stageSeq: num(item.stage_seq ?? item.stageSeq),
+    message: str(item.message ?? item.error).trim(),
+    failurePath: str(item.failure_path ?? item.failurePath ?? item.path).trim(),
+    failureKind: str(item.failure_kind ?? item.failureKind ?? item.kind).trim(),
+    orphanedWorkers: (Array.isArray(workers) ? workers : [])
+      .map(normalizeFailureWorker)
+      .filter((worker): worker is StageFailureWorker => worker !== null),
+  }
+}
+
 export function normalizeFileSnapshot(value: unknown): FileSnapshot {
   const item = objectOf(value)
   return {
@@ -127,6 +180,18 @@ export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
     agentState: str(item.agent_state ?? item.agentState),
     healthStatus: str(item.health_status ?? item.healthStatus),
     currentTaskRuntimeStatus: str(item.current_task_runtime_status ?? item.currentTaskRuntimeStatus),
+    turnState: str(item.turn_state ?? item.turnState),
+    tmuxControlStatus: str(item.tmux_control_status ?? item.tmuxControlStatus),
+    tmuxControlError: str(item.tmux_control_error ?? item.tmuxControlError),
+    tmuxUnavailableSince: str(
+      item.tmux_control_unavailable_since
+      ?? item.tmuxControlUnavailableSince
+      ?? item.tmux_unavailable_since
+      ?? item.tmuxUnavailableSince,
+    ),
+    stageRunnerId: str(item.stage_runner_id ?? item.stageRunnerId),
+    orphanedAt: str(item.orphaned_at ?? item.orphanedAt),
+    orphanedReason: str(item.orphaned_reason ?? item.orphanedReason),
     retryCount: num(item.retry_count ?? item.retryCount),
     note: str(item.note),
     transcriptPath: str(item.transcript_path ?? item.transcriptPath),
@@ -218,13 +283,34 @@ export function normalizeArtifactsSnapshot(value: unknown): ArtifactsSnapshot {
 export function normalizeAppSnapshot(value: unknown): AppSnapshot {
   const item = objectOf(value)
   const runs = Array.isArray(item.available_runs) ? item.available_runs : Array.isArray(item.availableRuns) ? item.availableRuns : []
+  const activeStage = str(item.active_stage ?? item.activeStage ?? 'idle')
+  const activeStageStatus = str(item.active_stage_status ?? item.activeStageStatus)
+  const activeStageSeq = num(item.active_stage_seq ?? item.activeStageSeq)
+  const activeStageRunnerId = str(item.active_stage_runner_id ?? item.activeStageRunnerId ?? item.runner_id ?? item.runnerId)
+  const activeStageSource = str(item.active_stage_source ?? item.activeStageSource ?? item.source)
+  const activeStageLabel = str(item.active_stage_label ?? item.activeStageLabel ?? '等待中')
+  const rawFailure = objectOf(item.active_stage_failure ?? item.activeStageFailure)
+  const activeStageFailure = Object.keys(rawFailure).length > 0 ? normalizeStageFailure({
+    ...rawFailure,
+    action: rawFailure.action ?? activeStage,
+    stage_label: rawFailure.stage_label ?? rawFailure.stageLabel ?? activeStageLabel,
+    status: rawFailure.status ?? activeStageStatus,
+    source: rawFailure.source ?? activeStageSource,
+    runner_id: rawFailure.runner_id ?? rawFailure.runnerId ?? activeStageRunnerId,
+    stage_seq: rawFailure.stage_seq ?? rawFailure.stageSeq ?? activeStageSeq,
+  }) : null
   return {
     projectDir: str(item.project_dir ?? item.projectDir),
     requirementName: str(item.requirement_name ?? item.requirementName),
     currentAction: str(item.current_action ?? item.currentAction),
     activeRunId: str(item.active_run_id ?? item.activeRunId),
-    activeStage: str(item.active_stage ?? item.activeStage ?? 'idle'),
-    activeStageLabel: str(item.active_stage_label ?? item.activeStageLabel ?? '等待中'),
+    activeStage,
+    activeStageStatus,
+    activeStageSeq,
+    activeStageRunnerId,
+    activeStageSource,
+    activeStageLabel,
+    activeStageFailure,
     pendingHitl: bool(item.pending_hitl ?? item.pendingHitl),
     pendingAttention: bool(item.pending_attention ?? item.pendingAttention),
     pendingAttentionReason: str(item.pending_attention_reason ?? item.pendingAttentionReason),

@@ -14,6 +14,7 @@ type BackendEnvelope = {
 
 const BACKEND_STOP_KILL_GRACE_MS = 10000
 const BACKEND_CLEANUP_ONLY_EXIT_TIMEOUT_MS = 30000
+const BACKEND_SHUTDOWN_POLICY_TIMEOUT_MS = 1500
 
 export type BackendEvent = {
   type: string
@@ -22,7 +23,7 @@ export type BackendEvent = {
 
 export type BackendStopOptions = {
   forceKillAfterMs?: number
-  reason?: 'normal' | 'signal'
+  reason?: 'normal' | 'signal' | 'runner_failure'
 }
 
 export type BackendStopResult = {
@@ -35,6 +36,8 @@ export type BackendCleanupContext = {
   requirementName?: string
   action?: string
 }
+
+type BackendProcess = Bun.Subprocess<'pipe', 'pipe', 'pipe'>
 
 export function repoRoot() {
   return resolve(import.meta.dir, '../../../..')
@@ -91,9 +94,11 @@ export async function runCleanupOnlyBackend(context: BackendCleanupContext): Pro
 }
 
 export class BackendClient {
-  private process?: Bun.Subprocess<'pipe', 'pipe', 'pipe'>
-  private stoppingProcess?: Bun.Subprocess<'pipe', 'pipe', 'pipe'>
+  private process?: BackendProcess
+  private stoppingProcess?: BackendProcess
   private stoppingPromise?: Promise<BackendStopResult>
+  private disconnectedProcess?: BackendProcess
+  private backendDisconnectError?: Error
   private processExitHandler?: () => void
   private nextId = 1
   private buffer = ''
@@ -101,19 +106,47 @@ export class BackendClient {
   private listeners = new Set<(event: BackendEvent) => void>()
 
   async start() {
-    if (this.process) return
+    if (this.process) {
+      if (this.backendDisconnectError) throw this.backendDisconnectError
+      return
+    }
     const python = readPythonPath()
     const backendPath = join(repoRoot(), 'T11_tui_backend.py')
-    this.process = Bun.spawn([python, backendPath], {
+    const child = Bun.spawn([python, backendPath], {
       cwd: repoRoot(),
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
       env: process.env,
     })
+    this.process = child
+    this.disconnectedProcess = undefined
+    this.backendDisconnectError = undefined
     this.ensureProcessExitHandler()
-    this.consumeStream(this.process.stdout)
-    this.consumeStderr(this.process.stderr)
+    void this.consumeStream(child.stdout, child)
+    void this.consumeStderr(child.stderr)
+    void Promise.resolve(child.exited).then(
+      (exitCode) => this.handleUnexpectedDisconnect(child, `backend exited with code ${Number(exitCode ?? 0)}`, Number(exitCode ?? 0)),
+      (error) => this.handleUnexpectedDisconnect(child, `backend exit wait failed: ${String(error)}`),
+    )
+  }
+
+  private handleUnexpectedDisconnect(child: BackendProcess, reason: string, exitCode?: number) {
+    if (this.process !== child || this.stoppingProcess === child || this.disconnectedProcess === child) return
+    this.disconnectedProcess = child
+    const message = String(reason || 'backend disconnected').trim() || 'backend disconnected'
+    const error = new Error(message)
+    this.backendDisconnectError = error
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const waiter of pending) waiter.reject(error)
+    this.emit({
+      type: 'backend.disconnected',
+      payload: {
+        message,
+        ...(exitCode === undefined ? {} : { exit_code: exitCode }),
+      },
+    })
   }
 
   private ensureProcessExitHandler() {
@@ -147,6 +180,7 @@ export class BackendClient {
     this.listeners.clear()
     const child = this.process
     this.process = undefined
+    this.backendDisconnectError = undefined
     if (!child) {
       if (this.stoppingPromise) return await this.stoppingPromise
       return { graceful: true, signalEscalatedToSigkill: false }
@@ -191,10 +225,31 @@ export class BackendClient {
       if (timer) clearTimeout(timer)
       if (this.stoppingProcess === child) this.stoppingProcess = undefined
       if (this.stoppingPromise === stopPromise) this.stoppingPromise = undefined
+      if (this.disconnectedProcess === child) this.disconnectedProcess = undefined
       this.clearProcessExitHandlerIfIdle()
     })
     this.stoppingPromise = stopPromise
     return await this.stoppingPromise
+  }
+
+  async requestShutdownPolicy(
+    policy: 'cleanup' | 'preserve_orphans',
+    reason: string,
+    timeoutMs = BACKEND_SHUTDOWN_POLICY_TIMEOUT_MS,
+  ): Promise<boolean> {
+    if (!this.process) return false
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+    const timeout = new Promise<boolean>((resolve) => {
+      timeoutId = setTimeout(() => resolve(false), Math.max(0, timeoutMs))
+    })
+    try {
+      return await Promise.race([
+        this.request('app.shutdown', { policy, reason }).then(() => true, () => false),
+        timeout,
+      ])
+    } finally {
+      if (timeoutId) clearTimeout(timeoutId)
+    }
   }
 
   private async consumeStderr(stream: ReadableStream<Uint8Array>) {
@@ -208,20 +263,25 @@ export class BackendClient {
     }
   }
 
-  private async consumeStream(stream: ReadableStream<Uint8Array>) {
+  private async consumeStream(stream: ReadableStream<Uint8Array>, child: BackendProcess) {
     const reader = stream.getReader()
     const decoder = new TextDecoder()
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      this.buffer += decoder.decode(value, { stream: true })
-      let index = this.buffer.indexOf('\n')
-      while (index >= 0) {
-        const line = this.buffer.slice(0, index).trim()
-        this.buffer = this.buffer.slice(index + 1)
-        if (line) this.handleLine(line)
-        index = this.buffer.indexOf('\n')
+    try {
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        this.buffer += decoder.decode(value, { stream: true })
+        let index = this.buffer.indexOf('\n')
+        while (index >= 0) {
+          const line = this.buffer.slice(0, index).trim()
+          this.buffer = this.buffer.slice(index + 1)
+          if (line) this.handleLine(line)
+          index = this.buffer.indexOf('\n')
+        }
       }
+      this.handleUnexpectedDisconnect(child, 'backend stdout closed unexpectedly')
+    } catch (error) {
+      this.handleUnexpectedDisconnect(child, `backend stdout failed: ${String(error)}`)
     }
   }
 

@@ -25,7 +25,8 @@ import {
   normalizeStageSnapshot,
 } from './domain/normalize'
 import { STAGE_LABELS, STAGE_ROUTES, routeLabel, stageRouteForAction } from './domain/stages'
-import type { AppSnapshot, ArtifactsSnapshot, BridgeEvent, ControlSnapshot, FilePreview, HitlSnapshot, LogEntry, PromptSnapshot, RunOption, SnapshotsPayload, StageRoute, StageSnapshot, WorkerSnapshot } from './domain/types'
+import { applyStageGeneration, EMPTY_STAGE_GENERATION, stageFailureFromEvent, stagePayloadFromApp } from './domain/stageState'
+import type { AppSnapshot, ArtifactsSnapshot, BridgeEvent, ControlSnapshot, FilePreview, HitlSnapshot, LogEntry, PromptSnapshot, RunOption, SnapshotsPayload, StageFailureSnapshot, StageRoute, StageSnapshot, WorkerSnapshot } from './domain/types'
 
 type AppTab = 'home' | 'stages' | 'files' | 'logs'
 type SheetKind = 'advanced' | 'preview' | null
@@ -45,7 +46,7 @@ function emptySnapshots(): SnapshotsPayload {
 
 function statusClass(value: string): string {
   const text = String(value || '').toLowerCase()
-  if (text.includes('fail') || text.includes('dead') || text.includes('error')) return 'danger'
+  if (text.includes('fail') || text.includes('dead') || text.includes('error') || text.includes('orphan')) return 'danger'
   if (text.includes('busy') || text.includes('running') || text.includes('pending') || text.includes('start')) return 'active'
   if (text.includes('complete') || text.includes('ready') || text.includes('alive')) return 'good'
   return 'muted'
@@ -311,6 +312,32 @@ function CurrentCard(props: {
   )
 }
 
+function StageFailureCard(props: { failure: StageFailureSnapshot; onPreview: (path: string) => void }) {
+  return (
+    <section class="hero-card failure-card" role="alert">
+      <div class="card-kicker">阶段执行失败</div>
+      <h2>{props.failure.stageLabel || routeLabel(stageRouteForAction(props.failure.action)) || props.failure.action || '未知阶段'}</h2>
+      <p class="failure-message">{props.failure.message || props.failure.failureKind || 'unknown error'}</p>
+      <Show when={props.failure.failurePath}>
+        <PathButton path={props.failure.failurePath} label={`失败记录 · ${props.failure.failurePath}`} onPreview={props.onPreview} />
+      </Show>
+      <Show when={props.failure.orphanedWorkers.length > 0}>
+        <div class="failure-workers">
+          <span>智能体现场已保留</span>
+          <For each={props.failure.orphanedWorkers}>
+            {(worker) => (
+              <button class="link-button" onClick={() => void copyText(worker.attachCommand)}>
+                <Copy size={14} />
+                <span>{worker.attachCommand}</span>
+              </button>
+            )}
+          </For>
+        </div>
+      </Show>
+    </section>
+  )
+}
+
 function StartWorkflowCard(props: { busy: boolean; promptPending: boolean; onStart: () => Promise<void> }) {
   const [starting, setStarting] = createSignal(false)
   const [error, setError] = createSignal('')
@@ -360,6 +387,9 @@ function HomeView(props: {
   const busy = createMemo(() => Boolean(props.progress || (app().activeStage && app().activeStage !== 'idle') || props.snapshots.control.workers.length > 0))
   return (
     <div class="view-stack home-view">
+      <Show when={app().activeStageFailure} keyed>
+        {(failure) => <StageFailureCard failure={failure} onPreview={props.onPreview} />}
+      </Show>
       <Show when={props.snapshots.prompt.pending}>
         <PromptCard prompt={props.snapshots.prompt} hitl={props.snapshots.hitl} onSubmit={props.onPromptSubmit} onPreview={props.onPreview} />
       </Show>
@@ -405,6 +435,9 @@ function WorkerList(props: { workers: WorkerSnapshot[]; onPreview: (path: string
               <p>{worker.workflowStage || worker.currentTaskRuntimeStatus || 'running'}</p>
             </div>
             <div class="status-pills">
+              <Show when={worker.turnState}>
+                <span class={`pill ${statusClass(worker.turnState)}`}>{worker.turnState}</span>
+              </Show>
               <span class={`pill ${statusClass(worker.status || worker.agentState)}`}>{worker.status || worker.agentState || 'unknown'}</span>
               <span class={`pill ${statusClass(worker.healthStatus)}`}>{worker.healthStatus || '-'}</span>
             </div>
@@ -669,6 +702,7 @@ export function App() {
   const [preview, setPreview] = createSignal<FilePreview | null>(null)
   const [previewError, setPreviewError] = createSignal('')
   const [sheet, setSheet] = createSignal<SheetKind>(null)
+  const [stageGeneration, setStageGeneration] = createSignal(EMPTY_STAGE_GENERATION)
   let scheduledRefreshTimer = 0
   let disconnectBridgeEvents: (() => void) | undefined
 
@@ -678,10 +712,32 @@ export function App() {
     setLogs((prev) => appendLog(prev, classifyLog(JSON.stringify(event.payload, null, 2), event.type, event.payload)))
   }
 
+  const reconcileAppSnapshot = (next: AppSnapshot, previous: AppSnapshot): AppSnapshot => {
+    const payload = stagePayloadFromApp(next)
+    if (!payload) return next
+    const transition = applyStageGeneration(stageGeneration(), payload)
+    if (transition.accepted) {
+      setStageGeneration(transition.cursor)
+      return next
+    }
+    return {
+      ...next,
+      currentAction: previous.currentAction,
+      activeStage: previous.activeStage,
+      activeStageStatus: previous.activeStageStatus,
+      activeStageSeq: previous.activeStageSeq,
+      activeStageRunnerId: previous.activeStageRunnerId,
+      activeStageSource: previous.activeStageSource,
+      activeStageLabel: previous.activeStageLabel,
+      activeStageFailure: previous.activeStageFailure,
+    }
+  }
+
   const applySnapshots = (payload: SnapshotsPayload) => {
-    setSnapshots(payload)
+    const reconciled = { ...payload, app: reconcileAppSnapshot(payload.app, snapshots().app) }
+    setSnapshots(reconciled)
     setSelectedControlIndex((prev) => Math.min(prev, Math.max(payload.control.workers.length - 1, 0)))
-    const activeStageRoute = stageRouteForAction(payload.app.activeStage)
+    const activeStageRoute = stageRouteForAction(reconciled.app.activeStage)
     if (activeStageRoute) setSelectedStage(activeStageRoute)
   }
 
@@ -736,7 +792,10 @@ export function App() {
       return
     }
     if (event.type === 'snapshot.app') {
-      setSnapshots((prev) => ({ ...prev, app: normalizeAppSnapshot(event.payload) }))
+      setSnapshots((prev) => ({
+        ...prev,
+        app: reconcileAppSnapshot(normalizeAppSnapshot(event.payload), prev.app),
+      }))
       return
     }
     if (event.type === 'snapshot.stage') {
@@ -761,6 +820,24 @@ export function App() {
       return
     }
     if (event.type === 'stage.changed') {
+      const transition = applyStageGeneration(stageGeneration(), event.payload)
+      if (!transition.accepted) return
+      setStageGeneration(transition.cursor)
+      const failure = stageFailureFromEvent(event.payload)
+      setSnapshots((prev) => ({
+        ...prev,
+        app: {
+          ...prev.app,
+          currentAction: transition.action || prev.app.currentAction,
+          activeStage: transition.action || prev.app.activeStage,
+          activeStageStatus: transition.status,
+          activeStageSeq: transition.stageSeq || prev.app.activeStageSeq,
+          activeStageRunnerId: transition.runnerId || prev.app.activeStageRunnerId,
+          activeStageSource: transition.source || prev.app.activeStageSource,
+          activeStageLabel: routeLabel(stageRouteForAction(transition.action)) || prev.app.activeStageLabel,
+          activeStageFailure: failure,
+        },
+      }))
       setLogs((prev) => appendLog(prev, classifyLog(`stage ${String(event.payload.action ?? '')}: ${String(event.payload.status ?? '')}`, event.type, event.payload)))
       queueRefreshSnapshots(150)
       return

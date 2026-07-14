@@ -61,11 +61,16 @@ from A07_Development import (
     run_reviewer_turn_with_recreation,
     fintech_developer_role,
     _recover_development_runtime_resume,
+    _recover_worker_from_state,
+    _developer_init_contract_is_ready,
+    _worker_appears_live_for_reviewer_recovery,
 )
 from tmux_core.runtime.contracts import TaskResultContract, TurnFileContract, TurnFileResult, finalize_task_result
 from tmux_core.runtime.tmux_runtime import (
     CommandResult,
     TASK_RESULT_CONTRACT_ERROR_PREFIX,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     TURN_ARTIFACT_CONTRACT_ERROR_PREFIX,
 )
 from tmux_core.prompt_contracts.spec import CHANGE_MUST_CHANGE
@@ -239,6 +244,68 @@ def _write_required_inputs(paths: dict[str, Path]) -> None:
 
 
 class A07DevelopmentTests(unittest.TestCase):
+    def test_recovery_helpers_propagate_tmux_liveness_uncertainty(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="has-session",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="probe-fixture", error="outcome unknown"),
+        )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                worker = _FakeWorker(session_name="开发工程师-天魁星")
+                with patch(
+                    "A07_Development.load_worker_from_state_path",
+                    return_value=worker,
+                ), patch("A07_Development.try_resume_worker", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        _recover_worker_from_state(Path("/tmp/worker.state.json"))
+
+    def test_developer_init_contract_probe_propagates_tmux_control_unavailable(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            paths["ask_human_path"].write_text("", encoding="utf-8")
+            state_path = project_dir / "worker.state.json"
+            result_path = project_dir / "developer_init_result.json"
+            task_status_path = project_dir / "developer_init_status.json"
+
+            class ProbeWorker:
+                def __init__(self) -> None:
+                    self.state_path = state_path
+                    self.current_task_status_path = task_status_path
+                    self.current_task_result_path = result_path
+
+                def read_state(self):
+                    return {
+                        "state_path": str(state_path),
+                        "current_task_status_path": str(task_status_path),
+                        "current_task_result_path": str(result_path),
+                    }
+
+                def observe(self, **_kwargs):
+                    raise TmuxControlUnavailable(
+                        operation="capture-pane",
+                        error="timeout",
+                        elapsed_sec=60.0,
+                        attempts=4,
+                    )
+
+                def _try_finalize_a07_legacy_task_result_from_observation(self, **_kwargs):
+                    raise AssertionError("finalizer must not run without an observation")
+
+            with self.assertRaises(TmuxControlUnavailable):
+                _developer_init_contract_is_ready(ProbeWorker(), paths=paths)
+
+                with patch.object(worker, "session_exists", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        _worker_appears_live_for_reviewer_recovery(worker)
+
     def test_code_review_reviewer_count_prompt_allows_previous_step_back(self):
         from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, PromptBackRequested, use_terminal_ui
 
@@ -548,6 +615,49 @@ class A07DevelopmentTests(unittest.TestCase):
             self.assertTrue(reviewer.worker.killed)
             self.assertFalse(old_runtime_dir.exists())
             self.assertTrue(new_runtime_dir.exists())
+
+    def test_recreate_reviewer_does_not_launch_replacement_when_old_kill_is_unknown(self):
+        class UnknownKillWorker(_FakeWorker):
+            def request_kill(self):
+                raise TmuxMutationOutcomeUnknown(operation="kill-session", error="timeout")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            runtime_root = build_development_runtime_root(project_dir, "需求A")
+            old_runtime_dir = runtime_root / "development-review-old"
+            old_runtime_dir.mkdir(parents=True)
+            reviewer = ReviewerRuntime(
+                reviewer_name="审核员",
+                selection=ReviewAgentSelection("codex", "gpt-test", "high", ""),
+                worker=UnknownKillWorker(
+                    session_name="审核员-地辟星",
+                    runtime_root=runtime_root,
+                    runtime_dir=old_runtime_dir,
+                ),
+                review_md_path=project_dir / "需求A_代码评审记录_审核员.md",
+                review_json_path=project_dir / "需求A_评审记录_审核员.json",
+                contract=_dummy_contract(),
+            )
+
+            with patch("A07_Development.stdin_is_interactive", return_value=True), patch(
+                "A07_Development.prompt_replacement_review_agent_selection",
+                return_value=reviewer.selection,
+            ), patch("A07_Development.create_reviewer_runtime") as create_replacement:
+                with self.assertRaises(TmuxMutationOutcomeUnknown):
+                    recreate_development_reviewer_runtime(
+                        project_dir=project_dir,
+                        requirement_name="需求A",
+                        reviewer=reviewer,
+                        reviewer_spec=DevelopmentReviewerSpec(
+                            role_name="审核员",
+                            role_prompt="复核视角",
+                            reviewer_key="审核员",
+                        ),
+                        force_model_change=False,
+                    )
+
+            create_replacement.assert_not_called()
+            self.assertTrue(old_runtime_dir.exists())
 
     def test_reviewer_turn_rebuilds_prompt_after_replacement(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2962,6 +3072,96 @@ class A07DevelopmentTests(unittest.TestCase):
         prompt_recovery.assert_called_once()
         self.assertFalse(prompt_recovery.call_args.kwargs["can_skip"])
         recreate_runtime.assert_not_called()
+
+    def test_tmux_control_failure_propagates_without_developer_or_reviewer_redispatch(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="capture-pane",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="send-keys", error="timeout"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                developer = DeveloperRuntime(
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                    role_prompt="实现视角",
+                )
+                with patch(
+                    "A07_Development.run_task_result_turn_with_repair",
+                    side_effect=error,
+                ) as run_developer, patch(
+                    "A07_Development.try_resume_worker",
+                ) as resume_developer:
+                    with self.assertRaises(type(error)):
+                        _run_developer_result_turn(
+                            developer,
+                            label="developer_turn",
+                            prompt="请开发",
+                            result_contract=_dummy_task_result_contract(),
+                        )
+                run_developer.assert_called_once()
+                resume_developer.assert_not_called()
+
+                project_dir = Path(tmp_dir)
+                reviewer = ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=project_dir / "review.md",
+                    review_json_path=project_dir / "review.json",
+                    contract=_dummy_contract(),
+                )
+                paths = build_development_paths(project_dir, "需求A")
+                reviewer_spec = DevelopmentReviewerSpec(
+                    role_name="测试工程师",
+                    role_prompt="测试视角",
+                    reviewer_key="测试工程师",
+                )
+                with patch(
+                    "A07_Development.run_completion_turn_with_repair",
+                    side_effect=error,
+                ) as run_reviewer, patch(
+                    "A07_Development._wait_for_reviewer_materialized_outputs",
+                    return_value=False,
+                ), patch(
+                    "A07_Development.try_resume_worker",
+                ) as resume_reviewer, patch(
+                    "A07_Development.recreate_development_reviewer_runtime",
+                ) as recreate_reviewer:
+                    with self.assertRaises(type(error)):
+                        run_reviewer_turn_with_recreation(
+                            reviewer,
+                            project_dir=project_dir,
+                            requirement_name="需求A",
+                            task_name="M1-T1",
+                            reviewer_spec=reviewer_spec,
+                            paths=paths,
+                            reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                            label="reviewer_turn",
+                            prompt="请审核",
+                        )
+                run_reviewer.assert_called_once()
+                resume_reviewer.assert_not_called()
+                recreate_reviewer.assert_not_called()
+
+                class PrelaunchWorker(_FakeWorker):
+                    def ensure_agent_ready(self, **_kwargs):  # noqa: ANN003
+                        raise error
+
+                prelaunch_reviewer = ReviewerRuntime(
+                    reviewer_name="预启动审核器",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=PrelaunchWorker(session_name="预启动审核器-天英星"),
+                    review_md_path=project_dir / "prelaunch.md",
+                    review_json_path=project_dir / "prelaunch.json",
+                    contract=_dummy_contract(),
+                )
+                with self.assertRaises(type(error)):
+                    prelaunch_development_reviewers([prelaunch_reviewer])
 
     def test_developer_result_turn_uses_fast_dispatch_budget(self):
         developer = DeveloperRuntime(
@@ -5509,6 +5709,7 @@ class A07DevelopmentTests(unittest.TestCase):
                         "project_dir": str(root.resolve()),
                         "requirement_name": "需求A",
                         "workflow_action": "stage.a07.start",
+                        "agent_state": "DEAD",
                     },
                     ensure_ascii=False,
                 ),
@@ -5565,7 +5766,10 @@ class A07DevelopmentTests(unittest.TestCase):
 
             class FakeTmuxRuntimeController:
                 def session_exists(self, session_name: str) -> bool:
-                    return session_name in {"开发-遗留存活", "开发-其他需求"}
+                    return session_name in {"开发-当前需求", "开发-遗留存活", "开发-其他需求"}
+
+                def session_matches_worker_state(self, session_name, state, state_path):  # noqa: ANN001, ARG002
+                    return session_name == "开发-当前需求"
 
                 def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
                     killed_sessions.append(session_name)
@@ -5575,16 +5779,16 @@ class A07DevelopmentTests(unittest.TestCase):
                 removed = cleanup_stale_development_runtime_state(root, "需求A")
 
             self.assertFalse(target_dir.exists())
-            self.assertFalse(legacy_dead_dir.exists())
+            self.assertTrue(legacy_dead_dir.exists())
             self.assertTrue(prelaunch_dir.exists())
             self.assertTrue(other_requirement_dir.exists())
             self.assertTrue(legacy_live_dir.exists())
             self.assertIn("开发-当前需求", killed_sessions)
-            self.assertIn("开发-遗留死亡", killed_sessions)
+            self.assertNotIn("开发-遗留死亡", killed_sessions)
             self.assertIn(str(target_dir.resolve()), removed)
-            self.assertIn(str(legacy_dead_dir.resolve()), removed)
+            self.assertNotIn(str(legacy_dead_dir.resolve()), removed)
 
-    def test_cleanup_stale_development_runtime_state_scans_requirement_subdirectories(self):
+    def test_cleanup_stale_development_runtime_state_preserves_live_matching_worker_in_requirement_subdirectory(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             runtime_root = root / ".development_runtime"
@@ -5621,15 +5825,18 @@ class A07DevelopmentTests(unittest.TestCase):
                 def session_exists(self, session_name: str) -> bool:
                     return True
 
+                def session_matches_worker_state(self, session_name, state, state_path):  # noqa: ANN001, ARG002
+                    return session_name == "开发-当前需求"
+
                 def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
                     return session_name
 
             with patch("tmux_core.stage_kernel.runtime_scope_cleanup.TmuxRuntimeController", FakeTmuxRuntimeController):
                 removed = cleanup_stale_development_runtime_state(root, "需求A")
 
-            self.assertFalse(target_dir.exists())
+            self.assertTrue(target_dir.exists())
             self.assertTrue(other_dir.exists())
-            self.assertIn(str(target_dir.resolve()), removed)
+            self.assertNotIn(str(target_dir.resolve()), removed)
 
     def test_cleanup_stale_development_runtime_state_preserves_lock_subdirectories(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -5644,6 +5851,7 @@ class A07DevelopmentTests(unittest.TestCase):
                         "project_dir": str(root.resolve()),
                         "requirement_name": "需求A",
                         "workflow_action": "stage.a07.start",
+                        "agent_state": "DEAD",
                     },
                     ensure_ascii=False,
                 ),
@@ -5655,6 +5863,9 @@ class A07DevelopmentTests(unittest.TestCase):
             class FakeTmuxRuntimeController:
                 def session_exists(self, session_name: str) -> bool:
                     return True
+
+                def session_matches_worker_state(self, session_name, state, state_path):  # noqa: ANN001, ARG002
+                    return session_name == "开发-当前需求"
 
                 def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
                     return session_name

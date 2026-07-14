@@ -34,6 +34,8 @@ from tmux_core.runtime.tmux_runtime import (
     AgentRuntimeState,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     SHELL_COMMANDS,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     WorkerStatus,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
@@ -358,11 +360,15 @@ def _is_live_developer_handoff(handoff: DevelopmentAgentHandoff | None) -> bool:
         return False
     get_state = getattr(handoff.worker, "get_agent_state", None)
     if callable(get_state):
-        with contextlib.suppress(Exception):
+        try:
             state = get_state()
             state_name = str(getattr(state, "value", state) or "").strip().upper()
             if state_name == "DEAD":
                 return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
+        except Exception:
+            pass
     session_name = str(getattr(handoff.worker, "session_name", "") or "").strip()
     if not session_name:
         return False
@@ -370,8 +376,8 @@ def _is_live_developer_handoff(handoff: DevelopmentAgentHandoff | None) -> bool:
     if callable(session_exists):
         try:
             return bool(session_exists())
-        except Exception:
-            return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
     return True
 
 
@@ -380,11 +386,15 @@ def _is_live_reviewer_handoff(handoff: ReviewAgentHandoff) -> bool:
         return False
     get_state = getattr(handoff.worker, "get_agent_state", None)
     if callable(get_state):
-        with contextlib.suppress(Exception):
+        try:
             state = get_state()
             state_name = str(getattr(state, "value", state) or "").strip().upper()
             if state_name == "DEAD":
                 return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
+        except Exception:
+            pass
     session_name = str(getattr(handoff.worker, "session_name", "") or "").strip()
     if not session_name:
         return False
@@ -392,8 +402,8 @@ def _is_live_reviewer_handoff(handoff: ReviewAgentHandoff) -> bool:
     if callable(session_exists):
         try:
             return bool(session_exists())
-        except Exception:
-            return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
     return True
 
 
@@ -621,8 +631,8 @@ def discover_live_development_handoffs(
         try:
             if not session_exists():
                 continue
-        except Exception:
-            continue
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         updated_at = str(payload.get("updated_at", "")).strip()
         candidate_sort_key = f"{_workflow_action_priority(workflow_action)}|{updated_at}"
         worker_id = str(payload.get("worker_id", "")).strip()
@@ -1334,9 +1344,11 @@ def _run_overall_review_developer_turn(
         worker = current_developer.worker
         session_exists = getattr(worker, "session_exists", None)
         if callable(session_exists):
-            with contextlib.suppress(Exception):
+            try:
                 if not session_exists():
                     return False
+            except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                raise
         read_state = getattr(worker, "read_state", None)
         if callable(read_state):
             with contextlib.suppress(Exception):
@@ -1350,9 +1362,13 @@ def _run_overall_review_developer_turn(
                         return True
         get_agent_state = getattr(worker, "get_agent_state", None)
         if callable(get_agent_state):
-            with contextlib.suppress(Exception):
+            try:
                 state = get_agent_state()
                 return str(getattr(state, "value", state) or "").strip().upper() in {"READY", "BUSY", "STARTING"}
+            except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                raise
+            except Exception:
+                pass
         return True
 
     def _mark_developer_fallback_completed() -> None:
@@ -1427,6 +1443,8 @@ def _run_overall_review_developer_turn(
             if _developer_output_fallback_ready(error):
                 _mark_developer_fallback_completed()
                 return current_developer
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             if is_worker_death_error(error) or is_recoverable_startup_failure(error, current_developer.worker):
                 current_developer = _replace_dead_overall_review_developer(
                     current_developer,
@@ -1583,6 +1601,8 @@ def _run_single_overall_review_reviewer_init(
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             if is_worker_death_error(error):
                 failure_reason = describe_reviewer_failure_reason(error, current_reviewer.worker)
                 failed_reviewer = note_reviewer_failure(current_reviewer, reason_text=failure_reason)
@@ -1740,6 +1760,8 @@ def run_overall_review_turn_with_recreation(
                 and _reviewer_artifact_signature(current_reviewer) != baseline_signature
             ):
                 return current_reviewer
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
             provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
@@ -1973,11 +1995,18 @@ def _shutdown_workers(
     project_dir: str | Path,
     requirement_name: str,
     cleanup_runtime: bool,
+    preserve_workers: bool = False,
 ) -> tuple[str, ...]:
     return shutdown_stage_workers(
         developer,
         reviewers,
         cleanup_runtime=cleanup_runtime,
+        preserve_ba_worker=preserve_workers,
+        preserve_reviewer_keys=(
+            [reviewer.reviewer_name for reviewer in reviewers]
+            if preserve_workers
+            else ()
+        ),
         runtime_root_filter=build_development_runtime_root(project_dir, requirement_name),
     )
 
@@ -1987,6 +2016,7 @@ def run_overall_review_stage(
     *,
     developer_handoff: DevelopmentAgentHandoff | None = None,
     reviewer_handoff: Sequence[ReviewAgentHandoff] = (),
+    preserve_workers: bool = False,
 ) -> OverallReviewStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -1994,13 +2024,13 @@ def run_overall_review_stage(
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     requirement_name = str(args.requirement_name).strip() if args.requirement_name else prompt_requirement_name_selection(project_dir, "").requirement_name
 
+    progress = ReviewStageProgress(initial_phase="复核阶段准备中")
     lock_context = requirement_concurrency_lock(
         project_dir,
         requirement_name,
         action="stage.a08.start",
     )
     lock_context.__enter__()
-    progress = ReviewStageProgress(initial_phase="复核阶段准备中")
     developer: DeveloperRuntime | None = None
     reviewers: list[ReviewerRuntime] = []
     cleanup_paths: list[str] = []
@@ -2294,6 +2324,7 @@ def run_overall_review_stage(
                 project_dir=project_dir,
                 requirement_name=requirement_name,
                 cleanup_runtime=True,
+                preserve_workers=preserve_workers,
             )
         )
         append_stage_audit_record(
@@ -2336,8 +2367,12 @@ def run_overall_review_stage(
         )
         raise
     finally:
-        progress.stop()
-        lock_context.__exit__(None, None, None)
+        try:
+            progress.stop()
+        except Exception:
+            pass
+        finally:
+            lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

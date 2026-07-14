@@ -43,6 +43,8 @@ from tmux_core.runtime.hitl import build_prefixed_sha256
 from tmux_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     TmuxBatchWorker,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     Vendor,
     build_session_name,
     cleanup_registered_tmux_workers,
@@ -483,11 +485,15 @@ def _is_live_ba_handoff(handoff: RequirementsAnalystHandoff | None) -> bool:
         return False
     get_state = getattr(handoff.worker, "get_agent_state", None)
     if callable(get_state):
-        with contextlib.suppress(Exception):
+        try:
             state = get_state()
             state_name = str(getattr(state, "value", state) or "").strip().upper()
             if state_name == "DEAD":
                 return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
+        except Exception:
+            pass
     session_name = str(getattr(handoff.worker, "session_name", "") or "").strip()
     if not session_name:
         return False
@@ -495,19 +501,23 @@ def _is_live_ba_handoff(handoff: RequirementsAnalystHandoff | None) -> bool:
     if callable(session_exists):
         try:
             return bool(session_exists())
-        except Exception:
-            return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
     return True
 
 
 def _is_live_reviewer_handoff(handoff: ReviewAgentHandoff) -> bool:
     get_state = getattr(handoff.worker, "get_agent_state", None)
     if callable(get_state):
-        with contextlib.suppress(Exception):
+        try:
             state = get_state()
             state_name = str(getattr(state, "value", state) or "").strip().upper()
             if state_name == "DEAD":
                 return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
+        except Exception:
+            pass
     session_name = str(getattr(handoff.worker, "session_name", "") or "").strip()
     if not session_name:
         return False
@@ -515,8 +525,8 @@ def _is_live_reviewer_handoff(handoff: ReviewAgentHandoff) -> bool:
     if callable(session_exists):
         try:
             return bool(session_exists())
-        except Exception:
-            return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
     return True
 
 
@@ -655,6 +665,23 @@ def create_task_split_ba_handoff(
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
     )
+
+
+def _scope_task_split_worker(
+    worker: object,
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+) -> None:
+    set_runtime_metadata = getattr(worker, "set_runtime_metadata", None)
+    if not callable(set_runtime_metadata):
+        return
+    with contextlib.suppress(Exception):
+        set_runtime_metadata(
+            project_dir=str(Path(project_dir).expanduser().resolve()),
+            requirement_name=str(requirement_name or "").strip(),
+            workflow_action="stage.a06.start",
+        )
 
 
 def prepare_task_split_ba_handoff(
@@ -947,6 +974,8 @@ def run_ba_turn_with_recovery(
             )
             return current_handoff, payload
         except Exception as error:  # noqa: BLE001
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             ba_display_name = _task_split_ba_display_name(project_dir=project_dir, handoff=current_handoff)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_handoff.worker)
             provider_runtime_error = worker_has_provider_runtime_error(current_handoff.worker)
@@ -1373,6 +1402,8 @@ def _run_reviewer_result_turn(
             )
             return current_reviewer
         except Exception as error:  # noqa: BLE001
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
             provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
@@ -1496,6 +1527,8 @@ def _run_reviewer_turn_with_resume(
                 and _reviewer_artifact_signature(current_reviewer) != baseline_signature
             ):
                 return current_reviewer
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             reviewer_display_name = _reviewer_artifact_agent_name(current_reviewer)
             auth_error = is_provider_auth_error(error) or worker_has_provider_auth_error(current_reviewer.worker)
             provider_runtime_error = worker_has_provider_runtime_error(current_reviewer.worker)
@@ -2047,6 +2080,8 @@ def generate_task_split_json(
                 progress=progress,
             )
         except Exception as error:  # noqa: BLE001
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             last_error = error
             continue
         if is_standard_task_initial_json(paths["task_json_path"]):
@@ -2088,6 +2123,12 @@ def run_task_split_stage(
     else:
         requirement_name = prompt_requirement_name_selection(project_dir, "").requirement_name
 
+    if ba_handoff is not None:
+        _scope_task_split_worker(
+            ba_handoff.worker,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
     progress = ReviewStageProgress(initial_phase="任务拆分准备中")
     active_ba_handoff = ba_handoff
     active_reviewer_handoff = tuple(reviewer_handoff or ())
@@ -2118,6 +2159,12 @@ def run_task_split_stage(
             ba_handoff=active_ba_handoff,
             reviewer_handoff=active_reviewer_handoff,
         )
+        if active_ba_handoff is not None:
+            _scope_task_split_worker(
+                active_ba_handoff.worker,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+            )
         existing_task_prompted = stdin_is_interactive() and not bool(getattr(args, "yes", False)) and bool(get_markdown_content(paths["task_md_path"]).strip())
         existing_task_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
@@ -2714,8 +2761,12 @@ def run_task_split_stage(
         )
         raise
     finally:
-        progress.stop()
-        lock_context.__exit__(None, None, None)
+        try:
+            progress.stop()
+        except Exception:
+            pass
+        finally:
+            lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

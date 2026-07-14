@@ -24,7 +24,7 @@ test('route files exist with expected exports', () => {
 test('index handles Ctrl+C through graceful backend shutdown', () => {
   const content = readFileSync(join(import.meta.dir, 'index.tsx'), 'utf8')
   const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
-  expect(content.includes("import { App, getLatestBackendCleanupContext, runBackendCleanupFallback, stopBackendClient } from './app'")).toBe(true)
+  expect(content.includes("requestBackendPreserveOrphansShutdown")).toBe(true)
   expect(content.includes('exitOnCtrlC: false')).toBe(true)
   expect(content.includes("for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const)")).toBe(true)
   expect(content.includes("await stopBackendClient({ reason: 'signal', forceKillAfterMs: 30000 })")).toBe(true)
@@ -32,11 +32,24 @@ test('index handles Ctrl+C through graceful backend shutdown', () => {
   expect(content.includes('await runBackendCleanupFallback(getLatestBackendCleanupContext())')).toBe(true)
   expect(content.includes('process.exit(exitCodeForSignal(signal))')).toBe(true)
   expect(content.includes("onExitRequest={() => shutdownFromSignal('SIGINT')}")).toBe(true)
+  expect(content.includes('onTerminalFailure={shutdownFromTerminalFailure}')).toBe(true)
+  expect(content.includes("claimBackendShutdownOwnership()")).toBe(true)
+  expect(content.includes("process.stderr.write(formatStageFailureReport(failure))")).toBe(true)
+  expect(content.includes("await stopBackendClient({ reason: 'runner_failure', forceKillAfterMs: 30000 })")).toBe(true)
+  expect(content.includes('shutdownFromTerminalFailure(failure')).toBe(true)
+  expect(content.includes('shutdownFromTerminalFailure(failure: StageFailureSnapshot) {\n  if (shutdownStarted) return')).toBe(true)
+  expect(content.includes('runBackendCleanupFallback(getLatestBackendCleanupContext())', content.indexOf('shutdownFromTerminalFailure'))).toBe(false)
   expect(appContent.includes('onExitRequest?: () => void | Promise<void>')).toBe(true)
+  expect(appContent.includes('onTerminalFailure?: (failure: StageFailureSnapshot) => void | Promise<void>')).toBe(true)
   expect(appContent.includes("if (event.name === 'c' && event.ctrl)")).toBe(true)
   expect(appContent.includes('await props.onExitRequest?.()')).toBe(true)
   expect(appContent.includes('export function getLatestBackendCleanupContext(): BackendCleanupContext')).toBe(true)
   expect(appContent.includes('export function runBackendCleanupFallback(context: BackendCleanupContext)')).toBe(true)
+})
+
+test('tmux-tui launcher propagates the TUI terminal failure exit code', () => {
+  const launcher = readFileSync(join(import.meta.dir, '../../../scripts/tmux-tui'), 'utf8')
+  expect(launcher.includes('exec bun run src/index.tsx "$@"')).toBe(true)
 })
 
 test('development route renders milestone checklist and app status includes current milestone support', () => {
@@ -152,12 +165,60 @@ test('app keeps terminal stage failures sticky and does not let stale progress e
   expect(content.includes("from './stageStatus'")).toBe(true)
   expect(content.includes('const [stageCursor, setStageCursor] = createSignal(EMPTY_STAGE_CURSOR)')).toBe(true)
   expect(content.includes('if (!shouldAcceptProgressEvent(stageCursor(), event.payload)) return')).toBe(true)
-  expect(content.includes("setStageCursor((prev) => markTerminalStage(prev))")).toBe(true)
+  expect(content.includes('markTerminalStage')).toBe(false)
   expect(content.includes("if (event.type === 'progress.start') {")).toBe(true)
   expect(content.includes("if (event.type === 'progress.start') {\n      setStatus('running')")).toBe(false)
   expect(stageStatus.includes('export function applyStageChanged(')).toBe(true)
   expect(stageStatus.includes('export function shouldAcceptProgressEvent(')).toBe(true)
   expect(stageStatus.includes('export function markTerminalStage(')).toBe(true)
+  expect(content.includes('shouldRecoverRunningFromStageSnapshot')).toBe(false)
+  expect(content.includes("requestTerminalFailureExit(failure)")).toBe(true)
+  expect(content.includes("buildSyntheticTerminalFailure(message, 'backend_disconnected')")).toBe(true)
+  expect(content.includes("buildSyntheticTerminalFailure(message, 'backend_startup_failed')")).toBe(true)
+  expect(content.includes("activeStageFailure: failure")).toBe(true)
+})
+
+test('non-authoritative errors do not advance the stage cursor or app stage', () => {
+  const content = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  const backendDisconnected = content.slice(
+    content.indexOf("if (event.type === 'backend.disconnected')"),
+    content.indexOf("if (event.type === 'error')"),
+  )
+  const genericError = content.slice(
+    content.indexOf("if (event.type === 'error')"),
+    content.indexOf('appendRuntimeLog(event.type, event.payload)'),
+  )
+  const requestAction = content.slice(
+    content.indexOf('const requestAction = async'),
+    content.indexOf('onMount(async () =>'),
+  )
+  const startup = content.slice(
+    content.indexOf('onMount(async () =>'),
+    content.indexOf('onMount(() =>'),
+  )
+
+  for (const block of [backendDisconnected, genericError, requestAction, startup]) {
+    expect(block.includes('markTerminalStage')).toBe(false)
+    expect(block.includes('applyStageChanged')).toBe(false)
+    expect(block.includes('setStageCursor')).toBe(false)
+    expect(block.includes('setAppSnapshot')).toBe(false)
+  }
+  expect(genericError.includes('setStatus')).toBe(false)
+  expect(requestAction.includes('setStatus')).toBe(false)
+  expect(backendDisconnected.includes("buildSyntheticTerminalFailure(message, 'backend_disconnected')")).toBe(true)
+  expect(startup.includes("buildSyntheticTerminalFailure(message, 'backend_startup_failed')")).toBe(true)
+})
+
+test('explicit startup action gets a chance to create a new runner before persisted failure exits', () => {
+  const content = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  expect(content.includes('const bootstrapFailure = applyBootstrapSnapshots(result)')).toBe(true)
+  expect(content.includes('const previousGeneration = stageCursor()')).toBe(true)
+  expect(content.includes('await requestAction(props.initialAction, { argv: props.initialArgv ?? [] }, true)')).toBe(true)
+  expect(content.includes('let initialActionFailureGateOpen = Boolean(props.initialAction)')).toBe(true)
+  expect(content.includes('const isNewGenerationFailure = Boolean(')).toBe(true)
+  expect(content.includes('const newGenerationObserved = await waitForNewRunnerGeneration(previousGeneration)')).toBe(true)
+  expect(content.includes('releaseInitialActionFailureGate(bootstrapFailure, newGenerationObserved)')).toBe(true)
+  expect(content.includes('} else {\n        requestTerminalFailureExit(bootstrapFailure)')).toBe(true)
 })
 
 test('app isolates dialog, log, prompt, and content focus in the new shell layout', () => {
@@ -261,7 +322,8 @@ test('app aggregates running workers for home overview and HomeRoute uses the ne
   expect(types.includes('reasoningEffort?: string')).toBe(true)
   expect(types.includes('agentConfigLabel: string')).toBe(true)
   expect(types.includes('attachCommand: string')).toBe(true)
-  expect(content.includes('activeStageLabel: String(payload.active_stage_label ?? payload.activeStageLabel ?? \'等待中\')')).toBe(true)
+  expect(content.includes("const activeStageLabel = String(payload.active_stage_label ?? payload.activeStageLabel ?? '等待中')")).toBe(true)
+  expect(content.includes('activeStageFailure: failure')).toBe(true)
   expect(content.includes('pendingAttention: Boolean(payload.pending_attention ?? payload.pendingAttention)')).toBe(true)
   expect(content.includes('pendingAttentionReason: String(payload.pending_attention_reason ?? payload.pendingAttentionReason ?? \'\')')).toBe(true)
   expect(content.includes('pendingAttentionSince: String(payload.pending_attention_since ?? payload.pendingAttentionSince ?? \'\')')).toBe(true)

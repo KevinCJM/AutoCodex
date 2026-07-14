@@ -49,6 +49,8 @@ from tmux_core.runtime.tmux_runtime import (
     CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     TmuxBatchWorker,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     Vendor,
     WorkerStatus,
     build_session_name,
@@ -490,8 +492,8 @@ def _is_live_ba_handoff(handoff: RequirementsAnalystHandoff | None) -> bool:
     if callable(session_exists):
         try:
             return bool(session_exists())
-        except Exception:
-            return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
     return True
 
 
@@ -1010,6 +1012,8 @@ def prepare_design_ba_handoff(
     if ba_handoff is not None and strategy in {"reuse", "rebuild"}:
         try:
             ba_handoff.worker.request_kill()
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception:
             pass
     return new_handoff, True
@@ -2318,6 +2322,12 @@ def run_detailed_design_stage(
     else:
         requirement_name = prompt_requirement_name_selection(project_dir, "").requirement_name
 
+    if ba_handoff is not None:
+        _scope_detailed_design_worker(
+            ba_handoff.worker,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
     progress = ReviewStageProgress()
     paths = ensure_detailed_design_inputs(args, project_dir=project_dir, requirement_name=requirement_name)
     active_ba_handoff: RequirementsAnalystHandoff | None = None
@@ -2882,8 +2892,6 @@ def run_detailed_design_stage(
             },
             metadata={"error": str(error)},
         )
-        if pending_discard_ba_handoff is not None:
-            _discard_unused_ba_handoff(pending_discard_ba_handoff)
         _shutdown_workers(
             active_ba_handoff,
             reviewer_workers,
@@ -2893,8 +2901,12 @@ def run_detailed_design_stage(
         )
         raise
     finally:
-        progress.stop()
-        lock_context.__exit__(None, None, None)
+        try:
+            progress.stop()
+        except Exception:
+            pass
+        finally:
+            lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

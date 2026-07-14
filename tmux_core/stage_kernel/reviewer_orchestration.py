@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Callable, Sequence, TypeVar
 
 from tmux_core.runtime.tmux_runtime import (
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     worker_state_has_launch_evidence,
     worker_state_is_prelaunch_active,
 )
@@ -70,7 +72,7 @@ def run_parallel_reviewer_round(
             executor.submit(run_turn, reviewer): key_func(reviewer)
             for reviewer in reviewer_list
         }
-        errors: list[str] = []
+        errors: list[tuple[str, Exception]] = []
         for future in as_completed(future_map):
             reviewer_key = future_map[future]
             try:
@@ -80,9 +82,12 @@ def run_parallel_reviewer_round(
                     continue
                 reviewer_list[reviewer_index[reviewer_key]] = result
             except Exception as error:  # noqa: BLE001
-                errors.append(f"{reviewer_key}: {error}")
+                errors.append((reviewer_key, error))
         if errors:
-            raise RuntimeError(error_prefix + "\n" + "\n".join(errors))
+            for _, error in errors:
+                if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                    raise error
+            raise RuntimeError(error_prefix + "\n" + "\n".join(f"{key}: {error}" for key, error in errors))
     return [reviewer for reviewer in reviewer_list if key_func(reviewer) not in dropped_keys]
 
 
@@ -115,7 +120,7 @@ def repair_reviewer_round_outputs(
                 if not fix_prompt:
                     continue
                 future_map[executor.submit(run_fix_turn, reviewer, fix_prompt, repair_attempt)] = key_func(reviewer)
-            errors: list[str] = []
+            errors: list[tuple[str, Exception]] = []
             dropped_keys: set[str] = set()
             for future in as_completed(future_map):
                 reviewer_key = future_map[future]
@@ -126,9 +131,12 @@ def repair_reviewer_round_outputs(
                         continue
                     reviewer_list[reviewer_index[reviewer_key]] = result
                 except Exception as error:  # noqa: BLE001
-                    errors.append(f"{reviewer_key}: {error}")
+                    errors.append((reviewer_key, error))
             if errors:
-                raise RuntimeError(error_prefix + "\n" + "\n".join(errors))
+                for _, error in errors:
+                    if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                        raise error
+                raise RuntimeError(error_prefix + "\n" + "\n".join(f"{key}: {error}" for key, error in errors))
             if dropped_keys:
                 reviewer_list = [item for item in reviewer_list if key_func(item) not in dropped_keys]
                 reviewer_index = {key_func(item): index for index, item in enumerate(reviewer_list)}
@@ -201,6 +209,7 @@ def shutdown_stage_workers(
     runtime_root_filter: str | Path | None = None,
 ) -> tuple[str, ...]:
     removed: list[str] = []
+    cleanup_errors: list[BaseException] = []
     seen_runtime_dirs: set[Path] = set()
     runtime_roots: set[Path] = set()
     preserved_reviewer_keys = {
@@ -223,8 +232,12 @@ def shutdown_stage_workers(
             if cleanup_runtime:
                 try:
                     reviewer.worker.request_kill()
-                except Exception:
-                    pass
+                except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown) as error:
+                    cleanup_errors.append(error)
+                    continue
+                except Exception as error:  # noqa: BLE001
+                    cleanup_errors.append(error)
+                    continue
             seen_runtime_dirs.add(reviewer_runtime_dir)
             runtime_roots.add(reviewer_runtime_root)
     if ba_handoff is not None and not preserve_ba_worker:
@@ -234,10 +247,16 @@ def shutdown_stage_workers(
             if cleanup_runtime:
                 try:
                     ba_handoff.worker.request_kill()
-                except Exception:
-                    pass
-            seen_runtime_dirs.add(ba_runtime_dir)
-            runtime_roots.add(ba_runtime_root)
+                except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown) as error:
+                    cleanup_errors.append(error)
+                except Exception as error:  # noqa: BLE001
+                    cleanup_errors.append(error)
+                else:
+                    seen_runtime_dirs.add(ba_runtime_dir)
+                    runtime_roots.add(ba_runtime_root)
+            else:
+                seen_runtime_dirs.add(ba_runtime_dir)
+                runtime_roots.add(ba_runtime_root)
     if not cleanup_runtime:
         return ()
     for runtime_dir in seen_runtime_dirs:
@@ -248,4 +267,6 @@ def shutdown_stage_workers(
         if runtime_root.exists() and runtime_root.is_dir() and not any(runtime_root.iterdir()):
             runtime_root.rmdir()
             removed.append(str(runtime_root))
+    if cleanup_errors:
+        raise cleanup_errors[0]
     return tuple(removed)

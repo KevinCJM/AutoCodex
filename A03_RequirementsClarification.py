@@ -37,9 +37,12 @@ from T02_tmux_agents import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     AgentRunConfig,
     TmuxBatchWorker,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
     is_provider_auth_error,
+    is_runtime_shutdown_error,
     is_worker_death_error,
     worker_state_is_prelaunch_active,
 )
@@ -73,6 +76,7 @@ from T12_requirements_common import (
     build_requirements_clarification_paths,
     clear_requirements_human_exchange_file,
     cleanup_runtime_paths,
+    cleanup_runtime_root_if_empty,
     ensure_requirements_hitl_record_file,
     prompt_project_dir,
     prompt_requirement_name_selection,
@@ -240,6 +244,18 @@ def render_requirements_clarification_progress_line(*, worker: TmuxBatchWorker, 
         f" | health={health_status}"
         f" | {note}"
     )
+
+
+def preserve_worker_after_unhandled_stage_failure(
+        worker: TmuxBatchWorker | None,
+        error: BaseException,
+) -> bool:
+    """Keep a live worker inspectable until the runner records and marks the failure."""
+    if worker is None or isinstance(error, PromptBackRequested):
+        return False
+    if is_runtime_shutdown_error(error) or is_worker_death_error(error):
+        return False
+    return True
 
 
 def collect_requirements_clarification_agent_selection(args: argparse.Namespace) -> RequirementsClarificationAgentSelection:
@@ -451,6 +467,7 @@ def run_requirements_clarification(
     )
     boot_progress_active = False
     progress_active = False
+    stage_completed = False
 
     def start_boot_progress() -> None:
         nonlocal boot_progress_active
@@ -463,8 +480,13 @@ def run_requirements_clarification(
         nonlocal boot_progress_active
         if not boot_progress_active:
             return
-        boot_progress_monitor.stop()
-        boot_progress_active = False
+        try:
+            boot_progress_monitor.stop()
+        except Exception:
+            # Progress transport is diagnostic only and must not replace the stage failure.
+            pass
+        finally:
+            boot_progress_active = False
 
     def start_progress() -> None:
         nonlocal progress_active
@@ -478,8 +500,13 @@ def run_requirements_clarification(
         nonlocal progress_active
         if not progress_active:
             return
-        progress_monitor.stop()
-        progress_active = False
+        try:
+            progress_monitor.stop()
+        except Exception:
+            # Progress transport is diagnostic only and must not replace the stage failure.
+            pass
+        finally:
+            progress_active = False
 
     def handle_worker_started(live_worker: TmuxBatchWorker) -> None:
         stop_boot_progress()
@@ -499,6 +526,13 @@ def run_requirements_clarification(
                     ),
                     runtime_root=runtime_root,
                 )
+                set_runtime_metadata = getattr(worker, "set_runtime_metadata", None)
+                if callable(set_runtime_metadata):
+                    set_runtime_metadata(
+                        project_dir=str(project_root),
+                        requirement_name=requirement_name,
+                        workflow_action="stage.a03.start",
+                    )
             except Exception as error:  # noqa: BLE001
                 stop_progress()
                 stop_boot_progress()
@@ -637,13 +671,13 @@ def run_requirements_clarification(
                     cleanup_paths = (
                         str(ask_human_path.resolve()),
                         str(Path(runtime_dir).expanduser().resolve()),
-                        str(Path(runtime_root).expanduser().resolve()),
                     )
                 append_stage_audit_record(
                     audit_context,
                     event_type="clarification_updated",
                     source_paths={"requirements_clear": requirements_clear_path},
                 )
+                stage_completed = True
                 return RequirementsClarificationStageResult(
                     project_dir=str(project_root),
                     requirement_name=requirement_name,
@@ -660,8 +694,8 @@ def run_requirements_clarification(
                     if not keep_worker_alive:
                         try:
                             worker.request_kill()
-                        except Exception:
-                            pass
+                        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                            raise
                     selection = prompt_recreate_requirements_clarification_agent(
                         reason_text=f"检测到需求分析师仍在 agent 界面，但模型认证已失效: {requirement_name}\n需要更换模型后继续当前阶段。",
                         requirement_name=requirement_name,
@@ -684,8 +718,8 @@ def run_requirements_clarification(
                     if not keep_worker_alive:
                         try:
                             worker.request_kill()
-                        except Exception:
-                            pass
+                        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                            raise
                     selection = prompt_recreate_requirements_clarification_agent(
                         reason_text=f"需求分析师启动超时，未能进入可输入状态: {requirement_name}\n请重新选择模型后继续当前阶段。",
                         requirement_name=requirement_name,
@@ -708,8 +742,8 @@ def run_requirements_clarification(
                     if not keep_worker_alive:
                         try:
                             worker.request_kill()
-                        except Exception:
-                            pass
+                        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                            raise
                     selection = prompt_recreate_requirements_clarification_agent(
                         reason_text=f"检测到需求分析师已死亡: {requirement_name}\n需要更换模型后继续当前阶段。",
                         requirement_name=requirement_name,
@@ -727,6 +761,7 @@ def run_requirements_clarification(
                         current_resume_existing = current_resume_existing or bool(get_markdown_content(requirements_clear_path).strip())
                         keep_worker_alive = False
                         continue
+                keep_worker_alive = preserve_worker_after_unhandled_stage_failure(worker, error)
                 raise
     finally:
         stop_progress()
@@ -735,7 +770,8 @@ def run_requirements_clarification(
             try:
                 worker.request_kill()
             except Exception:
-                pass
+                if stage_completed:
+                    raise
 
 
 def collect_request(args: argparse.Namespace) -> tuple[str, str]:
@@ -857,6 +893,9 @@ def run_requirements_clarification_stage(
         cleanup_paths = result.cleanup_paths
         if cleanup_paths:
             cleanup_runtime_paths(cleanup_paths)
+            cleanup_runtime_root_if_empty(
+                Path(project_dir).expanduser().resolve() / REQUIREMENTS_RUNTIME_ROOT_NAME
+            )
             cleanup_paths = ()
         return RequirementsClarificationStageResult(
             project_dir=result.project_dir,

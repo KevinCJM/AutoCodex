@@ -26,12 +26,14 @@ from A06_TaskSplit import (
     ensure_task_split_inputs,
     generate_task_split_json,
     initialize_task_split_workers,
+    prepare_task_split_ba_handoff,
     resolve_review_max_rounds,
     run_ba_modify_loop,
     run_task_split_review_limit_hitl_loop,
     run_task_split_stage,
 )
 from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
+from tmux_core.runtime.tmux_runtime import TmuxControlUnavailable, TmuxMutationOutcomeUnknown
 from tmux_core.stage_kernel.stage_audit import begin_stage_audit_run
 from tmux_core.stage_kernel.shared_review import ReviewerRuntime
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
@@ -54,6 +56,8 @@ class _FakeWorker:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self._session_exists_value = session_exists_value
         self.killed = False
+        self.metadata_updates: list[dict[str, object]] = []
+        self._runtime_metadata: dict[str, object] = {}
 
     def request_kill(self):
         self.killed = True
@@ -61,6 +65,13 @@ class _FakeWorker:
 
     def session_exists(self) -> bool:
         return self._session_exists_value
+
+    def set_runtime_metadata(self, **metadata):  # noqa: ANN003
+        self.metadata_updates.append(dict(metadata))
+        self._runtime_metadata.update(metadata)
+
+    def read_state(self):
+        return dict(self._runtime_metadata)
 
 
 class _ReconfigurableWorker(_FakeWorker):
@@ -1034,6 +1045,69 @@ class A06TaskSplitTests(unittest.TestCase):
         self.assertEqual([item.reviewer_name for item in reviewers], ["开发工程师", "测试工程师"])
         self.assertEqual([item.worker.session_name for item in reviewers], ["开发工程师-天魁星", "测试工程师-天英星"])
 
+    def test_task_split_reuse_does_not_create_workers_when_tmux_liveness_is_uncertain(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="has-session",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="probe-fixture", error="outcome unknown"),
+        )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                ba_worker = _FakeWorker(session_name="需求分析师-天佑星")
+                ba_handoff = RequirementsAnalystHandoff(
+                    worker=ba_worker,
+                    vendor="codex",
+                    model="gpt-5.4",
+                    reasoning_effort="high",
+                    proxy_url="",
+                )
+                args = build_parser().parse_args(
+                    ["--project-dir", tmp_dir, "--requirement-name", "需求A"]
+                )
+                with patch.object(ba_worker, "session_exists", side_effect=error), patch(
+                    "A06_TaskSplit.create_task_split_ba_handoff"
+                ) as create_ba:
+                    with self.assertRaises(type(error)):
+                        prepare_task_split_ba_handoff(
+                            args,
+                            project_dir=tmp_dir,
+                            ba_handoff=ba_handoff,
+                        )
+                create_ba.assert_not_called()
+
+                reviewer_worker = _FakeWorker(session_name="测试工程师-天英星")
+                reviewer_handoff = ReviewAgentHandoff(
+                    reviewer_key="测试工程师",
+                    role_name="测试工程师",
+                    role_prompt="测试视角",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=reviewer_worker,
+                )
+                reviewer_specs = [
+                    TaskSplitReviewerSpec(
+                        role_name="测试工程师",
+                        role_prompt="测试视角",
+                        reviewer_key="测试工程师",
+                    )
+                ]
+                with patch.object(reviewer_worker, "session_exists", side_effect=error), patch(
+                    "A06_TaskSplit.create_reviewer_runtime"
+                ) as create_reviewer:
+                    with self.assertRaises(type(error)):
+                        build_reviewer_workers(
+                            args,
+                            project_dir=tmp_dir,
+                            requirement_name="需求A",
+                            reviewer_specs=reviewer_specs,
+                            reviewer_handoff=(reviewer_handoff,),
+                        )
+                create_reviewer.assert_not_called()
+
     def test_build_reviewer_workers_reuses_live_handoff_and_only_rebuilds_dead_entries(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             reviewer_handoff = (
@@ -1587,6 +1661,59 @@ class A06TaskSplitTests(unittest.TestCase):
         self.assertIn("结构化数据转换专家", prompts[0])
         self.assertIn("重新解析", prompts[1])
 
+    def test_tmux_control_failure_is_not_retried_by_task_json_or_reviewer_init(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="capture-pane",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="send-keys", error="timeout"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                paths = build_task_split_paths(tmp_dir, "需求A")
+                paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
+                handoff = RequirementsAnalystHandoff(
+                    worker=_FakeWorker(session_name="需求分析师-天佑星"),
+                    vendor="codex",
+                    model="gpt-5.4",
+                    reasoning_effort="high",
+                    proxy_url="",
+                )
+                with patch(
+                    "A06_TaskSplit.run_ba_turn_with_recovery",
+                    side_effect=error,
+                ) as run_ba:
+                    with self.assertRaises(type(error)):
+                        generate_task_split_json(handoff, project_dir=tmp_dir, paths=paths)
+                run_ba.assert_called_once()
+
+                reviewer = ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=Path(tmp_dir) / "review.md",
+                    review_json_path=Path(tmp_dir) / "review.json",
+                    contract=_dummy_contract(),
+                )
+                with patch(
+                    "A06_TaskSplit.run_task_result_turn_with_repair",
+                    side_effect=error,
+                ) as run_reviewer, patch(
+                    "A06_TaskSplit.request_worker_manual_intervention",
+                ) as intervention:
+                    with self.assertRaises(type(error)):
+                        _run_reviewer_result_turn(
+                            reviewer,
+                            label="reviewer_init",
+                            prompt="init",
+                            result_contract=SimpleNamespace(mode="a06_reviewer_init"),
+                        )
+                run_reviewer.assert_called_once()
+                intervention.assert_not_called()
+
     def test_run_reviewer_turn_with_resume_reuses_materialized_outputs_after_runtime_failure(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -1789,6 +1916,8 @@ class A06TaskSplitTests(unittest.TestCase):
             pre_development_payload = json.loads(pre_development_path.read_text(encoding="utf-8"))
 
         self.assertFalse(pre_development_payload["任务拆分"]["任务拆分"])
+        self.assertEqual(ba_handoff.worker.metadata_updates[0]["requirement_name"], "需求A")
+        self.assertEqual(ba_handoff.worker.metadata_updates[0]["workflow_action"], "stage.a06.start")
 
     def test_cleanup_stale_task_split_runtime_state_scopes_by_requirement_and_keeps_live_legacy(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1803,6 +1932,7 @@ class A06TaskSplitTests(unittest.TestCase):
                         "project_dir": str(root.resolve()),
                         "requirement_name": "需求A",
                         "workflow_action": "stage.a06.start",
+                        "agent_state": "DEAD",
                     },
                     ensure_ascii=False,
                 ),
@@ -1838,7 +1968,10 @@ class A06TaskSplitTests(unittest.TestCase):
 
             class FakeTmuxRuntimeController:
                 def session_exists(self, session_name: str) -> bool:
-                    return session_name in {"任务拆分-遗留存活", "任务拆分-其他需求"}
+                    return session_name in {"任务拆分-当前需求", "任务拆分-遗留存活", "任务拆分-其他需求"}
+
+                def session_matches_worker_state(self, session_name, state, state_path):  # noqa: ANN001, ARG002
+                    return session_name == "任务拆分-当前需求"
 
                 def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
                     killed_sessions.append(session_name)
@@ -1848,10 +1981,10 @@ class A06TaskSplitTests(unittest.TestCase):
                 removed = cleanup_stale_task_split_runtime_state(root, "需求A")
 
             self.assertFalse(target_dir.exists())
-            self.assertFalse(legacy_dead_dir.exists())
+            self.assertTrue(legacy_dead_dir.exists())
             self.assertTrue(other_requirement_dir.exists())
             self.assertTrue(legacy_live_dir.exists())
             self.assertIn("任务拆分-当前需求", killed_sessions)
-            self.assertIn("任务拆分-遗留死亡", killed_sessions)
+            self.assertNotIn("任务拆分-遗留死亡", killed_sessions)
             self.assertIn(str(target_dir.resolve()), removed)
-            self.assertIn(str(legacy_dead_dir.resolve()), removed)
+            self.assertNotIn(str(legacy_dead_dir.resolve()), removed)

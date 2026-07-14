@@ -1,7 +1,16 @@
 import { createCliRenderer } from '@opentui/core'
 import { render } from '@opentui/solid'
-import { App, getLatestBackendCleanupContext, runBackendCleanupFallback, stopBackendClient } from './app'
+import {
+  App,
+  claimBackendShutdownOwnership,
+  getLatestBackendCleanupContext,
+  requestBackendPreserveOrphansShutdown,
+  runBackendCleanupFallback,
+  stopBackendClient,
+} from './app'
 import { copyToClipboard } from './clipboard'
+import { formatStageFailureReport } from './terminalFailure'
+import type { StageFailureSnapshot } from './types'
 
 type StartupRoute = 'home' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'overall-review' | 'control'
 type ShutdownSignal = 'SIGINT' | 'SIGTERM' | 'SIGHUP'
@@ -98,6 +107,34 @@ async function shutdownFromSignal(signal: ShutdownSignal) {
   process.exit(exitCodeForSignal(signal))
 }
 
+async function shutdownFromTerminalFailure(failure: StageFailureSnapshot) {
+  if (shutdownStarted) return
+  shutdownStarted = true
+  claimBackendShutdownOwnership()
+  try {
+    renderer.destroy()
+  } catch {
+    // Renderer may already be shutting down.
+  }
+  try {
+    process.stderr.write(formatStageFailureReport(failure))
+  } catch {
+    // A closed stderr must not prevent failure shutdown.
+  }
+  try {
+    await requestBackendPreserveOrphansShutdown()
+  } catch {
+    // The backend already latches preserve-orphans before emitting runner_failure.
+  }
+  try {
+    await stopBackendClient({ reason: 'runner_failure', forceKillAfterMs: 30000 })
+  } finally {
+    // Failure shutdown deliberately has no cleanup-only fallback: the tmux sessions
+    // are the diagnostic evidence the user was promised would be preserved.
+    process.exit(1)
+  }
+}
+
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
   process.on(signal, () => {
     void shutdownFromSignal(signal)
@@ -113,6 +150,7 @@ await render(
       initialAction={startup.action}
       initialArgv={startup.initialArgv}
       onExitRequest={() => shutdownFromSignal('SIGINT')}
+      onTerminalFailure={shutdownFromTerminalFailure}
     />
   ),
   renderer,

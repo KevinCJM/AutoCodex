@@ -231,6 +231,42 @@ textarea {
   border-color: rgba(0, 210, 255, 0.8);
 }
 
+.failure-card {
+  border-color: rgba(255, 93, 93, 0.72);
+  background:
+    linear-gradient(135deg, rgba(255, 93, 93, 0.16), transparent 46%),
+    var(--panel-strong);
+}
+
+.failure-card .card-kicker,
+.failure-card h2 {
+  color: var(--red);
+}
+
+.failure-message {
+  margin: 0;
+  color: #ffb3b3;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.failure-workers {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid rgba(255, 93, 93, 0.28);
+  padding-top: 12px;
+}
+
+.failure-workers > span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.failure-workers .link-button {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+}
+
 .prompt-processing {
   display: flex;
   align-items: center;

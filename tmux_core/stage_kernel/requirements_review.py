@@ -530,6 +530,41 @@ def _reviewer_artifact_agent_name(reviewer: ReviewerRuntime) -> str:
     return session_name or reviewer_name
 
 
+def _worker_requirement_scope(worker: object) -> str:
+    runtime_metadata = getattr(worker, "runtime_metadata", None)
+    if callable(runtime_metadata):
+        with suppress(Exception):
+            payload = runtime_metadata()
+            if isinstance(payload, dict):
+                requirement_name = str(payload.get("requirement_name", "") or "").strip()
+                if requirement_name:
+                    return requirement_name
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        with suppress(Exception):
+            payload = read_state()
+            if isinstance(payload, dict):
+                return str(payload.get("requirement_name", "") or "").strip()
+    return ""
+
+
+def _scope_requirements_review_worker(
+        worker: object,
+        *,
+        project_dir: str | Path,
+        requirement_name: str,
+) -> None:
+    set_runtime_metadata = getattr(worker, "set_runtime_metadata", None)
+    if not callable(set_runtime_metadata):
+        return
+    with suppress(Exception):
+        set_runtime_metadata(
+            project_dir=str(Path(project_dir).expanduser().resolve()),
+            requirement_name=str(requirement_name or "").strip(),
+            workflow_action="stage.a04.start",
+        )
+
+
 def _predict_reviewer_display_name(
         *,
         project_dir: str | Path,
@@ -986,6 +1021,7 @@ def run_ba_turn_with_recreation(
         handoff: RequirementsAnalystHandoff,
         *,
         project_dir: str | Path,
+        requirement_name: str = "",
         label: str,
         prompt: str,
         result_contract: TaskResultContract,
@@ -994,6 +1030,14 @@ def run_ba_turn_with_recreation(
     progress = _resolve_review_progress(progress)
     current_handoff = handoff
     while True:
+        effective_requirement_name = str(requirement_name or "").strip() or _worker_requirement_scope(
+            current_handoff.worker
+        )
+        _scope_requirements_review_worker(
+            current_handoff.worker,
+            project_dir=project_dir,
+            requirement_name=effective_requirement_name,
+        )
         try:
             payload = _run_ba_turn(
                 current_handoff,
@@ -1037,6 +1081,11 @@ def run_ba_turn_with_recreation(
                         work_dir=Path(project_dir).expanduser().resolve(),
                         config=config,
                         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+                        runtime_metadata={
+                            "project_dir": str(Path(project_dir).expanduser().resolve()),
+                            "requirement_name": effective_requirement_name,
+                            "workflow_action": "stage.a04.start",
+                        },
                     ),
                     vendor=selection.vendor,
                     model=selection.model,
@@ -1071,6 +1120,11 @@ def run_ba_turn_with_recreation(
                         work_dir=Path(project_dir).expanduser().resolve(),
                         config=config,
                         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+                        runtime_metadata={
+                            "project_dir": str(Path(project_dir).expanduser().resolve()),
+                            "requirement_name": effective_requirement_name,
+                            "workflow_action": "stage.a04.start",
+                        },
                     ),
                     vendor=selection.vendor,
                     model=selection.model,
@@ -1273,12 +1327,14 @@ def prepare_ba_handoff(
     message("当前没有可复用的需求分析师，将新建需求分析师处理评审反馈")
     handoff = _create_review_ba_handoff(
         project_dir=project_dir,
+        requirement_name=requirement_name,
         selection_title="进入需求评审阶段（需求分析师）",
         progress=progress,
     )
     handoff, payload = run_ba_turn_with_recreation(
         handoff,
         project_dir=project_dir,
+        requirement_name=requirement_name,
         label="resume_requirements_review_ba",
         prompt=resume_ba(
             original_requirement_md=str(paths["original_requirement_path"].resolve()),
@@ -1297,6 +1353,7 @@ def prepare_ba_handoff(
 def _create_review_ba_handoff(
         *,
         project_dir: str | Path,
+        requirement_name: str = "",
         selection_title: str,
         progress: ReviewStageProgress | None = None,
 ) -> RequirementsAnalystHandoff:
@@ -1320,6 +1377,7 @@ def _create_review_ba_handoff(
         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
         runtime_metadata={
             "project_dir": str(Path(project_dir).expanduser().resolve()),
+            "requirement_name": str(requirement_name or "").strip(),
             "workflow_action": "stage.a04.start",
         },
     )
@@ -1365,6 +1423,7 @@ def recreate_ba_handoff(
         runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
         runtime_metadata={
             "project_dir": str(Path(project_dir).expanduser().resolve()),
+            "requirement_name": _worker_requirement_scope(previous_handoff.worker),
             "workflow_action": "stage.a04.start",
         },
     )
@@ -1482,6 +1541,7 @@ def run_human_check_loop(
             message("当前没有可复用的需求分析师，将新建需求分析师处理后续需求评审")
             current_handoff = _create_review_ba_handoff(
                 project_dir=paths["project_root"],
+                requirement_name=requirement_name,
                 selection_title="进入需求评审阶段（需求分析师）",
                 progress=progress,
             )
@@ -1518,6 +1578,7 @@ def run_human_check_loop(
                 message("当前没有可复用的需求分析师，将新建需求分析师处理后续需求评审")
                 current_handoff = _create_review_ba_handoff(
                     project_dir=paths["project_root"],
+                    requirement_name=requirement_name,
                     selection_title="进入需求评审阶段（需求分析师）",
                     progress=progress,
                 )
@@ -1534,6 +1595,7 @@ def run_human_check_loop(
                 progress.set_phase("需求评审 / 处理人类建议")
             current_handoff = _create_review_ba_handoff(
                 project_dir=paths["project_root"],
+                requirement_name=requirement_name,
                 selection_title="按人类建议启动需求分析师",
                 progress=progress,
             )
@@ -2034,6 +2096,7 @@ def run_requirements_review_limit_hitl_loop(
             run_phase=lambda active_handoff: run_ba_turn_with_recreation(
                 active_handoff,
                 project_dir=paths["project_root"],
+                requirement_name=requirement_name,
                 label="requirements_review_limit_hitl",
                 prompt=build_requirements_review_limit_force_hitl_prompt(
                     paths=paths,
@@ -2066,6 +2129,7 @@ def run_requirements_review_limit_hitl_loop(
             run_phase=lambda active_handoff: run_ba_turn_with_recreation(
                 active_handoff,
                 project_dir=paths["project_root"],
+                requirement_name=requirement_name,
                 label="requirements_review_limit_human_reply",
                 prompt=build_requirements_review_limit_human_reply_prompt(
                     paths=paths,
@@ -2134,19 +2198,25 @@ def run_requirements_review_stage(
     else:
         requirement_name = prompt_requirement_name_selection(project_dir, "").requirement_name
 
+    if ba_handoff is not None:
+        _scope_requirements_review_worker(
+            ba_handoff.worker,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+        )
     paths = build_requirements_review_paths(project_dir, requirement_name)
     ensure_review_stage_inputs(paths, requirement_name)
     ensure_pre_development_task_record(project_dir, requirement_name)
     update_pre_development_task_status(project_dir, requirement_name, task_key="需求评审", completed=False)
 
+    progress = ReviewStageProgress()
+    shared_review._ACTIVE_REVIEW_PROGRESS = progress
     lock_context = requirement_concurrency_lock(
         project_dir,
         requirement_name,
         action="stage.a04.start",
     )
     lock_context.__enter__()
-    progress = ReviewStageProgress()
-    shared_review._ACTIVE_REVIEW_PROGRESS = progress
     active_ba_handoff: RequirementsAnalystHandoff | None = None
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_paths: tuple[str, ...] = ()
@@ -2390,9 +2460,13 @@ def run_requirements_review_stage(
         )
         raise
     finally:
-        progress.stop()
-        shared_review._ACTIVE_REVIEW_PROGRESS = None
-        lock_context.__exit__(None, None, None)
+        try:
+            progress.stop()
+        except Exception:
+            pass
+        finally:
+            shared_review._ACTIVE_REVIEW_PROGRESS = None
+            lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

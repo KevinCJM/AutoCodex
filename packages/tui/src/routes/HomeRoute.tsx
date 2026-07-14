@@ -1,5 +1,5 @@
 import { For, Show, createMemo, createSignal, onCleanup } from 'solid-js'
-import type { AppSnapshot, HitlSnapshot, HomeAgentItem } from '../types'
+import type { AppSnapshot, HitlSnapshot, HomeAgentItem, StageFailureSnapshot } from '../types'
 
 type Props = {
   snapshot: AppSnapshot
@@ -49,6 +49,20 @@ export function HomeRoute(props: Props) {
       <text fg="#888888">{`项目目录: ${props.snapshot.projectDir || '(unset)'}`}</text>
       <Show when={props.snapshot.requirementName}>
         <text fg="#888888">{`需求名称: ${props.snapshot.requirementName}`}</text>
+      </Show>
+      <Show when={props.snapshot.activeStageFailure} keyed>
+        {(failure: StageFailureSnapshot) => (
+          <box borderStyle="single" borderColor="#ff5d5d" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
+            <text fg="#ff5d5d">阶段执行失败</text>
+            <text fg="#ffb3b3">{failure.message || failure.failureKind || 'unknown error'}</text>
+            <Show when={failure.failurePath}>
+              <text fg="#888888">failure: {failure.failurePath}</text>
+            </Show>
+            <For each={failure.orphanedWorkers}>
+              {(worker) => <text fg="#f7c948">{worker.attachCommand}</text>}
+            </For>
+          </box>
+        )}
       </Show>
       <box borderStyle="single" paddingLeft={1} paddingRight={1} paddingTop={1} paddingBottom={1} flexDirection="column">
         <text>待处理人工输入</text>

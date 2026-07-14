@@ -38,10 +38,15 @@ import {
   applyStageChanged,
   EMPTY_STAGE_CURSOR,
   inferBootstrapStatus,
-  markTerminalStage,
+  isNewRunnerGeneration,
   shouldAcceptProgressEvent,
-  shouldRecoverRunningFromStageSnapshot,
 } from './stageStatus'
+import {
+  isAuthoritativeStageFailure,
+  normalizeAppStageFailure,
+  normalizeStageFailure,
+  stageFailureMatchesGeneration,
+} from './terminalFailure'
 import { DialogSelect } from './ui/DialogSelect'
 import { DialogConfirm } from './ui/DialogConfirm'
 import { PromptInputPanel } from './ui/PromptInputPanel'
@@ -62,6 +67,7 @@ import type {
   DevelopmentSnapshot,
   TaskSplitSnapshot,
   WorkerSnapshot,
+  StageFailureSnapshot,
 } from './types'
 
 type RouteName = 'home' | 'routing' | 'requirements' | 'review' | 'design' | 'task-split' | 'development' | 'overall-review' | 'control'
@@ -92,6 +98,7 @@ type StartupOptions = {
   initialAction?: string
   initialArgv?: string[]
   onExitRequest?: () => void | Promise<void>
+  onTerminalFailure?: (failure: StageFailureSnapshot) => void | Promise<void>
 }
 
 type FooterPromptHostProps = {
@@ -131,7 +138,10 @@ const EMPTY_APP_SNAPSHOT: AppSnapshot = {
   activeStage: 'idle',
   activeStageStatus: 'ready',
   activeStageSeq: 0,
+  activeStageRunnerId: '',
+  activeStageSource: '',
   activeStageLabel: '等待中',
+  activeStageFailure: null,
   pendingHitl: false,
   pendingAttention: false,
   pendingAttentionReason: '',
@@ -217,6 +227,7 @@ const EMPTY_ARTIFACTS_SNAPSHOT: ArtifactsSnapshot = {
 }
 
 let latestBackendCleanupContext: BackendCleanupContext = { projectDir: '' }
+let backendShutdownOwnedExternally = false
 
 function logEntryPalette(kind: LogKind, hitlRound?: number) {
   if (kind === 'hitl') {
@@ -721,6 +732,19 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     currentTaskRuntimeStatus: String(value.current_task_runtime_status ?? value.currentTaskRuntimeStatus ?? ''),
     dispatchState: String(value.dispatch_state ?? value.dispatchState ?? ''),
     dispatchReason: String(value.dispatch_reason ?? value.dispatchReason ?? ''),
+    turnState: String(value.turn_state ?? value.turnState ?? ''),
+    tmuxControlStatus: String(value.tmux_control_status ?? value.tmuxControlStatus ?? ''),
+    tmuxControlError: String(value.tmux_control_error ?? value.tmuxControlError ?? ''),
+    tmuxUnavailableSince: String(
+      value.tmux_control_unavailable_since
+      ?? value.tmuxControlUnavailableSince
+      ?? value.tmux_unavailable_since
+      ?? value.tmuxUnavailableSince
+      ?? '',
+    ),
+    stageRunnerId: String(value.stage_runner_id ?? value.stageRunnerId ?? ''),
+    orphanedAt: String(value.orphaned_at ?? value.orphanedAt ?? ''),
+    orphanedReason: String(value.orphaned_reason ?? value.orphanedReason ?? ''),
     vendor: String(value.vendor ?? ''),
     model: String(value.model ?? ''),
     resolvedModel: String(value.resolved_model ?? value.resolvedModel ?? ''),
@@ -884,15 +908,25 @@ function normalizeArtifactsSnapshot(payload: Record<string, unknown>): Artifacts
 }
 
 function normalizeAppSnapshot(payload: Record<string, unknown>): AppSnapshot {
+  const activeStage = String(payload.active_stage ?? payload.activeStage ?? 'idle')
+  const activeStageStatus = String(payload.active_stage_status ?? payload.activeStageStatus ?? '')
+  const activeStageSeq = Number(payload.active_stage_seq ?? payload.activeStageSeq ?? 0)
+  const activeStageRunnerId = String(payload.active_stage_runner_id ?? payload.activeStageRunnerId ?? payload.runner_id ?? payload.runnerId ?? '')
+  const activeStageSource = String(payload.active_stage_source ?? payload.activeStageSource ?? payload.source ?? '')
+  const activeStageLabel = String(payload.active_stage_label ?? payload.activeStageLabel ?? '等待中')
+  const failure = normalizeAppStageFailure(payload)
   return {
     projectDir: String(payload.project_dir ?? payload.projectDir ?? ''),
     requirementName: String(payload.requirement_name ?? payload.requirementName ?? ''),
     currentAction: String(payload.current_action ?? payload.currentAction ?? ''),
     activeRunId: String(payload.active_run_id ?? payload.activeRunId ?? ''),
-    activeStage: String(payload.active_stage ?? payload.activeStage ?? 'idle'),
-    activeStageStatus: String(payload.active_stage_status ?? payload.activeStageStatus ?? ''),
-    activeStageSeq: Number(payload.active_stage_seq ?? payload.activeStageSeq ?? 0),
-    activeStageLabel: String(payload.active_stage_label ?? payload.activeStageLabel ?? '等待中'),
+    activeStage,
+    activeStageStatus,
+    activeStageSeq,
+    activeStageRunnerId,
+    activeStageSource,
+    activeStageLabel,
+    activeStageFailure: failure,
     pendingHitl: Boolean(payload.pending_hitl ?? payload.pendingHitl),
     pendingAttention: Boolean(payload.pending_attention ?? payload.pendingAttention),
     pendingAttentionReason: String(payload.pending_attention_reason ?? payload.pendingAttentionReason ?? ''),
@@ -954,6 +988,14 @@ const client = new BackendClient()
 
 export function stopBackendClient(options?: BackendStopOptions) {
   return client.stop(options)
+}
+
+export function requestBackendPreserveOrphansShutdown() {
+  return client.requestShutdownPolicy('preserve_orphans', 'runner_failure')
+}
+
+export function claimBackendShutdownOwnership() {
+  backendShutdownOwnedExternally = true
 }
 
 export function getLatestBackendCleanupContext(): BackendCleanupContext {
@@ -1044,6 +1086,10 @@ export function App(props: StartupOptions) {
   let logScrollbox: ScrollBoxRenderable | undefined
   let documentPreviewScrollbox: ScrollBoxRenderable | undefined
   let controlPollInFlight = false
+  let terminalFailureRequested = false
+  let initialActionFailureGateOpen = Boolean(props.initialAction)
+  let gatedTerminalFailure: StageFailureSnapshot | null = null
+  let initialActionPreviousGeneration: ReturnType<typeof stageCursor> | null = null
   const promptPreview = createMemo<DocumentPreviewState | null>(() => {
     const active = dialogPrompt() ?? footerPrompt()
     if (!active) return null
@@ -1221,6 +1267,130 @@ export function App(props: StartupOptions) {
     setControlSelectedIndex((prev) => Math.min(prev, nextSnapshot.workers.length - 1))
   }
 
+  const enrichTerminalFailure = (failure: StageFailureSnapshot): StageFailureSnapshot => {
+    return {
+      ...failure,
+      stageLabel: failure.stageLabel || displayAppSnapshot().activeStageLabel,
+    }
+  }
+
+  const buildSyntheticTerminalFailure = (
+    message: string,
+    failureKind: 'backend_disconnected' | 'backend_startup_failed',
+  ) => {
+    const cursor = stageCursor()
+    return normalizeStageFailure({
+      action: cursor.activeAction || displayAppSnapshot().activeStage,
+      stage_label: displayAppSnapshot().activeStageLabel,
+      status: 'failed',
+      source: 'runner_failure',
+      runner_id: cursor.activeRunnerId,
+      stage_seq: cursor.activeStageSeq,
+      message,
+      failure_kind: failureKind,
+      orphaned_workers: [],
+    })
+  }
+
+  const requestTerminalFailureExit = (failure: StageFailureSnapshot | null) => {
+    if (!isAuthoritativeStageFailure(failure) || terminalFailureRequested) return
+    if (initialActionFailureGateOpen) {
+      const currentGeneration = stageCursor()
+      const isNewGenerationFailure = Boolean(
+        initialActionPreviousGeneration
+        && isNewRunnerGeneration(initialActionPreviousGeneration, currentGeneration)
+        && stageFailureMatchesGeneration(failure, currentGeneration),
+      )
+      if (!isNewGenerationFailure) {
+        gatedTerminalFailure = failure
+        return
+      }
+      initialActionFailureGateOpen = false
+      gatedTerminalFailure = null
+    }
+    terminalFailureRequested = true
+    void props.onTerminalFailure?.(enrichTerminalFailure(failure))
+  }
+
+  const releaseInitialActionFailureGate = (
+    bootstrapFailure: StageFailureSnapshot | null,
+    newGenerationObserved: boolean,
+  ) => {
+    initialActionFailureGateOpen = false
+    const currentFailure = displayAppSnapshot().activeStageFailure
+    const failure = newGenerationObserved
+      ? (stageFailureMatchesGeneration(currentFailure, stageCursor()) ? currentFailure : null)
+      : (currentFailure ?? gatedTerminalFailure ?? bootstrapFailure)
+    gatedTerminalFailure = null
+    initialActionPreviousGeneration = null
+    requestTerminalFailureExit(failure)
+  }
+
+  const waitForNewRunnerGeneration = async (previous: ReturnType<typeof stageCursor>, timeoutMs = 2000) => {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if (isNewRunnerGeneration(previous, stageCursor())) return true
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    return isNewRunnerGeneration(previous, stageCursor())
+  }
+
+  const applyAppStageState = (nextSnapshot: AppSnapshot, triggerFailureExit: boolean) => {
+    const failure = nextSnapshot.activeStageFailure ?? normalizeStageFailure({}, {
+      action: nextSnapshot.activeStage,
+      stageLabel: nextSnapshot.activeStageLabel,
+      status: nextSnapshot.activeStageStatus,
+      source: nextSnapshot.activeStageSource,
+      runnerId: nextSnapshot.activeStageRunnerId,
+      stageSeq: nextSnapshot.activeStageSeq,
+    })
+    const authoritativeFailure = isAuthoritativeStageFailure(failure) ? failure : null
+    const hasStageState = Boolean(
+      nextSnapshot.activeStageStatus
+      || nextSnapshot.activeStageSeq
+      || nextSnapshot.activeStageRunnerId
+      || nextSnapshot.activeStageSource
+      || authoritativeFailure,
+    )
+    if (!hasStageState) {
+      setAppSnapshot(nextSnapshot)
+      return authoritativeFailure
+    }
+    const transition = applyStageChanged(stageCursor(), authoritativeFailure ?? {
+      action: nextSnapshot.activeStage,
+      status: nextSnapshot.activeStageStatus,
+      source: nextSnapshot.activeStageSource,
+      runner_id: nextSnapshot.activeStageRunnerId,
+      stage_seq: nextSnapshot.activeStageSeq,
+    })
+    if (!transition.accepted) {
+      setAppSnapshot((previous) => ({
+        ...nextSnapshot,
+        currentAction: previous.currentAction,
+        activeStage: previous.activeStage,
+        activeStageStatus: previous.activeStageStatus,
+        activeStageSeq: previous.activeStageSeq,
+        activeStageRunnerId: previous.activeStageRunnerId,
+        activeStageSource: previous.activeStageSource,
+        activeStageLabel: previous.activeStageLabel,
+        activeStageFailure: previous.activeStageFailure,
+      }))
+      return null
+    }
+    setStageCursor(transition.cursor)
+    const visibleStatus = (
+      !authoritativeFailure
+      && (nextSnapshot.pendingHitl || nextSnapshot.pendingAttention)
+    ) ? 'awaiting-input' : transition.status
+    setStatus(visibleStatus)
+    setAppSnapshot({
+      ...nextSnapshot,
+      activeStageFailure: authoritativeFailure,
+    })
+    if (triggerFailureExit) requestTerminalFailureExit(authoritativeFailure)
+    return authoritativeFailure
+  }
+
   const applyBootstrapSnapshots = (payload: Record<string, unknown>) => {
     const snapshots = (payload.snapshots as Record<string, unknown>) ?? {}
     const restoredPrompt = promptStateFromSnapshot(snapshots.prompt, buildPromptDraftKey)
@@ -1229,7 +1399,10 @@ export function App(props: StartupOptions) {
       setPrompt(restoredPrompt)
       setShellFocus(nextFocus)
     }
-    if (snapshots.app && typeof snapshots.app === 'object') setAppSnapshot(normalizeAppSnapshot(snapshots.app as Record<string, unknown>))
+    let bootstrapFailure: StageFailureSnapshot | null = null
+    if (snapshots.app && typeof snapshots.app === 'object') {
+      bootstrapFailure = applyAppStageState(normalizeAppSnapshot(snapshots.app as Record<string, unknown>), false)
+    }
     if (snapshots.stages && typeof snapshots.stages === 'object') {
       const stageSnapshots = snapshots.stages as Record<string, unknown>
       if (stageSnapshots.routing && typeof stageSnapshots.routing === 'object') {
@@ -1263,6 +1436,7 @@ export function App(props: StartupOptions) {
     if (snapshots.artifacts && typeof snapshots.artifacts === 'object') {
       setArtifactsSnapshot(normalizeArtifactsSnapshot(snapshots.artifacts as Record<string, unknown>))
     }
+    return bootstrapFailure
   }
 
   const reportPresence = (reason: string, focus: ShellFocus = shellFocus()) => {
@@ -1321,6 +1495,26 @@ export function App(props: StartupOptions) {
       setStageCursor(transition.cursor)
       if (transition.status !== 'running') setProgress({})
       setStatus(transition.status)
+      const failure = transition.authoritativeFailure
+        ? normalizeStageFailure(event.payload, {
+          action: String(event.payload.action ?? ''),
+          stageLabel: displayAppSnapshot().activeStageLabel,
+          status: transition.status,
+          source: transition.source,
+          runnerId: transition.runnerId,
+          stageSeq: transition.stageSeq,
+        })
+        : null
+      setAppSnapshot((previous) => ({
+        ...previous,
+        currentAction: String(event.payload.action ?? previous.currentAction),
+        activeStage: String(event.payload.action ?? previous.activeStage),
+        activeStageStatus: transition.status,
+        activeStageSeq: transition.stageSeq || previous.activeStageSeq,
+        activeStageRunnerId: transition.runnerId || previous.activeStageRunnerId,
+        activeStageSource: transition.source || previous.activeStageSource,
+        activeStageFailure: failure,
+      }))
       appendStructuredLog(
         buildLogEntry({
           kind: 'stage',
@@ -1329,10 +1523,11 @@ export function App(props: StartupOptions) {
           lines: [`status: ${transition.status}`],
         }),
       )
+      requestTerminalFailureExit(failure)
       return
     }
     if (event.type === 'snapshot.app') {
-      setAppSnapshot(normalizeAppSnapshot(event.payload))
+      applyAppStageState(normalizeAppSnapshot(event.payload), true)
       return
     }
     if (event.type === 'snapshot.stage') {
@@ -1345,11 +1540,6 @@ export function App(props: StartupOptions) {
       if (stageRoute === 'task-split') setTaskSplitSnapshot(normalizeTaskSplitSnapshot(stageSnapshot))
       if (stageRoute === 'development') setDevelopmentSnapshot(normalizeDevelopmentSnapshot(stageSnapshot))
       if (stageRoute === 'overall-review') setOverallReviewSnapshot(normalizeOverallReviewSnapshot(stageSnapshot))
-      const activeStage = displayAppSnapshot().activeStage !== 'idle' ? displayAppSnapshot().activeStage : stageCursor().activeAction
-      const hasPendingInput = Boolean(prompt()) || Boolean(hitlSnapshot().pending) || Boolean(displayAppSnapshot().pendingAttention)
-      if (shouldRecoverRunningFromStageSnapshot(status(), activeStage, stageRoute, stageSnapshot, hasPendingInput)) {
-        setStatus('running')
-      }
       return
     }
     if (event.type === 'snapshot.control') {
@@ -1366,9 +1556,26 @@ export function App(props: StartupOptions) {
       setArtifactsSnapshot(normalizeArtifactsSnapshot(event.payload))
       return
     }
-    if (event.type === 'error') {
+    if (event.type === 'backend.disconnected') {
+      const message = String(event.payload.message ?? 'backend disconnected')
+      const failure = buildSyntheticTerminalFailure(message, 'backend_disconnected')
       setProgress({})
-      setStageCursor((prev) => markTerminalStage(prev))
+      setStatus('error')
+      appendStructuredLog(
+        buildLogEntry({
+          kind: 'error',
+          sourceEventType: event.type,
+          title: 'Backend 连接中断',
+          lines: [message],
+        }),
+      )
+      initialActionFailureGateOpen = false
+      gatedTerminalFailure = null
+      initialActionPreviousGeneration = null
+      requestTerminalFailureExit(failure)
+      return
+    }
+    if (event.type === 'error') {
       appendStructuredLog(
         buildLogEntry({
           kind: 'error',
@@ -1377,7 +1584,6 @@ export function App(props: StartupOptions) {
           lines: normalizeLogLines(String(event.payload.message ?? 'unknown error')),
         }),
       )
-      setStatus('error')
       return
     }
     appendRuntimeLog(event.type, event.payload)
@@ -1398,8 +1604,6 @@ export function App(props: StartupOptions) {
       return result
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      setProgress({})
-      setStageCursor((prev) => markTerminalStage(prev))
       appendStructuredLog(
         buildLogEntry({
           kind: 'error',
@@ -1408,7 +1612,6 @@ export function App(props: StartupOptions) {
           lines: [message],
         }),
       )
-      setStatus('error')
       throw error
     }
   }
@@ -1421,31 +1624,42 @@ export function App(props: StartupOptions) {
     onCleanup(() => clearInterval(spinnerTimer))
     onCleanup(() => {
       unsubscribeBackend?.()
-      void client.stop()
+      if (!backendShutdownOwnedExternally) void client.stop()
     })
     try {
       await client.start()
       unsubscribeBackend = client.subscribe(handleEvent)
       const result = (await client.bootstrap()) as Record<string, unknown>
       setBootstrap(result)
-      applyBootstrapSnapshots(result)
+      const bootstrapFailure = applyBootstrapSnapshots(result)
       setStatus(inferBootstrapStatus(result))
       if (props.initialRoute) {
         setRoute(props.initialRoute)
       }
       if (props.initialAction) {
+        const previousGeneration = stageCursor()
+        initialActionPreviousGeneration = previousGeneration
         try {
           await requestAction(props.initialAction, { argv: props.initialArgv ?? [] }, true)
         } catch {
+          releaseInitialActionFailureGate(bootstrapFailure, false)
           return
         }
+        const newGenerationObserved = await waitForNewRunnerGeneration(previousGeneration)
+        releaseInitialActionFailureGate(bootstrapFailure, newGenerationObserved)
+      } else {
+        requestTerminalFailureExit(bootstrapFailure)
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       appendLog(`ERROR: ${message}`)
       setProgress({})
-      setStageCursor((prev) => markTerminalStage(prev))
       setStatus('error')
+      const failure = buildSyntheticTerminalFailure(message, 'backend_startup_failed')
+      initialActionFailureGateOpen = false
+      gatedTerminalFailure = null
+      initialActionPreviousGeneration = null
+      requestTerminalFailureExit(failure)
     }
   })
 

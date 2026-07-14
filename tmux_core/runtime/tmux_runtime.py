@@ -21,6 +21,7 @@ import time
 import uuid
 import weakref
 import contextlib
+from contextvars import ContextVar, Token
 from datetime import datetime
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
@@ -52,6 +53,22 @@ from tmux_core.runtime.contracts import (
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUNTIME_ROOT = PROJECT_ROOT / ".agent_init_runtime"
 DEFAULT_COMMAND_TIMEOUT_SEC = 60 * 20
+TMUX_CONTROL_RECOVERY_TIMEOUT_SEC = 60.0
+TMUX_CONTROL_RETRY_INITIAL_SEC = 0.1
+TMUX_CONTROL_RETRY_MAX_SEC = 2.0
+TMUX_MISSING_CONFIRMATION_DELAY_SEC = 0.05
+TMUX_CAPTURE_COMMAND_TIMEOUT_SEC = 3.0
+TMUX_CAPTURE_RECOVERY_TIMEOUT_SEC = 5.0
+TMUX_DELETE_BUFFER_TIMEOUT_SEC = 2.0
+TMUX_MISSING_ERROR_MARKERS = (
+    "can't find session",
+    "can't find pane",
+    "session not found",
+    "pane not found",
+    "unknown target",
+    "no server running",
+    "no sessions",
+)
 
 
 def _positive_int_env(name: str, default: int) -> int:
@@ -96,13 +113,6 @@ TERMINAL_WORKER_RESULT_STATUSES = {
     "passed",
     "skipped",
     "stale_failed",
-    "succeeded",
-}
-COMPLETED_WORKER_RESULT_STATUSES = {
-    "completed",
-    "done",
-    "passed",
-    "skipped",
     "succeeded",
 }
 WORKER_DEATH_ERROR_MARKERS = (
@@ -165,6 +175,28 @@ _runtime_state_notify_lock = threading.Lock()
 _runtime_state_notify_timer: threading.Timer | None = None
 _runtime_state_notify_pending = False
 _runtime_state_notify_running = False
+_CURRENT_STAGE_RUNNER_ID: ContextVar[str] = ContextVar("tmux_stage_runner_id", default="")
+
+
+def get_current_stage_runner_id() -> str:
+    return str(_CURRENT_STAGE_RUNNER_ID.get() or "").strip()
+
+
+def set_current_stage_runner_id(runner_id: str) -> Token[str]:
+    return _CURRENT_STAGE_RUNNER_ID.set(str(runner_id or "").strip())
+
+
+def reset_current_stage_runner_id(token: Token[str]) -> None:
+    _CURRENT_STAGE_RUNNER_ID.reset(token)
+
+
+@contextmanager
+def stage_runner_context(runner_id: str):
+    token = set_current_stage_runner_id(runner_id)
+    try:
+        yield get_current_stage_runner_id()
+    finally:
+        reset_current_stage_runner_id(token)
 
 
 def _truthy_runtime_flag(value: object) -> bool:
@@ -203,6 +235,10 @@ def _worker_state_payload(source: Mapping[str, object] | object | None) -> dict[
         "pane_id",
         "result_status",
         "status",
+        "turn_state",
+        "stage_runner_id",
+        "orphaned_at",
+        "orphaned_reason",
         "workflow_stage",
     ):
         if field_name not in payload and hasattr(source, field_name):
@@ -269,12 +305,29 @@ def worker_state_is_prelaunch_active(source: Mapping[str, object] | object | Non
 
 
 def _worker_state_payload_has_completed_status(payload: Mapping[str, object]) -> bool:
-    statuses = {
-        str(payload.get(field_name, "") or "").strip().lower()
-        for field_name in ("status", "result_status")
-    }
+    worker_status = str(payload.get("status", "") or "").strip().lower()
+    result_status = str(payload.get("result_status", "") or "").strip().lower()
+    turn_state = str(payload.get("turn_state", "") or "").strip().lower()
+    if worker_status == WorkerStatus.FAILED.value or turn_state in {
+        TurnState.FAILED.value,
+        TurnState.ORPHANED.value,
+    }:
+        return False
+    return worker_status == WorkerStatus.SUCCEEDED.value or result_status == WorkerStatus.SUCCEEDED.value
+
+
+def worker_state_has_unresolved_turn(source: Mapping[str, object] | object | None) -> bool:
+    payload = _worker_state_payload(source)
+    turn_state = str(payload.get("turn_state", "") or "").strip().lower()
+    if turn_state in UNRESOLVED_TURN_STATES:
+        return True
     runtime_status = str(payload.get("current_task_runtime_status", "") or "").strip().lower()
-    return runtime_status == TASK_STATUS_DONE or bool(statuses & COMPLETED_WORKER_RESULT_STATUSES)
+    dispatch_state = str(payload.get("dispatch_state", "") or "").strip().lower()
+    if dispatch_state in {"preparing", "submitting", "submitted", "running", "submission_unknown"}:
+        return True
+    # A task status signal is not the result contract. Only the validated
+    # success path changes runtime_status to done / turn_state to succeeded.
+    return runtime_status == TASK_STATUS_RUNNING
 
 
 BRAILLE_SPINNER_PREFIX_RE = re.compile(rf"^[{BRAILLE_SPINNER_CHARS}]")
@@ -769,6 +822,74 @@ class WorkerStatus(str, Enum):
     FAILED = "failed"
 
 
+class TurnState(str, Enum):
+    IDLE = "idle"
+    PREPARING = "preparing"
+    SUBMITTED = "submitted"
+    WAITING_RESULT = "waiting_result"
+    SUBMISSION_UNKNOWN = "submission_unknown"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    ORPHANED = "orphaned"
+
+
+UNRESOLVED_TURN_STATES = {
+    TurnState.PREPARING.value,
+    TurnState.SUBMITTED.value,
+    TurnState.WAITING_RESULT.value,
+    TurnState.SUBMISSION_UNKNOWN.value,
+}
+
+
+class TmuxProbeStatus(str, Enum):
+    PRESENT = "PRESENT"
+    MISSING = "MISSING"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+@dataclass(frozen=True)
+class TmuxProbeResult:
+    status: TmuxProbeStatus
+    value: object = None
+    error: str = ""
+    attempts: int = 1
+    unavailable_duration_sec: float = 0.0
+
+    @property
+    def present(self) -> bool:
+        return self.status == TmuxProbeStatus.PRESENT
+
+
+class TmuxControlUnavailable(RuntimeError):
+    """The tmux control plane could not be queried within the recovery budget."""
+
+    def __init__(
+            self,
+            *,
+            operation: str,
+            error: BaseException | str,
+            elapsed_sec: float,
+            attempts: int,
+    ) -> None:
+        self.operation = str(operation or "tmux_read").strip()
+        self.original_error = error
+        self.elapsed_sec = max(float(elapsed_sec), 0.0)
+        self.attempts = max(int(attempts), 1)
+        super().__init__(
+            f"tmux control unavailable while {self.operation} "
+            f"after {self.elapsed_sec:.1f}s ({self.attempts} attempts): {error}"
+        )
+
+
+class TmuxMutationOutcomeUnknown(RuntimeError):
+    """A tmux mutation may have completed; callers must never retry it blindly."""
+
+    def __init__(self, *, operation: str, error: BaseException | str) -> None:
+        self.operation = str(operation or "tmux_mutation").strip()
+        self.original_error = error
+        super().__init__(f"tmux mutation outcome unknown while {self.operation}: {error}")
+
+
 class AgentRuntimeState(str, Enum):
     DEAD = "DEAD"
     STARTING = "STARTING"
@@ -941,6 +1062,9 @@ class WorkerObservation:
     log_mtime: float
     observed_at: str
     pane_title: str = ""
+    tmux_control_status: str = "available"
+    tmux_control_error: str = ""
+    tmux_control_unavailable_since: str = ""
 
 
 @dataclass(frozen=True)
@@ -958,7 +1082,146 @@ class WorkerHealthSnapshot:
     pane_title: str = ""
 
 
+@dataclass(frozen=True)
+class WorkerResumeAssessment:
+    resumable: bool
+    reason: str
+    agent_state: str = ""
+    turn_state: str = ""
+    session_exists: bool = False
+    observation: WorkerObservation | None = None
+
+
 class TmuxBackend:
+    def __init__(self) -> None:
+        self._control_state_lock = threading.RLock()
+        self._control_status = "available"
+        self._control_error = ""
+        self._control_unavailable_since = ""
+        self._control_unavailable_total_sec = 0.0
+        self._control_unavailable_started_monotonic: float | None = None
+        self._control_unavailable_accounted_through_monotonic: float | None = None
+        self._control_unavailable_probe_tokens: set[str] = set()
+        self._control_state_callbacks: list[Callable[[Mapping[str, object]], None]] = []
+
+    @property
+    def control_unavailable_total_sec(self) -> float:
+        with self._control_state_lock:
+            return self._effective_control_unavailable_total_locked(time.monotonic())
+
+    def _effective_control_unavailable_total_locked(self, now_monotonic: float) -> float:
+        total = self._control_unavailable_total_sec
+        if self._control_unavailable_started_monotonic is not None:
+            total += max(now_monotonic - self._control_unavailable_started_monotonic, 0.0)
+        return total
+
+    def _control_unavailable_elapsed_sec(self) -> float:
+        with self._control_state_lock:
+            if self._control_unavailable_started_monotonic is None:
+                return 0.0
+            return max(time.monotonic() - self._control_unavailable_started_monotonic, 0.0)
+
+    def business_monotonic(self) -> float:
+        """Monotonic time excluding each global tmux-control outage exactly once."""
+        with self._control_state_lock:
+            now_monotonic = time.monotonic()
+            unavailable_total = self._effective_control_unavailable_total_locked(now_monotonic)
+            return now_monotonic - unavailable_total
+
+    def control_state(self) -> dict[str, object]:
+        with self._control_state_lock:
+            return {
+                "tmux_control_status": self._control_status,
+                "tmux_control_error": self._control_error,
+                "tmux_control_unavailable_since": self._control_unavailable_since,
+            }
+
+    def add_control_state_listener(self, callback: Callable[[Mapping[str, object]], None]) -> None:
+        if not callable(callback):
+            return
+        with self._control_state_lock:
+            if callback not in self._control_state_callbacks:
+                self._control_state_callbacks.append(callback)
+
+    def _notify_control_state_listeners(self) -> None:
+        payload = self.control_state()
+        with self._control_state_lock:
+            callbacks = tuple(self._control_state_callbacks)
+        for callback in callbacks:
+            with contextlib.suppress(Exception):
+                callback(payload)
+
+    def _mark_control_unavailable(
+            self,
+            error: BaseException | str,
+            *,
+            probe_token: str = "",
+            started_monotonic: float | None = None,
+    ) -> None:
+        should_notify = False
+        with self._control_state_lock:
+            should_notify = self._control_status != "unavailable"
+            if probe_token:
+                self._control_unavailable_probe_tokens.add(probe_token)
+            now_monotonic = time.monotonic()
+            outage_started = (
+                min(float(started_monotonic), now_monotonic)
+                if started_monotonic is not None
+                else now_monotonic
+            )
+            if self._control_unavailable_accounted_through_monotonic is not None:
+                outage_started = max(
+                    outage_started,
+                    self._control_unavailable_accounted_through_monotonic,
+                )
+            if self._control_unavailable_started_monotonic is None:
+                self._control_unavailable_started_monotonic = outage_started
+            else:
+                self._control_unavailable_started_monotonic = min(
+                    self._control_unavailable_started_monotonic,
+                    outage_started,
+                )
+            self._control_status = "unavailable"
+            self._control_error = str(error or "").strip()
+            if not self._control_unavailable_since:
+                self._control_unavailable_since = _now_iso()
+        if should_notify:
+            self._notify_control_state_listeners()
+
+    def _mark_control_available(self, *, probe_token: str = "") -> float:
+        should_notify = False
+        unavailable_duration_sec = 0.0
+        with self._control_state_lock:
+            if probe_token:
+                self._control_unavailable_probe_tokens.discard(probe_token)
+            else:
+                self._control_unavailable_probe_tokens.clear()
+            if self._control_unavailable_probe_tokens:
+                return 0.0
+            should_notify = self._control_status != "available"
+            if self._control_unavailable_started_monotonic is not None:
+                now_monotonic = time.monotonic()
+                unavailable_duration_sec = max(
+                    now_monotonic - self._control_unavailable_started_monotonic,
+                    0.0,
+                )
+                self._control_unavailable_total_sec += unavailable_duration_sec
+                self._control_unavailable_accounted_through_monotonic = now_monotonic
+                self._control_unavailable_started_monotonic = None
+            self._control_status = "available"
+            self._control_error = ""
+            self._control_unavailable_since = ""
+        if should_notify:
+            self._notify_control_state_listeners()
+        return unavailable_duration_sec
+
+    def _release_control_probe(self, probe_token: str) -> None:
+        """Drop a finished probe token without claiming that tmux recovered."""
+        if not probe_token:
+            return
+        with self._control_state_lock:
+            self._control_unavailable_probe_tokens.discard(probe_token)
+
     def run(
             self,
             *args: str,
@@ -975,33 +1238,162 @@ class TmuxBackend:
             timeout=timeout_sec,
         )
 
+    def _probe_readonly(
+            self,
+            operation: str,
+            *args: str,
+            timeout_sec: float = 10.0,
+            recovery_timeout_sec: float = TMUX_CONTROL_RECOVERY_TIMEOUT_SEC,
+            confirm_missing: bool = False,
+    ) -> TmuxProbeResult:
+        probe_token = uuid.uuid4().hex
+        probe_started_monotonic = time.monotonic()
+        recovery_budget = max(float(recovery_timeout_sec), 0.0)
+        attempts = 0
+        missing_hits = 0
+        retry_delay = TMUX_CONTROL_RETRY_INITIAL_SEC
+        last_error: BaseException | str = ""
+
+        def raise_budget_exhausted(error: BaseException | str) -> None:
+            elapsed = max(time.monotonic() - probe_started_monotonic, 0.0)
+            self._mark_control_unavailable(
+                error,
+                probe_token=probe_token,
+                started_monotonic=probe_started_monotonic,
+            )
+            raise TmuxControlUnavailable(
+                operation=operation,
+                error=error,
+                elapsed_sec=elapsed,
+                attempts=max(attempts, 1),
+            )
+
+        def wait_for_recovery(error: BaseException | str) -> None:
+            nonlocal retry_delay
+            self._mark_control_unavailable(
+                error,
+                probe_token=probe_token,
+                started_monotonic=probe_started_monotonic,
+            )
+            elapsed = max(time.monotonic() - probe_started_monotonic, 0.0)
+            if elapsed >= recovery_budget:
+                raise_budget_exhausted(error)
+            time.sleep(min(retry_delay, max(recovery_budget - elapsed, 0.0)))
+            retry_delay = min(retry_delay * 2, TMUX_CONTROL_RETRY_MAX_SEC)
+
+        completed = False
+        try:
+            while True:
+                raise_if_runtime_shutdown_requested(f"probing tmux control: {operation}")
+                elapsed = max(time.monotonic() - probe_started_monotonic, 0.0)
+                remaining_budget = max(recovery_budget - elapsed, 0.0)
+                if attempts > 0 and remaining_budget <= 0.0:
+                    raise_budget_exhausted(last_error or "tmux probe recovery budget exhausted")
+                # The subprocess timeout is part of the same recovery budget.
+                # Without this cap, a probe started near the deadline could exceed
+                # the advertised 60-second recovery window by a full command timeout.
+                attempt_timeout_sec = min(
+                    max(float(timeout_sec), 0.001),
+                    max(remaining_budget, 0.001),
+                )
+                attempts += 1
+                try:
+                    result = self.run(*args, timeout_sec=attempt_timeout_sec, check=False)
+                except (subprocess.TimeoutExpired, OSError, subprocess.SubprocessError) as error:
+                    last_error = error
+                    missing_hits = 0
+                    wait_for_recovery(error)
+                    continue
+
+                if result.returncode == 0:
+                    unavailable_duration = self._mark_control_available(probe_token=probe_token)
+                    completed = True
+                    return TmuxProbeResult(
+                        status=TmuxProbeStatus.PRESENT,
+                        value=result.stdout,
+                        attempts=attempts,
+                        unavailable_duration_sec=unavailable_duration,
+                    )
+
+                error_text = str(result.stderr or result.stdout or "").strip()
+                missing_result = any(marker in error_text.lower() for marker in TMUX_MISSING_ERROR_MARKERS)
+                if not missing_result:
+                    last_error = error_text or f"tmux exited with status {result.returncode}"
+                    missing_hits = 0
+                    wait_for_recovery(last_error)
+                    continue
+
+                # A known missing-target result must repeat before it is authoritative.
+                last_error = error_text or str(last_error or "tmux target missing").strip()
+                missing_hits += 1
+                if not confirm_missing or missing_hits >= 2:
+                    unavailable_duration = self._mark_control_available(probe_token=probe_token)
+                    completed = True
+                    return TmuxProbeResult(
+                        status=TmuxProbeStatus.MISSING,
+                        error=error_text or str(last_error or "").strip(),
+                        attempts=attempts,
+                        unavailable_duration_sec=unavailable_duration,
+                    )
+                elapsed = max(time.monotonic() - probe_started_monotonic, 0.0)
+                remaining_budget = max(recovery_budget - elapsed, 0.0)
+                if remaining_budget <= 0.0:
+                    raise_budget_exhausted(last_error)
+                time.sleep(min(TMUX_MISSING_CONFIRMATION_DELAY_SEC, remaining_budget))
+        finally:
+            if not completed:
+                self._release_control_probe(probe_token)
+
+    def probe_has_session(self, session_name: str) -> TmuxProbeResult:
+        return self._probe_readonly(
+            "has-session",
+            "has-session",
+            "-t",
+            session_name,
+            confirm_missing=True,
+        )
+
+    def probe_target_exists(self, target_name: str) -> TmuxProbeResult:
+        return self._probe_readonly(
+            "list-panes",
+            "list-panes",
+            "-t",
+            target_name,
+            confirm_missing=True,
+        )
+
     def has_session(self, session_name: str) -> bool:
-        result = self.run("has-session", "-t", session_name, check=False)
-        return result.returncode == 0
+        return self.probe_has_session(session_name).present
 
     def list_sessions(self) -> list[str]:
-        result = self.run("list-sessions", "-F", "#S", check=False)
-        if result.returncode != 0:
+        probe = self._probe_readonly("list-sessions", "list-sessions", "-F", "#S")
+        if not probe.present:
             return []
-        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return [line.strip() for line in str(probe.value or "").splitlines() if line.strip()]
 
     def create_session(self, session_name: str, work_dir: Path, command: str) -> str:
-        result = self.run(
-            "new-session",
-            "-d",
-            "-P",
-            "-F",
-            "#{pane_id}",
-            "-s",
-            session_name,
-            "-c",
-            str(work_dir),
-            command,
-        )
+        try:
+            result = self.run(
+                "new-session",
+                "-d",
+                "-P",
+                "-F",
+                "#{pane_id}",
+                "-s",
+                session_name,
+                "-c",
+                str(work_dir),
+                command,
+            )
+        except (subprocess.TimeoutExpired, OSError) as error:
+            raise TmuxMutationOutcomeUnknown(operation="new-session", error=error) from error
         return result.stdout.strip()
 
     def kill_session(self, session_name: str) -> None:
-        self.run("kill-session", "-t", session_name)
+        try:
+            self.run("kill-session", "-t", session_name)
+        except (subprocess.TimeoutExpired, OSError) as error:
+            raise TmuxMutationOutcomeUnknown(operation="kill-session", error=error) from error
 
     def attach_session(self, session_name: str) -> None:
         subprocess.run(["tmux", "attach-session", "-t", session_name], check=True)
@@ -1010,20 +1402,35 @@ class TmuxBackend:
         self.run("detach-client", "-s", session_name)
 
     def target_exists(self, target_name: str) -> bool:
-        result = self.run("list-panes", "-t", target_name, check=False)
-        return result.returncode == 0
+        return self.probe_target_exists(target_name).present
 
     def display_message(self, target: str, expression: str) -> str:
-        return self.run("display-message", "-p", "-t", target, expression).stdout.strip()
+        probe = self._probe_readonly(
+            "display-message",
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            expression,
+        )
+        return str(probe.value or "").strip() if probe.present else ""
 
     def show_option(self, target: str, option_name: str) -> str:
-        result = self.run("show-options", "-qv", "-t", target, option_name, check=False)
-        if result.returncode != 0:
+        probe = self._probe_readonly(
+            "show-options",
+            "show-options",
+            "-qv",
+            "-t",
+            target,
+            option_name,
+        )
+        if not probe.present:
             return ""
-        return result.stdout.strip()
+        return str(probe.value or "").strip()
 
     def capture_visible(self, target: str, *, tail_lines: int = DEFAULT_CAPTURE_TAIL_LINES) -> str:
-        return self.run(
+        probe = self._probe_readonly(
+            "capture-pane",
             "capture-pane",
             "-J",
             "-p",
@@ -1031,15 +1438,22 @@ class TmuxBackend:
             target,
             "-S",
             f"-{tail_lines}",
-            timeout_sec=15.0,
-        ).stdout
+            timeout_sec=TMUX_CAPTURE_COMMAND_TIMEOUT_SEC,
+            recovery_timeout_sec=TMUX_CAPTURE_RECOVERY_TIMEOUT_SEC,
+        )
+        if not probe.present:
+            raise subprocess.CalledProcessError(1, ["tmux", "capture-pane", "-t", target])
+        return str(probe.value or "")
 
     def pipe_log(self, target: str, raw_log_path: Path) -> None:
         command = f"cat >> {shlex.quote(str(raw_log_path))}"
         self.run("pipe-pane", "-t", target, "-o", command)
 
     def send_key(self, target: str, key: str) -> None:
-        self.run("send-keys", "-t", target, key)
+        try:
+            self.run("send-keys", "-t", target, key)
+        except (subprocess.TimeoutExpired, OSError) as error:
+            raise TmuxMutationOutcomeUnknown(operation="send-keys", error=error) from error
 
     def send_text(self, target: str, text: str, *, submit_count: int) -> None:
         buffer_name = f"acx_{uuid.uuid4().hex[:8]}"
@@ -1048,18 +1462,48 @@ class TmuxBackend:
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, suffix=".tmux-prompt") as prompt_file:
                 prompt_file.write(text)
                 prompt_file_path = prompt_file.name
-            self.run("load-buffer", "-b", buffer_name, prompt_file_path, timeout_sec=30.0)
-            self.run("paste-buffer", "-p", "-b", buffer_name, "-t", target, timeout_sec=30.0)
+            load_error: BaseException | None = None
+            for load_attempt in range(2):
+                try:
+                    # Reusing the exact buffer name is idempotent and cannot submit
+                    # the prompt, so one bounded retry is safe here.
+                    self.run("load-buffer", "-b", buffer_name, prompt_file_path, timeout_sec=30.0)
+                    load_error = None
+                    break
+                except (subprocess.TimeoutExpired, OSError) as error:
+                    load_error = error
+                    if load_attempt == 0:
+                        continue
+            if load_error is not None:
+                raise TmuxControlUnavailable(
+                    operation="load-buffer",
+                    error=load_error,
+                    elapsed_sec=0.0,
+                    attempts=2,
+                ) from load_error
+            try:
+                self.run("paste-buffer", "-p", "-b", buffer_name, "-t", target, timeout_sec=30.0)
+            except (subprocess.TimeoutExpired, OSError) as error:
+                raise TmuxMutationOutcomeUnknown(operation="paste-buffer", error=error) from error
             time.sleep(0.3)
             for index in range(submit_count):
                 if index > 0:
                     time.sleep(0.5)
-                self.run("send-keys", "-t", target, "Enter", timeout_sec=15.0)
+                try:
+                    self.run("send-keys", "-t", target, "Enter", timeout_sec=15.0)
+                except (subprocess.TimeoutExpired, OSError) as error:
+                    raise TmuxMutationOutcomeUnknown(operation="send-keys Enter", error=error) from error
         finally:
             if prompt_file_path:
                 with contextlib.suppress(OSError):
                     os.unlink(prompt_file_path)
-            subprocess.run(["tmux", "delete-buffer", "-b", buffer_name], check=False, capture_output=True)
+            with contextlib.suppress(Exception):
+                subprocess.run(
+                    ["tmux", "delete-buffer", "-b", buffer_name],
+                    check=False,
+                    capture_output=True,
+                    timeout=TMUX_DELETE_BUFFER_TIMEOUT_SEC,
+                )
 
     def tail_raw_log(
             self,
@@ -1444,7 +1888,7 @@ def is_task_result_contract_error(error: BaseException | str) -> bool:
     return TASK_RESULT_CONTRACT_ERROR_PREFIX in message
 
 
-def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -> bool:
+def _try_resume_worker_bool(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -> bool:
     if worker is None:
         return False
 
@@ -1454,6 +1898,8 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             return {}
         try:
             payload = read_state()
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception:
             return {}
         return payload if isinstance(payload, dict) else {}
@@ -1464,6 +1910,8 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             return False
         try:
             return bool(session_exists())
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception:
             return False
 
@@ -1473,6 +1921,8 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             return True
         try:
             return bool(target_exists())
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception:
             return False
 
@@ -1482,6 +1932,8 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             return None
         try:
             return observe(tail_lines=120, tail_bytes=12000)
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception:
             return None
 
@@ -1495,8 +1947,12 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             except TypeError:
                 try:
                     return get_agent_state()
+                except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                    raise
                 except Exception:
                     return None
+            except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                raise
             except Exception:
                 return None
         state = _read_state()
@@ -1552,12 +2008,19 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             worker.launch_coordinator.record_launch_result(worker.config.vendor, success=True)
 
     state = _read_state()
+    if str(state.get("turn_state", "") or "").strip().lower() == TurnState.ORPHANED.value:
+        return False
     dispatch_reason = str(state.get("dispatch_reason", "") or "").strip()
     dispatch_state = str(state.get("dispatch_state", "") or "").strip().lower()
     note = str(state.get("note", "") or "").strip().lower()
     health_status = str(state.get("health_status", "") or "").strip().lower()
     health_note = str(state.get("health_note", "") or "").strip()
     current_command_state = str(state.get("current_command", "") or "").strip()
+
+    # READY is terminal health only. It cannot complete or erase an unresolved
+    # turn whose file/result contract has not been validated.
+    if worker_state_has_unresolved_turn(state):
+        return False
 
     if dispatch_reason.startswith(f"{STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX}:"):
         return False
@@ -1580,8 +2043,12 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
                 idle_surface = False
                 idle_checker = getattr(worker, "_observation_indicates_ready_or_idle_surface", None)
                 if callable(idle_checker):
-                    with contextlib.suppress(Exception):
+                    try:
                         idle_surface = bool(idle_checker(observation))
+                    except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                        raise
+                    except Exception:
+                        pass
                 if agent_state == AgentRuntimeState.READY or idle_surface:
                     _normalize_ready_state(observation)
                     return True
@@ -1627,6 +2094,59 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
                 return False
         time.sleep(FILE_CONTRACT_POLL_INTERVAL_SEC)
     return False
+
+
+def assess_worker_resume(
+        worker: "TmuxBatchWorker",
+        *,
+        timeout_sec: float = 60.0,
+) -> WorkerResumeAssessment:
+    if worker is None:
+        return WorkerResumeAssessment(resumable=False, reason="worker_missing")
+    state: dict[str, object] = {}
+    read_state = getattr(worker, "read_state", None)
+    if callable(read_state):
+        with contextlib.suppress(Exception):
+            payload = read_state()
+            if isinstance(payload, dict):
+                state = payload
+    turn_state = str(state.get("turn_state", "") or "").strip().lower()
+    agent_state = str(state.get("agent_state", "") or "").strip().upper()
+    if turn_state == TurnState.ORPHANED.value:
+        return WorkerResumeAssessment(
+            resumable=False,
+            reason="worker_orphaned",
+            agent_state=agent_state,
+            turn_state=turn_state,
+            session_exists=bool(state.get("agent_alive", False)),
+        )
+    if worker_state_has_unresolved_turn(state):
+        return WorkerResumeAssessment(
+            resumable=False,
+            reason="turn_unresolved",
+            agent_state=agent_state,
+            turn_state=turn_state or TurnState.WAITING_RESULT.value,
+            session_exists=bool(state.get("agent_alive", False)),
+        )
+    resumed = _try_resume_worker_bool(worker, timeout_sec=timeout_sec)
+    next_state = state
+    if callable(read_state):
+        with contextlib.suppress(Exception):
+            payload = read_state()
+            if isinstance(payload, dict):
+                next_state = payload
+    return WorkerResumeAssessment(
+        resumable=resumed,
+        reason="ready" if resumed else "not_resumable",
+        agent_state=str(next_state.get("agent_state", agent_state) or "").strip().upper(),
+        turn_state=str(next_state.get("turn_state", turn_state) or "").strip().lower(),
+        session_exists=bool(next_state.get("agent_alive", state.get("agent_alive", False))),
+    )
+
+
+def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -> bool:
+    """Compatibility boolean wrapper for the richer resume assessment."""
+    return assess_worker_resume(worker, timeout_sec=timeout_sec).resumable
 
 
 def load_worker_from_state_path(
@@ -1861,6 +2381,8 @@ def _list_backend_session_names(backend: Any | None) -> set[str]:
         return set()
     try:
         return {str(name).strip() for name in list_sessions() if str(name).strip()}
+    except TmuxControlUnavailable:
+        raise
     except Exception:
         return set()
 
@@ -1879,6 +2401,8 @@ def _backend_show_option(backend: Any, target: str, option_name: str) -> str:
     if callable(show_option):
         try:
             return str(show_option(target, option_name) or "").strip()
+        except TmuxControlUnavailable:
+            raise
         except Exception:
             return ""
     run = getattr(backend, "run", None)
@@ -1886,6 +2410,8 @@ def _backend_show_option(backend: Any, target: str, option_name: str) -> str:
         return ""
     try:
         result = run("show-options", "-qv", "-t", target, option_name, check=False)
+    except TmuxControlUnavailable:
+        raise
     except Exception:
         return ""
     if getattr(result, "returncode", 1) != 0:
@@ -1899,6 +2425,8 @@ def _backend_current_path(backend: Any, target: str) -> str:
         return ""
     try:
         return str(display_message(target, "#{pane_current_path}") or "").strip()
+    except TmuxControlUnavailable:
+        raise
     except Exception:
         return ""
 
@@ -1923,7 +2451,38 @@ def _tmux_session_matches_context(
     try:
         if not bool(has_session(session_name_text)):
             return False
+    except TmuxControlUnavailable:
+        raise
     except Exception:
+        return False
+
+    return _tmux_target_matches_context_without_presence(
+        backend,
+        session_name_text,
+        runtime_dir=runtime_dir,
+        work_dir=work_dir,
+        requirement_name=requirement_name,
+        workflow_action=workflow_action,
+    )
+
+
+def _tmux_target_matches_context_without_presence(
+    backend: Any,
+    target: str,
+    *,
+    runtime_dir: str | Path = "",
+    work_dir: str | Path = "",
+    requirement_name: str = "",
+    workflow_action: str = "",
+) -> bool:
+    """Validate ownership for an already-confirmed tmux target.
+
+    This intentionally does not run ``has-session``. It is used when the
+    session probe and pane probe disagree transiently; the pane may keep the
+    worker alive only when its persisted identity still matches.
+    """
+    target_text = str(target or "").strip()
+    if not target_text:
         return False
 
     expected_runtime_dir = _resolved_path_text(runtime_dir)
@@ -1931,29 +2490,31 @@ def _tmux_session_matches_context(
     expected_requirement_name = str(requirement_name or "").strip()
     expected_workflow_action = str(workflow_action or "").strip()
 
-    actual_runtime_dir = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_RUNTIME_DIR_OPTION)
+    actual_runtime_dir = _backend_show_option(backend, target_text, TMUX_IDENTITY_RUNTIME_DIR_OPTION)
     if actual_runtime_dir:
         return bool(expected_runtime_dir and _same_resolved_path(actual_runtime_dir, expected_runtime_dir))
 
-    actual_work_dir = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_WORK_DIR_OPTION)
+    actual_work_dir = _backend_show_option(backend, target_text, TMUX_IDENTITY_WORK_DIR_OPTION)
     if actual_work_dir and expected_work_dir and not _same_resolved_path(actual_work_dir, expected_work_dir):
         return False
 
-    actual_requirement_name = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_REQUIREMENT_NAME_OPTION)
+    actual_requirement_name = _backend_show_option(backend, target_text, TMUX_IDENTITY_REQUIREMENT_NAME_OPTION)
     if actual_requirement_name and expected_requirement_name and actual_requirement_name != expected_requirement_name:
         return False
 
-    actual_workflow_action = _backend_show_option(backend, session_name_text, TMUX_IDENTITY_WORKFLOW_ACTION_OPTION)
+    actual_workflow_action = _backend_show_option(backend, target_text, TMUX_IDENTITY_WORKFLOW_ACTION_OPTION)
     if actual_workflow_action and expected_workflow_action and actual_workflow_action != expected_workflow_action:
         return False
 
     if actual_work_dir or actual_requirement_name or actual_workflow_action:
         return True
 
-    current_path = _backend_current_path(backend, session_name_text)
+    current_path = _backend_current_path(backend, target_text)
     if current_path and expected_work_dir:
         return _path_is_same_or_under(current_path, expected_work_dir)
-    return True
+    # A reused session name is not ownership evidence. Destructive cleanup is
+    # authorized only by an identity option or a matching current path.
+    return False
 
 
 def _occupied_session_names(backend: Any | None = None) -> set[str]:
@@ -3245,11 +3806,26 @@ class TmuxBatchWorker:
         self.current_task_runtime_status = ""
         self.dispatch_state = ""
         self.dispatch_reason = ""
+        self.turn_state = TurnState.IDLE
+        self.stage_runner_id = ""
+        self.orphaned_at = ""
+        self.orphaned_reason = ""
         self._runtime_metadata: dict[str, object] = {
             key: value
             for key, value in dict(runtime_metadata or {}).items()
             if str(key).strip()
         }
+        metadata_owns_runner_id = (
+            "stage_runner_id" in self._runtime_metadata
+            or "runner_id" in self._runtime_metadata
+        )
+        current_stage_runner_id = get_current_stage_runner_id()
+        if not metadata_owns_runner_id and current_stage_runner_id:
+            self._runtime_metadata["stage_runner_id"] = current_stage_runner_id
+            metadata_owns_runner_id = True
+        self.stage_runner_id = str(
+            self._runtime_metadata.get("stage_runner_id", self._runtime_metadata.get("runner_id", "")) or ""
+        ).strip()
         self.last_terminal_signature = ""
         self.last_terminal_changed_at = ""
         self.terminal_recently_changed = False
@@ -3279,6 +3855,26 @@ class TmuxBatchWorker:
             self.current_task_runtime_status = str(existing_state.get("current_task_runtime_status", ""))
             self.dispatch_state = str(existing_state.get("dispatch_state", ""))
             self.dispatch_reason = str(existing_state.get("dispatch_reason", ""))
+            existing_turn_state = str(existing_state.get("turn_state", "") or "").strip().lower()
+            if existing_turn_state in {item.value for item in TurnState}:
+                self.turn_state = TurnState(existing_turn_state)
+            if not metadata_owns_runner_id:
+                self.stage_runner_id = str(existing_state.get("stage_runner_id", "") or "").strip()
+            self.orphaned_at = str(existing_state.get("orphaned_at", "") or "").strip()
+            self.orphaned_reason = str(existing_state.get("orphaned_reason", "") or "").strip()
+            existing_runner_id = str(existing_state.get("stage_runner_id", "") or "").strip()
+            if (
+                    metadata_owns_runner_id
+                    and existing_runner_id
+                    and self.stage_runner_id
+                    and self.stage_runner_id != existing_runner_id
+                    and self.turn_state == TurnState.ORPHANED
+            ):
+                # A new authoritative runner generation may reuse this worker,
+                # but it must not inherit the previous runner's orphan marker.
+                self.turn_state = TurnState.IDLE
+                self.orphaned_at = ""
+                self.orphaned_reason = ""
             self.startup_blocker_kind = str(existing_state.get("startup_blocker_kind", ""))
             self.startup_blocker_requires_manual = bool(existing_state.get("startup_blocker_requires_manual", False))
             self.last_terminal_signature = str(existing_state.get("last_terminal_signature", ""))
@@ -3303,7 +3899,12 @@ class TmuxBatchWorker:
             ):
                 if key in existing_state and key not in self._runtime_metadata:
                     self._runtime_metadata[key] = existing_state.get(key)
+        if metadata_owns_runner_id:
+            self._runtime_metadata["stage_runner_id"] = self.stage_runner_id
         self._session_name_reserved = bool(reserved_session_name)
+        add_control_listener = getattr(self.backend, "add_control_state_listener", None)
+        if callable(add_control_listener):
+            add_control_listener(self._persist_tmux_control_state)
         _register_live_worker(self)
 
     def __del__(self) -> None:
@@ -3313,6 +3914,53 @@ class TmuxBatchWorker:
     def _tmux(self, *args: str, input_text: str | None = None, timeout_sec: float = 10.0) -> \
     subprocess.CompletedProcess[str]:
         return self.backend.run(*args, input_text=input_text, timeout_sec=timeout_sec, check=True)
+
+    def _business_monotonic(self) -> float:
+        backend_business_monotonic = getattr(self.backend, "business_monotonic", None)
+        if callable(backend_business_monotonic):
+            with contextlib.suppress(Exception):
+                return float(backend_business_monotonic())
+        unavailable_total = 0.0
+        with contextlib.suppress(Exception):
+            unavailable_total = float(getattr(self.backend, "control_unavailable_total_sec", 0.0) or 0.0)
+        return time.monotonic() - max(unavailable_total, 0.0)
+
+    def _tmux_control_state_payload(self) -> dict[str, object]:
+        control_state = getattr(self.backend, "control_state", None)
+        if callable(control_state):
+            with contextlib.suppress(Exception):
+                payload = control_state()
+                if isinstance(payload, Mapping):
+                    return dict(payload)
+        return {
+            "tmux_control_status": "available",
+            "tmux_control_error": "",
+            "tmux_control_unavailable_since": "",
+        }
+
+    def _persist_tmux_control_state(self, control_state: Mapping[str, object]) -> None:
+        """Persist only transport health; never infer or mutate agent/turn state here."""
+        if not self.state_path.exists():
+            return
+        with self.state_lock:
+            previous = self.read_state()
+            payload = dict(previous)
+            payload.update(
+                {
+                    "tmux_control_status": str(
+                        control_state.get("tmux_control_status", "available") or "available"
+                    ),
+                    "tmux_control_error": str(control_state.get("tmux_control_error", "") or ""),
+                    "tmux_control_unavailable_since": str(
+                        control_state.get("tmux_control_unavailable_since", "") or ""
+                    ),
+                    "updated_at": _now_iso(),
+                    "state_revision": int(previous.get("state_revision", 0)) + 1,
+                    "last_writer": "TmuxBatchWorker.tmux_control",
+                }
+            )
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
 
     def session_exists(self) -> bool:
         return _tmux_session_matches_context(
@@ -3393,20 +4041,78 @@ class TmuxBatchWorker:
         return payload
 
     def set_runtime_metadata(self, **metadata: object) -> None:
-        if not metadata:
+        current_stage_runner_id = get_current_stage_runner_id()
+        if not metadata and not current_stage_runner_id:
             return
         normalized = {
             str(key): value
             for key, value in metadata.items()
             if str(key).strip()
         }
+        if current_stage_runner_id:
+            normalized["stage_runner_id"] = current_stage_runner_id
+        if "stage_runner_id" in normalized or "runner_id" in normalized:
+            self.stage_runner_id = str(
+                normalized.get("stage_runner_id", normalized.get("runner_id", "")) or ""
+            ).strip()
+            normalized["stage_runner_id"] = self.stage_runner_id
         self._runtime_metadata.update(normalized)
         if not self.state_path.exists():
             return
         with self.state_lock:
             payload = self.read_state()
+            previous_runner_id = str(payload.get("stage_runner_id", "") or "").strip()
+            incoming_runner_id = str(normalized.get("stage_runner_id", "") or "").strip()
+            starts_new_runner_generation = bool(
+                previous_runner_id
+                and incoming_runner_id
+                and incoming_runner_id != previous_runner_id
+            )
             payload.update(normalized)
+            if (
+                    starts_new_runner_generation
+                    and str(payload.get("turn_state", "") or "").strip().lower() == TurnState.ORPHANED.value
+            ):
+                payload["turn_state"] = TurnState.IDLE.value
+                payload["orphaned_at"] = ""
+                payload["orphaned_reason"] = ""
+                payload["orphaned_stage_action"] = ""
+                payload["updated_at"] = _now_iso()
+                payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+                payload["last_writer"] = "TmuxBatchWorker.new_runner_generation"
+                self.turn_state = TurnState.IDLE
+                self.orphaned_at = ""
+                self.orphaned_reason = ""
             _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def mark_orphaned(self, reason: str, stage_runner_id: str = "") -> None:
+        """Preserve a live worker for inspection without changing health or tmux state."""
+        reason_text = str(reason or "stage_runner_failed").strip() or "stage_runner_failed"
+        orphaned_at = _now_iso()
+        with self.state_lock:
+            previous = self.read_state()
+            runner_id = str(stage_runner_id or previous.get("stage_runner_id", "") or "").strip()
+            payload = dict(previous)
+            payload.update(self.runtime_metadata())
+            payload.update(
+                {
+                    "turn_state": TurnState.ORPHANED.value,
+                    "orphaned_at": orphaned_at,
+                    "orphaned_reason": reason_text,
+                    "stage_runner_id": runner_id,
+                    "updated_at": orphaned_at,
+                    "state_revision": int(previous.get("state_revision", 0)) + 1,
+                    "last_writer": "TmuxBatchWorker.mark_orphaned",
+                }
+            )
+            payload.update(self._tmux_control_state_payload())
+            _atomic_write_json(self.state_path, payload)
+        self.turn_state = TurnState.ORPHANED
+        self.orphaned_at = orphaned_at
+        self.orphaned_reason = reason_text
+        self.stage_runner_id = runner_id
+        self._log_event("worker_orphaned", reason=reason_text, stage_runner_id=runner_id)
         _notify_runtime_state_changed_best_effort()
 
     def target_exists(self, target: str | None = None) -> bool:
@@ -3436,16 +4142,94 @@ class TmuxBatchWorker:
         except Exception as error:  # noqa: BLE001
             return f"(unable to capture tmux pane: {error})"
 
+    def _safe_turn_failure_diagnostic(self, original_error: BaseException, *, tail_lines: int = 200) -> str:
+        if isinstance(original_error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+            cached_tail = clean_ansi(read_text_tail(self.raw_log_path, max_lines=min(tail_lines, 200)))
+            return cached_tail[-4000:] if cached_tail and cached_tail != "(文件不存在)" else ""
+        try:
+            if not self.pane_id or not self.target_exists():
+                return ""
+            return clean_ansi(self.capture_visible(tail_lines))[-4000:]
+        except Exception as diagnostic_error:  # noqa: BLE001
+            self._log_event(
+                "turn_failure_diagnostic_failed",
+                original_error=str(original_error),
+                diagnostic_error=str(diagnostic_error),
+            )
+            return f"(diagnostic unavailable: {diagnostic_error})"
+
+    def _pane_belongs_to_expected_session(self) -> bool:
+        if not self.pane_id or not self.session_name:
+            return False
+        actual_session_name = str(
+            self.backend.display_message(self.pane_id, "#{session_name}") or ""
+        ).strip()
+        return actual_session_name == self.session_name
+
+    def _pane_matches_worker_identity(self) -> bool:
+        if not self._pane_belongs_to_expected_session():
+            return False
+        return _tmux_target_matches_context_without_presence(
+            self.backend,
+            self.pane_id,
+            runtime_dir=self.runtime_dir,
+            work_dir=self.work_dir,
+            requirement_name=str(self._runtime_metadata.get("requirement_name", "") or "").strip(),
+            workflow_action=str(self._runtime_metadata.get("workflow_action", "") or "").strip(),
+        )
+
+    def _probe_session_and_pane_presence(self) -> tuple[bool, bool]:
+        """Cross-check the session and owned pane before declaring the worker dead."""
+        try:
+            session_present = self.session_exists()
+        except subprocess.TimeoutExpired as error:
+            raise TmuxControlUnavailable(
+                operation="has-session",
+                error=error,
+                elapsed_sec=float(getattr(error, "timeout", 0.0) or 0.0),
+                attempts=1,
+            ) from error
+        if not self.pane_id:
+            return session_present, False
+        try:
+            pane_present = self.target_exists()
+        except subprocess.TimeoutExpired as error:
+            raise TmuxControlUnavailable(
+                operation="list-panes",
+                error=error,
+                elapsed_sec=float(getattr(error, "timeout", 0.0) or 0.0),
+                attempts=1,
+            ) from error
+        if not pane_present:
+            return False, False
+        if not session_present:
+            # Pane ids can be reused after a tmux server restart. Presence alone
+            # must never override a session identity mismatch or authorize
+            # interaction with a foreign pane.
+            if not self._pane_matches_worker_identity():
+                return False, False
+        # A matching owned pane is stronger evidence than a contradictory raw
+        # session miss and prevents a transient has-session probe from producing
+        # DEAD without weakening identity safety.
+        return True, True
+
     def _capture_pane_snapshot(self, *, tail_lines: int) -> tuple[bool, str, str, str, str, bool]:
-        session_exists = self.session_exists()
-        if not session_exists or not self.pane_id:
+        session_exists, target_exists = self._probe_session_and_pane_presence()
+        if not session_exists or not target_exists:
             return False, "", "", "", "", False
         try:
+            visible_text = clean_ansi(self.capture_visible(tail_lines))
+        except subprocess.TimeoutExpired as error:
+            raise TmuxControlUnavailable(
+                operation="capture-pane",
+                error=error,
+                elapsed_sec=float(getattr(error, "timeout", 0.0) or 0.0),
+                attempts=1,
+            ) from error
+        except subprocess.CalledProcessError:
             if not self.target_exists():
                 return False, "", "", "", "", False
-            visible_text = clean_ansi(self.capture_visible(tail_lines))
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-            return False, "", "", "", "", False
+            raise
         def _display_fallback(getter: Callable[[], str], previous: str = "") -> str:
             try:
                 value = getter()
@@ -3462,13 +4246,8 @@ class TmuxBatchWorker:
         return True, visible_text, current_command, current_path, pane_title, pane_dead
 
     def _capture_pane_liveness_snapshot(self) -> tuple[bool, str, str, str, bool]:
-        session_exists = self.session_exists()
-        if not session_exists or not self.pane_id:
-            return False, "", "", "", False
-        try:
-            if not self.target_exists():
-                return False, "", "", "", False
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        session_exists, target_exists = self._probe_session_and_pane_presence()
+        if not session_exists or not target_exists:
             return False, "", "", "", False
 
         def _display_fallback(getter: Callable[[], str], previous: str = "") -> str:
@@ -3494,6 +4273,7 @@ class TmuxBatchWorker:
         self.current_command = current_command or self.current_command
         self.current_path = current_path or self.current_path
         self.last_heartbeat_at = observed_at
+        control_state = self._tmux_control_state_payload()
         return WorkerObservation(
             visible_text="",
             raw_log_delta="",
@@ -3505,6 +4285,9 @@ class TmuxBatchWorker:
             session_exists=session_exists,
             log_mtime=0.0,
             observed_at=observed_at,
+            tmux_control_status=str(control_state.get("tmux_control_status", "available") or "available"),
+            tmux_control_error=str(control_state.get("tmux_control_error", "") or ""),
+            tmux_control_unavailable_since=str(control_state.get("tmux_control_unavailable_since", "") or ""),
         )
 
     def _capture_visible_observation_without_raw_log(self, *, tail_lines: int = DEFAULT_CAPTURE_TAIL_LINES) -> WorkerObservation:
@@ -3518,6 +4301,7 @@ class TmuxBatchWorker:
         self.last_heartbeat_at = observed_at
         terminal_surface = "\n".join(part for part in [pane_title, visible_text] if part)
         self._update_terminal_activity(terminal_surface, observed_at=observed_at)
+        control_state = self._tmux_control_state_payload()
         return WorkerObservation(
             visible_text=visible_text,
             raw_log_delta="",
@@ -3529,6 +4313,9 @@ class TmuxBatchWorker:
             session_exists=session_exists,
             log_mtime=0.0,
             observed_at=observed_at,
+            tmux_control_status=str(control_state.get("tmux_control_status", "available") or "available"),
+            tmux_control_error=str(control_state.get("tmux_control_error", "") or ""),
+            tmux_control_unavailable_since=str(control_state.get("tmux_control_unavailable_since", "") or ""),
         )
 
     def _build_shell_bootstrap_command(self) -> str:
@@ -3689,7 +4476,13 @@ class TmuxBatchWorker:
         max_retries = SESSION_NAME_CREATE_MAX_RETRIES
         while True:
             raise_if_runtime_shutdown_requested("creating tmux session")
-            if self.session_exists():
+            raw_has_session = getattr(self.backend, "has_session", None)
+            session_name_in_use = (
+                bool(raw_has_session(self.session_name))
+                if callable(raw_has_session)
+                else self.session_exists()
+            )
+            if session_name_in_use:
                 if retry_count >= max_retries:
                     self._release_session_name_reservation()
                     self._raise_session_name_conflict(retries=retry_count, conflict_source="pre-check")
@@ -3715,6 +4508,9 @@ class TmuxBatchWorker:
                 self._abort_session_create_if_runtime_shutdown_requested("creating tmux session")
                 break
             except Exception as error:
+                if isinstance(error, TmuxMutationOutcomeUnknown):
+                    self._release_session_name_reservation()
+                    raise
                 if not self._is_session_name_conflict_error(error):
                     self._release_session_name_reservation()
                     raise
@@ -3774,6 +4570,7 @@ class TmuxBatchWorker:
         self.last_heartbeat_at = observed_at
         terminal_surface = "\n".join(part for part in [pane_title, visible_text or clean_ansi(raw_log_tail)] if part)
         self._update_terminal_activity(terminal_surface, observed_at=observed_at)
+        control_state = self._tmux_control_state_payload()
         observation = WorkerObservation(
             visible_text=visible_text,
             raw_log_delta=clean_ansi(raw_log_delta),
@@ -3785,6 +4582,9 @@ class TmuxBatchWorker:
             session_exists=session_exists,
             log_mtime=log_mtime,
             observed_at=observed_at,
+            tmux_control_status=str(control_state.get("tmux_control_status", "available") or "available"),
+            tmux_control_error=str(control_state.get("tmux_control_error", "") or ""),
+            tmux_control_unavailable_since=str(control_state.get("tmux_control_unavailable_since", "") or ""),
         )
         self.agent_state = self.get_agent_state(observation)
         self.wrapper_state = self._infer_wrapper_state(
@@ -3841,6 +4641,10 @@ class TmuxBatchWorker:
                 "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
                 "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "")),
                 "dispatch_reason": self.dispatch_reason or str(previous.get("dispatch_reason", "")),
+                "turn_state": TurnState.IDLE.value,
+                "stage_runner_id": self.stage_runner_id or str(previous.get("stage_runner_id", "") or ""),
+                "orphaned_at": "",
+                "orphaned_reason": "",
                 "startup_blocker_kind": self.startup_blocker_kind or str(previous.get("startup_blocker_kind", "")),
                 "startup_blocker_requires_manual": (
                     self.startup_blocker_requires_manual
@@ -3851,6 +4655,24 @@ class TmuxBatchWorker:
                 "terminal_recently_changed": self.terminal_recently_changed,
             }
             payload.update(self._runtime_metadata)
+            previous_runner_id = str(previous.get("stage_runner_id", "") or "").strip()
+            incoming_runner_id = str(payload.get("stage_runner_id", "") or "").strip()
+            preserve_orphan = (
+                str(previous.get("turn_state", "") or "").strip().lower() == TurnState.ORPHANED.value
+                and incoming_runner_id == previous_runner_id
+            )
+            if preserve_orphan:
+                payload["turn_state"] = TurnState.ORPHANED.value
+                for field_name in ("orphaned_at", "orphaned_reason", "orphaned_stage_action"):
+                    payload[field_name] = previous.get(field_name, "")
+                self.turn_state = TurnState.ORPHANED
+                self.orphaned_at = str(previous.get("orphaned_at", "") or "").strip()
+                self.orphaned_reason = str(previous.get("orphaned_reason", "") or "").strip()
+            else:
+                self.turn_state = TurnState.IDLE
+                self.orphaned_at = ""
+                self.orphaned_reason = ""
+            payload.update(self._tmux_control_state_payload())
             _atomic_write_json(self.state_path, payload)
         self._log_event("state_changed", status=WorkerStatus.READY.value, note="session_created")
         _notify_runtime_state_changed_best_effort()
@@ -3858,24 +4680,58 @@ class TmuxBatchWorker:
     def _write_state(self, status: WorkerStatus, *, note: str, extra: dict[str, object] | None = None) -> None:
         with self.state_lock:
             previous = self.read_state()
-            agent_alive = self.is_agent_alive()
-            agent_state = self.get_agent_state().value
             extra_payload = dict(extra or {})
+            if "agent_alive" in extra_payload:
+                agent_alive = bool(extra_payload.get("agent_alive"))
+            else:
+                try:
+                    agent_alive = self.is_agent_alive()
+                except TmuxControlUnavailable:
+                    agent_alive = bool(previous.get("agent_alive", self.agent_state != AgentRuntimeState.DEAD))
+            if "agent_state" in extra_payload:
+                agent_state = str(
+                    extra_payload.get("agent_state", previous.get("agent_state", self.agent_state.value))
+                    or previous.get("agent_state", self.agent_state.value)
+                    or self.agent_state.value
+                )
+            else:
+                try:
+                    agent_state = self.get_agent_state().value
+                except TmuxControlUnavailable:
+                    agent_state = str(previous.get("agent_state", self.agent_state.value) or self.agent_state.value)
             result_status = str(previous.get("result_status", "pending"))
             current_task_runtime_status = self.current_task_runtime_status or str(previous.get("current_task_runtime_status", ""))
             effective_result_status = str(extra_payload.get("result_status", result_status) or "").strip().lower()
-            effective_runtime_status = str(
-                extra_payload.get("current_task_runtime_status", current_task_runtime_status) or ""
+            completed_success = status == WorkerStatus.SUCCEEDED or (
+                status != WorkerStatus.FAILED
+                and effective_result_status == WorkerStatus.SUCCEEDED.value
+            )
+            requested_turn_state = str(
+                extra_payload.get("turn_state", self.turn_state.value if isinstance(self.turn_state, TurnState) else self.turn_state)
+                or previous.get("turn_state", TurnState.IDLE.value)
             ).strip().lower()
-            completed_success = status == WorkerStatus.SUCCEEDED or effective_result_status in COMPLETED_WORKER_RESULT_STATUSES
-            completed_runtime = effective_runtime_status == TASK_STATUS_DONE
-            if status == WorkerStatus.READY and agent_state == AgentRuntimeState.READY.value:
+            prospective_state = dict(previous)
+            prospective_state.update(extra_payload)
+            prospective_state.update(
+                {
+                    "turn_state": requested_turn_state,
+                    "current_task_runtime_status": current_task_runtime_status,
+                    "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "")),
+                }
+            )
+            unresolved_turn = worker_state_has_unresolved_turn(prospective_state)
+            if status == WorkerStatus.READY and agent_state == AgentRuntimeState.READY.value and not unresolved_turn:
                 if "result_status" not in extra_payload and result_status in {"running", "pending"}:
                     result_status = WorkerStatus.READY.value
                 if "current_task_runtime_status" not in extra_payload and current_task_runtime_status == TASK_STATUS_RUNNING:
                     current_task_runtime_status = ""
                     self.current_task_runtime_status = ""
-            if completed_success:
+            if status == WorkerStatus.FAILED and requested_turn_state != TurnState.ORPHANED.value:
+                requested_turn_state = TurnState.FAILED.value
+                self.turn_state = TurnState.FAILED
+            elif completed_success:
+                requested_turn_state = TurnState.SUCCEEDED.value
+                self.turn_state = TurnState.SUCCEEDED
                 result_status = str(extra_payload.get("result_status", WorkerStatus.SUCCEEDED.value) or WorkerStatus.SUCCEEDED.value)
                 current_task_runtime_status = str(
                     extra_payload.get("current_task_runtime_status", current_task_runtime_status) or ""
@@ -3883,10 +4739,7 @@ class TmuxBatchWorker:
                 if not current_task_runtime_status or current_task_runtime_status == TASK_STATUS_RUNNING:
                     current_task_runtime_status = TASK_STATUS_DONE
                 self.current_task_runtime_status = current_task_runtime_status
-            elif completed_runtime:
-                current_task_runtime_status = TASK_STATUS_DONE
-                self.current_task_runtime_status = TASK_STATUS_DONE
-            if completed_success or completed_runtime:
+            if completed_success:
                 agent_state = AgentRuntimeState.READY.value
                 self.agent_state = AgentRuntimeState.READY
                 self.agent_ready = True
@@ -3940,6 +4793,10 @@ class TmuxBatchWorker:
                 "current_task_runtime_status": current_task_runtime_status,
                 "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "")),
                 "dispatch_reason": self.dispatch_reason or str(previous.get("dispatch_reason", "")),
+                "turn_state": requested_turn_state or TurnState.IDLE.value,
+                "stage_runner_id": self.stage_runner_id or str(previous.get("stage_runner_id", "") or ""),
+                "orphaned_at": self.orphaned_at or str(previous.get("orphaned_at", "") or ""),
+                "orphaned_reason": self.orphaned_reason or str(previous.get("orphaned_reason", "") or ""),
                 "startup_blocker_kind": self.startup_blocker_kind or str(previous.get("startup_blocker_kind", "")),
                 "startup_blocker_requires_manual": (
                     self.startup_blocker_requires_manual
@@ -3965,6 +4822,35 @@ class TmuxBatchWorker:
             payload.update(self._runtime_metadata)
             if extra_payload:
                 payload.update(extra_payload)
+            payload["turn_state"] = requested_turn_state or TurnState.IDLE.value
+            previous_runner_id = str(previous.get("stage_runner_id", "") or "").strip()
+            incoming_runner_id = str(payload.get("stage_runner_id", "") or "").strip()
+            starts_new_runner_generation = bool(
+                previous_runner_id
+                and incoming_runner_id
+                and incoming_runner_id != previous_runner_id
+            )
+            if (
+                    starts_new_runner_generation
+                    and str(previous.get("turn_state", "") or "").strip().lower() == TurnState.ORPHANED.value
+            ):
+                payload["orphaned_at"] = ""
+                payload["orphaned_reason"] = ""
+                payload["orphaned_stage_action"] = ""
+                self.orphaned_at = ""
+                self.orphaned_reason = ""
+            preserve_orphan = (
+                str(previous.get("turn_state", "") or "").strip().lower() == TurnState.ORPHANED.value
+                and incoming_runner_id == previous_runner_id
+            )
+            if preserve_orphan:
+                payload["turn_state"] = TurnState.ORPHANED.value
+                for field_name in ("orphaned_at", "orphaned_reason", "orphaned_stage_action"):
+                    payload[field_name] = previous.get(field_name, "")
+                self.turn_state = TurnState.ORPHANED
+                self.orphaned_at = str(previous.get("orphaned_at", "") or "").strip()
+                self.orphaned_reason = str(previous.get("orphaned_reason", "") or "").strip()
+            payload.update(self._tmux_control_state_payload())
             _atomic_write_json(self.state_path, payload)
         self._log_event("state_changed", status=status.value, note=note)
         _notify_runtime_state_changed_best_effort()
@@ -4052,7 +4938,9 @@ class TmuxBatchWorker:
                 session_name=self.session_name,
             )
         observed_agent_state = self.get_agent_state(passive_observation)
-        if (
+        if pane_dead:
+            agent_state = AgentRuntimeState.DEAD
+        elif (
                 self.current_task_runtime_status == TASK_STATUS_RUNNING
                 and self.dispatch_state == "submitted"
                 and self.agent_started
@@ -4062,14 +4950,8 @@ class TmuxBatchWorker:
             agent_state = AgentRuntimeState.BUSY
         else:
             agent_state = observed_agent_state
-        if self.current_task_runtime_status == TASK_STATUS_DONE:
+        if self.current_task_runtime_status == TASK_STATUS_DONE and agent_state != AgentRuntimeState.DEAD:
             agent_state = AgentRuntimeState.READY
-        if agent_state == AgentRuntimeState.READY:
-            if self.current_task_runtime_status == TASK_STATUS_RUNNING:
-                self.current_task_runtime_status = ""
-            if self.dispatch_state == "submitted":
-                self.dispatch_state = ""
-                self.dispatch_reason = ""
         self.agent_state = agent_state
         if agent_state in {AgentRuntimeState.READY, AgentRuntimeState.BUSY}:
             self.agent_started = True
@@ -4122,6 +5004,7 @@ class TmuxBatchWorker:
             clear_stale_runtime_markers = (
                 snapshot.agent_state == AgentRuntimeState.READY.value
                 and not previous_completed
+                and not worker_state_has_unresolved_turn(previous)
                 and (
                     str(previous.get("current_task_runtime_status", "")) == TASK_STATUS_RUNNING
                     or str(previous.get("dispatch_state", "")) == "submitted"
@@ -4181,7 +5064,11 @@ class TmuxBatchWorker:
                         payload["result_status"] = WorkerStatus.READY.value
                     if str(payload.get("status", "")) in {"running", "pending"}:
                         payload["status"] = WorkerStatus.READY.value
-                if previous_completed:
+                if (
+                        previous_completed
+                        and snapshot.agent_state != AgentRuntimeState.DEAD.value
+                        and snapshot.health_status not in {"missing_session", "pane_dead"}
+                ):
                     payload["agent_ready"] = True
                     payload["agent_started"] = True
                     payload["agent_state"] = AgentRuntimeState.READY.value
@@ -4248,10 +5135,15 @@ class TmuxBatchWorker:
                        extra: dict[str, object] | None = None) -> None:
         extra_payload = dict(extra or {})
         if status == WorkerStatus.SUCCEEDED:
+            self.turn_state = TurnState.SUCCEEDED
             self.dispatch_state = ""
             self.dispatch_reason = ""
             extra_payload.setdefault("dispatch_state", "")
             extra_payload.setdefault("dispatch_reason", "")
+            extra_payload.setdefault("turn_state", TurnState.SUCCEEDED.value)
+        elif status == WorkerStatus.FAILED:
+            self.turn_state = TurnState.FAILED
+            extra_payload.setdefault("turn_state", TurnState.FAILED.value)
         self.results.append(result)
         self._write_state(status, note=note, extra=extra_payload)
         self._append_transcript(f"{result.label} / output", f"```text\n{result.clean_output}\n```")
@@ -4409,14 +5301,15 @@ class TmuxBatchWorker:
             *,
             prompt: str,
             timeout_sec: float,
+            allow_extra_enter: bool = True,
     ) -> WorkerObservation:
-        deadline = time.monotonic() + timeout_sec
+        deadline = self._business_monotonic() + timeout_sec
         extra_enter_sent = False
-        submit_started_at = time.monotonic()
+        submit_started_at = self._business_monotonic()
         submission_observed = False
         initial_state = self.agent_state
 
-        while time.monotonic() < deadline:
+        while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for prompt submission")
             observation = self.observe(tail_lines=320)
             if not observation.session_exists:
@@ -4465,8 +5358,9 @@ class TmuxBatchWorker:
 
             if (
                     not submission_observed
+                    and allow_extra_enter
                     and not extra_enter_sent
-                    and time.monotonic() - submit_started_at >= 3.0
+                    and self._business_monotonic() - submit_started_at >= 3.0
                     and current_state in {AgentRuntimeState.READY, AgentRuntimeState.STARTING}
             ):
                 self.send_special_key("Enter")
@@ -4484,19 +5378,19 @@ class TmuxBatchWorker:
             task_status_path: Path | None = None,
             timeout_sec: float,
     ) -> TurnFileResult:
-        deadline = time.monotonic() + timeout_sec
+        deadline = self._business_monotonic() + timeout_sec
         stable_signature: tuple[object, ...] | None = None
         stable_since_monotonic = 0.0
         invalid_signature: tuple[object, ...] | None = None
         invalid_since_monotonic = 0.0
         status_done_seen = task_status_path is None
-        post_done_since_monotonic = time.monotonic() if status_done_seen else 0.0
+        post_done_since_monotonic = self._business_monotonic() if status_done_seen else 0.0
         post_done_grace_sec = max(float(contract.quiet_window_sec), TURN_ARTIFACT_POST_DONE_GRACE_SEC)
         last_probe_monotonic = 0.0
         last_validation_error: Exception | None = None
         last_file_wait_observation: WorkerObservation | None = None
 
-        while time.monotonic() < deadline:
+        while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for turn artifacts")
             previous_done_seen = status_done_seen
             status_done_seen = self._track_task_completion_signal(
@@ -4504,7 +5398,7 @@ class TmuxBatchWorker:
                 status_done_seen=status_done_seen,
             )
             if status_done_seen and not previous_done_seen and not post_done_since_monotonic:
-                post_done_since_monotonic = time.monotonic()
+                post_done_since_monotonic = self._business_monotonic()
 
             try:
                 file_result = contract.validator(contract.status_path)
@@ -4530,13 +5424,13 @@ class TmuxBatchWorker:
                 )
                 if current_invalid_signature == invalid_signature:
                     invalid_elapsed = (
-                        time.monotonic() - invalid_since_monotonic
+                        self._business_monotonic() - invalid_since_monotonic
                         if invalid_since_monotonic
                         else 0.0
                     )
                 else:
                     invalid_signature = current_invalid_signature
-                    invalid_since_monotonic = time.monotonic()
+                    invalid_since_monotonic = self._business_monotonic()
                     invalid_elapsed = 0.0
                 if status_done_seen:
                     if invalid_elapsed >= max(post_done_grace_sec, 0.0):
@@ -4593,10 +5487,10 @@ class TmuxBatchWorker:
                 tuple(sorted(file_result.artifact_hashes.items())),
             )
             if signature == stable_signature:
-                stable_elapsed = time.monotonic() - stable_since_monotonic if stable_since_monotonic else 0.0
+                stable_elapsed = self._business_monotonic() - stable_since_monotonic if stable_since_monotonic else 0.0
             else:
                 stable_signature = signature
-                stable_since_monotonic = time.monotonic()
+                stable_since_monotonic = self._business_monotonic()
                 stable_elapsed = 0.0
 
             if stable_elapsed >= max(float(contract.quiet_window_sec), 0.0):
@@ -4619,7 +5513,7 @@ class TmuxBatchWorker:
                     )
                     return file_result
                 observation = self._probe_agent_liveness_for_file_wait()
-                last_probe_monotonic = time.monotonic()
+                last_probe_monotonic = self._business_monotonic()
                 if not observation.session_exists:
                     raise RuntimeError("tmux pane exited while waiting for turn artifacts")
                 if observation.pane_dead:
@@ -4687,7 +5581,7 @@ class TmuxBatchWorker:
                             f"agent exited back to shell while waiting for turn artifacts:\n{self._diagnostic_visible_tail(160)}"
                         )
                     post_done_elapsed = (
-                        time.monotonic() - post_done_since_monotonic
+                        self._business_monotonic() - post_done_since_monotonic
                         if post_done_since_monotonic
                         else 0.0
                     )
@@ -4842,6 +5736,55 @@ class TmuxBatchWorker:
             )
         except Exception:
             return None
+
+    def _completed_contract_proves_unknown_submission(
+            self,
+            *,
+            completion_contract: TurnFileContract | None,
+            result_contract: TaskResultContract | None,
+            task_status_path: Path,
+            result_path: Path,
+    ) -> bool:
+        if completion_contract is not None:
+            return self._try_finalize_turn_artifacts_after_timeout(
+                contract=completion_contract,
+                task_status_path=task_status_path,
+                prompt_submission_observed=True,
+            ) is not None
+        if result_contract is None:
+            return False
+        try:
+            first_result = self._validate_task_result_file(contract=result_contract, result_path=result_path)
+            first_stat = result_path.stat()
+            first_signature = (
+                first_stat.st_size,
+                first_stat.st_mtime_ns,
+                str(first_result.payload.get("status", "")),
+                tuple(sorted(first_result.artifact_hashes.items())),
+            )
+            time.sleep(FILE_CONTRACT_POLL_INTERVAL_SEC)
+            second_result = self._validate_task_result_file(contract=result_contract, result_path=result_path)
+            second_stat = result_path.stat()
+            second_signature = (
+                second_stat.st_size,
+                second_stat.st_mtime_ns,
+                str(second_result.payload.get("status", "")),
+                tuple(sorted(second_result.artifact_hashes.items())),
+            )
+        except Exception:
+            return False
+        if first_signature != second_signature:
+            return False
+        write_task_status(task_status_path, status=TASK_STATUS_DONE)
+        self.current_task_runtime_status = TASK_STATUS_DONE
+        self._log_event(
+            "task_result_proves_prompt_submission",
+            turn_id=result_contract.turn_id,
+            phase=result_contract.phase,
+            result_path=str(result_path),
+            status=str(second_result.payload.get("status", "")),
+        )
+        return True
 
     def _try_finalize_task_result_from_ready_agent_after_busy_timeout(
             self,
@@ -5249,7 +6192,20 @@ class TmuxBatchWorker:
         self._log_event("prompt_submission_busy_probe_exhausted")
         return False
 
-    def _turn_failure_runtime_state_extra(self, clean_output: str) -> dict[str, object]:
+    def _turn_failure_runtime_state_extra(
+            self,
+            clean_output: str,
+            *,
+            error: BaseException | None = None,
+    ) -> dict[str, object]:
+        if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+            previous = self.read_state()
+            return {
+                "agent_alive": bool(previous.get("agent_alive", self.agent_state != AgentRuntimeState.DEAD)),
+                "agent_ready": self.agent_state == AgentRuntimeState.READY,
+                "agent_state": str(previous.get("agent_state", self.agent_state.value) or self.agent_state.value),
+                **self._tmux_control_state_payload(),
+            }
         if is_provider_runtime_error(clean_output):
             self.agent_ready = False
             self.agent_state = AgentRuntimeState.STARTING
@@ -5372,14 +6328,14 @@ class TmuxBatchWorker:
             prompt: str,
             baseline_observation: WorkerObservation,
     ) -> TaskResultFile:
-        deadline = time.monotonic() + timeout_sec
+        deadline = self._business_monotonic() + timeout_sec
         baseline_signature = self._observation_terminal_signature(baseline_observation)
         saw_busy_after_submit = False
         saw_submission_evidence = False
         ready_hits = 0
         status_done_seen = task_status_path is None
 
-        while time.monotonic() < deadline:
+        while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for ready task result")
             status_done_seen = self._track_task_completion_signal(
                 task_status_path=task_status_path,
@@ -5500,7 +6456,7 @@ class TmuxBatchWorker:
             baseline_visible: str = "",
             baseline_raw_log_tail: str = "",
     ) -> TaskResultFile:
-        deadline = time.monotonic() + timeout_sec
+        deadline = self._business_monotonic() + timeout_sec
         stable_signature: tuple[object, ...] | None = None
         stable_hits = 0
         missing_contract_signature: tuple[object, ...] | None = None
@@ -5510,11 +6466,11 @@ class TmuxBatchWorker:
         ready_missing_signature: tuple[object, ...] | None = None
         ready_missing_since_monotonic = 0.0
         status_done_seen = task_status_path is None
-        post_done_since_monotonic = time.monotonic() if status_done_seen else 0.0
+        post_done_since_monotonic = self._business_monotonic() if status_done_seen else 0.0
         post_done_grace_sec = TASK_RESULT_POST_DONE_GRACE_SEC
         last_probe_monotonic = 0.0
 
-        while time.monotonic() < deadline:
+        while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for task result")
             previous_done_seen = status_done_seen
             status_done_seen = self._track_task_completion_signal(
@@ -5522,7 +6478,7 @@ class TmuxBatchWorker:
                 status_done_seen=status_done_seen,
             )
             if status_done_seen and not previous_done_seen and not post_done_since_monotonic:
-                post_done_since_monotonic = time.monotonic()
+                post_done_since_monotonic = self._business_monotonic()
 
             try:
                 result_file = self._validate_task_result_file(
@@ -5577,13 +6533,13 @@ class TmuxBatchWorker:
                     )
                     if current_invalid_signature == invalid_signature:
                         invalid_elapsed = (
-                            time.monotonic() - invalid_since_monotonic
+                            self._business_monotonic() - invalid_since_monotonic
                             if invalid_since_monotonic
                             else 0.0
                         )
                     else:
                         invalid_signature = current_invalid_signature
-                        invalid_since_monotonic = time.monotonic()
+                        invalid_since_monotonic = self._business_monotonic()
                         invalid_elapsed = 0.0
                     if invalid_elapsed >= max(post_done_grace_sec, 0.0):
                         raise RuntimeError(
@@ -5711,13 +6667,13 @@ class TmuxBatchWorker:
                         )
                         if current_ready_missing_signature == ready_missing_signature:
                             ready_missing_elapsed = (
-                                time.monotonic() - ready_missing_since_monotonic
+                                self._business_monotonic() - ready_missing_since_monotonic
                                 if ready_missing_since_monotonic
                                 else 0.0
                             )
                         else:
                             ready_missing_signature = current_ready_missing_signature
-                            ready_missing_since_monotonic = time.monotonic()
+                            ready_missing_since_monotonic = self._business_monotonic()
                             ready_missing_elapsed = 0.0
                         if ready_missing_elapsed >= TASK_RESULT_READY_MISSING_GRACE_SEC:
                             raise RuntimeError(
@@ -5780,7 +6736,7 @@ class TmuxBatchWorker:
                     )
                     return result_file
                 observation = self._probe_agent_liveness_for_file_wait()
-                last_probe_monotonic = time.monotonic()
+                last_probe_monotonic = self._business_monotonic()
                 if not observation.session_exists:
                     raise RuntimeError("tmux pane exited while waiting for task result")
                 if observation.pane_dead:
@@ -5826,7 +6782,7 @@ class TmuxBatchWorker:
                             f"agent exited back to shell while waiting for task result:\n{self._diagnostic_visible_tail(160)}"
                         )
                     post_done_elapsed = (
-                        time.monotonic() - post_done_since_monotonic
+                        self._business_monotonic() - post_done_since_monotonic
                         if post_done_since_monotonic
                         else 0.0
                     )
@@ -5863,12 +6819,12 @@ class TmuxBatchWorker:
         )
 
     def _wait_for_shell_ready(self, timeout_sec: float = 12.0) -> None:
-        deadline = time.monotonic() + timeout_sec
+        deadline = self._business_monotonic() + timeout_sec
         shell_context_stable_count = 0
         last_current_command = ""
         last_current_path = ""
         last_prompt_detected = False
-        while time.monotonic() < deadline:
+        while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for prompt output stability")
             observation = self.observe(tail_lines=120)
             if not observation.session_exists:
@@ -5920,11 +6876,11 @@ class TmuxBatchWorker:
     def _boot_action_allowed(self, action_signature: str, cooldown_sec: float = 3.0) -> bool:
         if (
             action_signature == self._last_boot_action_signature
-            and time.monotonic() - self._last_boot_action_at < cooldown_sec
+            and self._business_monotonic() - self._last_boot_action_at < cooldown_sec
         ):
             return False
         self._last_boot_action_signature = action_signature
-        self._last_boot_action_at = time.monotonic()
+        self._last_boot_action_at = self._business_monotonic()
         return True
 
     def _maybe_handle_codex_boot_prompt(self, visible_text: str) -> bool:
@@ -6111,7 +7067,7 @@ class TmuxBatchWorker:
             status_done_seen: bool,
             force: bool = False,
     ) -> tuple[WorkerObservation | None, float]:
-        now = time.monotonic()
+        now = self._business_monotonic()
         interval = POST_DONE_AGENT_PROBE_INTERVAL_SEC if status_done_seen else ACTIVE_AGENT_PROBE_INTERVAL_SEC
         if type(self).observe is not TmuxBatchWorker.observe:
             force = True
@@ -6139,7 +7095,7 @@ class TmuxBatchWorker:
         if self.terminal_recently_changed:
             return 0.0
         if self._last_terminal_change_monotonic:
-            return max(0.0, time.monotonic() - self._last_terminal_change_monotonic)
+            return max(0.0, self._business_monotonic() - self._last_terminal_change_monotonic)
         last_changed_at = str(self.last_terminal_changed_at or "").strip()
         if not last_changed_at:
             return 0.0
@@ -6196,7 +7152,7 @@ class TmuxBatchWorker:
         self._last_terminal_change_monotonic = 0.0
 
     def _update_terminal_activity(self, terminal_text: str, *, observed_at: str) -> None:
-        now = time.monotonic()
+        now = self._business_monotonic()
         signature = self._build_terminal_signature(terminal_text)
         if signature != self.last_terminal_signature:
             self.last_terminal_signature = signature
@@ -6618,6 +7574,17 @@ class TmuxBatchWorker:
         self.current_path = observation.current_path or self.current_path
         self.last_heartbeat_at = observation.observed_at or self.last_heartbeat_at
         previous = self.read_state()
+        unresolved_turn = worker_state_has_unresolved_turn(
+            {
+                **previous,
+                "turn_state": self.turn_state.value,
+                "current_task_runtime_status": (
+                    self.current_task_runtime_status
+                    or str(previous.get("current_task_runtime_status", "") or "")
+                ),
+                "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "") or ""),
+            }
+        )
         extra: dict[str, object] = {
             "agent_alive": self.is_agent_alive(observation),
             "agent_ready": True,
@@ -6630,12 +7597,12 @@ class TmuxBatchWorker:
             "startup_blocker_requires_manual": False,
         }
         result_status = str(previous.get("result_status", "pending") or "").strip().lower()
-        if result_status in {"", "running", "pending"}:
+        if not unresolved_turn and result_status in {"", "running", "pending"}:
             extra["result_status"] = WorkerStatus.READY.value
         current_task_runtime_status = self.current_task_runtime_status or str(
             previous.get("current_task_runtime_status", "")
         )
-        if current_task_runtime_status == TASK_STATUS_RUNNING:
+        if current_task_runtime_status == TASK_STATUS_RUNNING and not unresolved_turn:
             self.current_task_runtime_status = ""
             extra["current_task_runtime_status"] = ""
         self._write_state(
@@ -6654,6 +7621,7 @@ class TmuxBatchWorker:
             attempt: int,
             completion_contract: TurnFileContract | None,
     ) -> None:
+        self.turn_state = TurnState.SUBMITTED
         self.dispatch_state = "submitted"
         self.dispatch_reason = ""
         self.agent_ready = False
@@ -6681,18 +7649,32 @@ class TmuxBatchWorker:
                 "current_task_runtime_status": TASK_STATUS_RUNNING,
                 "dispatch_state": self.dispatch_state,
                 "dispatch_reason": self.dispatch_reason,
+                "turn_state": TurnState.SUBMITTED.value,
                 "result_status": "running",
                 "retry_count": attempt - 1,
             },
         )
 
+    def _mark_turn_waiting_result(self, *, label: str) -> None:
+        self.turn_state = TurnState.WAITING_RESULT
+        self._write_state(
+            WorkerStatus.RUNNING,
+            note=f"waiting_result:{label}",
+            extra={
+                "turn_state": TurnState.WAITING_RESULT.value,
+                "dispatch_state": self.dispatch_state or "submitted",
+                "current_task_runtime_status": TASK_STATUS_RUNNING,
+                "result_status": "running",
+            },
+        )
+
     def _wait_for_agent_ready(self, timeout_sec: float = 60.0) -> None:
-        deadline = time.monotonic() + timeout_sec
+        deadline = self._business_monotonic() + timeout_sec
         previous_ready_signature = ""
         stable_count = 0
         shell_after_ready_since = 0.0
         last_deveco_blocker = ""
-        while time.monotonic() < deadline:
+        while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for agent ready")
             observation = self.observe(tail_lines=220)
             if not observation.session_exists:
@@ -6753,7 +7735,7 @@ class TmuxBatchWorker:
                 shell_after_ready_since = 0.0
             elif current_command in SHELL_COMMANDS and previous_ready_signature:
                 if self.config.vendor == Vendor.CODEX:
-                    now = time.monotonic()
+                    now = self._business_monotonic()
                     if not shell_after_ready_since:
                         shell_after_ready_since = now
                     if now - shell_after_ready_since < CODEX_TRANSIENT_SHELL_START_GRACE_SEC:
@@ -7046,7 +8028,7 @@ class TmuxBatchWorker:
                 error=str(error),
             )
             current_error = error
-        turn_start_deadline = time.monotonic() + max(float(timeout_sec), 0.0)
+        turn_start_deadline = self._business_monotonic() + max(float(timeout_sec), 0.0)
         while True:
             raise_if_runtime_shutdown_requested("waiting for busy agent before turn start")
             if self._confirm_busy_agent_for_turn_start_ready_wait(
@@ -7065,7 +8047,7 @@ class TmuxBatchWorker:
                 stale_reason = "previous_worker_failed"
             if stale_reason and not self._busy_agent_can_continue_waiting_for_turn_start(reason=stale_reason):
                 self._restart_stale_busy_agent_for_turn_start(timeout_sec=timeout_sec, reason=stale_reason)
-            remaining_timeout = turn_start_deadline - time.monotonic()
+            remaining_timeout = turn_start_deadline - self._business_monotonic()
             if remaining_timeout <= 0:
                 raise current_error
             try:
@@ -7334,10 +8316,10 @@ class TmuxBatchWorker:
             task_status_path: Path | None = None,
             timeout_sec: float,
     ) -> str:
-        deadline = time.monotonic() + timeout_sec
+        deadline = self._business_monotonic() + timeout_sec
         resolved_reply = ""
         status_done_seen = task_status_path is None
-        while time.monotonic() < deadline:
+        while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for turn reply")
             observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
             if not observation.session_exists:
@@ -7424,6 +8406,7 @@ class TmuxBatchWorker:
             self.current_task_status_path = str(task_status_path)
             self.current_task_result_path = str(result_path) if result_contract is not None else ""
             self.current_task_runtime_status = TASK_STATUS_RUNNING
+            self.turn_state = TurnState.PREPARING
             self.dispatch_state = "preparing"
             self.dispatch_reason = ""
             prompt_submission_observed = False
@@ -7452,6 +8435,7 @@ class TmuxBatchWorker:
                     "current_task_runtime_status": TASK_STATUS_RUNNING,
                     "dispatch_state": self.dispatch_state,
                     "dispatch_reason": self.dispatch_reason,
+                    "turn_state": TurnState.PREPARING.value,
                     "result_status": "running",
                     "retry_count": attempt - 1,
                 },
@@ -7497,7 +8481,7 @@ class TmuxBatchWorker:
                         if pre_submit_observation_tail_bytes is None
                         else max(int(pre_submit_observation_tail_bytes), 1)
                     )
-                    observe_started_monotonic = time.monotonic()
+                    observe_started_monotonic = self._business_monotonic()
                     self._log_event(
                         "pre_submit_observe_start",
                         label=label,
@@ -7513,7 +8497,7 @@ class TmuxBatchWorker:
                         label=label,
                         tail_lines=observe_tail_lines,
                         tail_bytes=observe_tail_bytes,
-                        elapsed_ms=round((time.monotonic() - observe_started_monotonic) * 1000, 3),
+                        elapsed_ms=round((self._business_monotonic() - observe_started_monotonic) * 1000, 3),
                     )
                     baseline_visible = baseline_observation.visible_text
                     baseline_raw_log_tail = baseline_observation.raw_log_tail
@@ -7534,26 +8518,71 @@ class TmuxBatchWorker:
                         "current_task_runtime_status": TASK_STATUS_RUNNING,
                         "dispatch_state": self.dispatch_state,
                         "dispatch_reason": self.dispatch_reason,
+                        "turn_state": TurnState.PREPARING.value,
                         "retry_count": attempt - 1,
                     },
                 )
                 self._log_event("send_text_start", label=label, size=len(submitted_prompt))
+                unknown_submission_confirmed = False
                 try:
                     self._send_text(submitted_prompt)
-                except subprocess.TimeoutExpired as error:
-                    self.dispatch_state = "delayed"
-                    self.dispatch_reason = f"prompt_dispatch_timeout:{error}"
+                except (TmuxMutationOutcomeUnknown, subprocess.TimeoutExpired) as error:
+                    unknown_error = (
+                        error
+                        if isinstance(error, TmuxMutationOutcomeUnknown)
+                        else TmuxMutationOutcomeUnknown(operation="prompt submission", error=error)
+                    )
+                    self.turn_state = TurnState.SUBMISSION_UNKNOWN
+                    self.dispatch_state = "submission_unknown"
+                    self.dispatch_reason = str(unknown_error)
                     self._write_state(
                         WorkerStatus.RUNNING,
-                        note=f"dispatch_delayed:{label}",
+                        note=f"submission_unknown:{label}",
                         extra={
                             "dispatch_state": self.dispatch_state,
                             "dispatch_reason": self.dispatch_reason,
+                            "turn_state": TurnState.SUBMISSION_UNKNOWN.value,
+                            "current_task_runtime_status": TASK_STATUS_RUNNING,
+                            "result_status": "running",
                         },
                     )
-                    self._log_event("prompt_dispatch_timeout", label=label, timeout_sec=getattr(error, "timeout", 0.0))
-                    raise TimeoutError(str(error)) from error
-                self._log_event("send_text_done", label=label, size=len(submitted_prompt))
+                    self._log_event(
+                        "prompt_submission_unknown",
+                        label=label,
+                        operation=unknown_error.operation,
+                    )
+                    try:
+                        self._wait_for_prompt_submission(
+                            prompt=submitted_prompt,
+                            timeout_sec=min(
+                                timeout_sec,
+                                prompt_submit_timeout_sec if prompt_submit_timeout_sec is not None else 20.0,
+                            ),
+                            allow_extra_enter=False,
+                        )
+                    except Exception as confirmation_error:
+                        contract_proves_submission = self._completed_contract_proves_unknown_submission(
+                            completion_contract=completion_contract,
+                            result_contract=result_contract,
+                            task_status_path=task_status_path,
+                            result_path=result_path,
+                        )
+                        if not contract_proves_submission:
+                            self._log_event(
+                                "prompt_submission_unknown_unresolved",
+                                label=label,
+                                error=str(confirmation_error),
+                            )
+                            raise unknown_error from confirmation_error
+                        self._log_event(
+                            "prompt_submission_unknown_confirmed_by_contract",
+                            label=label,
+                        )
+                    prompt_submission_observed = True
+                    unknown_submission_confirmed = True
+                    self._log_event("prompt_submission_unknown_confirmed", label=label)
+                if not unknown_submission_confirmed:
+                    self._log_event("send_text_done", label=label, size=len(submitted_prompt))
                 self._mark_turn_submitted_busy(
                     label=label,
                     started_at=started_at,
@@ -7562,36 +8591,39 @@ class TmuxBatchWorker:
                     attempt=attempt,
                     completion_contract=completion_contract,
                 )
+                self._mark_turn_waiting_result(label=label)
                 prompt_confirmation_timeout = min(
                     timeout_sec,
                     prompt_submit_timeout_sec if prompt_submit_timeout_sec is not None else 20.0,
                 )
                 if completion_contract is not None:
-                    try:
-                        self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
-                        self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
-                        prompt_submission_observed = True
-                    except PromptSubmissionRejectedError as error:
-                        self._record_prompt_submission_rejected(
-                            label=label,
-                            error=error,
-                            timeout_sec=prompt_confirmation_timeout,
-                        )
-                        raise
-                    except TimeoutError as error:
-                        self.dispatch_state = "delayed"
-                        self.dispatch_reason = f"prompt_confirm_timeout:{error}"
-                        self._write_state(
-                            WorkerStatus.RUNNING,
-                            note=f"dispatch_delayed:{label}",
-                            extra={
-                                "dispatch_state": self.dispatch_state,
-                                "dispatch_reason": self.dispatch_reason,
-                                "dispatch_timeout_sec": prompt_confirmation_timeout,
-                            },
-                        )
-                        self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
-                        prompt_submission_observed = True
+                    if not prompt_submission_observed:
+                        try:
+                            self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
+                            self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
+                            prompt_submission_observed = True
+                        except PromptSubmissionRejectedError as error:
+                            self._record_prompt_submission_rejected(
+                                label=label,
+                                error=error,
+                                timeout_sec=prompt_confirmation_timeout,
+                            )
+                            raise
+                        except TimeoutError as error:
+                            self.dispatch_state = "delayed"
+                            self.dispatch_reason = f"prompt_confirm_timeout:{error}"
+                            self._write_state(
+                                WorkerStatus.RUNNING,
+                                note=f"dispatch_delayed:{label}",
+                                extra={
+                                    "dispatch_state": self.dispatch_state,
+                                    "dispatch_reason": self.dispatch_reason,
+                                    "dispatch_timeout_sec": prompt_confirmation_timeout,
+                                    "turn_state": TurnState.WAITING_RESULT.value,
+                                },
+                            )
+                            self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
+                            prompt_submission_observed = True
                     file_result = self.wait_for_turn_artifacts(
                         contract=completion_contract,
                         task_status_path=task_status_path,
@@ -7619,31 +8651,33 @@ class TmuxBatchWorker:
                             baseline_observation=baseline_observation,
                         )
                     else:
-                        try:
-                            self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
-                            self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
-                            prompt_submission_observed = True
-                        except PromptSubmissionRejectedError as error:
-                            self._record_prompt_submission_rejected(
-                                label=label,
-                                error=error,
-                                timeout_sec=prompt_confirmation_timeout,
-                            )
-                            raise
-                        except TimeoutError as error:
-                            self.dispatch_state = "delayed"
-                            self.dispatch_reason = f"prompt_confirm_timeout:{error}"
-                            self._write_state(
-                                WorkerStatus.RUNNING,
-                                note=f"dispatch_delayed:{label}",
-                                extra={
-                                    "dispatch_state": self.dispatch_state,
-                                    "dispatch_reason": self.dispatch_reason,
-                                    "dispatch_timeout_sec": prompt_confirmation_timeout,
-                                },
-                            )
-                            self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
-                            prompt_submission_observed = True
+                        if not prompt_submission_observed:
+                            try:
+                                self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
+                                self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
+                                prompt_submission_observed = True
+                            except PromptSubmissionRejectedError as error:
+                                self._record_prompt_submission_rejected(
+                                    label=label,
+                                    error=error,
+                                    timeout_sec=prompt_confirmation_timeout,
+                                )
+                                raise
+                            except TimeoutError as error:
+                                self.dispatch_state = "delayed"
+                                self.dispatch_reason = f"prompt_confirm_timeout:{error}"
+                                self._write_state(
+                                    WorkerStatus.RUNNING,
+                                    note=f"dispatch_delayed:{label}",
+                                    extra={
+                                        "dispatch_state": self.dispatch_state,
+                                        "dispatch_reason": self.dispatch_reason,
+                                        "dispatch_timeout_sec": prompt_confirmation_timeout,
+                                        "turn_state": TurnState.WAITING_RESULT.value,
+                                    },
+                                )
+                                self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
+                                prompt_submission_observed = True
                         task_result = self.wait_for_task_result(
                             contract=result_contract,
                             task_status_path=task_status_path,
@@ -7886,8 +8920,6 @@ class TmuxBatchWorker:
                 self.agent_ready = False
                 self.agent_state = AgentRuntimeState.STARTING
                 self.current_task_runtime_status = read_task_status(task_status_path)
-                if self.current_task_runtime_status == TASK_STATUS_RUNNING:
-                    self.current_task_runtime_status = ""
                 if attempt < 2 and not is_task_result_contract_error(error):
                     self._log_event("turn_timeout_retry", label=label, attempt=attempt)
                     self._write_state(
@@ -7947,17 +8979,13 @@ class TmuxBatchWorker:
                 return result
             except RuntimeShutdownRequested:
                 self.current_task_runtime_status = read_task_status(task_status_path)
-                if self.current_task_runtime_status == TASK_STATUS_RUNNING:
-                    self.current_task_runtime_status = ""
                 raise
             except Exception as error:
                 finished_at = _now_iso()
-                current_visible = clean_ansi(self.capture_visible(200)) if self.pane_id and self.target_exists() else ""
+                current_visible = self._safe_turn_failure_diagnostic(error, tail_lines=200)
                 clean_output = "\n".join(part for part in [str(error).strip(), current_visible.strip()] if part).strip()
-                runtime_state_extra = self._turn_failure_runtime_state_extra(clean_output)
+                runtime_state_extra = self._turn_failure_runtime_state_extra(clean_output, error=error)
                 self.current_task_runtime_status = read_task_status(task_status_path)
-                if self.current_task_runtime_status == TASK_STATUS_RUNNING:
-                    self.current_task_runtime_status = ""
                 error_extra = {
                     "label": label,
                     "result_status": "failed",
@@ -7967,6 +8995,7 @@ class TmuxBatchWorker:
                     "current_task_runtime_status": self.current_task_runtime_status,
                     "dispatch_state": self.dispatch_state,
                     "dispatch_reason": self.dispatch_reason,
+                    "turn_state": TurnState.FAILED.value,
                 }
                 error_extra.update(runtime_state_extra)
                 result = CommandResult(

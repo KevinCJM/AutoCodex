@@ -39,7 +39,11 @@ from A08_OverallReview import (
     _shutdown_workers as shutdown_overall_review_workers,
 )
 from tmux_core.runtime.contracts import TaskResultContract, resolve_task_result_decision
-from tmux_core.runtime.tmux_runtime import TASK_RESULT_CONTRACT_ERROR_PREFIX
+from tmux_core.runtime.tmux_runtime import (
+    TASK_RESULT_CONTRACT_ERROR_PREFIX,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
+)
 from tmux_core.stage_kernel.shared_review import ReviewAgentHandoff, ReviewAgentSelection, ReviewerRuntime
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
@@ -108,6 +112,92 @@ def _write_required_inputs(paths: dict[str, Path]) -> None:
 
 
 class A08OverallReviewTests(unittest.TestCase):
+    def test_discovery_propagates_tmux_liveness_uncertainty(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="has-session",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="probe-fixture", error="outcome unknown"),
+        )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                project_dir = Path(tmp_dir)
+                state_path = project_dir / ".development_runtime" / "developer" / "worker.state.json"
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "worker_id": "development-developer",
+                            "session_name": "开发工程师-天魁星",
+                            "project_dir": str(project_dir.resolve()),
+                            "requirement_name": "需求A",
+                            "workflow_action": "stage.a07.start",
+                            "config": {
+                                "vendor": "codex",
+                                "model": "gpt-5.4",
+                                "reasoning_effort": "high",
+                                "proxy_url": "",
+                            },
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
+                )
+                worker = _FakeWorker(session_name="开发工程师-天魁星")
+                with patch.object(worker, "session_exists", side_effect=error), patch(
+                    "A08_OverallReview.load_worker_from_state_path",
+                    return_value=worker,
+                ):
+                    with self.assertRaises(type(error)):
+                        discover_live_development_handoffs(project_dir, "需求A")
+
+    def test_shutdown_workers_preserves_live_workers_when_backend_needs_post_return_validation(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            runtime_root = build_development_runtime_root(project_dir, "需求A")
+            developer_worker = _FakeWorker(
+                session_name="开发工程师-天魁星",
+                runtime_root=runtime_root,
+                runtime_dir=runtime_root / "developer",
+            )
+            reviewer_worker = _FakeWorker(
+                session_name="测试工程师-天英星",
+                runtime_root=runtime_root,
+                runtime_dir=runtime_root / "reviewer",
+            )
+            developer = DeveloperRuntime(
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=developer_worker,
+                role_prompt="实现视角",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=reviewer_worker,
+                review_md_path=project_dir / "测试工程师.md",
+                review_json_path=project_dir / "测试工程师.json",
+                contract=_dummy_contract(),
+            )
+
+            removed = shutdown_overall_review_workers(
+                developer,
+                [reviewer],
+                project_dir=project_dir,
+                requirement_name="需求A",
+                cleanup_runtime=True,
+                preserve_workers=True,
+            )
+
+            self.assertEqual(removed, ())
+            self.assertFalse(developer_worker.killed)
+            self.assertFalse(reviewer_worker.killed)
+            self.assertTrue(developer_worker.runtime_dir.exists())
+            self.assertTrue(reviewer_worker.runtime_dir.exists())
+
     def test_resolve_overall_review_max_rounds_supports_default_and_infinite(self):
         self.assertEqual(resolve_overall_review_max_rounds(argparse.Namespace(review_max_rounds="")), 5)
         self.assertIsNone(resolve_overall_review_max_rounds(argparse.Namespace(review_max_rounds="infinite")))
@@ -585,6 +675,90 @@ class A08OverallReviewTests(unittest.TestCase):
         self.assertEqual(calls[0]["repair_result_contract"].mode, "a08_developer_refine_all_code")
         self.assertEqual(calls[0]["result_contract"].expected_statuses, ("completed",))
         self.assertEqual(calls[0]["repair_result_contract"].expected_statuses, ("completed",))
+
+    def test_tmux_control_failure_propagates_without_overall_review_redispatch_or_replacement(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="capture-pane",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="send-keys", error="timeout"),
+        )
+        for error in errors:
+            with self.subTest(error=type(error).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                project_dir = Path(tmp_dir)
+                paths = build_overall_review_paths(project_dir, "需求A")
+                developer = DeveloperRuntime(
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="开发工程师-天魁星"),
+                    role_prompt="实现视角",
+                )
+                contract = TaskResultContract(
+                    turn_id="a08_developer_init",
+                    phase="a08_developer_init",
+                    task_kind="a08_developer_init",
+                    mode="a08_developer_init",
+                    expected_statuses=("ready",),
+                )
+                with patch(
+                    "A08_OverallReview.run_task_result_turn_with_repair",
+                    side_effect=error,
+                ) as run_developer, patch(
+                    "A08_OverallReview.try_resume_worker",
+                ) as resume_developer, patch(
+                    "A08_OverallReview._replace_dead_overall_review_developer",
+                ) as replace_developer:
+                    with self.assertRaises(type(error)):
+                        _run_overall_review_developer_turn(
+                            developer,
+                            project_dir=project_dir,
+                            requirement_name="需求A",
+                            label="developer_init",
+                            prompt="init",
+                            result_contract=contract,
+                            paths=paths,
+                        )
+                run_developer.assert_called_once()
+                resume_developer.assert_not_called()
+                replace_developer.assert_not_called()
+
+                reviewer = ReviewerRuntime(
+                    reviewer_name="测试工程师",
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    worker=_FakeWorker(session_name="测试工程师-天英星"),
+                    review_md_path=project_dir / "review.md",
+                    review_json_path=project_dir / "review.json",
+                    contract=_dummy_contract(),
+                )
+                reviewer_spec = DevelopmentReviewerSpec(
+                    role_name="测试工程师",
+                    role_prompt="测试视角",
+                    reviewer_key="测试工程师",
+                )
+                with patch(
+                    "A08_OverallReview.run_completion_turn_with_repair",
+                    side_effect=error,
+                ) as run_reviewer, patch(
+                    "A08_OverallReview.try_resume_worker",
+                ) as resume_reviewer, patch(
+                    "A08_OverallReview.recreate_development_reviewer_runtime",
+                ) as recreate_reviewer:
+                    with self.assertRaises(type(error)):
+                        run_overall_review_turn_with_recreation(
+                            reviewer,
+                            project_dir=project_dir,
+                            requirement_name="需求A",
+                            reviewer_spec=reviewer_spec,
+                            paths=paths,
+                            reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                            label="reviewer_turn",
+                            prompt="review",
+                        )
+                run_reviewer.assert_called_once()
+                resume_reviewer.assert_not_called()
+                recreate_reviewer.assert_not_called()
 
     def test_overall_review_refine_turn_finalizes_fresh_output_after_stale_busy_contract_error(self):
         class RecordingWorker(_FakeWorker):

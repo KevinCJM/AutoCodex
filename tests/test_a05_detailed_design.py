@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import ANY, patch
 
 from tmux_core.runtime.contracts import resolve_task_result_decision
+from tmux_core.runtime.tmux_runtime import TmuxControlUnavailable, TmuxMutationOutcomeUnknown
 
 from A05_DetailedDesign import (
     DetailedDesignReviewerSpec,
@@ -54,6 +55,8 @@ class _FakeWorker:
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.killed = False
         self._session_exists_value = session_exists_value
+        self.metadata_updates: list[dict[str, object]] = []
+        self._runtime_metadata: dict[str, object] = {}
 
     def request_kill(self):
         self.killed = True
@@ -61,6 +64,13 @@ class _FakeWorker:
 
     def session_exists(self) -> bool:
         return self._session_exists_value
+
+    def set_runtime_metadata(self, **metadata):  # noqa: ANN003
+        self.metadata_updates.append(dict(metadata))
+        self._runtime_metadata.update(metadata)
+
+    def read_state(self):
+        return dict(self._runtime_metadata)
 
 
 class _FreshReviewerWorker:
@@ -673,7 +683,54 @@ class A05DetailedDesignTests(unittest.TestCase):
 
             self.assertTrue(result.passed)
             prepare_ba.assert_not_called()
+            self.assertEqual(incoming_handoff.worker.metadata_updates[0]["requirement_name"], "需求A")
+            self.assertEqual(incoming_handoff.worker.metadata_updates[0]["workflow_action"], "stage.a05.start")
             self.assertTrue(incoming_handoff.worker.killed)
+
+    def test_run_stage_failure_preserves_pending_live_ba_handoff_for_backend_orphaning(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            paths = build_detailed_design_paths(project_dir, "需求A")
+            paths["original_requirement_path"].write_text("原始需求\n", encoding="utf-8")
+            paths["requirements_clear_path"].write_text("需求澄清\n", encoding="utf-8")
+            paths["detailed_design_path"].write_text("已有详细设计\n", encoding="utf-8")
+            incoming_handoff = RequirementsAnalystHandoff(
+                worker=_FakeWorker(
+                    session_name="需求分析师-旧会话",
+                    runtime_root=project_dir / ".requirements_clarification_runtime",
+                    runtime_dir=project_dir / ".requirements_clarification_runtime" / "old-ba",
+                ),
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+
+            with patch("A05_DetailedDesign.stdin_is_interactive", return_value=True), patch(
+                "A05_DetailedDesign.prompt_select_option",
+                return_value="review_existing",
+            ), patch(
+                "A05_DetailedDesign.cleanup_stale_detailed_design_runtime_state",
+                return_value=(),
+            ), patch(
+                "A05_DetailedDesign.cleanup_existing_detailed_design_artifacts",
+                return_value=(),
+            ), patch(
+                "A05_DetailedDesign.resolve_reviewer_specs",
+                side_effect=RuntimeError("reviewer setup failed"),
+            ), patch(
+                "A05_DetailedDesign._shutdown_workers",
+                return_value=(),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "reviewer setup failed"):
+                    run_detailed_design_stage(
+                        ["--project-dir", str(project_dir), "--requirement-name", "需求A", "--review-max-rounds", "5"],
+                        ba_handoff=incoming_handoff,
+                    )
+
+            self.assertFalse(incoming_handoff.worker.killed)
+            self.assertEqual(incoming_handoff.worker.metadata_updates[0]["requirement_name"], "需求A")
+            self.assertEqual(incoming_handoff.worker.metadata_updates[0]["workflow_action"], "stage.a05.start")
 
     def test_run_stage_review_existing_discards_incoming_ba_handoff_before_creating_new_ba(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1014,6 +1071,43 @@ class A05DetailedDesignTests(unittest.TestCase):
 
         self.assertIs(reused, handoff)
         self.assertFalse(created_new)
+
+    def test_prepare_design_ba_handoff_does_not_rebuild_when_tmux_liveness_is_uncertain(self):
+        errors = (
+            TmuxControlUnavailable(
+                operation="has-session",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="probe-fixture", error="outcome unknown"),
+        )
+        args = build_parser().parse_args(
+            ["--project-dir", "/tmp/project", "--requirement-name", "需求A", "--reuse-review-ba"]
+        )
+
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                worker = _FakeWorker(session_exists_value=True)
+                handoff = RequirementsAnalystHandoff(
+                    worker=worker,
+                    vendor="codex",
+                    model="gpt-5.4",
+                    reasoning_effort="high",
+                    proxy_url="",
+                )
+                with patch.object(worker, "session_exists", side_effect=error), patch(
+                    "A05_DetailedDesign.create_design_ba_handoff"
+                ) as create_handoff:
+                    with self.assertRaises(type(error)):
+                        prepare_design_ba_handoff(
+                            args,
+                            project_dir="/tmp/project",
+                            ba_handoff=handoff,
+                        )
+
+                create_handoff.assert_not_called()
+                self.assertFalse(worker.killed)
 
     def test_prepare_design_ba_handoff_falls_back_to_rebuild_when_reuse_worker_is_not_live(self):
         old_handoff = RequirementsAnalystHandoff(
@@ -2257,6 +2351,7 @@ class A05DetailedDesignTests(unittest.TestCase):
                         "project_dir": str(root.resolve()),
                         "requirement_name": "需求A",
                         "workflow_action": "stage.a05.start",
+                        "agent_state": "DEAD",
                     },
                     ensure_ascii=False,
                 ),
@@ -2292,7 +2387,10 @@ class A05DetailedDesignTests(unittest.TestCase):
 
             class FakeTmuxRuntimeController:
                 def session_exists(self, session_name: str) -> bool:
-                    return session_name in {"详设-遗留存活", "详设-其他需求"}
+                    return session_name in {"详设-当前需求", "详设-遗留存活", "详设-其他需求"}
+
+                def session_matches_worker_state(self, session_name, state, state_path):  # noqa: ANN001, ARG002
+                    return session_name == "详设-当前需求"
 
                 def kill_session(self, session_name: str, *, missing_ok: bool = True):  # noqa: ANN001
                     killed_sessions.append(session_name)
@@ -2302,13 +2400,13 @@ class A05DetailedDesignTests(unittest.TestCase):
                 removed = cleanup_stale_detailed_design_runtime_state(root, "需求A")
 
             self.assertFalse(target_dir.exists())
-            self.assertFalse(legacy_dead_dir.exists())
+            self.assertTrue(legacy_dead_dir.exists())
             self.assertTrue(other_requirement_dir.exists())
             self.assertTrue(legacy_live_dir.exists())
             self.assertIn("详设-当前需求", killed_sessions)
-            self.assertIn("详设-遗留死亡", killed_sessions)
+            self.assertNotIn("详设-遗留死亡", killed_sessions)
             self.assertIn(str(target_dir.resolve()), removed)
-            self.assertIn(str(legacy_dead_dir.resolve()), removed)
+            self.assertNotIn(str(legacy_dead_dir.resolve()), removed)
 
 
 if __name__ == "__main__":

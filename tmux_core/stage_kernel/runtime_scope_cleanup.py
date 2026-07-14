@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 from tmux_core.runtime.tmux_runtime import TmuxRuntimeController, worker_state_is_prelaunch_active
 
@@ -39,13 +39,36 @@ def _classify_scope_match(
     return "unknown"
 
 
-def _session_exists(tmux_runtime: TmuxRuntimeController, session_name: str) -> bool:
+CleanupMode = Literal["stale_only", "all"]
+
+
+def _session_exists(tmux_runtime: TmuxRuntimeController, session_name: str) -> bool | None:
     if not session_name:
         return False
     try:
         return bool(tmux_runtime.session_exists(session_name))
     except Exception:
+        # A tmux control-plane failure is not evidence that the session vanished.
+        return None
+
+
+def _session_matches_worker_state(
+    tmux_runtime: TmuxRuntimeController,
+    *,
+    session_name: str,
+    payload: dict[str, object],
+    state_path: Path,
+) -> bool | None:
+    """Confirm destructive ownership without treating probe failure as a mismatch."""
+    if not session_name:
         return False
+    resolver = getattr(tmux_runtime, "session_matches_worker_state", None)
+    if not callable(resolver):
+        return None
+    try:
+        return bool(resolver(session_name, payload, state_path))
+    except Exception:
+        return None
 
 
 def _is_legacy_stale_worker(
@@ -59,7 +82,11 @@ def _is_legacy_stale_worker(
     agent_state = str(payload.get("agent_state", "") or "").strip().upper()
     if agent_state == "DEAD":
         return True
-    if session_name and not _session_exists(tmux_runtime, session_name):
+    turn_state = str(payload.get("turn_state", "") or "").strip().lower()
+    if turn_state == "orphaned":
+        return True
+    session_exists = _session_exists(tmux_runtime, session_name) if session_name else None
+    if session_exists is False:
         return True
     return False
 
@@ -72,7 +99,10 @@ def cleanup_runtime_dirs_by_scope(
     workflow_action: str,
     preserve_runtime_dirs: Sequence[str | Path] = (),
     preserve_session_names: Sequence[str] = (),
+    mode: CleanupMode = "stale_only",
 ) -> tuple[str, ...]:
+    if mode not in {"stale_only", "all"}:
+        raise ValueError(f"不支持的 runtime cleanup mode: {mode}")
     root = Path(runtime_root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
         return ()
@@ -107,7 +137,7 @@ def cleanup_runtime_dirs_by_scope(
         if resolved_worker_dir.name == "_locks":
             continue
         payload = _safe_read_worker_state(state_path)
-        if worker_state_is_prelaunch_active(payload):
+        if mode == "stale_only" and worker_state_is_prelaunch_active(payload):
             continue
         session_name = str(payload.get("session_name", "") or "").strip()
         if session_name and session_name in preserve_sessions:
@@ -119,21 +149,39 @@ def cleanup_runtime_dirs_by_scope(
             requirement_name=current_requirement,
             workflow_action=current_action,
         )
-        should_remove = scope_state == "match"
-        if scope_state == "unknown":
-            should_remove = _is_legacy_stale_worker(
+        should_remove = False
+        if scope_state == "match":
+            should_remove = mode == "all" or _is_legacy_stale_worker(
                 payload,
                 session_name=session_name,
                 tmux_runtime=tmux_runtime,
             )
+        # Unscoped legacy state cannot prove project + requirement + action
+        # ownership.  Preserve it for explicit/manual cleanup.
         if not should_remove:
             continue
 
         if session_name and session_name not in preserve_sessions:
-            try:
-                tmux_runtime.kill_session(session_name, missing_ok=True)
-            except Exception:
-                pass
+            identity_matches = _session_matches_worker_state(
+                tmux_runtime,
+                session_name=session_name,
+                payload=payload,
+                state_path=state_path,
+            )
+            if identity_matches is None:
+                # Neither a failed identity probe nor a runtime without an
+                # ownership resolver authorizes a destructive tmux mutation.
+                continue
+            if identity_matches:
+                try:
+                    tmux_runtime.kill_session(session_name, missing_ok=True)
+                except Exception:
+                    # Session deletion is a mutation.  If tmux cannot confirm its
+                    # outcome, retain the runtime evidence for the next explicit
+                    # cleanup instead of pretending the worker was removed.
+                    continue
+            # A definitive identity mismatch means that the name has been
+            # reused by another worker.  Remove only this stale runtime record.
         shutil.rmtree(resolved_worker_dir, ignore_errors=True)
         removed.append(str(resolved_worker_dir))
 

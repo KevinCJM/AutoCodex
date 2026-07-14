@@ -26,6 +26,13 @@ export type WorkerSnapshot = {
   agentState: string
   healthStatus: string
   currentTaskRuntimeStatus: string
+  turnState: string
+  tmuxControlStatus: string
+  tmuxControlError: string
+  tmuxUnavailableSince: string
+  stageRunnerId: string
+  orphanedAt: string
+  orphanedReason: string
   retryCount: number
   note: string
   transcriptPath: string
@@ -103,13 +110,38 @@ export type RunOption = {
   failedCount: number
 }
 
+export type StageFailureWorker = {
+  workerId: string
+  sessionName: string
+  attachCommand: string
+  workDir: string
+}
+
+export type StageFailureSnapshot = {
+  action: string
+  stageLabel: string
+  status: string
+  source: string
+  runnerId: string
+  stageSeq: number
+  message: string
+  failurePath: string
+  failureKind: string
+  orphanedWorkers: StageFailureWorker[]
+}
+
 export type AppSnapshot = {
   projectDir: string
   requirementName: string
   currentAction: string
   activeRunId: string
   activeStage: string
+  activeStageStatus: string
+  activeStageSeq: number
+  activeStageRunnerId: string
+  activeStageSource: string
   activeStageLabel: string
+  activeStageFailure: StageFailureSnapshot | null
   pendingHitl: boolean
   pendingAttention: boolean
   pendingAttentionReason: string

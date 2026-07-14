@@ -128,6 +128,67 @@ test('BackendClient process exit fallback sends SIGTERM only', () => {
   expect(signals).toEqual(['SIGTERM'])
 })
 
+test('BackendClient rejects pending requests and emits a terminal event on unexpected stdout EOF', async () => {
+  const client = new BackendClient() as any
+  const child = {}
+  const events: Array<{ type: string; payload: Record<string, unknown> }> = []
+  let rejectedMessage = ''
+  client.process = child
+  client.pending.set('req_1', {
+    resolve: () => {
+      throw new Error('unexpected disconnect must not resolve pending requests')
+    },
+    reject: (error: Error) => {
+      rejectedMessage = error.message
+    },
+  })
+  client.subscribe((event: { type: string; payload: Record<string, unknown> }) => events.push(event))
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.close()
+    },
+  })
+
+  await client.consumeStream(stream, child)
+
+  expect(rejectedMessage).toContain('stdout closed unexpectedly')
+  expect(client.pending.size).toBe(0)
+  expect(events).toEqual([{
+    type: 'backend.disconnected',
+    payload: { message: 'backend stdout closed unexpectedly' },
+  }])
+})
+
+test('BackendClient ignores child exit notification after an intentional stop begins', () => {
+  const client = new BackendClient() as any
+  const child = {}
+  const events: unknown[] = []
+  client.process = child
+  client.stoppingProcess = child
+  client.subscribe((event: unknown) => events.push(event))
+
+  client.handleUnexpectedDisconnect(child, 'backend exited with code 143', 143)
+
+  expect(events).toEqual([])
+  expect(client.backendDisconnectError).toBeUndefined()
+})
+
+test('BackendClient requests preserve-orphans policy before failure shutdown', async () => {
+  const client = new BackendClient() as any
+  client.process = { stdin: { write: () => undefined } }
+  const requests: Array<{ action: string; payload: Record<string, unknown> }> = []
+  client.request = async (action: string, payload: Record<string, unknown>) => {
+    requests.push({ action, payload })
+    return { accepted: true }
+  }
+
+  expect(await client.requestShutdownPolicy('preserve_orphans', 'runner_failure', 10)).toBe(true)
+  expect(requests).toEqual([{
+    action: 'app.shutdown',
+    payload: { policy: 'preserve_orphans', reason: 'runner_failure' },
+  }])
+})
+
 test('cleanup-only backend runner skips spawn when project dir is missing', async () => {
   const ok = await runCleanupOnlyBackend({ projectDir: '' })
   expect(ok).toBe(false)

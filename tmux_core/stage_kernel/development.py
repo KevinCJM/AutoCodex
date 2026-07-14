@@ -54,6 +54,8 @@ from tmux_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     LaunchCoordinator,
     TmuxBatchWorker,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     Vendor,
     WorkerStatus,
     build_session_name,
@@ -583,14 +585,17 @@ def _developer_init_contract_is_ready(
     finalizer = getattr(worker, "_try_finalize_a07_legacy_task_result_from_observation", None)
     if not callable(observe) or not callable(finalizer):
         return False
-    observation = None
-    with suppress(Exception):
+    try:
         observation = observe(tail_lines=200, tail_bytes=24000)
+    except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+        raise
+    except Exception:
+        observation = None
     if observation is None:
         return False
     for mode in ("a07_developer_init", "a07_developer_human_reply"):
         contract = build_developer_init_result_contract(paths, mode=mode)
-        with suppress(Exception):
+        try:
             result_file = finalizer(
                 contract=contract,
                 task_status_path=task_status_path,
@@ -600,6 +605,10 @@ def _developer_init_contract_is_ready(
             if result_file is not None and str(result_file.payload.get("status", "")).strip() == "ready":
                 _mark_ready_from_init_contract()
                 return True
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
+        except Exception:
+            pass
         if _is_ready_result(result_path):
             _mark_ready_from_init_contract()
             return True
@@ -620,13 +629,17 @@ def _recover_worker_from_state(
         session_exists = getattr(worker, "session_exists", None)
         target_exists = getattr(worker, "target_exists", None)
         if callable(session_exists):
-            with suppress(Exception):
+            try:
                 if not session_exists():
                     return None
+            except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                raise
         if callable(target_exists):
-            with suppress(Exception):
+            try:
                 if not target_exists():
                     return None
+            except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                raise
     return worker
 
 
@@ -1757,6 +1770,8 @@ def _run_developer_result_turn(
             if fallback_payload is not None and _worker_appears_live_for_reviewer_recovery(current_developer.worker):
                 _mark_developer_fallback_completed()
                 return current_developer, fallback_payload
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             if not _worker_has_stale_busy_without_contract(current_developer.worker) and try_resume_worker(current_developer.worker, timeout_sec=60.0):
                 continue
             if is_agent_ready_timeout_error(error):
@@ -2213,7 +2228,10 @@ def prelaunch_development_reviewers(
             try:
                 future.result()
             except Exception as error:  # noqa: BLE001
-                if is_runtime_shutdown_error(error):
+                if is_runtime_shutdown_error(error) or isinstance(
+                    error,
+                    (TmuxControlUnavailable, TmuxMutationOutcomeUnknown),
+                ):
                     raise
                 log_event = getattr(reviewer.worker, "_log_event", None)
                 if callable(log_event):
@@ -2305,6 +2323,9 @@ def initialize_developer_with_parallel_reviewer_prelaunch(
             except Exception as error:  # noqa: BLE001
                 errors[branch] = error
     if errors:
+        for error in errors.values():
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise error
         if len(errors) == 1:
             raise next(iter(errors.values()))
         summary = "\n".join(f"{branch}: {error}" for branch, error in errors.items())
@@ -2451,6 +2472,8 @@ def _run_single_reviewer_initialization(
             return current_reviewer
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             if not _worker_has_stale_busy_without_contract(current_reviewer.worker) and try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
                 continue
             if is_worker_death_error(error) and _reviewer_requires_reconfiguration_from_error(error, current_reviewer.worker):
@@ -2929,6 +2952,8 @@ def _run_reviewer_turn_with_resume(
                 return reviewer
             if _reviewer_has_materialized_outputs(reviewer, task_name) and _reviewer_artifact_signature(reviewer) != baseline_signature:
                 return reviewer
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             if is_worker_death_error(error):
                 message(f"{reviewer.worker.session_name or reviewer.reviewer_name} 已死亡，当前阶段将忽略该审核智能体。")
                 return None
@@ -2990,6 +3015,15 @@ def recreate_development_reviewer_runtime(
             )
             if selection is None:
                 return None
+    request_kill = getattr(reviewer.worker, "request_kill", None)
+    if not callable(request_kill):
+        raise RuntimeError(f"无法停止待替换审核智能体: {reviewer_display_name}")
+    request_kill()
+    runtime_dir_text = str(getattr(reviewer.worker, "runtime_dir", "") or "").strip()
+    if runtime_dir_text:
+        runtime_dir = Path(runtime_dir_text).expanduser().resolve()
+        if runtime_dir.exists():
+            shutil.rmtree(runtime_dir, ignore_errors=True)
     replacement = create_reviewer_runtime(
         project_dir=project_dir,
         requirement_name=requirement_name,
@@ -3001,13 +3035,6 @@ def recreate_development_reviewer_runtime(
         reviewer.review_md_path.unlink()
     if replacement.review_json_path != reviewer.review_json_path and reviewer.review_json_path.exists():
         reviewer.review_json_path.unlink()
-    with suppress(Exception):
-        reviewer.worker.request_kill()
-    runtime_dir_text = str(getattr(reviewer.worker, "runtime_dir", "") or "").strip()
-    if runtime_dir_text:
-        runtime_dir = Path(runtime_dir_text).expanduser().resolve()
-        if runtime_dir.exists():
-            shutil.rmtree(runtime_dir, ignore_errors=True)
     return replacement
 
 
@@ -3073,6 +3100,8 @@ def _worker_appears_live_for_reviewer_recovery(worker: object | None) -> bool:
         try:
             if not session_exists():
                 return False
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception:
             pass
     read_state = getattr(worker, "read_state", None)
@@ -3095,6 +3124,8 @@ def _worker_appears_live_for_reviewer_recovery(worker: object | None) -> bool:
         try:
             state = get_agent_state()
             return str(getattr(state, "value", state) or "").strip().upper() in {"READY", "BUSY", "STARTING"}
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception:
             return False
     return False
@@ -3345,6 +3376,8 @@ def run_reviewer_turn_with_recreation(
                     task_name=task_name,
                 )
                 return current_reviewer
+            if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                raise
             if is_turn_artifact_contract_error(error):
                 message(f"{current_reviewer.worker.session_name or current_reviewer.reviewer_name} 审核输出未及时稳定，继续检查智能体状态。")
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
@@ -4461,13 +4494,13 @@ def run_development_stage(
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     requirement_name = str(args.requirement_name).strip() if args.requirement_name else prompt_requirement_name_selection(project_dir, "").requirement_name
 
+    progress = ReviewStageProgress(initial_phase="任务开发准备中")
     lock_context = requirement_concurrency_lock(
         project_dir,
         requirement_name,
         action="stage.a07.start",
     )
     lock_context.__enter__()
-    progress = ReviewStageProgress(initial_phase="任务开发准备中")
     developer: DeveloperRuntime | None = None
     reviewer_workers: list[ReviewerRuntime] = []
     cleanup_records: list[str] = []
@@ -5216,8 +5249,12 @@ def run_development_stage(
         )
         raise
     finally:
-        progress.stop()
-        lock_context.__exit__(None, None, None)
+        try:
+            progress.stop()
+        except Exception:
+            pass
+        finally:
+            lock_context.__exit__(None, None, None)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
