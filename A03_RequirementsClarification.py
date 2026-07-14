@@ -44,6 +44,7 @@ from T02_tmux_agents import (
     worker_state_is_prelaunch_active,
 )
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop
+from tmux_core.stage_kernel.agent_intervention import wait_for_worker_startup_intervention
 from tmux_core.stage_kernel.shared_review import is_agent_config_error
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from tmux_core.stage_kernel.stage_audit import (
@@ -117,7 +118,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--vendor", help="需求澄清阶段厂商: codex|claude|gemini|opencode|mimo|agy")
+    parser.add_argument("--vendor", help="需求澄清阶段厂商: codex|claude|gemini|opencode|mimo|agy|deveco")
     parser.add_argument("--model", help="需求澄清阶段模型名称")
     parser.add_argument("--effort", help="需求澄清阶段推理强度")
     parser.add_argument("--proxy-url", default="", help="需求澄清阶段代理端口或完整代理 URL")
@@ -583,6 +584,15 @@ def run_requirements_clarification(
                 hitl_loop_kwargs: dict[str, object] = {}
                 if human_input_provider is not None:
                     hitl_loop_kwargs["human_input_provider"] = human_input_provider
+                def handle_startup_intervention(live_worker: object, error: object) -> None:
+                    stop_progress()
+                    stop_boot_progress()
+                    wait_for_worker_startup_intervention(
+                        live_worker,
+                        error=error,
+                        stage_label=REQUIREMENTS_CLARIFICATION_STAGE_NAME,
+                        role_label=str(getattr(live_worker, "session_name", "") or "需求分析师"),
+                    )
                 loop_result = run_hitl_agent_loop(
                     worker=worker,
                     stage_name=REQUIREMENTS_CLARIFICATION_STAGE_NAME,
@@ -602,6 +612,7 @@ def run_requirements_clarification(
                     on_before_question_clear=audit_before_question_clear,
                     on_hitl_question=audit_hitl_question,
                     on_hitl_answer=audit_hitl_answer,
+                    startup_intervention_handler=handle_startup_intervention,
                     timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
                     **hitl_loop_kwargs,
                 )

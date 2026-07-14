@@ -18,6 +18,7 @@ from typing import Callable, Mapping, Sequence
 
 from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
 from tmux_core.runtime.tmux_runtime import (
+    AgentStartupInterventionRequired,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     is_turn_artifact_contract_error,
     is_worker_death_error,
@@ -700,6 +701,7 @@ def run_hitl_agent_loop(
     max_contract_repair_attempts: int = DEFAULT_HITL_CONTRACT_REPAIR_ATTEMPTS,
     fresh_completion_paths: Sequence[str | Path] = (),
     fresh_completion_start_round: int = 1,
+    startup_intervention_handler: Callable[[object, AgentStartupInterventionRequired], None] | None = None,
 ) -> HitlLoopResult:
     output_file = Path(output_path).expanduser().resolve()
     question_file = Path(question_path).expanduser().resolve()
@@ -732,6 +734,9 @@ def run_hitl_agent_loop(
                 on_worker_started(worker)
             break
         except Exception as error:  # noqa: BLE001
+            if isinstance(error, AgentStartupInterventionRequired) and startup_intervention_handler is not None:
+                startup_intervention_handler(worker, error)
+                continue
             if replace_dead_worker is None or not is_worker_death_error(error):
                 raise
             worker = replace_dead_worker(worker, error)
@@ -792,6 +797,9 @@ def run_hitl_agent_loop(
                     timeout_sec=timeout_sec,
                 )
             except Exception as error:  # noqa: BLE001
+                if isinstance(error, AgentStartupInterventionRequired) and startup_intervention_handler is not None:
+                    startup_intervention_handler(turn_worker, error)
+                    continue
                 if replace_dead_worker is None or not is_worker_death_error(error):
                     raise
                 _replace_worker(turn_worker, error)

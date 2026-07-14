@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from T09_terminal_ops import message, prompt_select_option, terminal_ui_is_interactive
+from tmux_core.runtime.tmux_runtime import AgentStartupInterventionRequired, try_resume_worker
 
 AGENT_INTERVENTION_RECHECK = "recheck_after_manual_intervention"
 AGENT_INTERVENTION_RECREATE = "recreate_after_manual_intervention"
@@ -147,6 +148,59 @@ def request_worker_manual_intervention(
                 "target_paths": [str(Path(item).expanduser().resolve()) for item in target_paths if str(item or "").strip()],
                 "reason_text": str(reason_text or "").strip(),
             },
+        )
+
+
+def run_worker_turn_with_startup_recovery(
+    worker: object,
+    *,
+    run_turn_kwargs: Mapping[str, object],
+    stage_label: str,
+    role_label: str,
+    on_intervention: Callable[[AgentStartupInterventionRequired], None] | None = None,
+) -> Any:
+    """Keep startup HITL inside the current stage stack and reuse the same live worker."""
+    while True:
+        try:
+            return worker.run_turn(**dict(run_turn_kwargs))
+        except AgentStartupInterventionRequired as error:
+            if on_intervention is not None:
+                on_intervention(error)
+            wait_for_worker_startup_intervention(
+                worker,
+                error=error,
+                stage_label=stage_label,
+                role_label=role_label,
+            )
+
+
+def wait_for_worker_startup_intervention(
+    worker: object,
+    *,
+    error: AgentStartupInterventionRequired,
+    stage_label: str,
+    role_label: str,
+) -> None:
+    current_reason = str(error)
+    while True:
+        decision = request_worker_manual_intervention(
+            stage_label=stage_label or "智能体启动",
+            role_label=role_label or _session_name(worker) or "智能体",
+            worker=worker,
+            reason_text=current_reason,
+            allow_recreate=False,
+            allow_worker_dead=True,
+            recovery_kind="agent_startup_intervention",
+            mark_worker_state=False,
+        )
+        if decision == AGENT_INTERVENTION_WORKER_DEAD:
+            raise RuntimeError(f"tmux pane died during startup intervention: {current_reason}")
+        if decision != AGENT_INTERVENTION_RECHECK:
+            continue
+        if try_resume_worker(worker, timeout_sec=60.0):
+            return
+        current_reason = (
+            "人工处理后智能体仍未进入 READY；请继续在原 tmux 会话完成登录、协议或启动页面。"
         )
 
 

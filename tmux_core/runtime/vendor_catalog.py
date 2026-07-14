@@ -13,7 +13,7 @@ from typing import Any, Callable, Sequence
 
 SCHEMA_VERSION = "1.0"
 SCAN_TIMEOUT_SEC = 12.0
-VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode", "mimo", "agy")
+VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode", "mimo", "agy", "deveco")
 NORMALIZED_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 NATIVE_REASONING_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
 LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
@@ -23,6 +23,7 @@ LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
     "opencode": "default",
     "mimo": "mimo/mimo-v2.5-pro",
     "agy": "Gemini 3.5 Flash (High)",
+    "deveco": "default",
 }
 LEGACY_MODEL_CHOICES_BY_VENDOR: dict[str, tuple[str, ...]] = {
     "codex": ("gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.3-codex-spark", "gpt-5.2"),
@@ -40,6 +41,7 @@ LEGACY_MODEL_CHOICES_BY_VENDOR: dict[str, tuple[str, ...]] = {
         "Claude Opus 4.6 (Thinking)",
         "GPT-OSS 120B (Medium)",
     ),
+    "deveco": (),
 }
 LEGACY_MODEL_ALIASES_BY_VENDOR: dict[str, dict[str, str]] = {
     "codex": {
@@ -226,6 +228,7 @@ class LaunchResolution:
     catalog_source_kind: str
     confidence: str
     notes: tuple[str, ...] = ()
+    executable_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -349,6 +352,15 @@ def _resolved_binary_path(binary_name: str) -> str:
     if not candidate:
         return ""
     return str(Path(candidate).expanduser().resolve())
+
+
+def _resolved_vendor_binary_path(vendor_id: str) -> str:
+    candidates = ("deveco", "DevEco") if vendor_id == "deveco" else (vendor_id,)
+    for binary_name in candidates:
+        binary_path = _resolved_binary_path(binary_name)
+        if binary_path:
+            return binary_path
+    return ""
 
 
 def _unique_models(items: list[ModelInventory]) -> tuple[ModelInventory, ...]:
@@ -488,7 +500,7 @@ def _fallback_reasoning_for_vendor(vendor_id: str, model_id: str, *, source_kind
                 notes=("legacy_synthetic_family_alias",),
             )
         return _unsupported_reasoning(vendor_id, model_id, source_kind=source_kind, confidence=confidence, note="legacy_fallback")
-    if vendor_id in {"opencode", "mimo"}:
+    if vendor_id in {"opencode", "mimo", "deveco"}:
         return ReasoningInventory(
             vendor_id=vendor_id,
             model_id=model_id,
@@ -1003,9 +1015,10 @@ def _scan_codex_vendor(binary_path: str) -> VendorInventory:
     )
 
 
-def _scan_opencode_like_vendor(vendor_id: str, binary_name: str, binary_path: str) -> VendorInventory:
-    models_probe = _command_probe([binary_name, "models", "--verbose"], timeout_sec=15.0)
-    config_probe = _command_probe([binary_name, "debug", "config"])
+def _scan_opencode_like_vendor(vendor_id: str, binary_path: str, *, pure: bool = False) -> VendorInventory:
+    command_prefix = [binary_path, "--pure"] if pure else [binary_path]
+    models_probe = _command_probe([*command_prefix, "models", "--verbose"], timeout_sec=15.0)
+    config_probe = _command_probe([*command_prefix, "debug", "config"])
     dynamic_models = (
         _build_opencode_like_models(vendor_id, parse_opencode_verbose_output(models_probe.stdout))
         if models_probe.ok
@@ -1041,7 +1054,7 @@ def _scan_opencode_like_vendor(vendor_id: str, binary_name: str, binary_path: st
             ]
         )
     if not models:
-        fallback_models = () if vendor_id == "opencode" else None
+        fallback_models = () if vendor_id in {"opencode", "deveco"} else None
         return _fallback_vendor(
             vendor_id,
             binary_path=binary_path,
@@ -1066,11 +1079,15 @@ def _scan_opencode_like_vendor(vendor_id: str, binary_name: str, binary_path: st
 
 
 def _scan_opencode_vendor(binary_path: str) -> VendorInventory:
-    return _scan_opencode_like_vendor("opencode", "opencode", binary_path)
+    return _scan_opencode_like_vendor("opencode", binary_path)
 
 
 def _scan_mimo_vendor(binary_path: str) -> VendorInventory:
-    return _scan_opencode_like_vendor("mimo", "mimo", binary_path)
+    return _scan_opencode_like_vendor("mimo", binary_path)
+
+
+def _scan_deveco_vendor(binary_path: str) -> VendorInventory:
+    return _scan_opencode_like_vendor("deveco", binary_path, pure=True)
 
 
 def _scan_agy_vendor(binary_path: str) -> VendorInventory:
@@ -1143,7 +1160,14 @@ _SCANNERS: dict[str, Callable[[str], VendorInventory]] = {
     "opencode": _scan_opencode_vendor,
     "mimo": _scan_mimo_vendor,
     "agy": _scan_agy_vendor,
+    "deveco": _scan_deveco_vendor,
 }
+
+
+def _has_reusable_cached_models(inventory: VendorInventory | None) -> bool:
+    if inventory is None or not inventory.models:
+        return False
+    return all(model.source_kind != SOURCE_LEGACY_FALLBACK for model in inventory.models)
 
 
 def refresh_catalog_snapshot(*, prior_snapshot: CatalogSnapshot | None = None) -> CatalogSnapshot:
@@ -1151,17 +1175,33 @@ def refresh_catalog_snapshot(*, prior_snapshot: CatalogSnapshot | None = None) -
     prior_by_vendor = {item.vendor_id: item for item in prior_snapshot.vendors} if prior_snapshot else {}
     vendors: list[VendorInventory] = []
     for vendor_id in VENDOR_ORDER:
-        binary_path = _resolved_binary_path(vendor_id)
+        binary_path = _resolved_vendor_binary_path(vendor_id)
         if not binary_path:
             vendors.append(_unavailable_vendor(vendor_id, ""))
             continue
         scanner = _SCANNERS[vendor_id]
         try:
             inventory = scanner(binary_path)
+            prior_vendor = prior_by_vendor.get(vendor_id)
+            if (
+                vendor_id == "deveco"
+                and inventory.scan_status != OK_SCAN_STATUS
+                and _has_reusable_cached_models(prior_vendor)
+            ):
+                inventory = _cached_degraded_vendor(
+                    vendor_id,
+                    prior_vendor,
+                    binary_path=binary_path,
+                    note=f"scan_status={inventory.scan_status}",
+                )
         except Exception as error:  # noqa: BLE001
             prior_vendor = prior_by_vendor.get(vendor_id)
             note = f"scan_error={type(error).__name__}"
-            if prior_vendor is not None and prior_vendor.models:
+            if (
+                _has_reusable_cached_models(prior_vendor)
+                if vendor_id == "deveco"
+                else prior_vendor is not None and bool(prior_vendor.models)
+            ):
                 inventory = _cached_degraded_vendor(vendor_id, prior_vendor, binary_path=binary_path, note=note)
             else:
                 inventory = _fallback_vendor(vendor_id, binary_path=binary_path, note=note)
@@ -1204,6 +1244,8 @@ def get_default_model_for_vendor(vendor_id: str, *, catalog: CatalogSnapshot | N
     if inventory.default_model:
         return inventory.default_model
     normalized_vendor = normalize_vendor_id(vendor_id)
+    if normalized_vendor == "deveco":
+        return ""
     return LEGACY_DEFAULT_MODEL_BY_VENDOR[normalized_vendor]
 
 
@@ -1308,4 +1350,5 @@ def resolve_launch(
         catalog_source_kind=model.source_kind or inventory.source_kind,
         confidence=model.confidence or inventory.confidence,
         notes=tuple(dict.fromkeys(item for item in notes if item)),
+        executable_path=inventory.binary_path,
     )

@@ -3132,6 +3132,73 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertEqual(request_hitl.call_args.kwargs["stage_label"], "任务开发")
         self.assertEqual(request_hitl.call_args.kwargs["role_label"], "开发工程师")
 
+    def test_developer_task_contract_materializes_result_when_output_valid(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            developer_output = root / "工程师开发内容.md"
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": developer_output},
+            )
+            turn_goal = TaskTurnGoal(
+                goal_id="a07_developer_task_complete",
+                outcomes={"completed": OutcomeGoal(status="completed", required_aliases=("developer_output",))},
+                max_repair_attempts=2,
+            )
+
+            class OutputWithoutResultWorker(_FakeWorker):
+                def __init__(self) -> None:
+                    super().__init__(session_name="开发工程师-天魁星", runtime_root=root / "runtime", runtime_dir=root / "runtime" / "worker")
+                    self.current_task_status_path = str(task_status_path)
+                    self.current_task_result_path = ""
+
+                def run_turn(self, **kwargs):  # noqa: ANN003
+                    label = str(kwargs["label"])
+                    self.current_task_result_path = str(root / f"{label}_result.json")
+                    developer_output.write_text("- **完成任务**: `M5-T4`\n", encoding="utf-8")
+                    return CommandResult(
+                        label=label,
+                        command=str(kwargs["prompt"]),
+                        exit_code=1,
+                        raw_output=(
+                            f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: "
+                            f"turn={label} expected_status=completed missing_aliases=- "
+                            f"error=缺少 result.json: {self.current_task_result_path}"
+                        ),
+                        clean_output=(
+                            f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: "
+                            f"turn={label} expected_status=completed missing_aliases=- "
+                            f"error=缺少 result.json: {self.current_task_result_path}"
+                        ),
+                        started_at="2026-05-14T00:00:00",
+                        finished_at="2026-05-14T00:00:01",
+                    )
+
+            worker = OutputWithoutResultWorker()
+            with patch("tmux_core.stage_kernel.turn_output_goals.request_file_noncompliance_intervention") as request_hitl:
+                payload = run_task_result_turn_with_repair(
+                    worker=worker,  # type: ignore[arg-type]
+                    label="development_start_M5-T4",
+                    prompt="执行 M5-T4",
+                    result_contract=contract,
+                    parse_result_payload=lambda text: json.loads(text),
+                    turn_goal=turn_goal,
+                    stage_label="任务开发",
+                    role_label="开发工程师",
+                    task_name="M5-T4",
+                )
+
+                self.assertEqual(payload["status"], "completed")
+                self.assertTrue(Path(worker.current_task_result_path).exists())
+                self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "done"})
+                request_hitl.assert_not_called()
+
     def test_developer_ready_timeout_reopens_hitl_when_manual_retry_times_out_again(self):
         developer = DeveloperRuntime(
             selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
@@ -3338,9 +3405,9 @@ class A07DevelopmentTests(unittest.TestCase):
             paths = build_development_paths(tmp_dir, "需求A")
             _write_required_inputs(paths)
             paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
-            paths["developer_output_path"].write_text("- **完成任务**: `M1-T1`\n", encoding="utf-8")
             task_status_path = Path(tmp_dir) / "developer_task_status.json"
             task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            paths["developer_output_path"].write_text("- **完成任务**: `M1-T1`\n", encoding="utf-8")
             result_path = Path(tmp_dir) / "developer_task_result.json"
             worker = _RecordingStateWorker(
                 session_name="开发工程师-天魁星",
@@ -3482,9 +3549,9 @@ class A07DevelopmentTests(unittest.TestCase):
             paths = build_development_paths(tmp_dir, "需求A")
             _write_required_inputs(paths)
             paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
-            paths["developer_output_path"].write_text("- **完成任务**: `M6-T5`\n", encoding="utf-8")
             task_status_path = Path(tmp_dir) / "developer_task_status.json"
             task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            paths["developer_output_path"].write_text("- **完成任务**: `M6-T5`\n", encoding="utf-8")
             result_path = Path(tmp_dir) / "developer_task_result.json"
             worker = _RecordingStateWorker(
                 session_name="开发工程师-地雄星",
@@ -3583,9 +3650,9 @@ class A07DevelopmentTests(unittest.TestCase):
             paths = build_development_paths(tmp_dir, "需求A")
             _write_required_inputs(paths)
             paths["task_md_path"].write_text("任务单正文\n", encoding="utf-8")
-            paths["developer_output_path"].write_text("- **完成任务**: `M6-T1`\n", encoding="utf-8")
             task_status_path = Path(tmp_dir) / "developer_task_status.json"
             task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            paths["developer_output_path"].write_text("- **完成任务**: `M6-T1`\n", encoding="utf-8")
             result_path = Path(tmp_dir) / "developer_task_result.json"
             worker = _RecordingStateWorker(
                 session_name="开发工程师-地英星",

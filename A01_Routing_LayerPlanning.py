@@ -67,6 +67,7 @@ VENDOR_ALIASES = {
     "4": "opencode",
     "5": "mimo",
     "6": "agy",
+    "7": "deveco",
     "claude code": "claude",
     "claude-code": "claude",
     "open code": "opencode",
@@ -77,6 +78,9 @@ VENDOR_ALIASES = {
     "antigravity": "agy",
     "antigravity cli": "agy",
     "agy cli": "agy",
+    "deveco code": "deveco",
+    "deveco-code": "deveco",
+    "devecocode": "deveco",
 }
 DEFAULT_MODEL_BY_VENDOR = dict(LEGACY_DEFAULT_MODEL_BY_VENDOR)
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
@@ -117,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reuse-existing-original-requirement", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--allow-project-dir-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--target-dir", action="append", default=[], help="额外目标目录，可重复传入")
-    parser.add_argument("--vendor", help="厂商: codex|claude|gemini|opencode|mimo|agy")
+    parser.add_argument("--vendor", help="厂商: codex|claude|gemini|opencode|mimo|agy|deveco")
     parser.add_argument("--model", help="模型名称")
     parser.add_argument("--effort", help="推理强度")
     parser.add_argument("--proxy-port", default="", help="代理端口或完整代理 URL")
@@ -149,7 +153,7 @@ def normalize_model_choice(vendor: str, value: str | None) -> str:
         index = int(text)
         if 1 <= index <= len(models):
             return models[index - 1]
-    if normalized_vendor in {"opencode", "mimo", "agy"} and text == "default":
+    if normalized_vendor in {"opencode", "mimo", "agy", "deveco"} and text == "default":
         resolved_default = get_default_model_for_vendor(normalized_vendor)
         if resolved_default:
             return resolved_default

@@ -24,6 +24,7 @@ from tmux_core.stage_kernel.role_orchestration import (
     run_main_phase,
     run_reviewer_phase,
 )
+from tmux_core.runtime.tmux_runtime import AgentStartupInterventionRequired
 
 
 class _FakeWorker:
@@ -171,6 +172,23 @@ class _ReadyDeathWorker(_DeathAwareFakeWorker):
             f"检测到 {self.session_name} 需要重新启动或重建，但系统不会自动执行。\n"
             f"原因: tmux pane missing"
         )
+
+
+class _StartupInterventionWorker(_DeathAwareFakeWorker):
+    def __init__(self) -> None:
+        super().__init__("STARTING", launched=True)
+        self.session_name = "开发工程师-启动介入"
+        self.startup_error = AgentStartupInterventionRequired(
+            blocker_kind="deveco_login",
+            session_name=self.session_name,
+            state_path=self.state_path,
+            message="DevEco login requires manual intervention",
+        )
+
+    def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
+        _ = timeout_sec
+        self.ensure_calls += 1
+        raise self.startup_error
 
 
 class RoleOrchestrationTests(unittest.TestCase):
@@ -490,6 +508,37 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(replace_calls, [main])
         self.assertEqual(main.worker.ensure_calls, 1)
         prompt.assert_called_once()
+
+    def test_startup_intervention_uses_dedicated_recovery_without_wrapping_or_recreating_main(self):
+        worker = _StartupInterventionWorker()
+        main = SimpleNamespace(worker=worker)
+        replace_main = mock.Mock(side_effect=AssertionError("startup intervention must not recreate worker"))
+
+        def recover_startup(live_worker, *, error, stage_label, role_label):  # noqa: ANN001
+            self.assertIs(live_worker, worker)
+            self.assertIs(error, worker.startup_error)
+            self.assertEqual(stage_label, "阶段调度")
+            self.assertEqual(role_label, "开发工程师")
+            live_worker.state = "READY"
+
+        with mock.patch(
+            "tmux_core.stage_kernel.role_orchestration.wait_for_worker_startup_intervention",
+            side_effect=recover_startup,
+        ) as recover:
+            result, reviewers, current_main = run_main_phase_with_death_handling(
+                main,
+                reviewers=(),
+                run_phase=lambda owner: owner,
+                replace_dead_main_owner=replace_main,
+                main_label="开发工程师",
+            )
+
+        self.assertIs(result, main)
+        self.assertEqual(reviewers, [])
+        self.assertIs(current_main, main)
+        self.assertEqual(worker.ensure_calls, 1)
+        recover.assert_called_once()
+        replace_main.assert_not_called()
 
     def test_run_main_phase_noninteractive_recreates_main_without_prompt(self):
         main = SimpleNamespace(worker=_ReadyDeathWorker(session_name="开发工程师-柳土獐"))

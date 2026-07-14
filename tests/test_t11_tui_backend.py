@@ -39,7 +39,11 @@ from T11_tui_backend import (
 )
 from T10_tui_protocol import build_request
 from T09_terminal_ops import BridgePromptRequest
-from tmux_core.runtime.tmux_runtime import clear_runtime_shutdown_request, runtime_shutdown_requested
+from tmux_core.runtime.tmux_runtime import (
+    AgentStartupInterventionRequired,
+    clear_runtime_shutdown_request,
+    runtime_shutdown_requested,
+)
 
 
 def _write_valid_routing_layer(project_dir: Path) -> None:
@@ -4765,6 +4769,94 @@ class T11TuiBackendTests(unittest.TestCase):
                 for item in messages
             )
         )
+
+    def test_workflow_startup_intervention_uses_real_session_and_state_for_recovery(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str((Path(tmpdir) / "deveco-worker.state.json").resolve())
+            session_name = "DevEcoCode-启动介入"
+            startup_error = AgentStartupInterventionRequired(
+                blocker_kind="deveco_login",
+                session_name=session_name,
+                state_path=state_path,
+                message="DevEco login requires manual intervention",
+            )
+            recovered_worker = object()
+            writer = io.StringIO()
+            server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            expected_backend = server._tmux_runtime.backend  # noqa: SLF001
+
+            with patch("T11_tui_backend.a00_main", side_effect=startup_error), patch(
+                "T11_tui_backend.load_worker_from_state_path",
+                return_value=recovered_worker,
+            ) as load_worker, patch(
+                "T11_tui_backend.try_resume_worker",
+                return_value=True,
+            ) as resume_worker:
+                server.handle_request(
+                    build_request("workflow.a00.start", {"argv": []}, message_id="req_startup_intervention")
+                )
+                prompt_id = ""
+                prompt_messages: list[dict[str, object]] = []
+                deadline = time.time() + 2.0
+                while time.time() < deadline:
+                    messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+                    prompt_messages = [
+                        item
+                        for item in messages
+                        if item.get("kind") == "event" and item.get("type") == "prompt.request"
+                    ]
+                    if prompt_messages:
+                        prompt_id = str(prompt_messages[-1]["payload"]["id"])
+                        break
+                    time.sleep(0.01)
+
+                self.assertTrue(prompt_id)
+                server.handle_request(
+                    build_request(
+                        "prompt.response",
+                        {"prompt_id": prompt_id, "value": "recheck_after_manual_intervention"},
+                        message_id="req_startup_intervention_prompt",
+                    )
+                )
+                for worker_thread in list(server._workers.values()):  # noqa: SLF001
+                    worker_thread.join(timeout=2.0)
+
+            messages = [json.loads(line) for line in writer.getvalue().splitlines() if line.strip()]
+            prompt_payload = prompt_messages[-1]["payload"]
+            self.assertEqual(prompt_payload["recovery_kind"], "agent_startup_intervention")
+            self.assertEqual(prompt_payload["session_name"], session_name)
+            self.assertEqual(prompt_payload["attach_command"], f"tmux attach -t {session_name}")
+            self.assertEqual(prompt_payload["state_path"], state_path)
+            self.assertFalse(prompt_payload["can_skip"])
+            load_worker.assert_called_once_with(state_path, backend=expected_backend)
+            resume_worker.assert_called_once_with(recovered_worker, timeout_sec=60.0)
+            responses = [
+                item
+                for item in messages
+                if item.get("kind") == "response" and item.get("id") == "req_startup_intervention"
+            ]
+            self.assertTrue(responses)
+            self.assertTrue(responses[-1]["ok"])
+            self.assertEqual(
+                responses[-1]["payload"],
+                {
+                    "awaiting_input": False,
+                    "recovered": True,
+                    "recovery_kind": "agent_startup_intervention",
+                    "session_name": session_name,
+                    "attach_command": f"tmux attach -t {session_name}",
+                    "message": "DevEco login requires manual intervention",
+                },
+            )
+            self.assertFalse(
+                any(
+                    item.get("kind") == "event"
+                    and item.get("type") == "stage.changed"
+                    and item.get("payload", {}).get("status") == "failed"
+                    for item in messages
+                )
+            )
+            self.assertFalse(any(item.get("kind") == "event" and item.get("type") == "error" for item in messages))
 
     def test_prompt_shutdown_does_not_mark_stage_failed(self):
         clear_runtime_shutdown_request()

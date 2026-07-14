@@ -263,6 +263,7 @@ def render_prompt_contract_appendix(resolved: ResolvedPromptSpec) -> str:
             "- Change policies are outcome-scoped: enforce `change` only for aliases listed in the selected outcome.",
             "- Aliases in `forbids` must be absent or empty for the selected outcome.",
             "- stdout is not the completion truth.",
+            "- Do not create or modify runtime-internal files; the system derives runtime status from the business artifacts above.",
             "- Follow the file contract exactly before returning.",
         ]
     )

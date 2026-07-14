@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-dir", help="项目目录")
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode|mimo|agy")
+    parser.add_argument("--vendor", help="开发工程师厂商: codex|claude|gemini|opencode|mimo|agy|deveco")
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")

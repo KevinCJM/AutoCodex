@@ -29,6 +29,7 @@ from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from tmux_core.requirements_scope import resolve_requirement_name_from_prompt_response
 from tmux_core.runtime.tmux_runtime import (
+    AgentStartupInterventionRequired,
     RuntimeShutdownRequested,
     TMUX_IDENTITY_REQUIREMENT_NAME_OPTION,
     TMUX_IDENTITY_RUNTIME_DIR_OPTION,
@@ -40,11 +41,13 @@ from tmux_core.runtime.tmux_runtime import (
     clear_runtime_shutdown_request,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
+    is_agent_startup_intervention_error,
     is_runtime_shutdown_error,
     is_worker_death_error,
     load_worker_from_state_path,
     _backend_show_option,
     request_runtime_shutdown,
+    try_resume_worker,
     worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.detailed_design import (
@@ -1685,6 +1688,7 @@ def _read_worker_state_snapshot(
             or ""
         ).strip(),
         "session_name": session_name,
+        "state_path": str(Path(state_path).expanduser().resolve()),
         "work_dir": str(_state_or_identity("work_dir")).strip(),
         "status": status,
         "workflow_stage": str(state.get("workflow_stage", "pending")).strip(),
@@ -1722,6 +1726,8 @@ def _read_worker_state_snapshot(
         "model": str(config_payload.get("model", "")).strip(),
         "resolved_model": str(config_payload.get("resolved_model", "")).strip(),
         "reasoning_effort": str(config_payload.get("reasoning_effort", "")).strip(),
+        "startup_blocker_kind": str(state.get("startup_blocker_kind", "")).strip(),
+        "startup_blocker_requires_manual": bool(state.get("startup_blocker_requires_manual", False)),
     }
 
 
@@ -4673,15 +4679,33 @@ class BridgeCore:
             fallback_stage_seq=stage_seq,
         )
         message_text = str(error or "").strip()
+        startup_intervention = is_agent_startup_intervention_error(error)
+        recovery_kind = "agent_startup_intervention" if startup_intervention else "agent_ready_timeout"
+        workers = self._filter_workers_for_current_context(
+            self._current_stage_workers_without_runtime_io(final_action or action),
+            final_action or action,
+        )
+        if not workers:
+            workers = self._filter_workers_for_current_context(
+                self._current_stage_workers(final_action or action),
+                final_action or action,
+            )
+        worker_context = sorted(workers, key=_worker_snapshot_sort_key, reverse=True)
+        current_worker = worker_context[0] if worker_context else {}
+        state_path = str(getattr(error, "state_path", "") or current_worker.get("state_path", "")).strip()
+        session_name = str(getattr(error, "session_name", "") or current_worker.get("session_name", "")).strip()
+        role_label = session_name.split("-", 1)[0] if session_name else "当前智能体"
+        attach_command = f"tmux attach -t {session_name}" if session_name else ""
+        title = "HITL: 智能体启动需要人工介入" if startup_intervention else "HITL: 智能体启动超时"
         self.emit_event(
             "log.append",
             {
                 "text": (
-                    "检测到智能体启动超时，已转为 HITL 人工介入，系统不会标记为失败。\n"
-                    "处理后请选择继续尝试；如果这是未覆盖的兜底路径，可能需要重新发起当前阶段。\n"
+                    "检测到智能体启动需要人工处理，已转为 HITL，系统不会标记为失败。\n"
+                    + (f"{attach_command}\n" if attach_command else "")
                 ),
                 "log_kind": "warning",
-                "log_title": "agent ready timeout",
+                "log_title": recovery_kind,
             },
         )
         self._pending_prompt_display_state = {
@@ -4692,37 +4716,56 @@ class BridgeCore:
             "message": message_text,
             "force": True,
         }
+        recovered = False
         try:
             self._prompt_broker.request(
                 BridgePromptRequest(
                     prompt_type="select",
                     payload={
-                        "title": "HITL: 智能体启动超时",
-                        "prompt_text": "请先手动更换模型或处理该 AGENT，然后选择继续尝试。",
+                        "title": title,
+                        "prompt_text": "请先进入原 tmux 会话处理该 AGENT，然后重新检查。",
                         "options": [
                             {
-                                "value": "retry_after_manual_model_change",
-                                "label": "我已手动更换模型，继续尝试",
+                                "value": "recheck_after_manual_intervention",
+                                "label": "我已处理，重新检查",
                             }
                         ],
-                        "default_value": "retry_after_manual_model_change",
+                        "default_value": "recheck_after_manual_intervention",
                         "is_hitl": True,
-                        "recovery_kind": "agent_ready_timeout",
-                        "session_name": "",
-                        "role_label": "当前智能体",
+                        "recovery_kind": recovery_kind,
+                        "session_name": session_name,
+                        "role_label": role_label,
+                        "attach_command": attach_command,
+                        "state_path": state_path,
                         "can_skip": False,
                     },
                 )
             )
+            backend = getattr(self._tmux_runtime, "backend", None)
+            recovered_worker = load_worker_from_state_path(state_path, backend=backend) if state_path else None
+            if recovered_worker is not None:
+                recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
         finally:
             self._pending_prompt_display_state = None
+        if recovered:
+            self.emit_event(
+                "log.append",
+                {
+                    "text": "人工处理后已确认智能体 READY；原阶段调用栈若已退出，请重新发起当前阶段。\n",
+                    "log_kind": "success",
+                    "log_title": "agent startup recovered",
+                },
+            )
         if respond and request_id:
             self.emit_response(
                 request_id,
                 ok=True,
                 payload={
-                    "awaiting_input": True,
-                    "recovery_kind": "agent_ready_timeout",
+                    "awaiting_input": not recovered,
+                    "recovered": recovered,
+                    "recovery_kind": recovery_kind,
+                    "session_name": session_name,
+                    "attach_command": attach_command,
                     "message": message_text,
                 },
             )
@@ -4993,6 +5036,15 @@ class BridgeCore:
                     fallback_stage_seq=stage_seq,
                 )
                 if is_runtime_shutdown_error(error):
+                    return
+                if is_agent_startup_intervention_error(error):
+                    self._await_agent_ready_timeout_recovery(
+                        request_id=request_id,
+                        action=final_action or action,
+                        stage_seq=final_stage_seq,
+                        error=error,
+                        respond=respond,
+                    )
                     return
                 if is_agent_ready_timeout_error(error):
                     self._await_agent_ready_timeout_recovery(

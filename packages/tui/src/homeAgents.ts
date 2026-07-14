@@ -43,6 +43,7 @@ const VENDOR_LABELS: Record<string, string> = {
   opencode: 'OpenCode',
   mimo: 'MiMo Code',
   agy: 'AGY',
+  deveco: 'DevEco Code',
 }
 const EFFORT_LABELS: Record<string, string> = {
   high: 'High',

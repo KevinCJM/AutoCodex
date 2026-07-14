@@ -37,6 +37,7 @@ from T02_tmux_agents import (
     is_runtime_noise_line,
     worker_state_is_prelaunch_active,
 )
+from tmux_core.stage_kernel.agent_intervention import run_worker_turn_with_startup_recovery
 
 
 ROUTING_LAYER_REQUIRED_FILES = (
@@ -1787,6 +1788,35 @@ def run_directory_initialization_with_worker(
             note=note or workflow_stage,
         )
 
+    def run_routing_turn_with_startup_recovery(
+            *,
+            workflow_stage: str,
+            run_turn_kwargs: dict[str, object],
+    ) -> CommandResult:
+        def on_intervention(error: Exception) -> None:
+            sync_state(
+                workflow_stage,
+                note="awaiting_startup_intervention",
+                result_status="running",
+            )
+            if run_store is not None:
+                run_store.set_status("awaiting_input")
+                run_store.append_event(
+                    "startup_intervention_required",
+                    work_dir=str(target_dir),
+                    workflow_stage=workflow_stage,
+                    session_name=worker.session_name,
+                    blocker_kind=str(getattr(error, "blocker_kind", "") or ""),
+                )
+
+        return run_worker_turn_with_startup_recovery(
+            worker,
+            run_turn_kwargs=run_turn_kwargs,
+            stage_label="AGENT初始化",
+            role_label=str(worker.session_name or target_dir.name or "路由智能体"),
+            on_intervention=on_intervention,
+        )
+
     def fail(reason: str) -> DirectoryInitResult:
         collected = worker.collect_result()
         result = DirectoryInitResult(
@@ -1881,10 +1911,13 @@ def run_directory_initialization_with_worker(
         reset_turn_runtime_dir(worker.runtime_dir, current_turn_id)
         current_turn_status_path = str(contract.status_path)
         sync_state("create_running", note="create_routing_layer")
-        create_result = worker.run_turn(
-            label="create_routing_layer",
-            prompt=build_create_prompt(),
-            completion_contract=contract,
+        create_result = run_routing_turn_with_startup_recovery(
+            workflow_stage="create_running",
+            run_turn_kwargs={
+                "label": "create_routing_layer",
+                "prompt": build_create_prompt(),
+                "completion_contract": contract,
+            },
         )
         if run_store is not None:
             run_store.update_worker_state_from_file(
@@ -1920,12 +1953,13 @@ def run_directory_initialization_with_worker(
         current_turn_status_path = str(contract.status_path)
         reset_routing_audit_artifacts(target_dir)
         sync_state("audit_running", note=f"audit_routing_layer_{round_index}")
-        audit_result = worker.run_turn(
-            label=f"audit_routing_layer_{round_index}",
-            prompt=build_audit_prompt(
-                audit_round=round_index,
-            ),
-            completion_contract=contract,
+        audit_result = run_routing_turn_with_startup_recovery(
+            workflow_stage="audit_running",
+            run_turn_kwargs={
+                "label": f"audit_routing_layer_{round_index}",
+                "prompt": build_audit_prompt(audit_round=round_index),
+                "completion_contract": contract,
+            },
         )
         if run_store is not None:
             run_store.update_worker_state_from_file(
@@ -1967,12 +2001,13 @@ def run_directory_initialization_with_worker(
         reset_turn_runtime_dir(worker.runtime_dir, current_turn_id)
         current_turn_status_path = str(contract.status_path)
         sync_state("refine_running", note=f"refine_routing_layer_{current_round}")
-        refine_result = worker.run_turn(
-            label=f"refine_routing_layer_{current_round}",
-            prompt=build_refine_prompt(
-                audit_record,
-            ),
-            completion_contract=contract,
+        refine_result = run_routing_turn_with_startup_recovery(
+            workflow_stage="refine_running",
+            run_turn_kwargs={
+                "label": f"refine_routing_layer_{current_round}",
+                "prompt": build_refine_prompt(audit_record),
+                "completion_contract": contract,
+            },
         )
         if run_store is not None:
             run_store.update_worker_state_from_file(

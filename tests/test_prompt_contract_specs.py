@@ -95,6 +95,7 @@ class PromptContractSpecTests(unittest.TestCase):
                 **{key: str(value) for key, value in paths.items()},
             )
             self.assertIn("## 本轮文件契约", built.prompt)
+            self.assertIn("Do not create or modify runtime-internal files", built.prompt)
             self.assertIsNotNone(built.task_result_contract)
             contract = built.task_result_contract
             assert contract is not None

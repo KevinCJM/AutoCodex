@@ -1,23 +1,29 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from tmux_core.runtime.contracts import (
+    TASK_STATUS_DONE,
     CompletionObservation,
     TaskResultContract,
     TaskResultObservation,
     TurnFileContract,
+    build_missing_task_result_finalization_candidate,
+    finalize_task_result,
     observe_completion_state,
     observe_task_result_state,
     read_task_result_payload,
 )
 from tmux_core.runtime.tmux_runtime import (
+    AgentRuntimeState,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     TASK_RESULT_CONTRACT_ERROR_PREFIX,
     TURN_ARTIFACT_CONTRACT_ERROR_PREFIX,
     TmuxBatchWorker,
+    WorkerStatus,
     is_stale_busy_without_contract_error,
     is_task_result_contract_error,
     is_turn_artifact_contract_error,
@@ -25,6 +31,7 @@ from tmux_core.runtime.tmux_runtime import (
 from tmux_core.stage_kernel.agent_intervention import (
     AGENT_INTERVENTION_WORKER_DEAD,
     request_file_noncompliance_intervention,
+    run_worker_turn_with_startup_recovery,
 )
 
 DEFAULT_TURN_REPAIR_ATTEMPTS = 2
@@ -97,6 +104,145 @@ def _is_internal_task_result_error(message: str) -> bool:
     if "result.json" not in text and "_result.json" not in text:
         return False
     return "缺少 result.json" in text or "result_path=" in text or any(marker in text for marker in _INTERNAL_TASK_RESULT_MARKERS)
+
+
+def _task_status_path_for_worker(worker: object) -> Path | None:
+    status_path_text = str(getattr(worker, "current_task_status_path", "") or "").strip()
+    if not status_path_text:
+        read_state = getattr(worker, "read_state", None)
+        if callable(read_state):
+            try:
+                state = read_state()
+            except Exception:
+                state = {}
+            if isinstance(state, dict):
+                status_path_text = str(state.get("current_task_status_path", "") or "").strip()
+    return Path(status_path_text).expanduser().resolve() if status_path_text else None
+
+
+def _mark_worker_task_result_materialized(
+    *,
+    worker: object,
+    label: str,
+    result_path: Path,
+    task_status_path: Path | None,
+) -> None:
+    with suppress(Exception):
+        setattr(worker, "current_task_runtime_status", TASK_STATUS_DONE)
+    with suppress(Exception):
+        setattr(worker, "current_task_result_path", str(result_path))
+    if task_status_path is not None:
+        with suppress(Exception):
+            setattr(worker, "current_task_status_path", str(task_status_path))
+    with suppress(Exception):
+        setattr(worker, "agent_ready", True)
+    with suppress(Exception):
+        setattr(worker, "agent_started", True)
+    with suppress(Exception):
+        setattr(worker, "agent_state", AgentRuntimeState.READY)
+    write_state = getattr(worker, "_write_state", None)
+    if not callable(write_state):
+        return
+    extra: dict[str, object] = {
+        "label": label,
+        "result_status": "succeeded",
+        "current_task_runtime_status": TASK_STATUS_DONE,
+        "current_task_result_path": str(result_path),
+        "dispatch_state": "",
+        "dispatch_reason": "",
+        "agent_ready": True,
+        "agent_started": True,
+        "agent_state": AgentRuntimeState.READY.value,
+    }
+    if task_status_path is not None:
+        extra["current_task_status_path"] = str(task_status_path)
+    with suppress(Exception):
+        write_state(WorkerStatus.SUCCEEDED, note=f"done:{label}:runtime_materialized", extra=extra)
+
+
+def _try_materialize_valid_task_result_from_contract(
+    *,
+    worker: object,
+    label: str,
+    contract: TaskResultContract,
+    result_path: Path,
+) -> dict[str, object] | None:
+    task_status_path = _task_status_path_for_worker(worker)
+    candidate = build_missing_task_result_finalization_candidate(
+        contract,
+        task_status_path=task_status_path,
+    )
+    if candidate is None:
+        return None
+    try:
+        result_file = finalize_task_result(
+            contract=contract,
+            result_path=result_path,
+            task_status_path=task_status_path,
+        )
+    except Exception:
+        return None
+    _mark_worker_task_result_materialized(
+        worker=worker,
+        label=label,
+        result_path=result_path,
+        task_status_path=task_status_path,
+    )
+    return dict(result_file.payload)
+
+
+def _required_aliases_for_status(
+    *,
+    contract: TaskResultContract,
+    turn_goal: TaskTurnGoal | None,
+    status: str,
+) -> tuple[str, ...]:
+    status_text = str(status or "").strip()
+    if turn_goal is not None and status_text in turn_goal.outcomes:
+        return tuple(turn_goal.outcomes[status_text].required_aliases)
+    if status_text and contract.outcome_artifacts:
+        outcome = contract.outcome_artifacts.get(status_text, {})
+        if isinstance(outcome, dict):
+            return tuple(str(alias).strip() for alias in outcome.get("requires", ()) if str(alias).strip())
+    return tuple(contract.required_artifacts)
+
+
+def _stale_business_artifact_validation(
+    *,
+    contract: TaskResultContract,
+    turn_goal: TaskTurnGoal | None,
+    validation: GoalValidation,
+) -> GoalValidation:
+    required_aliases = _required_aliases_for_status(
+        contract=contract,
+        turn_goal=turn_goal,
+        status=validation.expected_status,
+    )
+    return GoalValidation(
+        valid=False,
+        expected_status=validation.expected_status,
+        missing_aliases=required_aliases,
+        forbidden_aliases=validation.forbidden_aliases,
+        message=(
+            "业务产物存在但未确认属于本轮执行；"
+            "系统不会用疑似上一轮产物生成 runtime 结果，请覆盖写入本轮业务产物。"
+        ),
+    )
+
+
+def _target_paths_for_task_intervention(
+    *,
+    observation: TaskResultObservation,
+    validation: GoalValidation,
+    fallback_result_path: Path,
+) -> tuple[str, ...]:
+    aliases = tuple(dict.fromkeys(validation.missing_aliases + validation.forbidden_aliases))
+    paths = tuple(
+        str(observation.artifact_paths[alias])
+        for alias in aliases
+        if alias in observation.artifact_paths
+    )
+    return paths or tuple(observation.artifact_paths.values()) or (str(fallback_result_path),)
 
 
 def _sanitize_task_validation_error(message: str) -> str:
@@ -342,7 +488,12 @@ def run_task_result_turn_with_repair(
             run_turn_kwargs["pre_submit_observation_tail_lines"] = pre_submit_observation_tail_lines
         if pre_submit_observation_tail_bytes is not None:
             run_turn_kwargs["pre_submit_observation_tail_bytes"] = pre_submit_observation_tail_bytes
-        result = worker.run_turn(**run_turn_kwargs)
+        result = run_worker_turn_with_startup_recovery(
+            worker,
+            run_turn_kwargs=run_turn_kwargs,
+            stage_label=stage_label or active_result_contract.stage_name or active_result_contract.phase,
+            role_label=role_label,
+        )
         current_error: RuntimeError | None = None
         payload: dict[str, object] | None = None
         if result.ok:
@@ -375,11 +526,18 @@ def run_task_result_turn_with_repair(
         if validation.valid and internal_result_error and (
             current_error is None or is_task_result_contract_error(current_error)
         ):
-            observed = observation.observed_status or validation.expected_status or "unknown"
-            raise RuntimeError(
-                f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: "
-                f"turn={current_label} observed_status={observed} "
-                "internal task result materialization missing"
+            payload_from_business_artifacts = _try_materialize_valid_task_result_from_contract(
+                worker=worker,
+                label=current_label,
+                contract=active_result_contract,
+                result_path=result_path,
+            )
+            if payload_from_business_artifacts is not None:
+                return payload_from_business_artifacts
+            validation = _stale_business_artifact_validation(
+                contract=active_result_contract,
+                turn_goal=turn_goal,
+                validation=validation,
             )
         if result.ok and validation.valid:
             return payload or {}
@@ -392,13 +550,26 @@ def run_task_result_turn_with_repair(
         ):
             raise current_error
         if repair_attempt >= repair_budget:
-            terminal_error = current_error or _build_task_goal_error(
-                turn_label=current_label,
-                observation=observation,
-                validation=validation,
+            terminal_error = (
+                _build_task_goal_error(
+                    turn_label=current_label,
+                    observation=observation,
+                    validation=validation,
+                )
+                if not validation.valid
+                else current_error
+                or _build_task_goal_error(
+                    turn_label=current_label,
+                    observation=observation,
+                    validation=validation,
+                )
             )
             while True:
-                target_paths = tuple(observation.artifact_paths.values()) or (str(result_path),)
+                target_paths = _target_paths_for_task_intervention(
+                    observation=observation,
+                    validation=validation,
+                    fallback_result_path=result_path,
+                )
                 decision = request_file_noncompliance_intervention(
                     stage_label=stage_label or active_result_contract.stage_name or active_result_contract.phase,
                     role_label=role_label,
@@ -421,8 +592,23 @@ def run_task_result_turn_with_repair(
                     else GoalValidation(valid=True, expected_status="", missing_aliases=(), forbidden_aliases=(), message="")
                 )
                 internal_result_error = _is_internal_task_result_error(observation.last_validation_error or "")
-                if validation.valid and not internal_result_error:
-                    return read_task_result_payload(result_path)
+                if validation.valid:
+                    if internal_result_error:
+                        payload_from_business_artifacts = _try_materialize_valid_task_result_from_contract(
+                            worker=worker,
+                            label=current_label,
+                            contract=active_result_contract,
+                            result_path=result_path,
+                        )
+                        if payload_from_business_artifacts is not None:
+                            return payload_from_business_artifacts
+                        validation = _stale_business_artifact_validation(
+                            contract=active_result_contract,
+                            turn_goal=turn_goal,
+                            validation=validation,
+                        )
+                    else:
+                        return read_task_result_payload(result_path)
                 terminal_error = _build_task_goal_error(
                     turn_label=current_label,
                     observation=observation,
@@ -437,7 +623,9 @@ def run_task_result_turn_with_repair(
             artifact_paths=observation.artifact_paths,
             present_aliases=observation.present_aliases,
             observed_status=observation.observed_status,
-            last_validation_error=observation.last_validation_error or (str(current_error).strip() if current_error else ""),
+            last_validation_error=validation.message
+            or observation.last_validation_error
+            or (str(current_error).strip() if current_error else ""),
             validation=validation,
         )
         current_prompt = repair_prompt_builder(context)
@@ -494,7 +682,12 @@ def run_completion_turn_with_repair(
             run_turn_kwargs["pre_submit_observation_tail_lines"] = pre_submit_observation_tail_lines
         if pre_submit_observation_tail_bytes is not None:
             run_turn_kwargs["pre_submit_observation_tail_bytes"] = pre_submit_observation_tail_bytes
-        result = worker.run_turn(**run_turn_kwargs)
+        result = run_worker_turn_with_startup_recovery(
+            worker,
+            run_turn_kwargs=run_turn_kwargs,
+            stage_label=stage_label or completion_contract.phase,
+            role_label=role_label,
+        )
         current_error = RuntimeError(result.clean_output or f"{current_label} 执行失败") if not result.ok else None
         observation = observe_completion_state(completion_contract)
         validation = (

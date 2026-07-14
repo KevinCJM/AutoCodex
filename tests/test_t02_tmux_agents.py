@@ -15,11 +15,13 @@ import T02_tmux_agents as runtime_module
 from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor, get_model_choices
 from T02_tmux_agents import (
     AgentRuntimeState,
+    AgentStartupInterventionRequired,
     AgentRunConfig,
     AgyOutputDetector,
     GeminiOutputDetector,
     HealthSupervisor,
     MimoOutputDetector,
+    DevEcoOutputDetector,
     OpenCodeOutputDetector,
     CodexOutputDetector,
     ClaudeOutputDetector,
@@ -47,6 +49,7 @@ from T02_tmux_agents import (
     build_session_name,
     extract_final_protocol_token,
     is_provider_runtime_error,
+    is_agent_startup_intervention_error,
     list_occupied_tmux_session_names,
     load_worker_from_state_path,
     normalize_proxy_url,
@@ -639,6 +642,13 @@ MIMO_STATE_TEST_DONE
 esc interrupt
 36.0K (3%) · tab 切换模式 ctrl+p 设置 @ 添加文件 $ 子智能体 / 唤起命令
 """
+            queued_visible = """
+┃  Build · MiMo-V2.5-Pro MiMo
+QUEUED
+╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+🛸˙·∙˙·          esc        122.1K (12%) · $0.81tab switch mode ctrl+p
+                 interrupt                                      settings
+"""
             trust_visible = """
 ●  访问工作区：
 │  安全确认：这是你自己创建或信任的项目吗？
@@ -655,7 +665,285 @@ esc interrupt
             self.assertTrue(worker._visible_indicates_agent_ready(english_waiting_visible))
             self.assertTrue(worker._visible_indicates_agent_ready(completed_visible))
             self.assertFalse(worker._visible_indicates_agent_ready(busy_visible))
+            self.assertFalse(worker._visible_indicates_agent_ready(queued_visible))
             self.assertEqual(worker.config.expected_current_commands(), ("mimo", "node"))
+
+    def test_deveco_launch_command_uses_resolved_binary_and_disables_auto_update(self):
+        resolution = SimpleNamespace(
+            resolved_model="deveco/GLM-current",
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test",
+            confidence="high",
+            native_reasoning_level="",
+            normalized_effort="high",
+            supports_reasoning=True,
+            notes=(),
+            executable_path="/opt/DevEco Code/bin/DevEco",
+        )
+        with mock.patch("tmux_core.runtime.tmux_runtime.resolve_launch", return_value=resolution):
+            config = AgentRunConfig(vendor="deveco", model="deveco/GLM-current")
+            command = config.build_launch_command(Path("/tmp/project with spaces"))
+
+        self.assertEqual(config.vendor, Vendor.DEVECO)
+        self.assertEqual(config.resolved_executable, "/opt/DevEco Code/bin/DevEco")
+        self.assertEqual(config.expected_current_commands(), ("deveco", "DevEco", "node"))
+        self.assertEqual(
+            command,
+            "env DEVECO_DISABLE_AUTOUPDATE=1 '/opt/DevEco Code/bin/DevEco' '/tmp/project with spaces' --pure --model deveco/GLM-current",
+        )
+
+    def test_deveco_run_config_freezes_scan_resolution_for_summary_prompt_and_launch(self):
+        resolution = SimpleNamespace(
+            resolved_model="deveco/GLM-current",
+            resolved_variant="high",
+            reasoning_control_mode="mapped",
+            catalog_source_kind="dynamic_cli",
+            confidence="high",
+            native_reasoning_level="high",
+            normalized_effort="high",
+            supports_reasoning=True,
+            notes=("scanned_once",),
+            executable_path="/opt/deveco/bin/deveco",
+        )
+        with mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            side_effect=[resolution, AssertionError("AgentRunConfig must not rescan after initialization")],
+        ) as resolve:
+            config = AgentRunConfig(vendor="deveco", model="deveco/GLM-current")
+            summary = config.to_summary()
+            prompt = config.with_prompt_header("continue")
+            command = config.build_launch_command(Path("/tmp/project"))
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(summary["resolved_model"], "deveco/GLM-current")
+        self.assertIn("deveco_model=deveco/GLM-current", prompt)
+        self.assertIn("/opt/deveco/bin/deveco", command)
+
+    def test_deveco_detector_prioritizes_current_blockers_and_busy_over_ready(self):
+        detector = DevEcoOutputDetector()
+        ready = "Ask anything...\nBuild · GLM-current DevEco Code\nctrl+p commands"
+        update = (
+            "Update Available\nA new release v0.1.2 is available.\n"
+            "Would you like to update now?\nSkip Confirm\n" + ready
+        )
+        studio_old = (
+            "Please configure your DevEco Studio path (Requires version 6.1 or later.)\n"
+            "Enter a custom path\nSkip (DevEco Studio Tools will be unavailable.)"
+        )
+        studio_new = (
+            "Configure DevEco Studio Path (Requires version 6.1 or later.)\n"
+            "Enter a custom path\nSkip"
+        )
+
+        self.assertEqual(detector.classify_agent_state(self._observation(visible_text=update, current_command="node")), AgentRuntimeState.STARTING)
+        self.assertEqual(
+            detector.classify_agent_state(
+                self._observation(
+                    visible_text=update,
+                    raw_log_tail="[[ACX_TURN:old:DONE]]\nAsk anything...\nctrl+p commands",
+                    current_command="node",
+                )
+            ),
+            AgentRuntimeState.STARTING,
+        )
+        self.assertEqual(detector.classify_agent_state(self._observation(visible_text=studio_old, current_command="node")), AgentRuntimeState.STARTING)
+        self.assertEqual(detector.classify_agent_state(self._observation(visible_text=studio_new, current_command="node")), AgentRuntimeState.STARTING)
+        self.assertEqual(
+            detector.classify_agent_state(self._observation(visible_text="Checking login status...", current_command="node")),
+            AgentRuntimeState.STARTING,
+        )
+        self.assertEqual(
+            detector.classify_agent_state(
+                self._observation(
+                    visible_text=f"esc again to interrupt\n{ready}",
+                    raw_log_tail="[[ACX_TURN:old:DONE]]",
+                    current_command="node",
+                )
+            ),
+            AgentRuntimeState.BUSY,
+        )
+        self.assertEqual(
+            detector.classify_agent_state(self._observation(visible_text=ready, raw_log_tail=studio_old, current_command="node")),
+            AgentRuntimeState.READY,
+        )
+        self.assertEqual(
+            detector.classify_agent_state(
+                self._observation(visible_text="DevEco Code", current_command="node", pane_title="DevEco Code")
+            ),
+            AgentRuntimeState.BUSY,
+        )
+        self.assertEqual(
+            detector.classify_agent_state(
+                self._observation(visible_text=ready, current_command="node", session_exists=False)
+            ),
+            AgentRuntimeState.DEAD,
+        )
+
+    def test_deveco_boot_actions_are_version_specific_visible_only_and_one_shot(self):
+        resolution = SimpleNamespace(
+            resolved_model="deveco/GLM-current",
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test",
+            confidence="high",
+            native_reasoning_level="",
+            normalized_effort="high",
+            supports_reasoning=True,
+            notes=(),
+            executable_path="/usr/bin/deveco",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            return_value=resolution,
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="deveco-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="deveco", model="deveco/GLM-current"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            keys: list[str] = []
+            worker.send_special_key = keys.append  # type: ignore[method-assign]
+            old_prompt = "Please select DevEco Studio path\nEnter a custom path\nSkip"
+            new_prompt = "Configure DevEco Studio Path\nEnter a custom path\nSkip"
+            update_prompt = (
+                "Update Available\nA new release v0.1.2 is available.\n"
+                "Would you like to update now?\nSkip Confirm"
+            )
+            with mock.patch("tmux_core.runtime.tmux_runtime.time.sleep"):
+                self.assertTrue(worker._maybe_handle_deveco_boot_prompt(old_prompt))
+                self.assertFalse(worker._maybe_handle_deveco_boot_prompt(old_prompt))
+                self.assertFalse(worker._maybe_handle_deveco_boot_prompt(new_prompt))
+                self.assertTrue(worker._maybe_handle_deveco_boot_prompt(update_prompt))
+                self.assertFalse(worker._maybe_handle_deveco_boot_prompt(update_prompt))
+                worker._deveco_boot_actions_handled.clear()
+                self.assertTrue(worker._maybe_handle_deveco_boot_prompt(new_prompt))
+
+            self.assertEqual(keys, ["Up", "Enter", "Left", "Enter", *("Down" for _ in range(6)), "Enter"])
+            keys.clear()
+            self.assertFalse(worker._maybe_handle_deveco_boot_prompt("Ask anything...\nctrl+p commands"))
+            self.assertEqual(keys, [])
+
+    def test_deveco_startup_intervention_state_persists_until_ready_normalization(self):
+        resolution = SimpleNamespace(
+            resolved_model="deveco/GLM-current",
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test",
+            confidence="high",
+            native_reasoning_level="",
+            normalized_effort="high",
+            supports_reasoning=True,
+            notes=(),
+            executable_path="/usr/bin/deveco",
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            return_value=resolution,
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="deveco-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="deveco", model="deveco/GLM-current"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            error = worker._deveco_startup_intervention("deveco_login")
+            self.assertIsInstance(error, AgentStartupInterventionRequired)
+            self.assertTrue(is_agent_startup_intervention_error(error))
+            self.assertEqual(error.state_path, str(worker.state_path))
+            with mock.patch.object(worker, "is_agent_alive", return_value=True), mock.patch.object(
+                worker,
+                "get_agent_state",
+                return_value=AgentRuntimeState.STARTING,
+            ):
+                worker.mark_awaiting_reconfiguration(
+                    reason_text=str(error),
+                    startup_blocker_kind=error.blocker_kind,
+                    startup_blocker_requires_manual=True,
+                )
+                worker._write_state(WorkerStatus.RUNNING, note="health_probe")
+            state = worker.read_state()
+            self.assertEqual(state["startup_blocker_kind"], "deveco_login")
+            self.assertTrue(state["startup_blocker_requires_manual"])
+            ready_observation = self._observation(
+                visible_text="Ask anything...\nBuild · GLM-current DevEco Code\nctrl+p commands",
+                current_command="node",
+                pane_title="DevEco Code",
+                current_path=tmp_dir,
+            )
+            with mock.patch.object(worker, "is_agent_alive", return_value=True), mock.patch.object(
+                worker,
+                "get_agent_state",
+                return_value=AgentRuntimeState.READY,
+            ):
+                worker._mark_agent_ready_from_observation(ready_observation)
+            ready_state = worker.read_state()
+            self.assertEqual(ready_state["startup_blocker_kind"], "")
+            self.assertFalse(ready_state["startup_blocker_requires_manual"])
+
+    def test_deveco_manual_blocker_keeps_live_pane_without_launch_failure_stagger(self):
+        resolution = SimpleNamespace(
+            resolved_model="deveco/GLM-current",
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test",
+            confidence="high",
+            native_reasoning_level="",
+            normalized_effort="high",
+            supports_reasoning=True,
+            notes=(),
+            executable_path="/usr/bin/deveco",
+        )
+
+        class ManualBlockerWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):  # noqa: ANN001
+                return True
+
+            def _ensure_health_supervisor_started(self):
+                return None
+
+            def _wait_for_shell_ready(self, timeout_sec=10.0):
+                return None
+
+            def _send_text(self, text, enter_count=1):  # noqa: ANN001
+                return None
+
+            def _wait_for_agent_ready(self, timeout_sec=60.0):
+                raise self._deveco_startup_intervention("deveco_login")
+
+            def is_agent_alive(self, observation=None):  # noqa: ANN001
+                return True
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001
+                return AgentRuntimeState.STARTING
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            return_value=resolution,
+        ):
+            worker = ManualBlockerWorker(
+                worker_id="deveco-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="deveco", model="deveco/GLM-current"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            startup_slot = mock.MagicMock()
+            startup_slot.__enter__.return_value = None
+            startup_slot.__exit__.return_value = False
+            with mock.patch.object(worker.launch_coordinator, "startup_slot", return_value=startup_slot), mock.patch.object(
+                worker.launch_coordinator,
+                "record_launch_result",
+            ) as record_launch_result:
+                with self.assertRaises(AgentStartupInterventionRequired):
+                    worker.launch_agent(timeout_sec=0.1)
+
+            record_launch_result.assert_not_called()
+            self.assertEqual(worker.pane_id, "%1")
+            self.assertEqual(worker.agent_state, AgentRuntimeState.STARTING)
+            self.assertEqual(worker.read_state()["startup_blocker_kind"], "deveco_login")
 
     def test_supported_vendor_state_classification_is_deterministic(self):
         cases = (
@@ -5904,6 +6192,77 @@ workspace (/directory)                                                     branc
                         timeout_sec=1.0,
                     )
 
+    def test_wait_for_task_result_keeps_waiting_when_mimo_surface_is_active(self):
+        active_surface = """
+~ Writing command...
+
+▣  Build · MiMo-V2.5-Pro                                                   █
+
+┃  Build · MiMo-V2.5-Pro MiMo
+╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+🛸∙˙·∙˙          esc        122.1K (12%) · $0.81tab switch mode ctrl+p
+                 interrupt                                      settings
+"""
+
+        class ActiveMimoMissingArtifactWorker(TmuxBatchWorker):
+            def target_exists(self, target=None):
+                return True
+
+            def _terminal_idle_elapsed_sec(self):
+                return 0.0
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                return WorkerObservation(
+                    visible_text=active_surface,
+                    raw_log_delta="",
+                    raw_log_tail=active_surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-06-28T08:47:20",
+                    pane_title="MC | 代码实现预研",
+                )
+
+            def capture_visible(self, tail_lines=200):
+                return active_surface
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            developer_output = root / "开发记录.md"
+            result_path = root / "result.json"
+            worker = ActiveMimoMissingArtifactWorker(
+                worker_id="active-mimo-missing-contract-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="mimo", model="xiaomi/mimo-v2.5-pro"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_command = "node"
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": developer_output},
+            )
+
+            with mock.patch("tmux_core.runtime.tmux_runtime.TASK_RESULT_READY_MISSING_GRACE_SEC", 0.0):
+                with self.assertRaisesRegex(TimeoutError, "等待任务结果超时"):
+                    worker.wait_for_task_result(
+                        contract=contract,
+                        task_status_path=task_status_path,
+                        result_path=result_path,
+                        timeout_sec=0.6,
+                    )
+            self.assertFalse(result_path.exists())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "running"})
+
     def test_wait_for_task_result_does_not_auto_ready_force_hitl_without_ask_human(self):
         class ReadyMissingHitlWorker(TmuxBatchWorker):
             def target_exists(self, target=None):
@@ -9374,6 +9733,22 @@ MIMO_STATE_TEST_DONE
 esc interrupt
 36.0K (3%) · tab 切换模式 ctrl+p 设置 @ 添加文件 $ 子智能体 / 唤起命令
 """
+        active_writing_surface = """
+~ Writing command...
+
+▣  Build · MiMo-V2.5-Pro                                                   █
+
+┃  Build · MiMo-V2.5-Pro MiMo
+╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+🛸∙˙·∙˙          esc        122.1K (12%) · $0.81tab switch mode ctrl+p
+                 interrupt                                      settings
+"""
+        queued_surface = """
+┃  Build · MiMo-V2.5-Pro MiMo
+QUEUED
+Build · MiMo-V2.5-Pro MiMo
+tab switch mode ctrl+p settings @ attach file $ subagent / commands
+"""
 
         waiting_phase = detector.classify_agent_state(
             WorkerObservation(
@@ -9431,11 +9806,41 @@ esc interrupt
                 pane_title="MiMoCode",
             )
         )
+        active_writing_phase = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=active_writing_surface,
+                raw_log_delta="",
+                raw_log_tail=active_writing_surface,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-06-17T00:00:03",
+                pane_title="MC | 代码实现预研",
+            )
+        )
+        queued_phase = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=queued_surface,
+                raw_log_delta="",
+                raw_log_tail=queued_surface,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-06-17T00:00:04",
+                pane_title="MC | 代码实现预研",
+            )
+        )
 
         self.assertEqual(waiting_phase, AgentRuntimeState.READY)
         self.assertEqual(english_waiting_phase, AgentRuntimeState.READY)
         self.assertEqual(completed_phase, AgentRuntimeState.READY)
         self.assertEqual(busy_phase, AgentRuntimeState.BUSY)
+        self.assertEqual(active_writing_phase, AgentRuntimeState.BUSY)
+        self.assertEqual(queued_phase, AgentRuntimeState.BUSY)
 
     def test_agy_output_detector_classifies_starting_ready_busy_and_completed_surfaces(self):
         detector = AgyOutputDetector()

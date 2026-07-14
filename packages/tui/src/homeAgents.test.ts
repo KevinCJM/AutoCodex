@@ -228,6 +228,11 @@ test('buildAgentConfigLabel formats vendor model and effort for home display', (
     model: 'Gemini 3.5 Flash (Low)',
     reasoningEffort: 'low',
   }))).toBe('AGY | Gemini 3.5 Flash (Low), Low')
+  expect(buildAgentConfigLabel(worker({
+    vendor: 'deveco',
+    model: 'deveco/GLM-5.1',
+    reasoningEffort: 'high',
+  }))).toBe('DevEco Code | deveco/GLM-5.1, High')
 })
 
 test('buildHomeAgents omits config label when worker config is missing', () => {

@@ -8,7 +8,7 @@ TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具�
 
 ## 谁适合用
 
-- 正在用 Codex CLI、Claude Code、Gemini CLI 或 OpenCode 处理真实代码库，希望把需求、设计、开发和复核串成固定流程的开发者。
+- 正在用 Codex、Claude、Gemini、OpenCode、MiMo、Antigravity 或 DevEco Code 处理真实代码库，希望把需求、设计、开发和复核串成固定流程的开发者。
 - 维护中大型本地项目，需要把多个 agent 拆成需求分析、架构评审、任务拆分、开发、代码复核等角色的维护者。
 - 想在本机 tmux 会话里长期运行 coding agent，并保留阶段产物、评审记录、恢复状态和审计日志的团队。
 - 想研究 multi-agent software engineering workflow 的开发者，尤其关注 HITL、人类确认、任务单 JSON 状态和可恢复执行。
@@ -70,7 +70,7 @@ TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具�
 - Python 3.9+。当前本地验证环境为 Python 3.9.13。
 - tmux。
 - Bun，用于 `packages/tui` 和 `packages/web`。
-- 至少一个可用的 agent CLI：`codex`、`claude`、`gemini` 或 `opencode`。
+- 至少一个可用的 agent CLI：`codex`、`claude`、`gemini`、`opencode`、`mimo`、`agy` 或 `deveco`（DevEco Code）。
 - 对应 agent CLI 的登录状态、API 认证和网络代理。
 - 可选：Node.js。部分厂商模型探测会读取 Node 包元数据。
 
@@ -221,7 +221,7 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
 
 多数阶段支持：
 
-- `--vendor codex|claude|gemini|opencode`
+- `--vendor codex|claude|gemini|opencode|mimo|agy|deveco`
 - `--model <model>`
 - `--effort low|medium|high|xhigh|max`
 - `--proxy-url <port-or-url>` 或路由阶段的 `--proxy-port`
@@ -405,7 +405,7 @@ bun run test:e2e
 
 - v0.1.x：稳定 A01-A08 主流程，补齐 README、license、release notes 和最小 demo，保证新用户能在本地跑通基础流程。
 - v0.2.x：完善 Web 控制台和 OpenTUI 的运行时可观测性，包括 worker 状态、阶段事件、文件预览和失败恢复提示。
-- v0.3.x：增强 release automation、测试执行和 PR review 支持，让 Codex/Claude/Gemini/OpenCode 可以更稳定地参与维护工作流。
+- v0.3.x：增强 release automation、测试执行和 PR review 支持，让 Codex/Claude/Gemini/OpenCode/MiMo/Antigravity/DevEco Code 可以更稳定地参与维护工作流。
 - v0.4.x：补充插件化 agent provider 配置、更多模型厂商适配和可复用 workflow template。
 - 长期方向：把 TmuxCodingTeam 打磨成可审计、可恢复、可扩展的本地 multi-agent software maintenance toolkit。
 
@@ -438,6 +438,9 @@ codex --help
 claude --help
 gemini --help
 opencode --help
+mimo --help
+agy --help
+deveco --help
 tmux -V
 ```
 

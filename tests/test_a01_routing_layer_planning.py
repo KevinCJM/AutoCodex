@@ -91,10 +91,14 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertEqual("opencode", normalize_vendor_choice("4"))
         self.assertEqual("mimo", normalize_vendor_choice("5"))
         self.assertEqual("agy", normalize_vendor_choice("6"))
+        self.assertEqual("deveco", normalize_vendor_choice("7"))
         self.assertEqual("mimo", normalize_vendor_choice("mimo code"))
         self.assertEqual("mimo", normalize_vendor_choice("mimocode"))
         self.assertEqual("agy", normalize_vendor_choice("antigravity"))
         self.assertEqual("agy", normalize_vendor_choice("agy cli"))
+        self.assertEqual("deveco", normalize_vendor_choice("deveco code"))
+        self.assertEqual("deveco", normalize_vendor_choice("deveco-code"))
+        self.assertEqual("deveco", normalize_vendor_choice("devecocode"))
         self.assertEqual("codex", normalize_vendor_choice("codex"))
         with self.assertRaises(ValueError):
             normalize_vendor_choice("qwen")
@@ -158,6 +162,23 @@ class RoutingLayerCliTests(unittest.TestCase):
             self.assertEqual("Gemini 3.5 Flash (Low)", normalize_model_choice("agy", "default"))
             self.assertEqual("Gemini 3.5 Flash (Low)", normalize_model_choice("agy", "1"))
             self.assertEqual("low", normalize_effort_choice("agy", "Gemini 3.5 Flash (Low)", "1"))
+
+    def test_deveco_model_and_effort_normalization_use_dynamic_catalog(self):
+        deveco_model = SimpleNamespace(model_id="deveco/current-model")
+        deveco_inventory = SimpleNamespace(installed=True)
+        with patch("A01_Routing_LayerPlanning.get_vendor_inventory", return_value=deveco_inventory), patch(
+            "A01_Routing_LayerPlanning.get_model_choices",
+            return_value=(deveco_model,),
+        ), patch(
+            "A01_Routing_LayerPlanning.get_default_model_for_vendor",
+            return_value="deveco/current-model",
+        ), patch(
+            "A01_Routing_LayerPlanning.get_normalized_effort_choices",
+            return_value=("low", "medium", "high"),
+        ):
+            self.assertEqual("deveco/current-model", normalize_model_choice("deveco", "default"))
+            self.assertEqual("deveco/current-model", normalize_model_choice("deveco", "1"))
+            self.assertEqual("medium", normalize_effort_choice("deveco", "deveco/current-model", "2"))
 
     def test_collect_cli_request_normalizes_opencode_model_and_effort_in_parameter_mode(self):
         parser = build_parser()

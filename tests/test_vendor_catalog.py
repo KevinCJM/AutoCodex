@@ -9,12 +9,15 @@ from tmux_core.runtime.vendor_catalog import (
     CatalogSnapshot,
     CONFIDENCE_HIGH,
     CONFIDENCE_MEDIUM,
+    DEGRADED_SCAN_STATUS,
     ModelInventory,
     OK_SCAN_STATUS,
     REASONING_MAPPED,
     REASONING_MODEL_FAMILY_ROUTING,
     REASONING_NATIVE,
     ReasoningInventory,
+    SOURCE_CACHE_FALLBACK,
+    SOURCE_CONFIG_FILE,
     SOURCE_DYNAMIC_CLI,
     SOURCE_PACKAGE_METADATA,
     VendorInventory,
@@ -28,16 +31,35 @@ from tmux_core.runtime.vendor_catalog import (
     parse_opencode_debug_config_output,
     parse_opencode_verbose_output,
     resolve_launch,
+    refresh_catalog_snapshot,
     _build_agy_models,
     _build_opencode_like_config_models,
     _build_opencode_like_models,
     _build_gemini_models,
     _scan_agy_vendor,
+    _scan_deveco_vendor,
     _scan_mimo_vendor,
+    _resolved_vendor_binary_path,
 )
 
 
 class VendorCatalogTests(unittest.TestCase):
+    def test_deveco_is_appended_without_changing_existing_vendor_order(self):
+        self.assertEqual(VENDOR_ORDER, ("codex", "claude", "gemini", "opencode", "mimo", "agy", "deveco"))
+        self.assertEqual(normalize_vendor_id("DevEco"), "deveco")
+
+    def test_deveco_binary_resolution_prefers_lowercase_and_falls_back_to_uppercase(self):
+        with patch("tmux_core.runtime.vendor_catalog.shutil.which", return_value="/opt/bin/deveco") as which:
+            self.assertEqual(_resolved_vendor_binary_path("deveco"), "/opt/bin/deveco")
+        which.assert_called_once_with("deveco")
+
+        def uppercase_only(binary_name):  # noqa: ANN001
+            return "/opt/bin/DevEco" if binary_name == "DevEco" else None
+
+        with patch("tmux_core.runtime.vendor_catalog.shutil.which", side_effect=uppercase_only) as which:
+            self.assertEqual(_resolved_vendor_binary_path("deveco"), "/opt/bin/DevEco")
+        self.assertEqual([call.args[0] for call in which.call_args_list], ["deveco", "DevEco"])
+
     def test_parse_codex_models_output_extracts_visible_models(self):
         payload = """
 [
@@ -251,7 +273,7 @@ mimo/mimo-v2.5-pro
 
     def test_scan_mimo_vendor_uses_mimo_cli_commands(self):
         def fake_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001
-            if argv == ["mimo", "models", "--verbose"]:
+            if argv == ["/usr/bin/mimo", "models", "--verbose"]:
                 return SimpleNamespace(
                     ok=True,
                     stdout="""
@@ -259,16 +281,119 @@ mimo/mimo-v2.5-pro
 {"id":"mimo-v2.5-pro","providerID":"mimo","name":"MiMo V2.5 Pro","capabilities":{"reasoning":true},"variants":{"high":{"reasoningEffort":"high"}}}
 """,
                 )
-            if argv == ["mimo", "debug", "config"]:
+            if argv == ["/usr/bin/mimo", "debug", "config"]:
                 return SimpleNamespace(ok=True, stdout='{"model":"mimo/mimo-v2.5-pro","provider":{}}')
             return SimpleNamespace(ok=False, stdout="")
 
         with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe) as probe:
             inventory = _scan_mimo_vendor("/usr/bin/mimo")
 
-        self.assertEqual([call.args[0] for call in probe.call_args_list], [["mimo", "models", "--verbose"], ["mimo", "debug", "config"]])
+        self.assertEqual(
+            [call.args[0] for call in probe.call_args_list],
+            [["/usr/bin/mimo", "models", "--verbose"], ["/usr/bin/mimo", "debug", "config"]],
+        )
         self.assertEqual(inventory.vendor_id, "mimo")
         self.assertEqual(inventory.default_model, "mimo/mimo-v2.5-pro")
+
+    def test_scan_deveco_uses_resolved_binary_pure_commands_and_dynamic_model(self):
+        binary_path = "/opt/bin/DevEco"
+
+        def fake_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001
+            if argv == [binary_path, "--pure", "models", "--verbose"]:
+                return SimpleNamespace(
+                    ok=True,
+                    stdout='deveco/GLM-current\n{"id":"GLM-current","providerID":"deveco","name":"GLM Current","capabilities":{"reasoning":true},"variants":{}}',
+                )
+            if argv == [binary_path, "--pure", "debug", "config"]:
+                return SimpleNamespace(ok=True, stdout='{"model":"deveco/GLM-current","provider":{}}')
+            return SimpleNamespace(ok=False, stdout="")
+
+        with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe) as probe:
+            inventory = _scan_deveco_vendor(binary_path)
+
+        self.assertEqual(
+            [call.args[0] for call in probe.call_args_list],
+            [
+                [binary_path, "--pure", "models", "--verbose"],
+                [binary_path, "--pure", "debug", "config"],
+            ],
+        )
+        self.assertEqual(inventory.vendor_id, "deveco")
+        self.assertEqual(inventory.default_model, "deveco/GLM-current")
+        self.assertEqual(inventory.model_ids(), ("deveco/GLM-current",))
+        catalog = CatalogSnapshot("1.0", "2026-07-11T00:00:00+00:00", "/tmp/catalog.json", (inventory,))
+        resolution = resolve_launch("deveco", "default", "high", catalog=catalog)
+        self.assertEqual(resolution.executable_path, binary_path)
+
+    def test_deveco_scan_failure_has_no_synthetic_or_hardcoded_model(self):
+        with patch(
+            "tmux_core.runtime.vendor_catalog._command_probe",
+            return_value=SimpleNamespace(ok=False, stdout=""),
+        ):
+            inventory = _scan_deveco_vendor("/usr/bin/deveco")
+
+        self.assertEqual(inventory.scan_status, DEGRADED_SCAN_STATUS)
+        self.assertEqual(inventory.models, ())
+        self.assertEqual(inventory.default_model, "")
+        catalog = CatalogSnapshot("1.0", "2026-07-11T00:00:00+00:00", "/tmp/catalog.json", (inventory,))
+        self.assertEqual(get_default_model_for_vendor("deveco", catalog=catalog), "")
+        with self.assertRaises(ValueError):
+            resolve_launch("deveco", "default", "high", catalog=catalog)
+
+    def test_refresh_reuses_only_real_cached_deveco_models_when_scan_degrades(self):
+        cached_model = ModelInventory(
+            vendor_id="deveco",
+            model_id="deveco/cached-model",
+            display_name="Cached Model",
+            source_kind=SOURCE_CONFIG_FILE,
+            confidence=CONFIDENCE_MEDIUM,
+            reasoning=ReasoningInventory(
+                vendor_id="deveco",
+                model_id="deveco/cached-model",
+                source_kind=SOURCE_CONFIG_FILE,
+                confidence=CONFIDENCE_MEDIUM,
+                reasoning_control_mode="implicit_default",
+                supports_reasoning=True,
+                normalized_reasoning_levels=("high",),
+            ),
+        )
+        prior_inventory = VendorInventory(
+            vendor_id="deveco",
+            installed=True,
+            scan_status=OK_SCAN_STATUS,
+            source_kind=SOURCE_CONFIG_FILE,
+            confidence=CONFIDENCE_MEDIUM,
+            binary_path="/old/bin/deveco",
+            models=(cached_model,),
+            default_model=cached_model.model_id,
+        )
+        prior = CatalogSnapshot("1.0", "2026-07-10T00:00:00+00:00", "/tmp/old.json", (prior_inventory,))
+        degraded = VendorInventory(
+            vendor_id="deveco",
+            installed=True,
+            scan_status=DEGRADED_SCAN_STATUS,
+            source_kind="legacy_fallback",
+            confidence="low",
+            binary_path="/new/bin/deveco",
+            models=(),
+            default_model="",
+        )
+
+        def binary_for(vendor_id):  # noqa: ANN001
+            return "/new/bin/deveco" if vendor_id == "deveco" else ""
+
+        with patch("tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path", side_effect=binary_for), patch(
+            "tmux_core.runtime.vendor_catalog._SCANNERS",
+            {"deveco": lambda _path: degraded},
+        ), patch("tmux_core.runtime.vendor_catalog._save_cached_snapshot"):
+            refreshed = refresh_catalog_snapshot(prior_snapshot=prior)
+
+        self.assertEqual(tuple(item.vendor_id for item in refreshed.vendors), VENDOR_ORDER)
+        deveco = refreshed.vendor("deveco")
+        self.assertEqual(deveco.source_kind, SOURCE_CACHE_FALLBACK)
+        self.assertEqual(deveco.binary_path, "/new/bin/deveco")
+        self.assertEqual(deveco.model_ids(), ("deveco/cached-model",))
+        self.assertEqual(deveco.default_model, "deveco/cached-model")
 
     def test_resolve_launch_maps_native_variant_prompt_and_boolean_modes(self):
         catalog = CatalogSnapshot(

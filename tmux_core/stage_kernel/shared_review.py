@@ -25,6 +25,7 @@ from tmux_core.runtime.tmux_runtime import (
     Vendor,
     WorkerStatus,
     is_agent_ready_timeout_error,
+    is_agent_startup_intervention_error,
     is_provider_auth_error,
     is_provider_runtime_error,
     is_worker_death_error,
@@ -956,6 +957,8 @@ def worker_has_agent_config_error(worker: TmuxBatchWorker | None) -> bool:
 
 def is_recoverable_startup_failure(error: Exception, worker: TmuxBatchWorker | None = None) -> bool:
     message_text = str(error or "").strip().lower()
+    if is_agent_startup_intervention_error(error):
+        return True
     if is_agent_config_error(error) or worker_has_agent_config_error(worker):
         return True
     if is_provider_auth_error(error) or worker_has_provider_auth_error(worker):

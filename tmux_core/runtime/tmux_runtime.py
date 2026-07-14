@@ -357,7 +357,7 @@ OPENCODE_READY_FOOTER_PATTERNS = (
     r"ctrl\+p commands",
 )
 OPENCODE_BUSY_PATTERNS = (
-    r"\besc interrupt\b",
+    r"\besc(?:\s+again\s+to)?\s+interrupt\b",
 )
 OPENCODE_STARTING_PATTERNS = (
     r"Performing one time database migration",
@@ -370,7 +370,7 @@ OPENCODE_READY_FOOTER_COMPACT_PATTERNS = (
     r"ctrl\+pcommands",
 )
 OPENCODE_BUSY_COMPACT_PATTERNS = (
-    r"escinterrupt",
+    r"esc(?:againto)?interrupt",
 )
 OPENCODE_STARTING_COMPACT_PATTERNS = (
     r"performingonetimedatabasemigration",
@@ -383,11 +383,11 @@ OPENCODE_FOOTER_PATTERNS = (
     r"^[╹▀]+$",
 )
 MIMO_READY_PROMPT_PATTERNS = (
+    r"准备就绪",
     r"输入消息",
     r"Type your message",
 )
 MIMO_READY_FOOTER_PATTERNS = (
-    r"Build\s*·\s*MiMo",
     r"@ ?添加文件",
     r"@ ?attach",
     r"\$ ?子智能体",
@@ -401,6 +401,11 @@ MIMO_READY_FOOTER_PATTERNS = (
 )
 MIMO_BUSY_PATTERNS = (
     r"\besc interrupt\b",
+    r"\besc\b.{0,200}\binterrupt\b",
+    r"\bQUEUED\b",
+    r"\bWriting command\b",
+    r"\bRunning command\b",
+    r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*Thinking\b",
 )
 MIMO_TRUST_PROMPT_PATTERNS = (
     r"访问工作区",
@@ -410,11 +415,11 @@ MIMO_TRUST_PROMPT_PATTERNS = (
 )
 MIMO_STARTING_PATTERNS = OPENCODE_STARTING_PATTERNS
 MIMO_READY_PROMPT_COMPACT_PATTERNS = (
+    r"准备就绪",
     r"输入消息",
     r"typeyourmessage",
 )
 MIMO_READY_FOOTER_COMPACT_PATTERNS = (
-    r"build·?mimo",
     r"@添加文件",
     r"@attach",
     r"\$子智能体",
@@ -428,6 +433,10 @@ MIMO_READY_FOOTER_COMPACT_PATTERNS = (
 )
 MIMO_BUSY_COMPACT_PATTERNS = (
     r"escinterrupt",
+    r"esc.{0,240}interrupt",
+    r"queued",
+    r"writingcommand",
+    r"runningcommand",
 )
 MIMO_TRUST_PROMPT_COMPACT_PATTERNS = (
     r"访问工作区",
@@ -443,6 +452,18 @@ MIMO_FOOTER_PATTERNS = (
     r"\$ ?子智能体",
     r"/ ?唤起命令",
 )
+DEVECO_UPDATE_BLOCKER = "deveco_update"
+DEVECO_STUDIO_V011_BLOCKER = "deveco_studio_v011"
+DEVECO_STUDIO_V012_BLOCKER = "deveco_studio_v012"
+DEVECO_STUDIO_UNKNOWN_BLOCKER = "deveco_studio_unknown"
+DEVECO_LOGIN_CHECK_BLOCKER = "deveco_login_check"
+DEVECO_LOGIN_BLOCKER = "deveco_login"
+DEVECO_AGREEMENT_BLOCKER = "deveco_agreement"
+DEVECO_MANUAL_BLOCKERS = {
+    DEVECO_STUDIO_UNKNOWN_BLOCKER,
+    DEVECO_LOGIN_BLOCKER,
+    DEVECO_AGREEMENT_BLOCKER,
+}
 AGY_READY_PROMPT_PATTERNS = (
     r"^\s*>\s*$",
 )
@@ -586,7 +607,7 @@ RUNTIME_NOISE_PATTERNS = (
     r"^✗\s*Auto-update.*$",
     r"^(?:~|/)\S+\s+.+$",
     r"^(?:~|/).+\s{2,}.+$",
-    r"^(?:gemini|claude|codex|opencode|mimo|agy)(?:[-_.a-z0-9]+)?$",
+    r"^(?:gemini|claude|codex|opencode|mimo|deveco|agy)(?:[-_.a-z0-9]+)?$",
 )
 
 _LIVE_WORKERS: "weakref.WeakSet[TmuxBatchWorker]" = weakref.WeakSet()
@@ -733,11 +754,12 @@ class Vendor(str, Enum):
     GEMINI = "gemini"
     OPENCODE = "opencode"
     MIMO = "mimo"
+    DEVECO = "deveco"
     AGY = "agy"
 
 
 def _is_opencode_like_vendor(vendor: Vendor) -> bool:
-    return vendor in {Vendor.OPENCODE, Vendor.MIMO}
+    return vendor in {Vendor.OPENCODE, Vendor.MIMO, Vendor.DEVECO}
 
 
 class WorkerStatus(str, Enum):
@@ -1284,6 +1306,23 @@ def _atomic_write_json(path: Path, payload: Mapping[str, object]) -> None:
     tmp_path.replace(target)
 
 
+class AgentStartupInterventionRequired(RuntimeError):
+    """A live agent pane is waiting for a startup action that must remain human-driven."""
+
+    def __init__(
+            self,
+            *,
+            blocker_kind: str,
+            session_name: str,
+            state_path: str = "",
+            message: str,
+    ) -> None:
+        self.blocker_kind = str(blocker_kind or "agent_startup_intervention").strip()
+        self.session_name = str(session_name or "").strip()
+        self.state_path = str(state_path or "").strip()
+        super().__init__(str(message or "Agent startup requires manual intervention.").strip())
+
+
 def is_worker_death_error(error: BaseException | str) -> bool:
     message = str(error or "").strip().lower()
     if not message:
@@ -1310,6 +1349,12 @@ def is_agent_ready_timeout_error(error: BaseException | str) -> bool:
     if not message:
         return False
     return any(marker in message for marker in AGENT_READY_TIMEOUT_ERROR_MARKERS)
+
+
+def is_agent_startup_intervention_error(error: BaseException | str) -> bool:
+    if isinstance(error, AgentStartupInterventionRequired):
+        return True
+    return "agent startup requires manual intervention" in str(error or "").strip().lower()
 
 
 def is_prompt_dispatch_timeout_error(error: BaseException | str) -> bool:
@@ -1487,6 +1532,8 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             "result_status": "ready",
             "status": WorkerStatus.READY.value,
             "current_task_runtime_status": "",
+            "startup_blocker_kind": "",
+            "startup_blocker_requires_manual": False,
         }
         if current_command:
             extra["current_command"] = current_command
@@ -1498,6 +1545,11 @@ def try_resume_worker(worker: "TmuxBatchWorker", *, timeout_sec: float = 60.0) -
             extra["pane_title"] = pane_title
         with contextlib.suppress(Exception):
             write_state(WorkerStatus.READY, note="auto_resume_ready", extra=extra)
+        with contextlib.suppress(Exception):
+            setattr(worker, "startup_blocker_kind", "")
+            setattr(worker, "startup_blocker_requires_manual", False)
+        with contextlib.suppress(Exception):
+            worker.launch_coordinator.record_launch_result(worker.config.vendor, success=True)
 
     state = _read_state()
     dispatch_reason = str(state.get("dispatch_reason", "") or "").strip()
@@ -1993,6 +2045,68 @@ def _matches_opencode_surface(
     )
 
 
+def _deveco_visible_startup_blocker(visible_text: str) -> str:
+    """Classify only the current pane surface; raw logs must never drive key presses."""
+    visible = _normalize_opencode_surface(visible_text)
+    if not visible:
+        return ""
+
+    update_available = all(
+        re.search(pattern, visible, re.IGNORECASE)
+        for pattern in (r"\bUpdate Available\b", r"\bSkip\b", r"\bConfirm\b")
+    )
+    update_available_zh = all(
+        re.search(pattern, visible, re.IGNORECASE)
+        for pattern in (r"有可用更新", r"跳过", r"确认")
+    )
+    if update_available or update_available_zh:
+        return DEVECO_UPDATE_BLOCKER
+
+    old_studio_prompt = re.search(
+        r"\bPlease\s+(?:configure(?:\s+your)?|select)\s+DevEco Studio path\b",
+        visible,
+        re.IGNORECASE,
+    )
+    has_skip = bool(re.search(r"\bSkip\b", visible, re.IGNORECASE))
+    if old_studio_prompt and has_skip:
+        return DEVECO_STUDIO_V011_BLOCKER
+
+    new_studio_prompt = re.search(r"\bConfigure\s+DevEco Studio Path\b", visible, re.IGNORECASE)
+    if new_studio_prompt and not old_studio_prompt and has_skip:
+        return DEVECO_STUDIO_V012_BLOCKER
+
+    if re.search(r"Checking login status\.\.\.", visible, re.IGNORECASE):
+        return DEVECO_LOGIN_CHECK_BLOCKER
+
+    login_groups = (
+        (r"\b(?:Log in|Login|Sign in)\b", r"\b(?:HUAWEI ID|Huawei account|DevEco Code)\b"),
+        (r"\b(?:HUAWEI ID|Huawei account)\b", r"\b(?:browser|authorize|authentication)\b"),
+    )
+    if any(all(re.search(pattern, visible, re.IGNORECASE) for pattern in group) for group in login_groups):
+        return DEVECO_LOGIN_BLOCKER
+
+    agreement_title = re.search(
+        r"(?:User Agreement|Privacy (?:Policy|Statement)|用户协议|隐私(?:政策|声明))",
+        visible,
+        re.IGNORECASE,
+    )
+    agreement_action = re.search(
+        r"(?:\bAccept\b|\bAgree\b|\bDecline\b|\bReject\b|同意|拒绝)",
+        visible,
+        re.IGNORECASE,
+    )
+    if agreement_title and agreement_action:
+        return DEVECO_AGREEMENT_BLOCKER
+
+    if re.search(r"DevEco Studio", visible, re.IGNORECASE) and re.search(
+        r"(?:path|configure|select)",
+        visible,
+        re.IGNORECASE,
+    ):
+        return DEVECO_STUDIO_UNKNOWN_BLOCKER
+    return ""
+
+
 def _classify_opencode_surface_state(
         *,
         visible_text: str,
@@ -2122,6 +2236,21 @@ def _classify_mimo_surface_state(
     return AgentRuntimeState.BUSY
 
 
+def _classify_deveco_surface_state(
+        *,
+        visible_text: str,
+        recent_log: str,
+        current_command: str,
+) -> AgentRuntimeState:
+    if _deveco_visible_startup_blocker(visible_text):
+        return AgentRuntimeState.STARTING
+    return _classify_opencode_surface_state(
+        visible_text=visible_text,
+        recent_log=recent_log,
+        current_command=current_command,
+    )
+
+
 def _classify_opencode_like_surface_state(
         *,
         vendor: Vendor,
@@ -2131,6 +2260,12 @@ def _classify_opencode_like_surface_state(
 ) -> AgentRuntimeState:
     if vendor == Vendor.MIMO:
         return _classify_mimo_surface_state(
+            visible_text=visible_text,
+            recent_log=recent_log,
+            current_command=current_command,
+        )
+    if vendor == Vendor.DEVECO:
+        return _classify_deveco_surface_state(
             visible_text=visible_text,
             recent_log=recent_log,
             current_command=current_command,
@@ -2195,6 +2330,21 @@ def _opencode_like_surface_has_launch_signal(vendor: Vendor, surface: str) -> bo
                     *MIMO_READY_PROMPT_COMPACT_PATTERNS,
                     *MIMO_READY_FOOTER_COMPACT_PATTERNS,
                     *MIMO_BUSY_COMPACT_PATTERNS,
+                ),
+            )
+        )
+    if vendor == Vendor.DEVECO:
+        return (
+            bool(_deveco_visible_startup_blocker(surface))
+            or bool(re.search(r"\bBuild\s*·.*\bDevEco Code\b", normalized, re.IGNORECASE))
+            or _matches_opencode_surface(
+                normalized,
+                compact,
+                patterns=(*OPENCODE_READY_PROMPT_PATTERNS, *OPENCODE_READY_FOOTER_PATTERNS, *OPENCODE_BUSY_PATTERNS),
+                compact_patterns=(
+                    *OPENCODE_READY_PROMPT_COMPACT_PATTERNS,
+                    *OPENCODE_READY_FOOTER_COMPACT_PATTERNS,
+                    *OPENCODE_BUSY_COMPACT_PATTERNS,
                 ),
             )
         )
@@ -2638,6 +2788,19 @@ class MimoOutputDetector(BaseOutputDetector):
         return super().extract_last_message("\n".join(lines))
 
 
+class DevEcoOutputDetector(OpenCodeOutputDetector):
+    def classify_agent_state(self, observation: WorkerObservation) -> AgentRuntimeState:
+        if observation.pane_dead or not observation.session_exists:
+            return AgentRuntimeState.DEAD
+        if observation.current_command in SHELL_COMMANDS:
+            return AgentRuntimeState.DEAD
+        return _classify_deveco_surface_state(
+            visible_text=self.current_visible_text(observation),
+            recent_log=self.recent_log_text(observation),
+            current_command=observation.current_command,
+        )
+
+
 class AgyOutputDetector(BaseOutputDetector):
     def classify_agent_state(self, observation: WorkerObservation) -> AgentRuntimeState:
         base_state = super().classify_agent_state(observation)
@@ -2675,6 +2838,8 @@ def build_output_detector(vendor: Vendor) -> BaseOutputDetector:
         return OpenCodeOutputDetector()
     if vendor == Vendor.MIMO:
         return MimoOutputDetector()
+    if vendor == Vendor.DEVECO:
+        return DevEcoOutputDetector()
     if vendor == Vendor.AGY:
         return AgyOutputDetector()
     raise ValueError(f"不支持的厂商: {vendor}")
@@ -2826,6 +2991,7 @@ class AgentRunConfig:
     native_reasoning_level: str = ""
     supports_reasoning: bool = False
     resolution_notes: tuple[str, ...] = ()
+    resolved_executable: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vendor", normalize_vendor(self.vendor))
@@ -2843,13 +3009,44 @@ class AgentRunConfig:
         object.__setattr__(self, "native_reasoning_level", resolution.native_reasoning_level)
         object.__setattr__(self, "supports_reasoning", resolution.supports_reasoning)
         object.__setattr__(self, "resolution_notes", resolution.notes)
+        object.__setattr__(self, "resolved_executable", str(getattr(resolution, "executable_path", "") or ""))
+
+    def _frozen_resolution(self) -> LaunchResolution:
+        return LaunchResolution(
+            vendor_id=self.vendor.value,
+            requested_model=self.model,
+            resolved_model=self.resolved_model,
+            requested_effort=self.reasoning_effort,
+            normalized_effort=self.reasoning_effort,
+            native_reasoning_level=self.native_reasoning_level,
+            resolved_variant=self.resolved_variant,
+            reasoning_control_mode=self.reasoning_control_mode,
+            supports_reasoning=self.supports_reasoning,
+            catalog_source_kind=self.catalog_source_kind,
+            confidence=self.catalog_confidence,
+            notes=self.resolution_notes,
+            executable_path=self.resolved_executable,
+        )
 
     def with_prompt_header(self, prompt: str) -> str:
-        header = build_prompt_header(self.vendor, self.model, self.reasoning_effort)
+        note = build_reasoning_note(
+            self.vendor,
+            self.reasoning_effort,
+            model=self.model,
+            resolution=self._frozen_resolution(),
+        )
+        header = (
+            "[Agent Runtime Context]\n"
+            f"- vendor: {self.vendor.value}\n"
+            f"- model: {self.resolved_model}\n"
+            f"- {note}\n"
+            "- execution_mode: tmux_interactive_conversation\n"
+            "- keep_scope_strict: true\n"
+        )
         return f"{header}\n\n{str(prompt or '').strip()}".strip()
 
     def to_summary(self) -> dict[str, str]:
-        resolution = resolve_launch(self.vendor.value, self.model, self.reasoning_effort)
+        resolution = self._frozen_resolution()
         return {
             "vendor": self.vendor.value,
             "model": self.model,
@@ -2869,6 +3066,7 @@ class AgentRunConfig:
             Vendor.GEMINI: ("gemini", "node"),
             Vendor.OPENCODE: ("opencode", "node"),
             Vendor.MIMO: ("mimo", "node"),
+            Vendor.DEVECO: ("deveco", "DevEco", "node"),
             Vendor.AGY: ("agy", "node"),
         }[self.vendor]
 
@@ -2876,7 +3074,7 @@ class AgentRunConfig:
         return 2 if self.vendor == Vendor.CODEX else 1
 
     def build_launch_command(self, work_dir: Path) -> str:
-        resolution = resolve_launch(self.vendor.value, self.model, self.reasoning_effort)
+        resolution = self._frozen_resolution()
         args: list[str] = []
         if self.vendor == Vendor.CODEX:
             args = [
@@ -2910,6 +3108,16 @@ class AgentRunConfig:
                 resolution.resolved_model,
                 "--approval-mode",
                 "yolo",
+            ]
+        elif self.vendor == Vendor.DEVECO:
+            args = [
+                "env",
+                "DEVECO_DISABLE_AUTOUPDATE=1",
+                self.resolved_executable or "deveco",
+                str(work_dir),
+                "--pure",
+                "--model",
+                resolution.resolved_model,
             ]
         elif _is_opencode_like_vendor(self.vendor):
             args = [
@@ -3048,6 +3256,9 @@ class TmuxBatchWorker:
         self._last_terminal_change_monotonic = 0.0
         self._last_boot_action_signature = ""
         self._last_boot_action_at = 0.0
+        self._deveco_boot_actions_handled: set[str] = set()
+        self.startup_blocker_kind = ""
+        self.startup_blocker_requires_manual = False
         self.launch_command = self.config.build_launch_command(self.work_dir)
         if self.state_path.exists():
             existing_state = self.read_state()
@@ -3068,6 +3279,8 @@ class TmuxBatchWorker:
             self.current_task_runtime_status = str(existing_state.get("current_task_runtime_status", ""))
             self.dispatch_state = str(existing_state.get("dispatch_state", ""))
             self.dispatch_reason = str(existing_state.get("dispatch_reason", ""))
+            self.startup_blocker_kind = str(existing_state.get("startup_blocker_kind", ""))
+            self.startup_blocker_requires_manual = bool(existing_state.get("startup_blocker_requires_manual", False))
             self.last_terminal_signature = str(existing_state.get("last_terminal_signature", ""))
             self.last_terminal_changed_at = str(existing_state.get("last_terminal_changed_at", ""))
             self.terminal_recently_changed = bool(existing_state.get("terminal_recently_changed", False))
@@ -3379,10 +3592,18 @@ class TmuxBatchWorker:
             self._release_session_name_reservation()
             raise
 
-    def mark_awaiting_reconfiguration(self, *, reason_text: str) -> None:
+    def mark_awaiting_reconfiguration(
+            self,
+            *,
+            reason_text: str,
+            startup_blocker_kind: str = "",
+            startup_blocker_requires_manual: bool = False,
+    ) -> None:
         self.agent_ready = False
         self.agent_state = AgentRuntimeState.STARTING
         self.wrapper_state = WrapperState.NOT_READY
+        self.startup_blocker_kind = str(startup_blocker_kind or "").strip()
+        self.startup_blocker_requires_manual = bool(startup_blocker_requires_manual)
         self._write_state(
             WorkerStatus.RUNNING,
             note="awaiting_reconfig",
@@ -3391,6 +3612,8 @@ class TmuxBatchWorker:
                 "health_status": "awaiting_reconfig",
                 "health_note": str(reason_text or "").strip(),
                 "agent_state": AgentRuntimeState.STARTING.value,
+                "startup_blocker_kind": self.startup_blocker_kind,
+                "startup_blocker_requires_manual": self.startup_blocker_requires_manual,
             },
         )
 
@@ -3618,6 +3841,11 @@ class TmuxBatchWorker:
                 "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
                 "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "")),
                 "dispatch_reason": self.dispatch_reason or str(previous.get("dispatch_reason", "")),
+                "startup_blocker_kind": self.startup_blocker_kind or str(previous.get("startup_blocker_kind", "")),
+                "startup_blocker_requires_manual": (
+                    self.startup_blocker_requires_manual
+                    or bool(previous.get("startup_blocker_requires_manual", False))
+                ),
                 "last_terminal_signature": self.last_terminal_signature,
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
@@ -3712,6 +3940,11 @@ class TmuxBatchWorker:
                 "current_task_runtime_status": current_task_runtime_status,
                 "dispatch_state": self.dispatch_state or str(previous.get("dispatch_state", "")),
                 "dispatch_reason": self.dispatch_reason or str(previous.get("dispatch_reason", "")),
+                "startup_blocker_kind": self.startup_blocker_kind or str(previous.get("startup_blocker_kind", "")),
+                "startup_blocker_requires_manual": (
+                    self.startup_blocker_requires_manual
+                    or bool(previous.get("startup_blocker_requires_manual", False))
+                ),
                 "last_terminal_signature": self.last_terminal_signature,
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
@@ -3756,6 +3989,7 @@ class TmuxBatchWorker:
                     not self.agent_started
                     or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
                     or title in {"OpenCode", "MiMoCode", "MiMo Code"}
+                    or title.startswith("DevEco Code")
             )
         if self.config.vendor == Vendor.AGY:
             return not self.agent_started or self.agent_state in {AgentRuntimeState.BUSY, AgentRuntimeState.STARTING}
@@ -5752,6 +5986,52 @@ class TmuxBatchWorker:
         self.send_special_key("Enter")
         return True
 
+    def _maybe_handle_deveco_boot_prompt(self, visible_text: str) -> bool:
+        if self.config.vendor != Vendor.DEVECO:
+            return False
+        blocker_kind = _deveco_visible_startup_blocker(visible_text)
+        key_sequence: tuple[str, ...] = ()
+        if blocker_kind == DEVECO_UPDATE_BLOCKER:
+            key_sequence = ("Left", "Enter")
+        elif blocker_kind == DEVECO_STUDIO_V011_BLOCKER:
+            key_sequence = ("Up", "Enter")
+        elif blocker_kind == DEVECO_STUDIO_V012_BLOCKER:
+            key_sequence = (*(("Down",) * 6), "Enter")
+        latch_kind = "deveco_update" if blocker_kind == DEVECO_UPDATE_BLOCKER else "deveco_studio"
+        if not key_sequence or latch_kind in self._deveco_boot_actions_handled:
+            return False
+
+        self._deveco_boot_actions_handled.add(latch_kind)
+        self.startup_blocker_kind = blocker_kind
+        self.startup_blocker_requires_manual = False
+        for index, key in enumerate(key_sequence):
+            self.send_special_key(key)
+            if index + 1 < len(key_sequence):
+                time.sleep(0.1)
+        return True
+
+    def _deveco_startup_intervention(self, blocker_kind: str) -> AgentStartupInterventionRequired:
+        blocker = str(blocker_kind or "deveco_startup_unknown").strip()
+        reason = {
+            DEVECO_LOGIN_BLOCKER: "DevEco 正在等待人工登录或账号授权。",
+            DEVECO_AGREEMENT_BLOCKER: "DevEco 正在等待人工阅读并处理协议或隐私页面。",
+            DEVECO_STUDIO_UNKNOWN_BLOCKER: "检测到未支持的 DevEco Studio 路径选择页面，系统不会猜测按键。",
+            DEVECO_STUDIO_V011_BLOCKER: "DevEco Studio 路径页面在自动 Skip 后仍未消失。",
+            DEVECO_STUDIO_V012_BLOCKER: "DevEco Studio 路径页面在自动 Skip 后仍未消失。",
+            DEVECO_UPDATE_BLOCKER: "DevEco 更新弹窗在自动 Skip 后仍未消失。",
+            DEVECO_LOGIN_CHECK_BLOCKER: "DevEco 登录状态检查长时间未完成。",
+        }.get(blocker, "DevEco 启动页面需要人工处理。")
+        return AgentStartupInterventionRequired(
+            blocker_kind=blocker,
+            session_name=self.session_name,
+            state_path=str(self.state_path),
+            message=(
+                "Agent startup requires manual intervention.\n"
+                f"{reason}\n"
+                f"请进入会话处理: tmux attach -t {self.session_name}"
+            ),
+        )
+
     def _task_runtime_dir(self) -> Path:
         path = self.runtime_dir / "task_runtime"
         path.mkdir(parents=True, exist_ok=True)
@@ -6205,7 +6485,8 @@ class TmuxBatchWorker:
             if self.config.vendor == Vendor.CODEX
             else _join_nonempty_text_parts(observation.visible_text, observation.raw_log_tail)
         )
-        if self._visible_indicates_agent_starting(surface):
+        starting_surface = observation.visible_text if self.config.vendor == Vendor.DEVECO else surface
+        if self._visible_indicates_agent_starting(starting_surface):
             return ""
         if not self._visible_indicates_agent_ready(
             observation.visible_text,
@@ -6330,6 +6611,8 @@ class TmuxBatchWorker:
         self.agent_started = True
         self.agent_state = AgentRuntimeState.READY
         self.wrapper_state = WrapperState.READY
+        self.startup_blocker_kind = ""
+        self.startup_blocker_requires_manual = False
         self.last_pane_title = observation.pane_title or self.last_pane_title
         self.current_command = current_command
         self.current_path = observation.current_path or self.current_path
@@ -6343,6 +6626,8 @@ class TmuxBatchWorker:
             "current_path": observation.current_path or self.current_path,
             "pane_title": self.last_pane_title,
             "last_heartbeat_at": self.last_heartbeat_at,
+            "startup_blocker_kind": "",
+            "startup_blocker_requires_manual": False,
         }
         result_status = str(previous.get("result_status", "pending") or "").strip().lower()
         if result_status in {"", "running", "pending"}:
@@ -6406,6 +6691,7 @@ class TmuxBatchWorker:
         previous_ready_signature = ""
         stable_count = 0
         shell_after_ready_since = 0.0
+        last_deveco_blocker = ""
         while time.monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for agent ready")
             observation = self.observe(tail_lines=220)
@@ -6417,6 +6703,19 @@ class TmuxBatchWorker:
             current_command = observation.current_command
             visible = observation.raw_log_tail or observation.visible_text
             fallback_visible = observation.visible_text
+            if self._maybe_handle_deveco_boot_prompt(fallback_visible):
+                time.sleep(0.6)
+                previous_ready_signature = ""
+                stable_count = 0
+                continue
+
+            if self.config.vendor == Vendor.DEVECO:
+                current_blocker = _deveco_visible_startup_blocker(fallback_visible)
+                if current_blocker in DEVECO_MANUAL_BLOCKERS:
+                    raise self._deveco_startup_intervention(current_blocker)
+                last_deveco_blocker = current_blocker
+                self.startup_blocker_kind = current_blocker
+                self.startup_blocker_requires_manual = bool(current_blocker in DEVECO_MANUAL_BLOCKERS)
             if (
                 self._maybe_handle_codex_boot_prompt(visible)
                 or self._maybe_handle_codex_boot_prompt(fallback_visible)
@@ -6467,6 +6766,8 @@ class TmuxBatchWorker:
             previous_ready_signature = ready_signature if self._agent_running(current_command) else ""
             time.sleep(0.5)
 
+        if self.config.vendor == Vendor.DEVECO and last_deveco_blocker:
+            raise self._deveco_startup_intervention(last_deveco_blocker)
         raise RuntimeError(f"Timed out waiting for agent ready.\n{self.capture_visible(240)}")
 
     def launch_agent(self, timeout_sec: float = 60.0) -> None:
@@ -6481,12 +6782,32 @@ class TmuxBatchWorker:
                         self._ensure_health_supervisor_started()
                     self._wait_for_shell_ready()
                     self.agent_state = AgentRuntimeState.STARTING
+                    self.startup_blocker_kind = ""
+                    self.startup_blocker_requires_manual = False
+                    self._deveco_boot_actions_handled.clear()
                     self._append_transcript("launch / command", f"```bash\n{self.launch_command}\n```")
                     self._log_event("launch_attempt", attempt=attempt, vendor=self.config.vendor.value)
                     self._send_text(self.launch_command, enter_count=1)
                     self._wait_for_agent_ready(timeout_sec=timeout_sec)
                 self.launch_coordinator.record_launch_result(self.config.vendor, success=True)
                 return
+            except AgentStartupInterventionRequired as error:
+                last_error = error
+                self.agent_state = AgentRuntimeState.STARTING
+                self.agent_ready = False
+                self.wrapper_state = WrapperState.NOT_READY
+                self._log_event(
+                    "launch_awaiting_startup_intervention",
+                    attempt=attempt,
+                    blocker_kind=error.blocker_kind,
+                    error=str(error),
+                )
+                self.mark_awaiting_reconfiguration(
+                    reason_text=str(error),
+                    startup_blocker_kind=error.blocker_kind,
+                    startup_blocker_requires_manual=True,
+                )
+                break
             except Exception as error:
                 last_error = error
                 self.launch_coordinator.record_launch_result(self.config.vendor, success=False)

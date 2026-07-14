@@ -4,13 +4,13 @@
 
 TmuxCodingTeam is a local multi-agent software development orchestration tool. It uses Python to connect requirements, design, task splitting, implementation, and review workflows, uses tmux to host long-running coding-agent sessions, and provides both an OpenTUI terminal interface and a Web console.
 
-The project is designed for heterogeneous coding-agent collaboration: different vendors and models, such as Codex CLI, Claude Code, Gemini CLI, and OpenCode, can work together through one auditable workflow from initial requirements analysis to final full-code review.
+The project is designed for heterogeneous coding-agent collaboration: Codex, Claude, Gemini, OpenCode, MiMo, Antigravity, and DevEco Code can work together through one auditable workflow from initial requirements analysis to final full-code review.
 
 This repository has been flattened into the current project root. The documentation below only describes code visible in this repository. External agent CLIs, authentication, network proxies, target project directories, and account setup are runtime requirements and are not included in this repository.
 
 ## Who Should Use This
 
-- Developers who already use Codex CLI, Claude Code, Gemini CLI, or OpenCode on real codebases and want to turn requirements, design, implementation, and review into a repeatable workflow.
+- Developers who already use Codex, Claude, Gemini, OpenCode, MiMo, Antigravity, or DevEco Code on real codebases and want to turn requirements, design, implementation, and review into a repeatable workflow.
 - Maintainers of medium or large local projects who want multiple agents to play distinct roles, such as requirements analyst, architect, task splitter, developer, and code reviewer.
 - Teams that want long-running coding-agent work to happen inside local tmux sessions while preserving stage artifacts, review records, recovery state, and audit logs.
 - Developers researching multi-agent software engineering workflows, especially HITL, human confirmation, task JSON state, and recoverable execution.
@@ -72,7 +72,7 @@ Some top-level files are compatibility entry points and map into real implementa
 - Python 3.9+. The current local validation environment is Python 3.9.13.
 - tmux.
 - Bun for `packages/tui` and `packages/web`.
-- At least one available agent CLI: `codex`, `claude`, `gemini`, or `opencode`.
+- At least one available agent CLI: `codex`, `claude`, `gemini`, `opencode`, `mimo`, `agy`, or `deveco` (DevEco Code).
 - Login, API authentication, and network proxy setup for the selected agent CLI.
 - Optional: Node.js. Some provider/model detection code reads Node package metadata.
 
@@ -225,7 +225,7 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
 
 Most stages support:
 
-- `--vendor codex|claude|gemini|opencode`
+- `--vendor codex|claude|gemini|opencode|mimo|agy|deveco`
 - `--model <model>`
 - `--effort low|medium|high|xhigh|max`
 - `--proxy-url <port-or-url>` or the routing-stage `--proxy-port`
@@ -411,7 +411,7 @@ bun run test:e2e
 
 - v0.1.x: Stabilize the A01-A08 workflow, keep README/license/release notes/minimal demo current, and make the basic local workflow easy for new users to run.
 - v0.2.x: Improve Web console and OpenTUI runtime observability, including worker state, stage events, file preview, and failure recovery hints.
-- v0.3.x: Improve release automation, test execution, and PR review support so Codex/Claude/Gemini/OpenCode can participate more reliably in maintenance workflows.
+- v0.3.x: Improve release automation, test execution, and PR review support so Codex/Claude/Gemini/OpenCode/MiMo/Antigravity/DevEco Code can participate more reliably in maintenance workflows.
 - v0.4.x: Add plugin-style agent provider configuration, more model/vendor adapters, and reusable workflow templates.
 - Long term: Turn TmuxCodingTeam into an auditable, recoverable, extensible local multi-agent software maintenance toolkit.
 
@@ -444,6 +444,9 @@ codex --help
 claude --help
 gemini --help
 opencode --help
+mimo --help
+agy --help
+deveco --help
 tmux -V
 ```
 

@@ -81,6 +81,7 @@ from tmux_core.stage_kernel.agent_intervention import (
     AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
     request_worker_manual_intervention,
+    wait_for_worker_startup_intervention,
 )
 from tmux_core.stage_kernel.shared_review import (
     DEFAULT_REVIEWER_COUNT,
@@ -1664,6 +1665,12 @@ def _run_review_clarification_continuation(
             f"需求评审 / 澄清中 | HITL 第 {context.hitl_round} 轮"
         ) if progress is not None else None,
         replace_dead_worker=replace_dead_worker,
+        startup_intervention_handler=lambda live_worker, error: wait_for_worker_startup_intervention(
+            live_worker,
+            error=error,
+            stage_label="需求评审",
+            role_label=str(getattr(live_worker, "session_name", "") or "需求分析师"),
+        ),
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         fresh_completion_paths=fresh_completion_paths,
         fresh_completion_start_round=2,

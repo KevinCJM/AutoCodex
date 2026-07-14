@@ -4,8 +4,15 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Sequence, TypeVar
 
-from tmux_core.runtime.tmux_runtime import DEFAULT_COMMAND_TIMEOUT_SEC, worker_state_is_prelaunch_active
-from tmux_core.stage_kernel.agent_intervention import render_worker_intervention_summary
+from tmux_core.runtime.tmux_runtime import (
+    AgentStartupInterventionRequired,
+    DEFAULT_COMMAND_TIMEOUT_SEC,
+    worker_state_is_prelaunch_active,
+)
+from tmux_core.stage_kernel.agent_intervention import (
+    render_worker_intervention_summary,
+    wait_for_worker_startup_intervention,
+)
 
 READY_STABILIZATION_GRACE_SEC = 10.0
 READY_STARTUP_STABILIZATION_GRACE_SEC = 60.0
@@ -186,6 +193,13 @@ def _ensure_worker_ready(
     if state_name != "READY":
         try:
             ensure_ready(timeout_sec=timeout_sec)
+        except AgentStartupInterventionRequired as error:
+            wait_for_worker_startup_intervention(
+                worker,
+                error=error,
+                stage_label="阶段调度",
+                role_label=role_label,
+            )
         except Exception as error:  # noqa: BLE001
             raise WorkerReadyCheckFailed(
                 role_label=role_label,

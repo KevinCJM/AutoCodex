@@ -36,6 +36,7 @@ from T02_tmux_agents import (
     worker_state_is_prelaunch_active,
 )
 from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop, validate_hitl_status_file
+from tmux_core.stage_kernel.agent_intervention import wait_for_worker_startup_intervention
 from T08_pre_development import ensure_pre_development_task_record, mark_requirement_intake_completed
 from T09_terminal_ops import (
     PROMPT_BACK_VALUE,
@@ -542,6 +543,16 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
             hitl_record_md=str(Path(context.record_path).resolve()),
         )
 
+    def handle_startup_intervention(live_worker: object, error: object) -> None:
+        stop_progress()
+        stop_boot_progress()
+        wait_for_worker_startup_intervention(
+            live_worker,
+            error=error,
+            stage_label=NOTION_STAGE_NAME,
+            role_label=str(getattr(live_worker, "session_name", "") or "Notion 临时智能体"),
+        )
+
     try:
         try:
             loop_result = run_hitl_agent_loop(
@@ -561,6 +572,7 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
                 on_agent_turn_started=lambda context, live_worker: start_progress(),
                 on_agent_turn_finished=lambda context, live_worker: stop_progress(),
                 replace_dead_worker=replace_dead_worker,
+                startup_intervention_handler=handle_startup_intervention,
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
             )
         except RuntimeError as error:

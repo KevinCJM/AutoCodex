@@ -117,17 +117,14 @@ def build_turn_status_contract_prompt(
         },
         "written_at": "<ISO8601 timestamp>",
     }
+    _ = example
     return (
-        "Runtime completion file contract:\n"
+        "Runtime completion is system-owned:\n"
         f"- This turn_id is `{turn_id}`.\n"
-        f"- First finish the stage status file `{stage_status_text}`.\n"
-        f"- Then write `{turn_status_text}` as the final completion file.\n"
-        f"- `{turn_status_text}` must be valid JSON using this shape:\n"
-        f"{json.dumps(example, ensure_ascii=False, indent=2)}\n"
-        f"- `artifacts.stage_status` must equal `{stage_status_text}`.\n"
-        f"- Also include every non-empty file path referenced by `{stage_status_text}` as additional artifact entries.\n"
-        "- Compute real sha256 hashes for every path listed in `artifacts` and store them in `artifact_hashes`.\n"
-        f"- `{turn_status_text}` must be written last.\n"
+        f"- Do not create or modify `{turn_status_text}`.\n"
+        f"- Do not create or modify `{stage_status_text}` unless it is explicitly listed as a business artifact elsewhere.\n"
+        "- Write only the business artifacts named by the task prompt.\n"
+        "- The system will derive the internal runtime completion files from those business artifacts.\n"
         "- stdout is not the completion protocol.\n"
     )
 
@@ -164,19 +161,16 @@ def build_hitl_status_contract_prompt(
         },
         "written_at": "<ISO8601 timestamp>",
     }
+    _ = example
     return (
-        "Runtime stage status contract:\n"
-        f"- Write `{stage_status_text}` on every turn using this JSON shape:\n"
-        f"{json.dumps(example, ensure_ascii=False, indent=2)}\n"
-        f"- `stage` must equal `{stage_name}`.\n"
-        f"- `turn_id` must equal `{turn_id}`.\n"
-        f"- `hitl_round` must equal `{hitl_round}`.\n"
-        f"- If `status` is `completed`, `output_path` must equal `{output_text}` and the file must exist and be non-empty.\n"
-        f"- If `status` is `hitl`, `question_path` must equal `{question_text}` and the file must exist and be non-empty.\n"
-        f"- If `status` is `hitl`, `record_path` must equal `{record_text}` and the file must exist after this turn.\n"
-        f"- If `status` is `completed`, `record_path` may be empty or `{record_text}` if you updated it.\n"
-        "- Use `error` only for unexpected runtime/tooling failures that cannot be expressed as HITL.\n"
-        "- `artifact_hashes` must contain every non-empty file path referenced by this status JSON.\n"
+        "Runtime stage status is system-owned:\n"
+        f"- This turn_id is `{turn_id}` and HITL round is `{hitl_round}`.\n"
+        f"- Do not create or modify `{stage_status_text}`.\n"
+        f"- Write only the business output/question/record artifacts if the task prompt explicitly asks for them.\n"
+        f"- Business output path: `{output_text}`.\n"
+        f"- Business question path: `{question_text}`.\n"
+        f"- Business record path: `{record_text}`.\n"
+        "- The system will derive the internal runtime stage status from those business artifacts.\n"
         "- stdout is not the state protocol.\n"
     )
 

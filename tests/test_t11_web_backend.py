@@ -123,6 +123,7 @@ class WebBackendTests(unittest.TestCase):
             'opencode': SimpleNamespace(vendor_id='opencode', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='opencode/big-pickle', models=[model('opencode/big-pickle', ('low', 'medium', 'high', 'xhigh', 'max'), 'high')]),
             'mimo': SimpleNamespace(vendor_id='mimo', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='mimo/mimo-v2.5-pro', models=[model('mimo/mimo-v2.5-pro', ('low', 'medium', 'high', 'xhigh', 'max'), 'high')]),
             'agy': SimpleNamespace(vendor_id='agy', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='Gemini 3.5 Flash (High)', models=[model('Gemini 3.5 Flash (High)', ('high',), 'high')]),
+            'deveco': SimpleNamespace(vendor_id='deveco', installed=True, scan_status='ok', source_kind='test', confidence='high', default_model='deveco/GLM-5.1', models=[model('deveco/GLM-5.1', ('low', 'medium', 'high'), 'high')], binary_path='/private/test/bin/deveco', executable_path='/private/test/bin/deveco'),
         }
         fake_snapshot = SimpleNamespace(
             generated_at='2026-04-27T00:00:00+08:00',
@@ -139,15 +140,19 @@ class WebBackendTests(unittest.TestCase):
         catalog = payload['payload']
         self.assertEqual(catalog['schema_version'], '1.0')
         vendors = {item['vendor_id']: item for item in catalog['vendors']}
-        self.assertEqual(tuple(vendors), ('codex', 'claude', 'gemini', 'opencode', 'mimo', 'agy'))
+        self.assertEqual(tuple(vendors), ('codex', 'claude', 'gemini', 'opencode', 'mimo', 'agy', 'deveco'))
         self.assertIn('default_model', vendors['gemini'])
         self.assertEqual(vendors['mimo']['default_model'], 'mimo/mimo-v2.5-pro')
         self.assertEqual(vendors['agy']['default_model'], 'Gemini 3.5 Flash (High)')
+        self.assertEqual(vendors['deveco']['default_model'], 'deveco/GLM-5.1')
         self.assertIsInstance(vendors['gemini']['models'], list)
         flash = next(item for item in vendors['gemini']['models'] if item['model_id'] == 'flash')
         self.assertIn('high', flash['efforts'])
         self.assertIn(flash['default_effort'], flash['efforts'])
         self.assertNotIn('commands', catalog)
+        self.assertNotIn('binary_path', str(catalog))
+        self.assertNotIn('executable_path', str(catalog))
+        self.assertNotIn('/private/test/bin/deveco', str(catalog))
 
     def test_web_backend_lists_existing_requirements(self):
         with tempfile.TemporaryDirectory() as tmpdir:

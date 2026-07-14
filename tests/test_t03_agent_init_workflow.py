@@ -8,7 +8,13 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
-from T02_tmux_agents import AgentRunConfig, AgentRuntimeState, CommandResult, WorkerResult
+from T02_tmux_agents import (
+    AgentRunConfig,
+    AgentRuntimeState,
+    AgentStartupInterventionRequired,
+    CommandResult,
+    WorkerResult,
+)
 from T03_agent_init_workflow import (
     BatchInitResult,
     DirectoryInitResult,
@@ -921,6 +927,94 @@ class AgentInitWorkflowTests(unittest.TestCase):
             self.assertEqual(len(result.results), 1)
             directory_result = result.results[0]
             self.assertEqual(directory_result.status, "passed")
+
+    def test_run_turn_startup_intervention_records_awaiting_input_and_resumes_same_worker(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            runtime_root = Path(tmpdir) / "runtime"
+            FakeWorker.scripts = {
+                str(project_dir): [
+                    {
+                        "label": "create_routing_layer",
+                        "output": "",
+                        "create_files": ROUTING_LAYER_REQUIRED_FILES,
+                    },
+                    {
+                        "label": "audit_routing_layer_1",
+                        "output": "",
+                        "write_files": self._audit_write_files(
+                            round_index=1,
+                            status=ROUTING_AUDIT_STATUS_PASS,
+                            record_text="- status: 审核通过\n- note: routing layer can be used as-is\n",
+                        ),
+                    },
+                ]
+            }
+
+            class StartupOnceFakeWorker(FakeWorker):
+                instances: list["StartupOnceFakeWorker"] = []
+
+                def __init__(self, **kwargs):  # noqa: ANN003
+                    super().__init__(**kwargs)
+                    self.__class__.instances.append(self)
+                    self.run_worker_ids: list[int] = []
+                    self.startup_error = AgentStartupInterventionRequired(
+                        blocker_kind="deveco_login",
+                        session_name=self.session_name,
+                        state_path=str(self.state_path),
+                        message="DevEco login requires manual intervention",
+                    )
+                    self._startup_error_raised = False
+
+                def run_turn(self, **kwargs):  # noqa: ANN003
+                    self.run_worker_ids.append(id(self))
+                    if not self._startup_error_raised:
+                        self._startup_error_raised = True
+                        raise self.startup_error
+                    return super().run_turn(**kwargs)
+
+            awaiting_manifests: list[dict[str, object]] = []
+
+            def complete_manual_recovery(live_worker, *, error, stage_label, role_label):  # noqa: ANN001
+                self.assertIs(live_worker, StartupOnceFakeWorker.instances[0])
+                self.assertIs(error, live_worker.startup_error)
+                self.assertEqual(stage_label, "AGENT初始化")
+                self.assertEqual(role_label, live_worker.session_name)
+                awaiting_manifests.append(
+                    json.loads((live_worker.runtime_root / "manifest.json").read_text(encoding="utf-8"))
+                )
+
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            with patch(
+                "tmux_core.stage_kernel.agent_intervention.wait_for_worker_startup_intervention",
+                side_effect=complete_manual_recovery,
+            ) as recover:
+                result = run_batch_initialization(
+                    selection=selection,
+                    config=config,
+                    runtime_root=runtime_root,
+                    worker_factory=StartupOnceFakeWorker,
+                )
+
+            self.assertEqual(result.results[0].status, "passed")
+            self.assertEqual(len(StartupOnceFakeWorker.instances), 1)
+            worker = StartupOnceFakeWorker.instances[0]
+            self.assertEqual(worker.run_worker_ids, [id(worker), id(worker), id(worker)])
+            recover.assert_called_once()
+            self.assertEqual(len(awaiting_manifests), 1)
+            awaiting_manifest = awaiting_manifests[0]
+            self.assertEqual(awaiting_manifest["status"], "awaiting_input")
+            self.assertEqual(len(awaiting_manifest["workers"]), 1)
+            awaiting_worker = awaiting_manifest["workers"][0]
+            self.assertEqual(awaiting_worker["session_name"], worker.session_name)
+            self.assertEqual(awaiting_worker["workflow_stage"], "create_running")
+            self.assertEqual(awaiting_worker["result_status"], "running")
+            self.assertEqual(awaiting_worker["note"], "awaiting_startup_intervention")
+            final_manifest = json.loads((worker.runtime_root / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(final_manifest["run_id"], result.run_id)
+            self.assertEqual(final_manifest["status"], "completed")
 
     def test_run_directory_initialization_normalizes_revise_output_before_refine_prompt(self):
         with tempfile.TemporaryDirectory() as tmpdir:
