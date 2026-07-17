@@ -32,14 +32,20 @@ import { ControlRoute } from './routes/ControlRoute'
 import { resolveFooterProgressLine } from './footerProgress'
 import { buildHomeAgents } from './homeAgents'
 import { promptAllowsBack, resolvePromptBackValue, withPromptBackOption } from './promptBack'
+import { writePromptDraft } from './promptMemory'
 import { promptStateFromSnapshot } from './promptSnapshot'
-import { resolvePromptResponseTransition } from './promptTransition'
+import { resolvePromptAwareStatus, resolvePromptResponseTransition } from './promptTransition'
 import {
   applyStageChanged,
+  bindProgressEntry,
   EMPTY_STAGE_CURSOR,
   inferBootstrapStatus,
   isNewRunnerGeneration,
+  progressEntryMatchesCursor,
+  resolveStageMessage,
+  shouldResetProgressForStageChange,
   shouldAcceptProgressEvent,
+  type ScopedProgressEntry,
 } from './stageStatus'
 import {
   isAuthoritativeStageFailure,
@@ -141,6 +147,7 @@ const EMPTY_APP_SNAPSHOT: AppSnapshot = {
   activeStageRunnerId: '',
   activeStageSource: '',
   activeStageLabel: '等待中',
+  activeStageMessage: '',
   activeStageFailure: null,
   pendingHitl: false,
   pendingAttention: false,
@@ -719,13 +726,21 @@ function normalizeFileSnapshot(value: Record<string, unknown>): FileSnapshot {
 
 function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot {
   const rawArtifactPaths = (value.artifact_paths ?? value.artifactPaths) as unknown
+  const rawStateRevision = value.state_revision ?? value.stateRevision
+  const stateRevision = (
+    typeof rawStateRevision === 'number'
+    || (typeof rawStateRevision === 'string' && rawStateRevision.trim() !== '')
+  ) ? Number(rawStateRevision) : Number.NaN
   return {
     index: Number(value.index ?? 0) || undefined,
     workerId: String(value.worker_id ?? value.workerId ?? ''),
+    statePath: String(value.state_path ?? value.statePath ?? ''),
+    stateRevision: Number.isFinite(stateRevision) ? stateRevision : undefined,
     workDir: String(value.work_dir ?? value.workDir ?? ''),
     sessionName: String(value.session_name ?? value.sessionName ?? ''),
     status: String(value.status ?? ''),
     resultStatus: String(value.result_status ?? value.resultStatus ?? ''),
+    workflowAction: String(value.workflow_action ?? value.workflowAction ?? ''),
     workflowStage: String(value.workflow_stage ?? value.workflowStage ?? ''),
     agentState: String(value.agent_state ?? value.agentState ?? ''),
     healthStatus: String(value.health_status ?? value.healthStatus ?? ''),
@@ -914,6 +929,7 @@ function normalizeAppSnapshot(payload: Record<string, unknown>): AppSnapshot {
   const activeStageRunnerId = String(payload.active_stage_runner_id ?? payload.activeStageRunnerId ?? payload.runner_id ?? payload.runnerId ?? '')
   const activeStageSource = String(payload.active_stage_source ?? payload.activeStageSource ?? payload.source ?? '')
   const activeStageLabel = String(payload.active_stage_label ?? payload.activeStageLabel ?? '等待中')
+  const activeStageMessage = String(payload.active_stage_message ?? payload.activeStageMessage ?? '')
   const failure = normalizeAppStageFailure(payload)
   return {
     projectDir: String(payload.project_dir ?? payload.projectDir ?? ''),
@@ -926,6 +942,7 @@ function normalizeAppSnapshot(payload: Record<string, unknown>): AppSnapshot {
     activeStageRunnerId,
     activeStageSource,
     activeStageLabel,
+    activeStageMessage,
     activeStageFailure: failure,
     pendingHitl: Boolean(payload.pending_hitl ?? payload.pendingHitl),
     pendingAttention: Boolean(payload.pending_attention ?? payload.pendingAttention),
@@ -990,8 +1007,8 @@ export function stopBackendClient(options?: BackendStopOptions) {
   return client.stop(options)
 }
 
-export function requestBackendPreserveOrphansShutdown() {
-  return client.requestShutdownPolicy('preserve_orphans', 'runner_failure')
+export function requestBackendCleanupShutdown(reason: 'normal' | 'signal' | 'runner_failure') {
+  return client.requestShutdownPolicy('cleanup', reason)
 }
 
 export function claimBackendShutdownOwnership() {
@@ -1000,6 +1017,14 @@ export function claimBackendShutdownOwnership() {
 
 export function getLatestBackendCleanupContext(): BackendCleanupContext {
   return { ...latestBackendCleanupContext }
+}
+
+export function setInitialBackendCleanupContext(context: BackendCleanupContext) {
+  latestBackendCleanupContext = {
+    projectDir: String(context.projectDir || latestBackendCleanupContext.projectDir || '').trim(),
+    requirementName: String(context.requirementName || latestBackendCleanupContext.requirementName || '').trim(),
+    action: String(context.action || latestBackendCleanupContext.action || '').trim(),
+  }
 }
 
 export function runBackendCleanupFallback(context: BackendCleanupContext) {
@@ -1011,11 +1036,13 @@ export function App(props: StartupOptions) {
   const dimensions = useTerminalDimensions()
   const [route, setRoute] = createSignal<RouteName>('home')
   const [logs, setLogs] = createSignal<LogEntry[]>([])
-  const [progress, setProgress] = createSignal<Record<string, string>>({})
+  const [progress, setProgress] = createSignal<Record<string, ScopedProgressEntry>>({})
   const [footerSpinnerTick, setFooterSpinnerTick] = createSignal(0)
   const [status, setStatus] = createSignal('booting')
   const [stageCursor, setStageCursor] = createSignal(EMPTY_STAGE_CURSOR)
   const [prompt, setPrompt] = createSignal<PromptState | null>(null)
+  const [promptSubmitRevision, setPromptSubmitRevision] = createSignal(0)
+  const promptSubmitInFlight = new Set<string>()
   const [localDialog, setLocalDialog] = createSignal<LocalDialogState | null>(null)
   const [bootstrap, setBootstrap] = createSignal<Record<string, unknown>>({})
   const [appSnapshot, setAppSnapshot] = createSignal<AppSnapshot>(EMPTY_APP_SNAPSHOT)
@@ -1044,9 +1071,9 @@ export function App(props: StartupOptions) {
   createEffect(() => {
     const snapshot = displayAppSnapshot()
     latestBackendCleanupContext = {
-      projectDir: String(snapshot.projectDir || '').trim(),
-      requirementName: String(snapshot.requirementName || '').trim(),
-      action: String(snapshot.currentAction || snapshot.activeStage || '').trim(),
+      projectDir: String(snapshot.projectDir || latestBackendCleanupContext.projectDir || '').trim(),
+      requirementName: String(snapshot.requirementName || latestBackendCleanupContext.requirementName || '').trim(),
+      action: String(snapshot.currentAction || snapshot.activeStage || latestBackendCleanupContext.action || '').trim(),
     }
   })
   const homeAgents = createMemo<HomeAgentItem[]>(() =>
@@ -1062,6 +1089,7 @@ export function App(props: StartupOptions) {
         { source: 'overall-review', workers: overallReviewSnapshot().workers },
       ],
       displayAppSnapshot().activeStage,
+      displayAppSnapshot().activeStageRunnerId,
     ),
   )
   const footerPrompt = createMemo<PromptState | null>(() => {
@@ -1081,7 +1109,9 @@ export function App(props: StartupOptions) {
   const [focusBeforeLog, setFocusBeforeLog] = createSignal<ShellFocus>('content')
   const [documentPreviewOpen, setDocumentPreviewOpen] = createSignal(false)
   const lastPresenceAtByReason = new Map<string, number>()
-  const footerPromptFocusToken = createMemo(() => `${footerPrompt()?.id ?? 'no-prompt'}:${shellFocus()}`)
+  const footerPromptFocusToken = createMemo(
+    () => `${footerPrompt()?.id ?? 'no-prompt'}:${shellFocus()}:${promptSubmitRevision()}`,
+  )
   const shellHeights = createMemo(() => allocateShellHeights(dimensions().height, Boolean(footerPrompt()), showLogs()))
   let logScrollbox: ScrollBoxRenderable | undefined
   let documentPreviewScrollbox: ScrollBoxRenderable | undefined
@@ -1102,7 +1132,10 @@ export function App(props: StartupOptions) {
   })
   const activeDocumentPreview = createMemo<DocumentPreviewState | null>(() => (documentPreviewOpen() ? promptPreview() : null))
 
-  const currentProgress = createMemo(() => Object.values(progress()).join(' | '))
+  const currentProgress = createMemo(() => Object.values(progress())
+    .filter((entry) => progressEntryMatchesCursor(stageCursor(), entry))
+    .map((entry) => entry.line)
+    .join(' | '))
   const footerProgressLine = createMemo(() =>
     resolveFooterProgressLine(
       {
@@ -1118,7 +1151,7 @@ export function App(props: StartupOptions) {
         developmentWorkers: developmentSnapshot().workers,
         overallReviewWorkers: overallReviewSnapshot().workers,
       },
-      currentProgress(),
+      currentProgress() || (status() === 'running' ? String(displayAppSnapshot().activeStageMessage || '') : ''),
       footerSpinnerTick(),
     ),
   )
@@ -1356,7 +1389,8 @@ export function App(props: StartupOptions) {
       setAppSnapshot(nextSnapshot)
       return authoritativeFailure
     }
-    const transition = applyStageChanged(stageCursor(), authoritativeFailure ?? {
+    const previousCursor = stageCursor()
+    const transition = applyStageChanged(previousCursor, authoritativeFailure ?? {
       action: nextSnapshot.activeStage,
       status: nextSnapshot.activeStageStatus,
       source: nextSnapshot.activeStageSource,
@@ -1373,20 +1407,31 @@ export function App(props: StartupOptions) {
         activeStageRunnerId: previous.activeStageRunnerId,
         activeStageSource: previous.activeStageSource,
         activeStageLabel: previous.activeStageLabel,
+        activeStageMessage: previous.activeStageMessage,
         activeStageFailure: previous.activeStageFailure,
       }))
       return null
     }
     setStageCursor(transition.cursor)
-    const visibleStatus = (
-      !authoritativeFailure
-      && (nextSnapshot.pendingHitl || nextSnapshot.pendingAttention)
-    ) ? 'awaiting-input' : transition.status
+    if (shouldResetProgressForStageChange(previousCursor, transition.cursor, transition.status)) setProgress({})
+    const visibleStatus = resolvePromptAwareStatus(
+      (
+        !authoritativeFailure
+        && (nextSnapshot.pendingHitl || nextSnapshot.pendingAttention)
+      ) ? 'awaiting-input' : transition.status,
+      Boolean(prompt()),
+    )
     setStatus(visibleStatus)
-    setAppSnapshot({
+    setAppSnapshot((previous) => ({
       ...nextSnapshot,
+      activeStageMessage: resolveStageMessage(
+        previousCursor,
+        transition.cursor,
+        previous.activeStageMessage || '',
+        nextSnapshot.activeStageMessage,
+      ),
       activeStageFailure: authoritativeFailure,
-    })
+    }))
     if (triggerFailureExit) requestTerminalFailureExit(authoritativeFailure)
     return authoritativeFailure
   }
@@ -1459,10 +1504,11 @@ export function App(props: StartupOptions) {
       return
     }
     if (event.type === 'progress.update') {
-      if (!shouldAcceptProgressEvent(stageCursor(), event.payload)) return
       const id = String(event.payload.id ?? '')
       const line = String(event.payload.line ?? '')
-      setProgress((prev) => ({ ...prev, [id]: line }))
+      const entry = bindProgressEntry(stageCursor(), event.payload, line)
+      if (!entry) return
+      setProgress((prev) => ({ ...prev, [id]: entry }))
       return
     }
     if (event.type === 'progress.stop') {
@@ -1490,15 +1536,22 @@ export function App(props: StartupOptions) {
       return
     }
     if (event.type === 'stage.changed') {
-      const transition = applyStageChanged(stageCursor(), event.payload)
+      const previousCursor = stageCursor()
+      const transition = applyStageChanged(previousCursor, event.payload)
       if (!transition.accepted) return
       setStageCursor(transition.cursor)
-      if (transition.status !== 'running') setProgress({})
-      setStatus(transition.status)
+      if (shouldResetProgressForStageChange(previousCursor, transition.cursor, transition.status)) setProgress({})
+      setStatus(resolvePromptAwareStatus(transition.status, Boolean(prompt())))
+      const activeStageLabel = resolveStageMessage(
+        previousCursor,
+        transition.cursor,
+        displayAppSnapshot().activeStageLabel,
+        event.payload.stage_label ?? event.payload.stageLabel,
+      ) || '等待中'
       const failure = transition.authoritativeFailure
         ? normalizeStageFailure(event.payload, {
           action: String(event.payload.action ?? ''),
-          stageLabel: displayAppSnapshot().activeStageLabel,
+          stageLabel: activeStageLabel,
           status: transition.status,
           source: transition.source,
           runnerId: transition.runnerId,
@@ -1513,6 +1566,13 @@ export function App(props: StartupOptions) {
         activeStageSeq: transition.stageSeq || previous.activeStageSeq,
         activeStageRunnerId: transition.runnerId || previous.activeStageRunnerId,
         activeStageSource: transition.source || previous.activeStageSource,
+        activeStageLabel,
+        activeStageMessage: resolveStageMessage(
+          previousCursor,
+          transition.cursor,
+          previous.activeStageMessage || '',
+          event.payload.message,
+        ),
         activeStageFailure: failure,
       }))
       appendStructuredLog(
@@ -1632,7 +1692,7 @@ export function App(props: StartupOptions) {
       const result = (await client.bootstrap()) as Record<string, unknown>
       setBootstrap(result)
       const bootstrapFailure = applyBootstrapSnapshots(result)
-      setStatus(inferBootstrapStatus(result))
+      setStatus(resolvePromptAwareStatus(inferBootstrapStatus(result), Boolean(prompt())))
       if (props.initialRoute) {
         setRoute(props.initialRoute)
       }
@@ -1712,11 +1772,48 @@ export function App(props: StartupOptions) {
   const sendPromptValue = async (value: unknown) => {
     const current = prompt()
     if (!current) return
-    await client.submitPrompt(current.id, value)
-    const transition = resolvePromptResponseTransition(current.id, prompt())
-    if (transition.clearPrompt) setPrompt(null)
-    setStatus(transition.nextStatus)
-    setShellFocus(transition.nextShellFocus)
+    if (promptSubmitInFlight.has(current.id)) return
+    promptSubmitInFlight.add(current.id)
+
+    const preserveRejectedPrompt = (message: string, kind: 'warning' | 'error') => {
+      if (!prompt()) setPrompt(current)
+      const retained = prompt() ?? current
+      if (retained.id === current.id && !isOverlayPromptType(current.promptType)) {
+        writePromptDraft(current.draftKey, String(value ?? ''))
+      }
+      const transition = resolvePromptResponseTransition(current.id, retained, false)
+      setStatus(transition.nextStatus)
+      setShellFocus(transition.nextShellFocus)
+      setPromptSubmitRevision((previous) => previous + 1)
+      appendStructuredLog(
+        buildLogEntry({
+          kind,
+          sourceEventType: 'prompt.response',
+          title: kind === 'error' ? '输入提交失败' : '输入尚未被接受',
+          lines: [message],
+        }),
+      )
+    }
+
+    try {
+      const response = normalizePayload<Record<string, unknown>>(await client.submitPrompt(current.id, value))
+      const accepted = response.accepted === true
+      if (!accepted) {
+        preserveRejectedPrompt('后端未接受本次输入，已保留当前内容，可重试。', 'warning')
+        return
+      }
+      const transition = resolvePromptResponseTransition(current.id, prompt(), true)
+      if (transition.clearPrompt) setPrompt(null)
+      setStatus(transition.nextStatus)
+      setShellFocus(transition.nextShellFocus)
+    } catch (error) {
+      preserveRejectedPrompt(
+        error instanceof Error ? error.message : String(error),
+        'error',
+      )
+    } finally {
+      promptSubmitInFlight.delete(current.id)
+    }
   }
 
   const openResumeDialog = async () => {

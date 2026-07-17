@@ -565,3 +565,110 @@ test('phone viewport keeps the prompt host app-like', async ({ page }) => {
   await page.locator('.bottom-tabs').getByRole('button', { name: '日志' }).click()
   await expect(page.getByText('已请求从路由层开始')).toBeVisible()
 })
+
+test('home uses TUI agent state precedence and revision-aware deduplication', async ({ page }) => {
+  await installFakeBridge(page)
+  const currentWorker = {
+    index: 1,
+    worker_id: 'development-developer',
+    state_path: '/tmp/dev.state.json',
+    state_revision: 42,
+    session_name: '开发工程师-天罡星',
+    status: 'running',
+    turn_state: 'waiting_result',
+    workflow_action: 'stage.a07.start',
+    stage_runner_id: 'runner-7',
+    agent_state: 'READY',
+    health_status: 'alive',
+    session_exists: true,
+    vendor: 'deveco',
+    model: 'deveco/GLM-5.1',
+    reasoning_effort: 'max',
+  }
+  const paritySnapshot = {
+    ...snapshotsPayload,
+    app: {
+      ...snapshotsPayload.app,
+      active_stage_status: 'running',
+      active_stage_seq: 7,
+      active_stage_runner_id: 'runner-7',
+      active_stage_source: 'runner_start',
+    },
+    stages: {
+      development: {
+        ...(snapshotsPayload.stages as any).development,
+        workers: [{ ...currentWorker, state_revision: 41, agent_state: 'BUSY' }],
+      },
+    },
+    control: {
+      ...snapshotsPayload.control,
+      workers: [currentWorker],
+    },
+  }
+  await mockBridgeApi(page, () => ({ pending: false }), paritySnapshot)
+
+  await page.goto('/')
+  const overview = page.locator('.app-card').filter({ hasText: '智能体状态' })
+  await expect(overview.getByText('开发工程师-天罡星')).toHaveCount(1)
+  await expect(overview.getByText('DevEco Code | deveco/GLM-5.1, Max')).toBeVisible()
+  await expect(overview.locator('.pill').filter({ hasText: /^READY$/ })).toBeVisible()
+  await expect(overview.locator('.pill').filter({ hasText: /^BUSY$/ })).toHaveCount(0)
+})
+
+test('late response for prompt A does not clear newer prompt B', async ({ page }) => {
+  await installFakeBridge(page)
+  let promptSnapshot: Record<string, unknown> = {
+    pending: true,
+    prompt_id: 'prompt-a',
+    prompt_type: 'text',
+    payload: { prompt_text: '问题 A' },
+  }
+  await mockBridgeApi(page, () => promptSnapshot, idleSnapshotsPayload)
+  let releaseResponse: (() => void) | undefined
+  await page.route('**/api/prompt-response', async (route) => {
+    await new Promise<void>((resolve) => { releaseResponse = resolve })
+    return route.fulfill({ json: { ok: true, payload: { accepted: true } } })
+  })
+
+  await page.goto('/')
+  await page.getByLabel('问题 A').fill('answer-a')
+  await page.getByRole('button', { name: '提交' }).click()
+  promptSnapshot = {
+    pending: true,
+    prompt_id: 'prompt-b',
+    prompt_type: 'text',
+    payload: { prompt_text: '问题 B' },
+  }
+  await emitPrompt(page, { id: 'prompt-b', prompt_type: 'text', prompt_text: '问题 B' })
+  releaseResponse?.()
+
+  await expect(page.getByLabel('问题 B')).toBeVisible()
+  await expect(page.locator('.prompt-card')).toHaveCount(1)
+})
+
+test('shows complete startup intervention details without relying on a prompt card', async ({ page }) => {
+  await installFakeBridge(page)
+  const hitlSnapshot = {
+    ...idleSnapshotsPayload,
+    app: {
+      ...(idleSnapshotsPayload.app as Record<string, unknown>),
+      pending_hitl: true,
+      pending_attention: true,
+      pending_attention_reason: '登录页需要人工处理',
+    },
+    hitl: {
+      pending: true,
+      summary: 'DevEco 需要登录',
+      attach_command: 'tmux attach -t 架构师-地强星',
+      recovery_kind: 'agent_startup_intervention',
+      reason_text: '不自动输入凭证',
+      target_paths: [],
+    },
+  }
+  await mockBridgeApi(page, () => ({ pending: false }), hitlSnapshot)
+
+  await page.goto('/')
+  await expect(page.getByText('DevEco 需要登录')).toBeVisible()
+  await expect(page.getByText('tmux attach -t 架构师-地强星')).toBeVisible()
+  await expect(page.getByText('agent_startup_intervention')).toBeVisible()
+})

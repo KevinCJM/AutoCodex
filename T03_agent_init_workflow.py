@@ -32,9 +32,12 @@ from T02_tmux_agents import (
     TurnFileContract,
     TurnFileResult,
     TmuxBatchWorker,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     TmuxRuntimeController,
     clean_ansi,
     is_runtime_noise_line,
+    list_registered_tmux_workers,
     worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.agent_intervention import run_worker_turn_with_startup_recovery
@@ -52,6 +55,7 @@ ROUTING_AUDIT_PASS_TOKEN = "[[ROUTING_AUDIT:PASS]]"
 ROUTING_AUDIT_REVISE_TOKEN = "[[ROUTING_AUDIT:REVISE]]"
 ROUTING_AUDIT_STATUS_PASS = "审核通过"
 ROUTING_AUDIT_STATUS_FAIL = "审核未通过"
+ROUTING_WORKFLOW_ACTION = "stage.a01.start"
 TURN_STATUS_FILE = "turn_status.json"
 TURN_STATUS_SCHEMA_VERSION = "1.0"
 PHASE_ROUTING_LAYER_CREATE = "routing_layer_create"
@@ -1562,7 +1566,13 @@ def prepare_live_workers(
                 work_dir=target_dir,
                 config=config,
                 runtime_root=store.run_root,
+                runtime_metadata={
+                    "project_dir": selection.project_dir,
+                    "workflow_action": ROUTING_WORKFLOW_ACTION,
+                },
             )
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
         except Exception as error:
             failed = DirectoryInitResult(
                 work_dir=target_dir,
@@ -2142,6 +2152,8 @@ def run_directory_initialization_with_worker(
             if isinstance(next_step, DirectoryInitResult):
                 return next_step
             next_action = next_step
+    except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+        raise
     except Exception as error:
         return fail(f"workflow_exception: {error}")
 
@@ -2163,6 +2175,8 @@ def run_directory_initialization(
             config=config,
             runtime_root=runtime_root,
         )
+    except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+        raise
     except Exception as error:
         return DirectoryInitResult(
             work_dir=str(target_dir),
@@ -2218,6 +2232,80 @@ def build_batch_result(
     return batch_result
 
 
+def _resolved_identity_path(path_value: object) -> str:
+    text = str(path_value or "").strip()
+    if not text:
+        return ""
+    return str(Path(text).expanduser().resolve())
+
+
+def _load_routing_worker_cleanup_identity(
+    *,
+    run_store: RunStore,
+    entry: WorkerManifestEntry,
+    session_name: str,
+) -> dict[str, str]:
+    """Prove that a manifest entry still names its own A01 worker runtime."""
+    state_path_text = str(getattr(entry, "state_path", "") or "").strip()
+    if not state_path_text:
+        raise RuntimeError("worker state_path 缺失")
+    state_path = Path(state_path_text).expanduser().resolve()
+    if not state_path.is_file():
+        raise RuntimeError(f"worker state 不存在: {state_path}")
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as error:  # noqa: BLE001
+        raise RuntimeError(f"worker state 不可读: {state_path}: {error}") from error
+    if not isinstance(state, dict):
+        raise RuntimeError(f"worker state 不是 object: {state_path}")
+
+    state_session_name = str(state.get("session_name", "") or "").strip()
+    if not state_session_name or state_session_name != session_name:
+        raise RuntimeError(
+            f"worker state session 不匹配: {state_session_name or '<missing>'} != {session_name}"
+        )
+
+    entry_runtime_dir = _resolved_identity_path(getattr(entry, "runtime_dir", ""))
+    state_runtime_dir = _resolved_identity_path(state.get("runtime_dir", ""))
+    state_parent_dir = str(state_path.parent)
+    if not entry_runtime_dir or not state_runtime_dir:
+        raise RuntimeError("worker runtime_dir 身份缺失")
+    if len({entry_runtime_dir, state_runtime_dir, state_parent_dir}) != 1:
+        raise RuntimeError(
+            "worker runtime_dir 身份不匹配: "
+            f"manifest={entry_runtime_dir}, state={state_runtime_dir}, state_parent={state_parent_dir}"
+        )
+
+    entry_work_dir = _resolved_identity_path(getattr(entry, "work_dir", ""))
+    state_work_dir = _resolved_identity_path(state.get("work_dir", ""))
+    if not entry_work_dir or not state_work_dir or entry_work_dir != state_work_dir:
+        raise RuntimeError(
+            "worker work_dir 身份不匹配: "
+            f"manifest={entry_work_dir or '<missing>'}, state={state_work_dir or '<missing>'}"
+        )
+
+    manifest_project_dir = _resolved_identity_path(getattr(run_store.manifest, "project_dir", ""))
+    state_project_dir = _resolved_identity_path(state.get("project_dir", ""))
+    if not manifest_project_dir or not state_project_dir or manifest_project_dir != state_project_dir:
+        raise RuntimeError(
+            "worker project_dir 身份不匹配: "
+            f"manifest={manifest_project_dir or '<missing>'}, state={state_project_dir or '<missing>'}"
+        )
+
+    workflow_action = str(state.get("workflow_action", "") or "").strip()
+    if workflow_action != ROUTING_WORKFLOW_ACTION:
+        raise RuntimeError(
+            "worker workflow_action 身份不匹配: "
+            f"{workflow_action or '<missing>'} != {ROUTING_WORKFLOW_ACTION}"
+        )
+
+    return {
+        "runtime_dir": state_runtime_dir,
+        "work_dir": state_work_dir,
+        "workflow_action": workflow_action,
+    }
+
+
 def kill_run_tmux_sessions(
     *,
     run_store: RunStore,
@@ -2225,19 +2313,157 @@ def kill_run_tmux_sessions(
 ) -> list[str]:
     controller = runtime_controller or TmuxRuntimeController()
     killed_sessions: list[str] = []
+    cleanup_errors: list[dict[str, str]] = []
     seen: set[str] = set()
     for entry in run_store.manifest.workers:
         session_name = str(entry.session_name or "").strip()
         if not session_name or session_name in seen:
             continue
         seen.add(session_name)
-        killed_sessions.append(controller.kill_session(session_name, missing_ok=True))
+        try:
+            identity = _load_routing_worker_cleanup_identity(
+                run_store=run_store,
+                entry=entry,
+                session_name=session_name,
+            )
+            matches_context = getattr(controller, "session_matches_context", None)
+            if not callable(matches_context):
+                raise RuntimeError("tmux controller 不支持 session identity 验证")
+            if not matches_context(
+                session_name,
+                runtime_dir=identity["runtime_dir"],
+                work_dir=identity["work_dir"],
+                workflow_action=identity["workflow_action"],
+            ):
+                session_exists = getattr(controller, "session_exists", None)
+                if callable(session_exists) and not session_exists(session_name):
+                    continue
+                raise RuntimeError("tmux session identity 无法证明，拒绝清理")
+            killed_sessions.append(controller.kill_session(session_name, missing_ok=True))
+        except Exception as error:  # noqa: BLE001
+            cleanup_errors.append(
+                {
+                    "session_name": session_name,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
     run_store.append_event(
         "routing_tmux_cleanup",
         session_names=[item for item in killed_sessions if item],
         count=len([item for item in killed_sessions if item]),
+        errors=cleanup_errors,
     )
+    if cleanup_errors:
+        failed_names = ", ".join(item["session_name"] for item in cleanup_errors)
+        raise RuntimeError(f"部分 tmux session 清理失败，保留运行产物: {failed_names}")
     return [item for item in killed_sessions if item]
+
+
+def mark_run_workers_orphaned(
+    *,
+    run_store: RunStore,
+    reason: str,
+) -> tuple[str, ...]:
+    """Persist failure ownership without probing or mutating tmux sessions."""
+    reason_text = str(reason or "routing_stage_failed").strip() or "routing_stage_failed"
+    live_workers_by_state_path = {
+        str(Path(worker.state_path).expanduser().resolve()): worker
+        for worker in list_registered_tmux_workers()
+        if str(getattr(worker, "state_path", "") or "").strip()
+    }
+    orphaned_sessions: list[str] = []
+    for entry in list(getattr(run_store.manifest, "workers", ()) or ()):
+        state_path_text = str(getattr(entry, "state_path", "") or "").strip()
+        if not state_path_text:
+            continue
+        state_path = Path(state_path_text).expanduser().resolve()
+        worker = live_workers_by_state_path.get(str(state_path))
+        if worker is not None:
+            try:
+                set_runtime_metadata = getattr(worker, "set_runtime_metadata", None)
+                if callable(set_runtime_metadata):
+                    try:
+                        set_runtime_metadata(orphaned_stage_action=ROUTING_WORKFLOW_ACTION)
+                    except Exception:
+                        pass
+                worker.mark_orphaned(reason_text)
+                live_payload = json.loads(state_path.read_text(encoding="utf-8"))
+                if (
+                    isinstance(live_payload, dict)
+                    and str(live_payload.get("orphaned_stage_action", "") or "").strip()
+                    != ROUTING_WORKFLOW_ACTION
+                ):
+                    orphaned_at = _now_iso()
+                    live_payload.update(
+                        {
+                            "orphaned_stage_action": ROUTING_WORKFLOW_ACTION,
+                            "updated_at": orphaned_at,
+                            "state_revision": int(live_payload.get("state_revision", 0) or 0) + 1,
+                            "last_writer": "mark_run_workers_orphaned.live_action",
+                        }
+                    )
+                    temporary_path = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}.tmp")
+                    try:
+                        temporary_path.write_text(
+                            json.dumps(live_payload, ensure_ascii=False, indent=2) + "\n",
+                            encoding="utf-8",
+                        )
+                        os.replace(temporary_path, state_path)
+                    finally:
+                        if temporary_path.exists():
+                            temporary_path.unlink()
+                session_name = str(getattr(worker, "session_name", "") or "").strip()
+                if session_name:
+                    orphaned_sessions.append(session_name)
+                continue
+            except Exception:
+                pass
+        try:
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            agent_state = str(payload.get("agent_state", "") or "").strip().upper()
+            if agent_state == AgentRuntimeState.DEAD.value and not bool(payload.get("agent_alive", False)):
+                continue
+            orphaned_at = _now_iso()
+            payload.update(
+                {
+                    "turn_state": "orphaned",
+                    "orphaned_at": orphaned_at,
+                    "orphaned_reason": reason_text,
+                    "orphaned_stage_action": ROUTING_WORKFLOW_ACTION,
+                    "updated_at": orphaned_at,
+                    "state_revision": int(payload.get("state_revision", 0) or 0) + 1,
+                    "last_writer": "mark_run_workers_orphaned",
+                }
+            )
+            temporary_path = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                temporary_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                os.replace(temporary_path, state_path)
+            finally:
+                if temporary_path.exists():
+                    temporary_path.unlink()
+            session_name = str(payload.get("session_name", getattr(entry, "session_name", "")) or "").strip()
+            if session_name:
+                orphaned_sessions.append(session_name)
+        except Exception:
+            continue
+    unique_sessions = tuple(dict.fromkeys(orphaned_sessions))
+    try:
+        run_store.append_event(
+            "routing_workers_orphaned",
+            reason=reason_text,
+            session_names=list(unique_sessions),
+            count=len(unique_sessions),
+        )
+    except Exception:
+        pass
+    return unique_sessions
 
 
 def cleanup_routing_stage_artifacts(
@@ -2315,22 +2541,51 @@ def run_batch_initialization(
 
     if live_workers:
         worker_count = determine_batch_worker_count([item.work_dir for item in live_workers], max_workers=max_workers)
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {
-                executor.submit(
-                    run_directory_initialization_with_worker,
+        executor = ThreadPoolExecutor(max_workers=worker_count)
+        shutdown_without_wait = False
+        try:
+            start_gate = threading.Event()
+
+            def run_prepared_worker(handle: LiveWorkerHandle) -> DirectoryInitResult:
+                start_gate.wait()
+                return run_directory_initialization_with_worker(
                     worker=handle.worker,
                     forced=handle.forced,
                     max_refine_rounds=max_refine_rounds,
                     run_store=run_store,
                     resume_state=handle.resume_state,
-                ): handle.work_dir
+                )
+
+            future_map = {
+                executor.submit(run_prepared_worker, handle): handle.work_dir
                 for handle in live_workers
             }
+
+            def cancel_pending_after_fatal_transport(completed_future) -> None:  # noqa: ANN001
+                try:
+                    error = completed_future.exception()
+                except BaseException:
+                    return
+                if not isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
+                    return
+                for pending_future in future_map:
+                    if pending_future is not completed_future:
+                        pending_future.cancel()
+
+            for submitted_future in future_map:
+                submitted_future.add_done_callback(cancel_pending_after_fatal_transport)
+            start_gate.set()
             for future in as_completed(future_map):
                 target_dir = future_map[future]
                 try:
                     result = future.result()
+                except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+                    for pending_future in future_map:
+                        if pending_future is not future:
+                            pending_future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    shutdown_without_wait = True
+                    raise
                 except Exception as error:
                     result = DirectoryInitResult(
                         work_dir=target_dir,
@@ -2343,6 +2598,10 @@ def run_batch_initialization(
                     )
                     run_store.update_worker_result(result)
                 results_by_dir[result.work_dir] = result
+        finally:
+            start_gate.set()
+            if not shutdown_without_wait:
+                executor.shutdown(wait=True)
 
     return build_batch_result(
         run_store=run_store,

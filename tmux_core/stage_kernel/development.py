@@ -69,8 +69,6 @@ from tmux_core.runtime.tmux_runtime import (
     is_provider_runtime_error,
     load_worker_from_state_path,
     list_registered_tmux_workers,
-    list_tmux_session_names,
-    list_occupied_tmux_session_names,
     try_resume_worker,
 )
 from tmux_core.stage_kernel.detailed_design import collect_ba_agent_selection
@@ -115,6 +113,7 @@ from tmux_core.stage_kernel.shared_review import (
     collect_auto_review_limit_hitl_response,
     ensure_empty_file,
     ensure_review_artifacts,
+    ensure_review_artifacts_exist,
     is_agent_config_error,
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
@@ -130,6 +129,7 @@ from tmux_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    resolve_reviewer_artifact_agent_name,
     resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     reviewer_requires_manual_model_reconfiguration,
@@ -732,20 +732,13 @@ def _predict_worker_display_name(
     worker_id: str,
     occupied_session_names: Sequence[str] = (),
 ) -> str:
+    # Keep interactive configuration independent of tmux control availability.
+    # The launch path owns collision detection and bounded rename retries.
     occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
-    for session_name in list_tmux_session_names():
-        name = str(session_name or "").strip()
-        if name:
-            occupied.add(name)
     for worker in list_registered_tmux_workers():
         session_name = str(getattr(worker, "session_name", "") or "").strip()
         if session_name:
             occupied.add(session_name)
-    occupied.update(
-        list_occupied_tmux_session_names(
-            additional_session_names=sorted(occupied),
-        )
-    )
     return build_session_name(
         worker_id,
         Path(project_dir).expanduser().resolve(),
@@ -1894,22 +1887,19 @@ def _build_reviewer_turn_goal() -> CompletionTurnGoal:
 
 
 def _infer_reviewer_artifact_name_from_context(context: RepairPromptContext) -> str:
-    role_label = str(context.role_label or "").strip()
-    if role_label:
-        return role_label
     review_json = str(context.artifact_paths.get("review_json", "") or "").strip()
-    if not review_json:
-        return ""
-    path = Path(review_json)
-    safe_requirement = sanitize_requirement_name(context.requirement_name) if context.requirement_name else ""
-    prefix = f"{safe_requirement}_评审记录_" if safe_requirement else ""
-    suffix = ".json"
-    name = path.name
-    if prefix and name.startswith(prefix) and name.endswith(suffix):
-        return name[len(prefix):-len(suffix)]
-    if name.endswith(suffix):
-        return name[:-len(suffix)]
-    return name
+    if review_json:
+        path = Path(review_json)
+        safe_requirement = sanitize_requirement_name(context.requirement_name) if context.requirement_name else ""
+        prefix = f"{safe_requirement}_评审记录_" if safe_requirement else ""
+        suffix = ".json"
+        name = path.name
+        if prefix and name.startswith(prefix) and name.endswith(suffix):
+            return name[len(prefix):-len(suffix)]
+        if name.endswith(suffix):
+            return name[:-len(suffix)]
+        return name
+    return str(context.role_label or "").strip()
 
 
 def _build_reviewer_protocol_repair_prompt(context: RepairPromptContext) -> str:
@@ -3339,7 +3329,7 @@ def run_reviewer_turn_with_recreation(
     while True:
         if allow_existing_outputs and _reviewer_outputs_satisfy_contract(current_reviewer, task_name):
             return current_reviewer
-        ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
+        ensure_review_artifacts_exist(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
         current_prompt = prompt_builder(current_reviewer) if prompt_builder is not None else prompt
         try:
@@ -3709,7 +3699,7 @@ def repair_reviewer_outputs(
     return repair_reviewer_round_outputs(
         reviewer_list,
         key_func=lambda reviewer: reviewer.reviewer_name,
-        artifact_name_func=lambda reviewer: str(reviewer.worker.session_name).strip() or reviewer.reviewer_name,
+        artifact_name_func=resolve_reviewer_artifact_agent_name,
         check_job=lambda reviewer_names: check_reviewer_job(
             reviewer_names,
             directory=project_dir,

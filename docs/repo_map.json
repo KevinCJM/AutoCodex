@@ -306,8 +306,11 @@
       ],
       "scope_notes": [],
       "grounding": {
-        "fact_status": "needs_code_confirmation",
-        "evidence": [],
+        "fact_status": "grounded",
+        "evidence": [
+          "A00_main_web.py",
+          "tests/test_a00_main_web.py"
+        ],
         "unsampled_paths": []
       }
     },
@@ -567,6 +570,7 @@
           "tmux_core/stage_kernel/role_orchestration.py",
           "tmux_core/stage_kernel/shared_review.py",
           "tmux_core/stage_kernel/turn_output_goals.py",
+          "tmux_core/stage_kernel/routing_init.py",
           "tests/test_a07_development.py",
       "tests/test_a08_overall_review.py",
         "tests/test_runtime_scope_cleanup.py",
@@ -942,6 +946,10 @@
           "type": "literal",
           "path": "tests/test_t09_terminal_ops.py"
         },
+        {
+          "type": "literal",
+          "path": "tests/test_b01_terminal_interaction.py"
+        },
       {
         "type": "literal",
         "path": "tests/test_runtime_contract_compat.py"
@@ -976,6 +984,14 @@
         {
           "type": "literal",
           "path": "tests/test_t02_tmux_agents.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_t09_terminal_ops.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_b01_terminal_interaction.py"
         },
       {
         "type": "literal",
@@ -1017,10 +1033,14 @@
       "grounding": {
         "fact_status": "mixed",
         "evidence": [
+          "B01_terminal_interaction.py",
+          "T09_terminal_ops.py",
           "tmux_core/runtime/tmux_runtime.py",
           "tmux_core/runtime/vendor_catalog.py",
           "tmux_core/runtime/hitl.py",
       "tests/test_t02_tmux_agents.py",
+      "tests/test_b01_terminal_interaction.py",
+      "tests/test_t09_terminal_ops.py",
       "tests/test_runtime_contract_compat.py",
       "tests/test_tmux_runtime_resilience.py",
           "tests/test_vendor_catalog.py",
@@ -1224,6 +1244,7 @@
         "fact_status": "mixed",
         "evidence": [
           "tmux_core/bridge/backend.py",
+          "tmux_core/bridge/web_backend.py",
           "tests/test_t11_tui_backend.py",
           "tests/test_t11_web_backend.py",
           "tests/test_tui_web_protocol_no_audit.py"
@@ -1420,6 +1441,14 @@
           "type": "literal",
           "path": "packages/tui/src/homeAgents.test.ts"
         },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/footerProgress.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/promptTransition.test.ts"
+        },
       {
         "type": "literal",
         "path": "packages/tui/src/routes_smoke.test.ts"
@@ -1440,10 +1469,14 @@
         "type": "literal",
         "path": "packages/web/src/domain/normalize.test.ts"
       },
-      {
-        "type": "literal",
-        "path": "packages/web/src/domain/stageState.test.ts"
-      }
+    {
+      "type": "literal",
+      "path": "packages/web/src/domain/stageState.test.ts"
+    },
+    {
+      "type": "literal",
+      "path": "packages/web/tests/e2e/control-deck.pw.ts"
+    }
       ],
       "related_config_selectors": [
         {
@@ -1454,9 +1487,13 @@
           "type": "literal",
           "path": "packages/web/package.json"
         },
-        {
-          "type": "literal",
-          "path": "packages/web/vite.config.ts"
+    {
+      "type": "literal",
+      "path": "packages/web/vite.config.ts"
+    },
+    {
+      "type": "literal",
+      "path": "packages/web/playwright.config.ts"
         }
       ],
       "edit_risk": "medium",
@@ -1483,6 +1520,14 @@
           "type": "literal",
           "path": "packages/tui/src/homeAgents.test.ts"
         },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/footerProgress.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/promptTransition.test.ts"
+        },
       {
         "type": "literal",
         "path": "packages/tui/src/routes_smoke.test.ts"
@@ -1499,9 +1544,13 @@
         "type": "literal",
         "path": "packages/tui/src/terminalFailure.test.ts"
       },
-      {
-        "type": "literal",
-        "path": "packages/web/src/domain/stageState.test.ts"
+    {
+      "type": "literal",
+      "path": "packages/web/src/domain/stageState.test.ts"
+    },
+    {
+      "type": "literal",
+      "path": "packages/web/tests/e2e/control-deck.pw.ts"
       }
       ],
       "read_before_edit_selectors": [
@@ -1529,6 +1578,10 @@
       "packages/tui/src/app.tsx",
       "packages/tui/src/backend/client.test.ts",
       "packages/tui/src/backend/client.ts",
+      "packages/tui/src/footerProgress.test.ts",
+      "packages/tui/src/footerProgress.ts",
+      "packages/tui/src/promptTransition.test.ts",
+      "packages/tui/src/promptTransition.ts",
           "packages/tui/src/homeAgents.ts",
           "packages/tui/src/homeAgents.test.ts",
           "packages/tui/src/routes/HomeRoute.tsx",
@@ -1545,8 +1598,11 @@
       "packages/web/src/domain/stageState.test.ts",
       "packages/web/src/domain/stageState.ts",
       "packages/web/src/domain/types.ts",
+      "packages/web/src",
       "packages/web/src/styles/app.css",
-          "tests/test_t11_web_backend.py"
+      "packages/web/tests",
+      "packages/web/playwright.config.ts",
+      "tests/test_t11_web_backend.py"
         ],
         "unsampled_paths": []
       }

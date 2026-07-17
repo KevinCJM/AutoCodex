@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import signal
 import sys
 import unittest
 from pathlib import Path
@@ -83,6 +84,38 @@ class A00MainWebTests(unittest.TestCase):
     def test_main_rejects_non_default_web_port_until_vite_port_is_configurable(self):
         with self.assertRaisesRegex(RuntimeError, "端口 5173"):
             A00_main_web.main(["--web-port", "3000", "--skip-install"])
+
+    def test_main_sigterm_terminates_backend_and_frontend(self):
+        processes = [_FakeProcess(), _FakeProcess()]
+        handlers: dict[int, object] = {}
+
+        started_count = 0
+
+        def ordered_popen(_command, cwd=None):  # noqa: ANN001, ARG001
+            nonlocal started_count
+            process = processes[started_count]
+            started_count += 1
+            return process
+
+        def fake_signal(signum, handler):  # noqa: ANN001
+            handlers[int(signum)] = handler
+
+        def raise_sigterm(_seconds):  # noqa: ANN001
+            handler = handlers[signal.SIGTERM]
+            handler(signal.SIGTERM, None)  # type: ignore[operator]
+
+        with patch("A00_main_web.ensure_web_dependencies_installed"), patch(
+            "A00_main_web.subprocess.Popen", side_effect=ordered_popen
+        ), patch("A00_main_web._wait_for_http"), patch(
+            "A00_main_web.signal.getsignal", return_value=signal.SIG_DFL
+        ), patch("A00_main_web.signal.signal", side_effect=fake_signal), patch(
+            "A00_main_web.time.sleep", side_effect=raise_sigterm
+        ):
+            with self.assertRaises(SystemExit) as context:
+                A00_main_web.main([])
+
+        self.assertEqual(context.exception.code, 128 + int(signal.SIGTERM))
+        self.assertTrue(all(process.terminated for process in processes))
 
 
 if __name__ == "__main__":

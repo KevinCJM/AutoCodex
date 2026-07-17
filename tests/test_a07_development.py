@@ -377,9 +377,11 @@ class A07DevelopmentTests(unittest.TestCase):
             )
             progress = object()
             captured: dict[str, object] = {}
+            worker.session_name = "测试工程师-天伤星"
 
             def fake_repair(reviewer_list, **kwargs):
                 captured["progress"] = kwargs.get("progress")
+                captured["artifact_name"] = kwargs["artifact_name_func"](reviewer_list[0])
                 return list(reviewer_list)
 
             with patch("A07_Development.repair_reviewer_round_outputs", side_effect=fake_repair):
@@ -396,6 +398,7 @@ class A07DevelopmentTests(unittest.TestCase):
 
         self.assertEqual(result, [reviewer])
         self.assertIs(captured["progress"], progress)
+        self.assertEqual(captured["artifact_name"], "测试工程师-天寿星")
 
     def test_initialization_prompts_do_not_append_task_routing_assessment(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1437,7 +1440,7 @@ class A07DevelopmentTests(unittest.TestCase):
 
         self.assertIs(result, reviewer)
 
-    def test_reviewer_turn_can_force_rerun_existing_valid_output(self):
+    def test_reviewer_turn_forced_repeat_preserves_existing_output_before_submit(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
             paths = build_development_paths(project_dir, "需求A")
@@ -1455,13 +1458,23 @@ class A07DevelopmentTests(unittest.TestCase):
                 review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
                 contract=_dummy_contract(),
             )
-            reviewer.review_md_path.write_text("", encoding="utf-8")
+            previous_md = ""
+            previous_json = [{"task_name": "M1-T3", "review_pass": True}]
+            reviewer.review_md_path.write_text(previous_md, encoding="utf-8")
             reviewer.review_json_path.write_text(
-                json.dumps([{"task_name": "M1-T3", "review_pass": True}], ensure_ascii=False),
+                json.dumps(previous_json, ensure_ascii=False),
                 encoding="utf-8",
             )
 
-            with patch("A07_Development.run_completion_turn_with_repair", return_value={}) as run_turn:
+            def assert_preserved_before_submit(**kwargs):  # noqa: ANN001
+                self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), previous_md)
+                self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), previous_json)
+                return {}
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=assert_preserved_before_submit,
+            ) as run_turn:
                 result = run_reviewer_turn_with_recreation(
                     reviewer,
                     project_dir=project_dir,
@@ -1481,8 +1494,57 @@ class A07DevelopmentTests(unittest.TestCase):
                 run_turn.call_args.kwargs["prompt_submit_timeout_sec"],
                 A07_REVIEWER_PROMPT_SUBMIT_TIMEOUT_SEC,
             )
-            self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
-            self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), [])
+            self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), previous_md)
+            self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), previous_json)
+
+    def test_reviewer_repair_preserves_partial_json_before_submit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            _write_required_inputs(paths)
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("opencode", "opencode/big-pickle", "high", ""),
+                worker=_LiveReadyWorker(session_name="测试工程师-天寿星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-天寿星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-天寿星.json",
+                contract=_dummy_contract(),
+            )
+            previous_json = [{"task_name": "M1-T3", "review_pass": False}]
+            reviewer.review_json_path.write_text(
+                json.dumps(previous_json, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            def assert_preserved_before_submit(**kwargs):  # noqa: ANN001
+                self.assertTrue(reviewer.review_md_path.exists())
+                self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
+                self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), previous_json)
+                return {}
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=assert_preserved_before_submit,
+            ):
+                result = run_reviewer_turn_with_recreation(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M1-T3",
+                    reviewer_spec=reviewer_spec,
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                    label="development_review_fix_M1-T3_测试工程师_round_1_attempt_1",
+                    prompt="repair",
+                )
+
+            self.assertIs(result, reviewer)
+            self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), previous_json)
 
     def test_parallel_reviewer_round_fast_dispatch_submits_all_ready_reviewers(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -1692,7 +1754,9 @@ class A07DevelopmentTests(unittest.TestCase):
             context = RepairPromptContext(
                 turn_label="development_review_init_M4-T1_架构师_round_1",
                 stage_label="任务开发",
-                role_label="架构师-柳土獐",
+                # The tmux session may be renamed after the artifact contract is
+                # bound. Repair must keep using the immutable path identity.
+                role_label="架构师-天伤星",
                 observed_status="",
                 expected_status="",
                 missing_aliases=("review_json",),
@@ -1712,6 +1776,7 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertIn("协议违态提醒", prompt)
         self.assertIn("需求A_评审记录_架构师-柳土獐.json", prompt)
         self.assertIn(str(expected_json), prompt)
+        self.assertNotIn("需求A_评审记录_架构师-天伤星.json", prompt)
         self.assertIn("不要在角色名与星宿名之间插入额外空格", prompt)
 
     def test_reviewer_completion_repair_turn_uses_check_reviewer_job_prompt(self):
@@ -1818,7 +1883,7 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertIn("ask_human", contract.optional_artifacts)
         self.assertIn("developer_output", contract.optional_artifacts)
 
-    def test_predict_worker_display_name_includes_tmux_sessions_in_occupied_pool(self):
+    def test_predict_worker_display_name_is_local_only_during_prompt_configuration(self):
         import A07_Development as development_module
 
         observed: dict[str, set[str]] = {}
@@ -1835,11 +1900,11 @@ class A07DevelopmentTests(unittest.TestCase):
             "A07_Development.build_session_name",
             side_effect=fake_build_session_name,
         ), patch(
-            "A07_Development.list_tmux_session_names",
-            return_value=["开发工程师-天暴星"],
-        ), patch(
             "A07_Development.list_registered_tmux_workers",
-            return_value=[],
+            return_value=[SimpleNamespace(session_name="开发工程师-天暴星")],
+        ), patch(
+            "tmux_core.runtime.tmux_runtime._list_backend_session_names",
+            side_effect=AssertionError("display-name prediction must not query tmux"),
         ):
             session_name = development_module._predict_worker_display_name(
                 project_dir=tmpdir,

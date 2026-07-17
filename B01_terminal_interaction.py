@@ -26,6 +26,7 @@ from A01_Routing_LayerPlanning import (
     display_status_label,
     normalize_run_init_choice,
     normalize_vendor_choice,
+    prepare_agent_run_config,
     prompt_confirmation,
     prompt_effort,
     prompt_model,
@@ -34,6 +35,7 @@ from A01_Routing_LayerPlanning import (
     prompt_vendor,
     render_noop_summary,
     render_preflight_summary,
+    resolve_batch_selection,
 )
 from T02_tmux_agents import (
     AgentRunConfig,
@@ -245,8 +247,8 @@ def collect_b01_request(args: argparse.Namespace) -> CliRequest:
             proxy_port = prompt_with_default("代理端口或完整代理 URL", "", allow_empty=False) if use_proxy else ""
     else:
         vendor = normalize_vendor_choice(args.vendor or "codex")
-        model = args.model or get_default_model_for_vendor(vendor)
-        reasoning_effort = args.effort or "high"
+        model = str(args.model or DEFAULT_MODEL_BY_VENDOR[vendor]).strip()
+        reasoning_effort = str(args.effort or "high").strip() or "high"
         proxy_port = args.proxy_port or ""
 
     return CliRequest(
@@ -995,17 +997,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return determine_exit_code(batch_result)
 
     request = collect_b01_request(args)
-    config = AgentRunConfig(
-        vendor=request.vendor,
-        model=request.model,
-        reasoning_effort=request.reasoning_effort,
-        proxy_url=request.proxy_port,
-    )
-    selection = resolve_target_selection(
-        project_dir=request.project_dir,
-        target_dirs=request.target_dirs,
-        run_init=request.run_init,
-    )
+    selection = resolve_batch_selection(request)
 
     if not selection.should_run:
         from A01_Routing_LayerPlanning import render_requirements_stage_placeholder
@@ -1016,6 +1008,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             message("当前项目路由层已完备，跳过路由初始化。")
         message(render_requirements_stage_placeholder([]))
         return 0
+
+    config = prepare_agent_run_config(request)
 
     preflight_summary = render_preflight_summary(request, config, selection)
     force_confirmation = bool(selection.project_missing_files)

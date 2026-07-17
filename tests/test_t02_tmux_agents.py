@@ -35,6 +35,7 @@ from T02_tmux_agents import (
     TaskResultContract,
     TmuxBackend,
     TmuxBatchWorker,
+    TmuxControlUnavailable,
     TmuxMutationOutcomeUnknown,
     TurnFileContract,
     TurnFileResult,
@@ -121,6 +122,63 @@ class TmuxAgentsTests(unittest.TestCase):
             with _session_name_lease_lock():
                 pass
 
+    def test_session_name_lease_file_lock_times_out_without_blocking_forever(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ), mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_LOCK_PATH",
+            Path(tmp_dir) / "leases" / ".lock",
+        ), mock.patch.object(
+            runtime_module.fcntl,
+            "flock",
+            side_effect=BlockingIOError(runtime_module.errno.EAGAIN, "busy"),
+        ):
+            started_at = time.monotonic()
+            with self.assertRaisesRegex(TimeoutError, "lease 文件锁超时"):
+                with _session_name_lease_lock(timeout_sec=0.02):
+                    pass
+
+        self.assertLess(time.monotonic() - started_at, 0.5)
+
+    def test_worker_constructor_does_not_query_tmux_and_publishes_prelaunch_state(self):
+        class NoTmuxProbeBackend:
+            def list_sessions(self):
+                raise AssertionError("worker construction must not query tmux")
+
+            def control_state(self):
+                return {
+                    "tmux_control_status": "available",
+                    "tmux_control_error": "",
+                    "tmux_control_unavailable_since": "",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ), mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_LOCK_PATH",
+            Path(tmp_dir) / "leases" / ".lock",
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="prelaunch-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=NoTmuxProbeBackend(),
+            )
+            state = worker.read_state()
+
+        self.assertTrue(worker.session_name)
+        self.assertEqual(state["status"], WorkerStatus.RUNNING.value)
+        self.assertEqual(state["note"], "worker_prepared")
+        self.assertEqual(state["agent_state"], AgentRuntimeState.STARTING.value)
+        self.assertFalse(state["agent_alive"])
+
     def test_health_supervisor_uses_adaptive_intervals_and_stops_terminal_health(self):
         supervisor = HealthSupervisor(
             refresh_callback=lambda: None,
@@ -154,6 +212,25 @@ class TmuxAgentsTests(unittest.TestCase):
 
         self.assertGreaterEqual(len(calls), 2)
         self.assertTrue(supervisor.stopped())
+        supervisor.stop()
+
+    def test_health_supervisor_request_refresh_wakes_long_idle_wait(self):
+        refreshed = threading.Event()
+
+        def refresh():
+            refreshed.set()
+            return self._health_snapshot(agent_state="READY")
+
+        supervisor = HealthSupervisor(
+            refresh_callback=refresh,
+            interval_sec=60.0,
+            ready_interval_sec=60.0,
+            idle_interval_sec=60.0,
+        )
+        supervisor.start()
+        supervisor.request_refresh()
+
+        self.assertTrue(refreshed.wait(timeout=0.5))
         supervisor.stop()
 
     def test_task_runtime_paths_do_not_collide_when_labels_share_truncated_prefix(self):
@@ -386,7 +463,7 @@ workspace (/directory)
             worker = TmuxBatchWorker(
                 worker_id="codex-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             visible = """
@@ -433,7 +510,7 @@ a07.developer.refine_code
             worker = TmuxBatchWorker(
                 worker_id="codex-worker",
                 work_dir=work_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -1995,6 +2072,7 @@ workspace (/directory)                                                     branc
         self.assertIsNotNone(restored)
         self.assertEqual(restored.worker_id, "detailed-design-review-开发工程师")
         self.assertTrue(restored.session_name.startswith("开发工程师-"))
+        self.assertIsNone(restored._passive_health_raw_log_delta_limit_bytes)  # noqa: SLF001
 
     def test_task_split_reviewer_worker_preserves_raw_worker_id_for_session_mapping(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2283,7 +2361,7 @@ workspace (/directory)                                                     branc
             )
 
             monotonic_values = iter((0.0, 0.1, 0.2, 0.3))
-            with mock.patch("T02_tmux_agents.time.monotonic", side_effect=lambda: next(monotonic_values)), mock.patch(
+            with mock.patch.object(worker, "_business_monotonic", side_effect=lambda: next(monotonic_values)), mock.patch(
                 "T02_tmux_agents.time.sleep",
                 return_value=None,
             ):
@@ -2317,7 +2395,7 @@ workspace (/directory)                                                     branc
             )
 
             monotonic_values = iter((0.0, 0.1, 0.6))
-            with mock.patch("T02_tmux_agents.time.monotonic", side_effect=lambda: next(monotonic_values)), mock.patch(
+            with mock.patch.object(worker, "_business_monotonic", side_effect=lambda: next(monotonic_values)), mock.patch(
                 "T02_tmux_agents.time.sleep",
                 return_value=None,
             ):
@@ -3525,7 +3603,7 @@ workspace (/directory)                                                     branc
             worker = RequirementsReadyWithStaleHistoryWorker(
                 worker_id="requirements-stale-codex-ready-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -4961,11 +5039,10 @@ workspace (/directory)                                                     branc
                 existing_pane_id="%1",
                 backend=RaceBackend(),
             )
-            observation = worker.observe()
-            self.assertTrue(observation.session_exists)
-            self.assertEqual("", observation.current_command)
-            self.assertEqual("› ready", observation.visible_text)
-            self.assertEqual("", observation.pane_title)
+            with self.assertRaises(TmuxControlUnavailable) as raised:
+                worker.observe()
+
+            self.assertEqual(raised.exception.operation, "display-message")
 
     def test_observe_uses_10000_line_default_tail(self):
         class ObserveWorker(TmuxBatchWorker):
@@ -7622,7 +7699,7 @@ workspace (/directory)                                                     branc
             worker = StaleNoActiveThreadPromptWorker(
                 worker_id="codex-stale-no-active-tail-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -8167,7 +8244,7 @@ workspace (/directory)                                                     branc
             worker = ReadyVisibleWithStaleHistoryWorker(
                 worker_id="codex-ready-stale-history-worker",
                 work_dir=work_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -8270,7 +8347,7 @@ workspace (/directory)                                                     branc
             worker = FastReadyWorker(
                 worker_id="fast-ready-worker",
                 work_dir=work_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -9199,6 +9276,146 @@ Do you trust the files in this folder?
             self.assertIn("gamma", tail2)
             self.assertGreater(next_offset2, next_offset)
 
+    def test_loaded_busy_opencode_passive_refresh_bounds_delta_and_persists_offset(self):
+        class RecordingBackend(TmuxBackend):
+            def __init__(self):
+                super().__init__()
+                self.delta_limits: list[int | None] = []
+                self.delta_sizes: list[int] = []
+                self.last_offsets: list[int] = []
+
+            def tail_raw_log(
+                    self,
+                    raw_log_path,
+                    *,
+                    last_offset=0,
+                    tail_bytes=24000,
+                    delta_bytes_limit=None,
+            ):
+                self.delta_limits.append(delta_bytes_limit)
+                self.last_offsets.append(last_offset)
+                result = super().tail_raw_log(
+                    raw_log_path,
+                    last_offset=last_offset,
+                    tail_bytes=tail_bytes,
+                    delta_bytes_limit=delta_bytes_limit,
+                )
+                self.delta_sizes.append(len(result[0].encode("utf-8")))
+                return result
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            runtime_root = root / "runtime"
+            runtime_dir = runtime_root / "detailed-design-review-test"
+            runtime_dir.mkdir(parents=True)
+            state_path = runtime_dir / "worker.state.json"
+            raw_log_path = runtime_dir / "worker.raw.log"
+            stale_offset = len(b"old\n")
+            sparse_size = 93 * 1024 * 1024
+            with raw_log_path.open("wb") as raw_log:
+                raw_log.write(b"old\n")
+                raw_log.seek(sparse_size - len(b"LATEST_BUSY\n"))
+                raw_log.write(b"LATEST_BUSY\n")
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "detailed-design-review-测试工程师",
+                        "session_name": "测试工程师-天寿星",
+                        "pane_id": "%24",
+                        "work_dir": str(root),
+                        "config": {"vendor": "opencode", "model": "default", "reasoning_effort": "high"},
+                        "status": "running",
+                        "result_status": "running",
+                        "turn_state": "waiting_result",
+                        "agent_state": "BUSY",
+                        "agent_started": True,
+                        "agent_ready": False,
+                        "agent_alive": True,
+                        "health_status": "alive",
+                        "health_note": "alive",
+                        "pane_title": "OpenCode",
+                        "current_command": "node",
+                        "current_path": str(root),
+                        "last_log_offset": stale_offset,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            backend = RecordingBackend()
+
+            def capture_busy_pane(*, tail_lines=500):  # noqa: ARG001
+                return True, "esc to interrupt", "node", str(root), "OpenCode", False
+
+            launch_resolution = SimpleNamespace(
+                resolved_model="default",
+                resolved_variant="",
+                reasoning_control_mode="implicit_default",
+                catalog_source_kind="test",
+                confidence="high",
+                native_reasoning_level="",
+                normalized_effort="high",
+                supports_reasoning=True,
+                notes=(),
+                executable_path="opencode",
+            )
+            with mock.patch(
+                "tmux_core.runtime.tmux_runtime.resolve_launch",
+                return_value=launch_resolution,
+            ):
+                first = load_worker_from_state_path(state_path, backend=backend, passive_health=True)
+                self.assertIsNotNone(first)
+                self.assertEqual(
+                    first._passive_health_raw_log_delta_limit_bytes,  # noqa: SLF001
+                    runtime_module.PASSIVE_REFRESH_RAW_LOG_DELTA_LIMIT_BYTES,
+                )
+                first._capture_pane_snapshot = capture_busy_pane  # noqa: SLF001
+                first.refresh_health(notify_on_change=False)
+                persisted_after_first = json.loads(state_path.read_text(encoding="utf-8"))
+
+                second = load_worker_from_state_path(state_path, backend=backend, passive_health=True)
+                self.assertIsNotNone(second)
+                second._capture_pane_snapshot = capture_busy_pane  # noqa: SLF001
+                second.refresh_health(notify_on_change=False)
+
+            file_size = raw_log_path.stat().st_size
+            limit = runtime_module.PASSIVE_REFRESH_RAW_LOG_DELTA_LIMIT_BYTES
+            self.assertEqual(backend.delta_limits, [limit, limit])
+            self.assertLessEqual(backend.delta_sizes[0], limit)
+            self.assertEqual(backend.delta_sizes[1], 0)
+            self.assertEqual(backend.last_offsets, [stale_offset, file_size])
+            self.assertEqual(persisted_after_first["last_log_offset"], file_size)
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["last_log_offset"], file_size)
+
+    def test_normal_observe_keeps_full_raw_log_delta_semantics(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            backend = TmuxBackend()
+            worker = TmuxBatchWorker(
+                worker_id="normal-observe-worker",
+                work_dir=root,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+                existing_session_name="normal-observe-session",
+                existing_pane_id="%1",
+                backend=backend,
+            )
+            raw_delta = "full-delta-line\n" * 4096
+            worker.raw_log_path.write_text(raw_delta, encoding="utf-8")
+            worker._capture_pane_snapshot = lambda **_kwargs: (  # noqa: SLF001
+                True,
+                "› ready",
+                "codex",
+                str(root),
+                "TmuxCodingTeam",
+                False,
+            )
+
+            observation = worker.observe(tail_bytes=1024)
+
+        self.assertEqual(observation.raw_log_delta, raw_delta)
+        self.assertEqual(worker.last_log_offset, len(raw_delta.encode("utf-8")))
+
     def test_read_text_tail_handles_missing_and_tail_only(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "demo.txt"
@@ -9370,7 +9587,7 @@ Do you trust the files in this folder?
             worker = SparseStateHealthWorker(
                 worker_id="development-review-测试工程师",
                 work_dir=root,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5", reasoning_effort="high"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini", reasoning_effort="high"),
                 runtime_root=root / ".development_runtime" / "需求A",
                 existing_session_name="测试工程师-天慧星",
                 existing_pane_id="%9",
@@ -9404,7 +9621,7 @@ Do you trust the files in this folder?
         self.assertEqual(payload["requirement_name"], "需求A")
         self.assertEqual(payload["workflow_action"], "stage.a07.start")
         self.assertEqual(payload["config"]["vendor"], "codex")
-        self.assertEqual(payload["config"]["model"], "gpt-5.5")
+        self.assertEqual(payload["config"]["model"], "gpt-5.4-mini")
         self.assertEqual(payload["agent_state"], "BUSY")
 
     def test_worker_restart_and_kill_are_runtime_level_ops(self):
@@ -9443,6 +9660,7 @@ Do you trust the files in this folder?
             def __init__(self):
                 self.live_sessions = {"session-a", "session-b"}
                 self.killed: list[str] = []
+                self.runtime_dirs: dict[str, str] = {}
 
             def has_session(self, session_name):
                 return session_name in self.live_sessions
@@ -9450,6 +9668,11 @@ Do you trust the files in this folder?
             def kill_session(self, session_name):
                 self.killed.append(session_name)
                 self.live_sessions.discard(session_name)
+
+            def show_option(self, target, option_name):
+                if option_name == "@tmux_runtime_dir":
+                    return self.runtime_dirs.get(target, "")
+                return ""
 
             def run(self, *args, **kwargs):
                 raise AssertionError("unexpected tmux run")
@@ -9472,6 +9695,10 @@ Do you trust the files in this folder?
                 backend=backend,
                 existing_session_name="session-b",
             )
+            backend.runtime_dirs = {
+                worker_a.session_name: str(worker_a.runtime_dir),
+                worker_b.session_name: str(worker_b.runtime_dir),
+            }
             cleaned = cleanup_registered_tmux_workers(reason="unit_test")
             self.assertEqual(sorted(cleaned), ["session-a", "session-b"])
             self.assertEqual(sorted(backend.killed), ["session-a", "session-b"])
@@ -9741,6 +9968,50 @@ Do you trust the files in this folder?
         )
         self.assertEqual(narrow_processing_phase, AgentRuntimeState.BUSY)
         self.assertEqual(extreme_wrapped_footer_ready_state, AgentRuntimeState.READY)
+
+    def test_opencode_output_detector_accepts_bloomberg_wrapped_footer_but_busy_wins(self):
+        detector = OpenCodeOutputDetector()
+        bloomberg_footer = """
+审核通过
+
+▣  Build · DeepSeek V4 Pro · 1m 28s
+┃  Build · DeepSeek V4 Pro OpenCode Go · max
+╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+ /workspace/canopy_v3/                               109.9K (11%) · ctrl+p
+ BloombergRating/v3_calculation_sevice                              commands
+"""
+
+        ready_state = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=bloomberg_footer,
+                raw_log_delta="",
+                raw_log_tail=bloomberg_footer,
+                current_command="opencode.exe",
+                current_path="/workspace/canopy_v3/BloombergRating/v3_calculation_sevice",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-07-15T05:42:27",
+                pane_title="OC | BloombergRating detailed design audit",
+            )
+        )
+        busy_state = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=f"esc interrupt\n{bloomberg_footer}",
+                raw_log_delta="",
+                raw_log_tail=f"esc interrupt\n{bloomberg_footer}",
+                current_command="opencode.exe",
+                current_path="/workspace/canopy_v3/BloombergRating/v3_calculation_sevice",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-07-15T05:42:28",
+                pane_title="OC | BloombergRating detailed design audit",
+            )
+        )
+
+        self.assertEqual(ready_state, AgentRuntimeState.READY)
+        self.assertEqual(busy_state, AgentRuntimeState.BUSY)
 
     def test_mimo_output_detector_classifies_ready_busy_and_completed_surfaces(self):
         detector = MimoOutputDetector()
@@ -10732,7 +11003,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = ReadyFooterCodexWorker(
                 worker_id="codex-passive-ready-footer-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -10768,7 +11039,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
         self.assertEqual(worker.capture_calls, 1)
         self.assertEqual(worker.last_log_offset, 99)
 
-    def test_passive_health_does_not_downgrade_completed_worker_to_busy(self):
+    def test_passive_health_preserves_busy_terminal_after_turn_completed(self):
         class CompletedBusyCodexWorker(TmuxBatchWorker):
             def session_exists(self):
                 return True
@@ -10818,9 +11089,9 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             snapshot = worker.refresh_health()
             state = worker.read_state()
 
-        self.assertEqual(snapshot.agent_state, AgentRuntimeState.READY.value)
-        self.assertEqual(state["agent_state"], AgentRuntimeState.READY.value)
-        self.assertTrue(state["agent_ready"])
+        self.assertEqual(snapshot.agent_state, AgentRuntimeState.BUSY.value)
+        self.assertEqual(state["agent_state"], AgentRuntimeState.BUSY.value)
+        self.assertFalse(state["agent_ready"])
         self.assertEqual(state["current_task_runtime_status"], TASK_STATUS_DONE)
         self.assertEqual(state["dispatch_state"], "")
 
@@ -11150,7 +11421,11 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
         self.assertFalse(worker.mid_turn_state["agent_ready"])
         self.assertEqual(worker.mid_turn_state["current_task_runtime_status"], "running")
         self.assertEqual(worker.mid_turn_state["dispatch_state"], "submitted")
-        self.assertEqual(final_state["agent_state"], AgentRuntimeState.READY.value)
+        # Turn completion is independent from the terminal's stable READY
+        # debounce; health supervision will publish READY after a second sample.
+        self.assertEqual(final_state["agent_state"], AgentRuntimeState.BUSY.value)
+        self.assertEqual(final_state["turn_state"], "succeeded")
+        self.assertEqual(final_state["current_task_runtime_status"], TASK_STATUS_DONE)
 
     def test_run_turn_fast_dispatch_uses_explicit_initial_ready_timeout(self):
         class FastDispatchWorker(TmuxBatchWorker):
@@ -11276,7 +11551,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = StaleSpinnerReadyWorker(
                 worker_id="codex-stale-spinner-ready",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -11482,7 +11757,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = TrulyBusyWorker(
                 worker_id="true-busy-before-submit",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -11587,17 +11862,19 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             )
             worker.pane_id = "%1"
 
-            result = worker.run_turn(
-                label="dispatch_timeout_retry",
-                prompt="hello",
-                timeout_sec=2.0,
-                turn_start_timeout_sec=8.0,
-                prompt_submit_timeout_sec=2.0,
-            )
+            with self.assertRaises(TmuxMutationOutcomeUnknown):
+                worker.run_turn(
+                    label="dispatch_timeout_retry",
+                    prompt="hello",
+                    timeout_sec=2.0,
+                    turn_start_timeout_sec=8.0,
+                    prompt_submit_timeout_sec=2.0,
+                )
             final_state = worker.read_state()
 
-        self.assertFalse(result.ok)
         self.assertEqual(worker.send_attempts, 1)
+        self.assertEqual(len(worker.results), 1)
+        self.assertFalse(worker.results[0].ok)
         unknown_entries = [extra for _, note, extra in worker.state_notes if note.startswith("submission_unknown:")]
         self.assertTrue(unknown_entries)
         self.assertEqual(unknown_entries[-1]["turn_state"], "submission_unknown")
@@ -11933,7 +12210,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = StaleBusyTaskResultWorker(
                 worker_id="stale-busy-a07-ready-legacy-delta",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -12005,7 +12282,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = StaleBusyTaskResultWorker(
                 worker_id="stale-busy-a07-ready-legacy-tail",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -12154,7 +12431,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = StaleBusyTaskResultWorker(
                 worker_id="stale-busy-a07-ready-legacy-tail-stale-artifact",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -12221,7 +12498,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = StaleBusyTaskResultWorker(
                 worker_id="stale-busy-a07-ready-legacy-conflict",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -12359,7 +12636,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = StaleBusyTaskResultWorker(
                 worker_id="stale-busy-task-result-completed",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.5"),
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -12939,6 +13216,128 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker.create_session()
             self.assertFalse(worker._session_name_reserved)
 
+    def test_lease_unlink_failure_is_deferred_and_retried(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ), mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_LOCK_PATH",
+            Path(tmp_dir) / "leases" / ".lock",
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="lease-unlink-retry",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            lease_path = runtime_module._session_name_lease_path(worker.session_name)  # noqa: SLF001
+            real_unlink = Path.unlink
+            unlink_attempts = 0
+
+            def flaky_unlink(path: Path, *args, **kwargs):  # noqa: ANN002, ANN003
+                nonlocal unlink_attempts
+                if path == lease_path:
+                    unlink_attempts += 1
+                    if unlink_attempts == 1:
+                        raise PermissionError("lease is temporarily read-only")
+                return real_unlink(path, *args, **kwargs)
+
+            with mock.patch.object(Path, "unlink", autospec=True, side_effect=flaky_unlink):
+                self.assertFalse(
+                    worker._release_session_name_reservation_best_effort(  # noqa: SLF001
+                        context="unit_test",
+                        original_error="primary",
+                    )
+                )
+                self.assertIn(worker.session_name, worker._deferred_session_name_reservations)  # noqa: SLF001
+                self.assertTrue(lease_path.exists())
+                worker._release_session_name_reservation()  # noqa: SLF001
+
+            self.assertFalse(lease_path.exists())
+            self.assertEqual(worker._deferred_session_name_reservations, set())  # noqa: SLF001
+            self.assertEqual(unlink_attempts, 2)
+
+    def test_successful_session_create_ignores_lease_release_failure_without_recreating(self):
+        class FakeBackend:
+            def __init__(self):
+                self.live_sessions: set[str] = set()
+                self.create_calls: list[str] = []
+
+            def has_session(self, session_name):
+                return session_name in self.live_sessions
+
+            def run(self, *args, **kwargs):  # noqa: ANN003
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+            def create_session(self, session_name, work_dir, command):  # noqa: ARG002
+                self.create_calls.append(session_name)
+                self.live_sessions.add(session_name)
+                return "%1"
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ), mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_LOCK_PATH",
+            Path(tmp_dir) / "leases" / ".lock",
+        ):
+            backend = FakeBackend()
+            worker = TmuxBatchWorker(
+                worker_id="successful-release-failure",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=backend,
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            worker._tmux = lambda *args, **kwargs: subprocess.CompletedProcess(["tmux"], 0, "", "")  # noqa: SLF001
+            worker._start_pipe_logging = lambda: None  # noqa: SLF001
+            worker._ensure_health_supervisor_started = lambda: None  # noqa: SLF001
+            worker._log_event = lambda event, **payload: events.append((event, payload))  # noqa: SLF001
+            real_release = runtime_module._release_reserved_session_name  # noqa: SLF001
+            release_attempts = 0
+
+            def flaky_release(session_name: str) -> None:
+                nonlocal release_attempts
+                release_attempts += 1
+                if release_attempts == 1:
+                    raise TimeoutError("lease lock timeout")
+                real_release(session_name)
+
+            with mock.patch.object(
+                runtime_module,
+                "_release_reserved_session_name",
+                side_effect=flaky_release,
+            ):
+                pane_id = worker.create_session()
+                state = worker.read_state()
+                self.assertTrue(worker._session_name_reserved)  # noqa: SLF001
+                self.assertIn(
+                    worker.session_name,
+                    worker._deferred_session_name_reservations,  # noqa: SLF001
+                )
+                worker.__del__()
+
+            self.assertFalse(worker._session_name_reserved)  # noqa: SLF001
+            self.assertEqual(worker._deferred_session_name_reservations, set())  # noqa: SLF001
+            self.assertFalse(runtime_module._session_name_lease_path(worker.session_name).exists())  # noqa: SLF001
+
+        self.assertEqual(pane_id, "%1")
+        self.assertEqual(backend.create_calls, [worker.session_name])
+        self.assertEqual(release_attempts, 2)
+        self.assertEqual(state["note"], "session_created")
+        self.assertTrue(
+            any(
+                event == "session_name_reservation_release_failed"
+                and payload.get("context") == "session_create_succeeded"
+                for event, payload in events
+            )
+        )
+
     def test_create_session_sets_tmux_history_limit_to_10000(self):
         class FakeBackend:
             def __init__(self):
@@ -13066,6 +13465,204 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
                 worker.create_session()
             self.assertFalse(worker._session_name_reserved)
 
+    def test_session_precheck_transport_failure_releases_reservation_and_preserves_error(self):
+        original_error = TmuxControlUnavailable(
+            operation="has-session",
+            error="tmux control timed out",
+            elapsed_sec=60.0,
+            attempts=4,
+        )
+
+        class FailingPrecheckBackend:
+            def __init__(self):
+                self.has_session_calls = 0
+
+            def has_session(self, session_name):  # noqa: ARG002
+                self.has_session_calls += 1
+                raise original_error
+
+            def run(self, *args, **kwargs):  # noqa: ANN003
+                raise AssertionError("tmux mutation must not run after a failed pre-check")
+
+            def create_session(self, session_name, work_dir, command):  # noqa: ARG002
+                raise AssertionError("session creation must not run after a failed pre-check")
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ), mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_LOCK_PATH",
+            Path(tmp_dir) / "leases" / ".lock",
+        ):
+            backend = FailingPrecheckBackend()
+            worker = TmuxBatchWorker(
+                worker_id="precheck-transport-failure",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=backend,
+            )
+            lease_path = runtime_module._session_name_lease_path(worker.session_name)  # noqa: SLF001
+            self.assertTrue(lease_path.exists())
+
+            with self.assertRaises(TmuxControlUnavailable) as raised:
+                worker.create_session()
+
+            self.assertIs(raised.exception, original_error)
+            self.assertEqual(backend.has_session_calls, 1)
+            self.assertFalse(worker._session_name_reserved)  # noqa: SLF001
+            self.assertEqual(worker._deferred_session_name_reservations, set())  # noqa: SLF001
+            self.assertFalse(lease_path.exists())
+
+    def test_session_precheck_release_failure_is_deferred_without_covering_transport_error(self):
+        original_error = TmuxControlUnavailable(
+            operation="has-session",
+            error="tmux control timed out",
+            elapsed_sec=60.0,
+            attempts=4,
+        )
+
+        class FailingPrecheckBackend:
+            def has_session(self, session_name):  # noqa: ARG002
+                raise original_error
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ), mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_LOCK_PATH",
+            Path(tmp_dir) / "leases" / ".lock",
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="precheck-release-failure",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=FailingPrecheckBackend(),
+            )
+            session_name = worker.session_name
+            lease_path = runtime_module._session_name_lease_path(session_name)  # noqa: SLF001
+            events: list[tuple[str, dict[str, object]]] = []
+            worker._log_event = lambda event, **payload: events.append((event, payload))  # noqa: SLF001
+
+            with mock.patch.object(
+                runtime_module,
+                "_release_reserved_session_name",
+                side_effect=TimeoutError("lease lock timeout"),
+            ):
+                with self.assertRaises(TmuxControlUnavailable) as raised:
+                    worker.create_session()
+
+            self.assertIs(raised.exception, original_error)
+            self.assertTrue(worker._session_name_reserved)  # noqa: SLF001
+            self.assertIn(session_name, worker._deferred_session_name_reservations)  # noqa: SLF001
+            self.assertTrue(lease_path.exists())
+            self.assertTrue(
+                any(
+                    event == "session_name_reservation_release_failed"
+                    and payload.get("context") == "session_precheck_failed"
+                    for event, payload in events
+                )
+            )
+
+            worker._release_session_name_reservation()  # noqa: SLF001
+            self.assertFalse(worker._session_name_reserved)  # noqa: SLF001
+            self.assertEqual(worker._deferred_session_name_reservations, set())  # noqa: SLF001
+            self.assertFalse(lease_path.exists())
+
+    def test_session_create_cleanup_failure_preserves_original_transport_error(self):
+        class FailingBackend:
+            def __init__(self, original_error):  # noqa: ANN001
+                self.original_error = original_error
+
+            def has_session(self, session_name):  # noqa: ARG002
+                return False
+
+            def run(self, *args, **kwargs):  # noqa: ANN003
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+            def create_session(self, session_name, work_dir, command):  # noqa: ARG002
+                raise self.original_error
+
+        original_errors = (
+            TmuxMutationOutcomeUnknown(operation="new-session", error="timeout"),
+            TmuxControlUnavailable(
+                operation="new-session",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+        )
+        for index, original_error in enumerate(original_errors):
+            with self.subTest(error=type(original_error).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                worker = TmuxBatchWorker(
+                    worker_id=f"release-failure-{index}",
+                    work_dir=tmp_dir,
+                    config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                    runtime_root=Path(tmp_dir) / "runtime",
+                    backend=FailingBackend(original_error),
+                )
+                events: list[tuple[str, dict[str, object]]] = []
+                worker._release_session_name_reservation = mock.Mock(  # noqa: SLF001
+                    side_effect=TimeoutError("lease lock timeout")
+                )
+                worker._log_event = lambda event, **payload: events.append((event, payload))  # noqa: SLF001
+
+                with self.assertRaises(type(original_error)) as raised:
+                    worker.create_session()
+
+                self.assertIs(raised.exception, original_error)
+                self.assertTrue(
+                    any(event == "session_name_reservation_release_failed" for event, _ in events)
+                )
+
+    def test_shutdown_cleanup_failure_preserves_original_shutdown_exception(self):
+        class CreatedBackend:
+            def has_session(self, session_name):  # noqa: ARG002
+                return False
+
+            def run(self, *args, **kwargs):  # noqa: ANN003
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+            def create_session(self, session_name, work_dir, command):  # noqa: ARG002
+                return "%1"
+
+            def kill_session(self, session_name):  # noqa: ARG002
+                return None
+
+        original_error = RuntimeShutdownRequested("shutdown requested")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="shutdown-release-failure",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=CreatedBackend(),
+            )
+            worker._release_session_name_reservation = mock.Mock(  # noqa: SLF001
+                side_effect=TimeoutError("lease lock timeout")
+            )
+            worker._log_event = mock.Mock()  # noqa: SLF001
+            with mock.patch.object(
+                runtime_module,
+                "raise_if_runtime_shutdown_requested",
+                side_effect=[None, None, original_error],
+            ):
+                with self.assertRaises(RuntimeShutdownRequested) as raised:
+                    worker.create_session()
+
+        self.assertIs(raised.exception, original_error)
+        self.assertTrue(
+            any(
+                call.args and call.args[0] == "session_name_reservation_release_failed"
+                for call in worker._log_event.call_args_list  # noqa: SLF001
+            )
+        )
+
     def test_create_session_renames_on_precheck_conflict_without_killing_existing_session(self):
         class FakeBackend:
             def __init__(self):
@@ -13119,7 +13716,10 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker._write_state = lambda *args, **kwargs: None
             worker._log_event = lambda event, **payload: events.append((event, payload))
 
-            pane_id = worker.create_session()
+            # The retry must not depend on the worker remaining discoverable in
+            # the process registry; the conflicting name is excluded explicitly.
+            with mock.patch.object(runtime_module, "list_registered_tmux_workers", return_value=[]):
+                pane_id = worker.create_session()
 
             self.assertEqual(pane_id, "%2")
             self.assertNotEqual(worker.session_name, original_name)
@@ -13127,7 +13727,84 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             self.assertIn(worker.session_name, backend.live_sessions)
             self.assertEqual(backend.kill_calls, [])
             self.assertTrue(any(event == "session_name_conflict_retry" for event, _ in events))
+            self.assertEqual(backend.create_calls, [worker.session_name])
             self.assertFalse(worker._session_name_reserved)
+
+    def test_conflict_retry_ignores_old_lease_release_failure(self):
+        class FakeBackend:
+            def __init__(self):
+                self.live_sessions: set[str] = set()
+                self.create_calls: list[str] = []
+
+            def has_session(self, session_name):
+                return session_name in self.live_sessions
+
+            def run(self, *args, **kwargs):  # noqa: ANN003
+                return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+            def create_session(self, session_name, work_dir, command):  # noqa: ARG002
+                self.create_calls.append(session_name)
+                self.live_sessions.add(session_name)
+                return "%2"
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_ROOT",
+            Path(tmp_dir) / "leases",
+        ), mock.patch.object(
+            runtime_module,
+            "_SESSION_NAME_LEASE_LOCK_PATH",
+            Path(tmp_dir) / "leases" / ".lock",
+        ):
+            backend = FakeBackend()
+            worker = TmuxBatchWorker(
+                worker_id="conflict-release-failure",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=backend,
+            )
+            original_name = worker.session_name
+            backend.live_sessions.add(original_name)
+            events: list[tuple[str, dict[str, object]]] = []
+            worker._tmux = lambda *args, **kwargs: subprocess.CompletedProcess(["tmux"], 0, "", "")  # noqa: SLF001
+            worker._start_pipe_logging = lambda: None  # noqa: SLF001
+            worker._ensure_health_supervisor_started = lambda: None  # noqa: SLF001
+            worker._log_event = lambda event, **payload: events.append((event, payload))  # noqa: SLF001
+            real_release = runtime_module._release_reserved_session_name  # noqa: SLF001
+            release_attempts: dict[str, int] = {}
+
+            def flaky_release(session_name: str) -> None:
+                release_attempts[session_name] = release_attempts.get(session_name, 0) + 1
+                if session_name == original_name and release_attempts[session_name] == 1:
+                    raise TimeoutError("lease lock timeout")
+                real_release(session_name)
+
+            with mock.patch.object(
+                runtime_module,
+                "_release_reserved_session_name",
+                side_effect=flaky_release,
+            ):
+                with mock.patch.object(runtime_module, "list_registered_tmux_workers", return_value=[]):
+                    pane_id = worker.create_session()
+
+            self.assertFalse(runtime_module._session_name_lease_path(original_name).exists())  # noqa: SLF001
+            self.assertFalse(runtime_module._session_name_lease_path(worker.session_name).exists())  # noqa: SLF001
+
+        self.assertEqual(pane_id, "%2")
+        self.assertNotEqual(worker.session_name, original_name)
+        self.assertEqual(backend.create_calls, [worker.session_name])
+        self.assertEqual(release_attempts[original_name], 2)
+        self.assertEqual(release_attempts[worker.session_name], 1)
+        self.assertFalse(worker._session_name_reserved)  # noqa: SLF001
+        self.assertEqual(worker._deferred_session_name_reservations, set())  # noqa: SLF001
+        self.assertTrue(
+            any(
+                event == "session_name_reservation_release_failed"
+                and payload.get("context") == "session_name_conflict_retry"
+                for event, payload in events
+            )
+        )
 
     def test_create_session_conflict_retry_fails_fast_after_retry_limit(self):
         class AlwaysConflictBackend:

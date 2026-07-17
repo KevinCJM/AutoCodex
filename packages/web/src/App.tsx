@@ -11,6 +11,7 @@ import {
   submitPromptResponse,
 } from './api/client'
 import { appendLog, classifyLog } from './domain/logs'
+import { buildAgentConfigLabel, buildHomeAgents, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState } from './domain/agents'
 import {
   EMPTY_APP,
   EMPTY_CONTROL,
@@ -24,9 +25,21 @@ import {
   normalizePromptSnapshot,
   normalizeStageSnapshot,
 } from './domain/normalize'
-import { STAGE_LABELS, STAGE_ROUTES, routeLabel, stageRouteForAction } from './domain/stages'
-import { applyStageGeneration, EMPTY_STAGE_GENERATION, stageFailureFromEvent, stagePayloadFromApp } from './domain/stageState'
-import type { AppSnapshot, ArtifactsSnapshot, BridgeEvent, ControlSnapshot, FilePreview, HitlSnapshot, LogEntry, PromptSnapshot, RunOption, SnapshotsPayload, StageFailureSnapshot, StageRoute, StageSnapshot, WorkerSnapshot } from './domain/types'
+import { resolvePromptAwareStatus, resolvePromptResponseTransition } from './domain/promptTransition'
+import { STAGE_LABELS, STAGE_ROUTES, routeLabel, stageLabelForAction, stageRouteForAction } from './domain/stages'
+import {
+  applyStageGeneration,
+  bindProgressEntry,
+  EMPTY_STAGE_GENERATION,
+  progressEntryMatchesCursor,
+  resolveStageMessage,
+  shouldAcceptProgressEvent,
+  shouldResetProgressForStageChange,
+  stageFailureFromEvent,
+  stagePayloadFromApp,
+} from './domain/stageState'
+import type { ScopedProgressEntry } from './domain/stageState'
+import type { AppSnapshot, ArtifactsSnapshot, BridgeEvent, ControlSnapshot, FilePreview, HitlSnapshot, HomeAgentItem, LogEntry, PromptSnapshot, RunOption, SnapshotsPayload, StageFailureSnapshot, StageRoute, StageSnapshot, WorkerSnapshot } from './domain/types'
 
 type AppTab = 'home' | 'stages' | 'files' | 'logs'
 type SheetKind = 'advanced' | 'preview' | null
@@ -294,8 +307,8 @@ function CurrentCard(props: {
   app: AppSnapshot
   stage: StageSnapshot
   artifacts: ArtifactsSnapshot
+  agentCount: number
 }) {
-  const workerCount = () => props.stage.workers.length
   const requirement = () => props.stage.requirementName || props.app.requirementName
   return (
     <section class="hero-card">
@@ -305,8 +318,63 @@ function CurrentCard(props: {
         <p class="hero-copy">{requirement()}</p>
       </Show>
       <div class="summary-strip">
-        <StatLine label="智能体" value={workerCount()} tone={workerCount() > 0 ? 'active' : 'muted'} />
+        <StatLine label="智能体" value={props.agentCount} tone={props.agentCount > 0 ? 'active' : 'muted'} />
         <StatLine label="文件" value={props.artifacts.items.length} />
+      </div>
+    </section>
+  )
+}
+
+function AttentionCard(props: { app: AppSnapshot; hitl: HitlSnapshot; onPreview: (path: string) => void }) {
+  const pending = () => props.hitl.pending || props.app.pendingAttention
+  return (
+    <Show when={pending()}>
+      <section class="app-card attention-card" aria-live="polite">
+        <div class="view-title">
+          <span>待处理人工输入</span>
+          <strong>{props.hitl.recoveryKind || '需要你处理'}</strong>
+        </div>
+        <Show when={props.hitl.summary || props.hitl.reasonText || props.app.pendingAttentionReason}>
+          <p>{props.hitl.summary || props.hitl.reasonText || props.app.pendingAttentionReason}</p>
+        </Show>
+        <Show when={props.hitl.attachCommand}>
+          <button class="link-button" onClick={() => void copyText(props.hitl.attachCommand)}>
+            <Copy size={14} /><span>{props.hitl.attachCommand}</span>
+          </button>
+        </Show>
+        <div class="file-actions">
+          <Show when={props.hitl.questionPath}><PathButton path={props.hitl.questionPath} label="question" onPreview={props.onPreview} /></Show>
+          <Show when={props.hitl.answerPath}><PathButton path={props.hitl.answerPath} label="answer" onPreview={props.onPreview} /></Show>
+          <For each={props.hitl.targetPaths}>{(path) => <PathButton path={path} label={path.split('/').at(-1) || path} onPreview={props.onPreview} />}</For>
+        </div>
+      </section>
+    </Show>
+  )
+}
+
+function AgentOverview(props: { agents: HomeAgentItem[] }) {
+  return (
+    <section class="app-card">
+      <div class="view-title"><span>智能体状态</span><strong>{props.agents.length}</strong></div>
+      <div class="worker-list">
+        <For each={props.agents}>
+          {(agent) => (
+            <article class="worker-card">
+              <div>
+                <button class="link-button" onClick={() => void copyText(agent.attachCommand)}>
+                  <Copy size={14} /><span>{agent.sessionName}</span>
+                </button>
+                <Show when={agent.agentConfigLabel}><p>{agent.agentConfigLabel}</p></Show>
+              </div>
+              <div class="status-pills">
+                <span class={`pill ${statusClass(agent.agentState)}`}>{agent.agentState}</span>
+                <span class={`pill ${statusClass(agent.healthStatus)}`}>{agent.healthStatus || '-'}</span>
+                <Show when={agent.turnState}><span class={`pill ${statusClass(agent.turnState)}`}>turn: {agent.turnState}</span></Show>
+              </div>
+            </article>
+          )}
+        </For>
+        <Show when={props.agents.length === 0}><p class="empty-state">当前没有可显示的智能体状态。</p></Show>
       </div>
     </section>
   )
@@ -376,6 +444,7 @@ function StartWorkflowCard(props: { busy: boolean; promptPending: boolean; onSta
 
 function HomeView(props: {
   snapshots: SnapshotsPayload
+  agents: HomeAgentItem[]
   progress: string
   onPromptSubmit: (value: unknown) => Promise<void>
   onStartWorkflow: () => Promise<void>
@@ -384,7 +453,13 @@ function HomeView(props: {
   const app = () => props.snapshots.app
   const stageRoute = () => stageRouteForAction(app().activeStage) || 'routing'
   const stage = () => props.snapshots.stages[stageRoute() as StageRoute] || EMPTY_STAGE
-  const busy = createMemo(() => Boolean(props.progress || (app().activeStage && app().activeStage !== 'idle') || props.snapshots.control.workers.length > 0))
+  const attentionPending = createMemo(() => props.snapshots.prompt.pending || props.snapshots.hitl.pending || app().pendingAttention)
+  const busy = createMemo(() => {
+    const status = String(app().activeStageStatus || '').trim().toLowerCase()
+    const terminal = status === 'failed' || status === 'error' || status === 'completed'
+    const runnerActive = Boolean(app().activeStage && app().activeStage !== 'idle' && !terminal && status !== 'ready')
+    return Boolean(props.progress || runnerActive || props.agents.some((agent) => agent.agentState === 'BUSY' || agent.agentState === 'STARTING'))
+  })
   return (
     <div class="view-stack home-view">
       <Show when={app().activeStageFailure} keyed>
@@ -393,10 +468,12 @@ function HomeView(props: {
       <Show when={props.snapshots.prompt.pending}>
         <PromptCard prompt={props.snapshots.prompt} hitl={props.snapshots.hitl} onSubmit={props.onPromptSubmit} onPreview={props.onPreview} />
       </Show>
-      <CurrentCard app={app()} stage={stage()} artifacts={props.snapshots.artifacts} />
+      <AttentionCard app={app()} hitl={props.snapshots.hitl} onPreview={props.onPreview} />
+      <CurrentCard app={app()} stage={stage()} artifacts={props.snapshots.artifacts} agentCount={props.agents.length} />
+      <AgentOverview agents={props.agents} />
       <StartWorkflowCard
         busy={busy()}
-        promptPending={props.snapshots.prompt.pending}
+        promptPending={attentionPending()}
         onStart={props.onStartWorkflow}
       />
       <section class="app-card details-card">
@@ -425,20 +502,23 @@ function WorkerList(props: { workers: WorkerSnapshot[]; onPreview: (path: string
   return (
     <div class="worker-list">
       <For each={props.workers}>
-        {(worker, index) => (
-          <article class="worker-card">
+        {(worker, index) => {
+          const agentState = () => resolveAgentState(worker)
+          const configLabel = () => buildAgentConfigLabel(worker)
+          return (
+            <article class="worker-card">
             <div>
               <button class="link-button" onClick={() => void copyText(`tmux attach -t ${worker.sessionName}`)}>
                 <Copy size={14} />
                 <span>{worker.sessionName || `worker-${index() + 1}`}</span>
               </button>
-              <p>{worker.workflowStage || worker.currentTaskRuntimeStatus || 'running'}</p>
+              <p>{configLabel() || worker.workflowStage || 'agent'}</p>
             </div>
             <div class="status-pills">
               <Show when={worker.turnState}>
-                <span class={`pill ${statusClass(worker.turnState)}`}>{worker.turnState}</span>
+                <span class={`pill ${statusClass(worker.turnState)}`}>turn: {worker.turnState}</span>
               </Show>
-              <span class={`pill ${statusClass(worker.status || worker.agentState)}`}>{worker.status || worker.agentState || 'unknown'}</span>
+              <span class={`pill ${statusClass(agentState())}`}>{agentState()}</span>
               <span class={`pill ${statusClass(worker.healthStatus)}`}>{worker.healthStatus || '-'}</span>
             </div>
             <div class="file-actions">
@@ -446,8 +526,9 @@ function WorkerList(props: { workers: WorkerSnapshot[]; onPreview: (path: string
               <Show when={worker.questionPath}><PathButton path={worker.questionPath} label="question" onPreview={props.onPreview} /></Show>
               <Show when={worker.turnStatusPath}><PathButton path={worker.turnStatusPath} label="turn" onPreview={props.onPreview} /></Show>
             </div>
-          </article>
-        )}
+            </article>
+          )
+        }}
       </For>
     </div>
   )
@@ -577,6 +658,9 @@ function LogsView(props: { logs: LogEntry[]; filter: string; onFilter: (value: s
   const filters = [
     { value: 'all', label: 'all' },
     { value: 'stage', label: 'stage' },
+    { value: 'summary', label: 'summary' },
+    { value: 'runtime', label: 'runtime' },
+    { value: 'warning', label: 'warning' },
     { value: 'hitl', label: 'hitl' },
     { value: 'error', label: 'error' },
     { value: 'plain', label: 'plain' },
@@ -610,6 +694,7 @@ function AdvancedPanel(props: {
   onControlSelect: (index: number) => void
   onControlAction: (action: 'attach' | 'detach' | 'restart' | 'retry' | 'kill') => void
   onRefresh: () => void
+  onPreview: (path: string) => void
   onResumeRun: (runId: string) => void
   resumeRuns: RunOption[]
   onOpenResume: () => void
@@ -623,11 +708,19 @@ function AdvancedPanel(props: {
     <div class="advanced-panel">
       <section>
         <h3>Control Worker</h3>
+        <Show when={props.snapshots.control.statusText}><p>{props.snapshots.control.statusText}</p></Show>
+        <Show when={props.snapshots.control.helpText}><p class="mono-line">{props.snapshots.control.helpText}</p></Show>
+        <Show when={props.snapshots.control.transitionText}><p>{props.snapshots.control.transitionText}</p></Show>
+        <Show when={props.snapshots.control.finalSummary}><p>{props.snapshots.control.finalSummary}</p></Show>
         <Show when={selectedWorker()} fallback={<p class="empty-state">no control worker</p>}>
           {(worker) => (
             <>
               <ChoiceButtons options={workerOptions()} value={String(props.selectedControlIndex)} onChange={(value) => props.onControlSelect(Number(value))} ariaLabel="选择 control worker" />
               <p class="mono-line">{worker().workDir || worker().note}</p>
+              <div class="file-actions">
+                <Show when={worker().answerPath}><PathButton path={worker().answerPath} label="answer" onPreview={props.onPreview} /></Show>
+                <Show when={worker().artifactPaths.length > 0}><span>{worker().artifactPaths.length} artifacts</span></Show>
+              </div>
               <div class="button-grid">
                 <button onClick={() => props.onControlAction('attach')}><Terminal size={15} />attach</button>
                 <button onClick={() => props.onControlAction('restart')}><RotateCcw size={15} />restart</button>
@@ -694,7 +787,7 @@ export function App() {
   const [activeTab, setActiveTab] = createSignal<AppTab>('home')
   const [selectedStage, setSelectedStage] = createSignal<StageRoute>('routing')
   const [logs, setLogs] = createSignal<LogEntry[]>([])
-  const [progress, setProgress] = createSignal<Record<string, string>>({})
+  const [progress, setProgress] = createSignal<Record<string, ScopedProgressEntry>>({})
   const [connection, setConnection] = createSignal('booting')
   const [selectedControlIndex, setSelectedControlIndex] = createSignal(0)
   const [resumeRuns, setResumeRuns] = createSignal<RunOption[]>([])
@@ -705,20 +798,73 @@ export function App() {
   const [stageGeneration, setStageGeneration] = createSignal(EMPTY_STAGE_GENERATION)
   let scheduledRefreshTimer = 0
   let disconnectBridgeEvents: (() => void) | undefined
+  let refreshSequence = 0
+  let latestAppliedRefresh = 0
+  let promptRevision = 0
 
-  const progressLine = createMemo(() => Object.values(progress()).filter(Boolean).join(' | '))
+  const homeAgents = createMemo(() => buildHomeAgents(
+    [
+      { source: 'control', workers: snapshots().control.workers },
+      ...STAGE_ROUTES.map((route) => ({ source: route, workers: snapshots().stages[route].workers })),
+    ],
+    snapshots().app.activeStage,
+    snapshots().app.activeStageRunnerId,
+  ))
+  const progressLine = createMemo(() => {
+    const app = snapshots().app
+    const explicit = Object.values(progress())
+      .filter((entry) => progressEntryMatchesCursor(stageGeneration(), entry))
+      .map((entry) => entry.line)
+      .filter(Boolean)
+      .join(' | ')
+    const route = stageRouteForAction(app.activeStage)
+    const workers = route ? snapshots().stages[route].workers : []
+    return resolveAgentProgressLine({
+      status: app.activeStageStatus,
+      action: app.activeStage,
+      activeRunnerId: app.activeStageRunnerId,
+      stageLabel: app.activeStageLabel,
+      stageMessage: app.activeStageMessage,
+      explicitProgress: explicit,
+      workers,
+    })
+  })
 
   const appendRuntimeLog = (event: BridgeEvent) => {
     setLogs((prev) => appendLog(prev, classifyLog(JSON.stringify(event.payload, null, 2), event.type, event.payload)))
   }
 
-  const reconcileAppSnapshot = (next: AppSnapshot, previous: AppSnapshot): AppSnapshot => {
+  const reconcileAppSnapshot = (next: AppSnapshot, previous: AppSnapshot, hasPrompt = snapshots().prompt.pending): AppSnapshot => {
     const payload = stagePayloadFromApp(next)
-    if (!payload) return next
-    const transition = applyStageGeneration(stageGeneration(), payload)
+    if (!payload) {
+      if (stageGeneration().stageSeq > 0) return {
+        ...next,
+        currentAction: previous.currentAction,
+        activeStage: previous.activeStage,
+        activeStageStatus: resolvePromptAwareStatus(previous.activeStageStatus, hasPrompt || next.pendingHitl || next.pendingAttention),
+        activeStageSeq: previous.activeStageSeq,
+        activeStageRunnerId: previous.activeStageRunnerId,
+        activeStageSource: previous.activeStageSource,
+        activeStageLabel: previous.activeStageLabel,
+        activeStageMessage: previous.activeStageMessage,
+        activeStageFailure: previous.activeStageFailure,
+      }
+      return {
+        ...next,
+        activeStageStatus: resolvePromptAwareStatus(next.activeStageStatus, hasPrompt || next.pendingHitl || next.pendingAttention),
+      }
+    }
+    const previousCursor = stageGeneration()
+    const transition = applyStageGeneration(previousCursor, payload)
     if (transition.accepted) {
       setStageGeneration(transition.cursor)
-      return next
+      if (shouldResetProgressForStageChange(previousCursor, transition.cursor, transition.status)) setProgress({})
+      const attentionPending = next.pendingHitl || next.pendingAttention
+      return {
+        ...next,
+        activeStageStatus: resolvePromptAwareStatus(attentionPending ? 'awaiting-input' : next.activeStageStatus, hasPrompt),
+        activeStageMessage: resolveStageMessage(previousCursor, transition.cursor, previous.activeStageMessage, next.activeStageMessage),
+      }
     }
     return {
       ...next,
@@ -729,21 +875,41 @@ export function App() {
       activeStageRunnerId: previous.activeStageRunnerId,
       activeStageSource: previous.activeStageSource,
       activeStageLabel: previous.activeStageLabel,
+      activeStageMessage: previous.activeStageMessage,
       activeStageFailure: previous.activeStageFailure,
     }
   }
 
   const applySnapshots = (payload: SnapshotsPayload) => {
-    const reconciled = { ...payload, app: reconcileAppSnapshot(payload.app, snapshots().app) }
+    const previous = snapshots()
+    const stages = Object.fromEntries(STAGE_ROUTES.map((route) => {
+      const incoming = payload.stages[route]
+      return [route, { ...incoming, workers: reconcileWorkerSnapshots(previous.stages[route].workers, incoming.workers) }]
+    })) as Record<StageRoute, StageSnapshot>
+    const control = {
+      ...payload.control,
+      workers: reconcileWorkerSnapshots(previous.control.workers, payload.control.workers),
+    }
+    const reconciled = {
+      ...payload,
+      stages,
+      control,
+      app: reconcileAppSnapshot(payload.app, previous.app, payload.prompt.pending),
+    }
     setSnapshots(reconciled)
-    setSelectedControlIndex((prev) => Math.min(prev, Math.max(payload.control.workers.length - 1, 0)))
+    setSelectedControlIndex((prev) => Math.min(prev, Math.max(control.workers.length - 1, 0)))
     const activeStageRoute = stageRouteForAction(reconciled.app.activeStage)
     if (activeStageRoute) setSelectedStage(activeStageRoute)
   }
 
   const refreshSnapshots = async () => {
+    const requestSequence = ++refreshSequence
+    const promptRevisionAtStart = promptRevision
     const [nextSnapshots, prompt] = await Promise.all([getSnapshots(), getPrompt()])
-    applySnapshots({ ...nextSnapshots, prompt })
+    if (requestSequence < latestAppliedRefresh) return
+    latestAppliedRefresh = requestSequence
+    const safePrompt = promptRevisionAtStart === promptRevision ? prompt : snapshots().prompt
+    applySnapshots({ ...nextSnapshots, prompt: safePrompt })
     setConnection('online')
   }
 
@@ -760,14 +926,21 @@ export function App() {
       setLogs((prev) => appendLog(prev, classifyLog(String(event.payload.text ?? ''), event.type, event.payload)))
       return
     }
-    if (event.type === 'progress.start' || event.type === 'progress.update') {
+    if (event.type === 'progress.start') {
+      if (!shouldAcceptProgressEvent(stageGeneration(), event.payload)) return
+      return
+    }
+    if (event.type === 'progress.update') {
       const id = String(event.payload.id ?? '')
       const line = String(event.payload.line ?? '')
-      setProgress((prev) => ({ ...prev, [id]: line }))
+      const entry = bindProgressEntry(stageGeneration(), event.payload, line)
+      if (!entry) return
+      setProgress((prev) => ({ ...prev, [id]: entry }))
       queueRefreshSnapshots()
       return
     }
     if (event.type === 'progress.stop') {
+      if (!shouldAcceptProgressEvent(stageGeneration(), event.payload)) return
       const id = String(event.payload.id ?? '')
       setProgress((prev) => {
         const next = { ...prev }
@@ -778,8 +951,13 @@ export function App() {
       return
     }
     if (event.type === 'prompt.request') {
+      promptRevision += 1
       setSnapshots((prev) => ({
         ...prev,
+        app: {
+          ...prev.app,
+          activeStageStatus: resolvePromptAwareStatus(prev.app.activeStageStatus, true),
+        },
         prompt: normalizePromptSnapshot({
           pending: true,
           prompt_id: event.payload.id,
@@ -794,25 +972,48 @@ export function App() {
     if (event.type === 'snapshot.app') {
       setSnapshots((prev) => ({
         ...prev,
-        app: reconcileAppSnapshot(normalizeAppSnapshot(event.payload), prev.app),
+        app: reconcileAppSnapshot(normalizeAppSnapshot(event.payload), prev.app, prev.prompt.pending),
       }))
       return
     }
     if (event.type === 'snapshot.stage') {
       const stageRoute = String(event.payload.route ?? '') as StageRoute
       if (!STAGE_ROUTES.includes(stageRoute)) return
-      setSnapshots((prev) => ({
-        ...prev,
-        stages: { ...prev.stages, [stageRoute]: normalizeStageSnapshot(event.payload.snapshot) },
-      }))
+      setSnapshots((prev) => {
+        const incoming = normalizeStageSnapshot(event.payload.snapshot)
+        return {
+          ...prev,
+          stages: {
+            ...prev.stages,
+            [stageRoute]: {
+              ...incoming,
+              workers: reconcileWorkerSnapshots(prev.stages[stageRoute].workers, incoming.workers),
+            },
+          },
+        }
+      })
       return
     }
     if (event.type === 'snapshot.control') {
-      setSnapshots((prev) => ({ ...prev, control: normalizeControlSnapshot(event.payload) }))
+      setSnapshots((prev) => {
+        const incoming = normalizeControlSnapshot(event.payload)
+        return { ...prev, control: { ...incoming, workers: reconcileWorkerSnapshots(prev.control.workers, incoming.workers) } }
+      })
       return
     }
     if (event.type === 'snapshot.hitl') {
-      setSnapshots((prev) => ({ ...prev, hitl: normalizeHitlSnapshot(event.payload) }))
+      setSnapshots((prev) => {
+        const hitl = normalizeHitlSnapshot(event.payload)
+        return {
+          ...prev,
+          hitl,
+          app: {
+            ...prev.app,
+            pendingHitl: hitl.pending,
+            activeStageStatus: resolvePromptAwareStatus(hitl.pending ? 'awaiting-input' : prev.app.activeStageStatus, prev.prompt.pending),
+          },
+        }
+      })
       return
     }
     if (event.type === 'snapshot.artifacts') {
@@ -820,9 +1021,11 @@ export function App() {
       return
     }
     if (event.type === 'stage.changed') {
-      const transition = applyStageGeneration(stageGeneration(), event.payload)
+      const previousCursor = stageGeneration()
+      const transition = applyStageGeneration(previousCursor, event.payload)
       if (!transition.accepted) return
       setStageGeneration(transition.cursor)
+      if (shouldResetProgressForStageChange(previousCursor, transition.cursor, transition.status)) setProgress({})
       const failure = stageFailureFromEvent(event.payload)
       setSnapshots((prev) => ({
         ...prev,
@@ -830,14 +1033,27 @@ export function App() {
           ...prev.app,
           currentAction: transition.action || prev.app.currentAction,
           activeStage: transition.action || prev.app.activeStage,
-          activeStageStatus: transition.status,
+          activeStageStatus: resolvePromptAwareStatus(transition.status, prev.prompt.pending),
           activeStageSeq: transition.stageSeq || prev.app.activeStageSeq,
           activeStageRunnerId: transition.runnerId || prev.app.activeStageRunnerId,
           activeStageSource: transition.source || prev.app.activeStageSource,
-          activeStageLabel: routeLabel(stageRouteForAction(transition.action)) || prev.app.activeStageLabel,
+          activeStageLabel: resolveStageMessage(
+            previousCursor,
+            transition.cursor,
+            prev.app.activeStageLabel,
+            event.payload.stage_label ?? event.payload.stageLabel,
+          ) || stageLabelForAction(transition.action) || '等待中',
+          activeStageMessage: resolveStageMessage(
+            previousCursor,
+            transition.cursor,
+            prev.app.activeStageMessage,
+            event.payload.message,
+          ),
           activeStageFailure: failure,
         },
       }))
+      const nextRoute = stageRouteForAction(transition.action)
+      if (nextRoute) setSelectedStage(nextRoute)
       setLogs((prev) => appendLog(prev, classifyLog(`stage ${String(event.payload.action ?? '')}: ${String(event.payload.status ?? '')}`, event.type, event.payload)))
       queueRefreshSnapshots(150)
       return
@@ -857,10 +1073,29 @@ export function App() {
   }
 
   const submitPrompt = async (value: unknown) => {
-    const prompt = snapshots().prompt
-    if (!prompt.pending || !prompt.promptId) return
-    await submitPromptResponse(prompt.promptId, value)
-    setSnapshots((prev) => ({ ...prev, prompt: EMPTY_PROMPT }))
+    const submitted = snapshots().prompt
+    if (!submitted.pending || !submitted.promptId) return
+    const response = await submitPromptResponse(submitted.promptId, value)
+    const accepted = response.accepted === true
+    const transition = resolvePromptResponseTransition(submitted.promptId, snapshots().prompt, accepted)
+    if (!transition.accepted) {
+      if (snapshots().prompt.promptId && snapshots().prompt.promptId !== submitted.promptId) return
+      throw new Error('后端未接受本次输入，已保留当前内容，可重试。')
+    }
+    if (transition.clearPrompt) {
+      promptRevision += 1
+      setSnapshots((prev) => {
+        if (prev.prompt.promptId && prev.prompt.promptId !== submitted.promptId) return prev
+        return {
+          ...prev,
+          prompt: EMPTY_PROMPT,
+          app: {
+            ...prev.app,
+            activeStageStatus: resolvePromptAwareStatus('running', false),
+          },
+        }
+      })
+    }
     await refreshSnapshots()
   }
 
@@ -925,10 +1160,15 @@ export function App() {
     })
     void (async () => {
       try {
+        const bootstrapPromptRevision = promptRevision
         const bootstrap = await getBootstrap()
-        applySnapshots(bootstrap.snapshots)
+        applySnapshots({
+          ...bootstrap.snapshots,
+          prompt: bootstrapPromptRevision === promptRevision ? bootstrap.snapshots.prompt : snapshots().prompt,
+        })
+        const promptRevisionAtStart = promptRevision
         const prompt = await getPrompt()
-        setSnapshots((prev) => ({ ...prev, prompt }))
+        if (promptRevisionAtStart === promptRevision) setSnapshots((prev) => ({ ...prev, prompt }))
         setConnection('online')
       } catch (error) {
         setConnection('offline')
@@ -950,6 +1190,7 @@ export function App() {
           <Match when={activeTab() === 'home'}>
             <HomeView
               snapshots={snapshots()}
+              agents={homeAgents()}
               progress={progressLine()}
               onPromptSubmit={submitPrompt}
               onStartWorkflow={startWorkflow}
@@ -976,6 +1217,7 @@ export function App() {
             onControlSelect={setSelectedControlIndex}
             onControlAction={(action) => void performControlAction(action)}
             onRefresh={() => void refreshSnapshots()}
+            onPreview={(path) => void openPreview(path)}
             resumeRuns={resumeRuns()}
             onOpenResume={() => void openResumeRuns()}
             onResumeRun={(runId) => void resumeRun(runId)}

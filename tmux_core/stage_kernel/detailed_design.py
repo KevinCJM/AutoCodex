@@ -60,8 +60,6 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     list_registered_tmux_workers,
-    list_tmux_session_names,
-    list_occupied_tmux_session_names,
 )
 from tmux_core.stage_kernel.reviewer_orchestration import (
     repair_reviewer_round_outputs,
@@ -99,6 +97,7 @@ from tmux_core.stage_kernel.shared_review import (
     collect_reviewer_agent_selections,
     ensure_empty_file,
     ensure_review_artifacts,
+    ensure_review_artifacts_exist,
     mark_reviewer_turn_succeeded_from_materialized_outputs,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
@@ -116,6 +115,7 @@ from tmux_core.stage_kernel.shared_review import (
     reviewer_artifact_signature,
     reviewer_outputs_satisfy_contract,
     reviewer_worker_needs_terminal_success_normalization,
+    resolve_reviewer_artifact_agent_name,
     resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
@@ -426,20 +426,14 @@ def _predict_worker_display_name(
     worker_id: str,
     occupied_session_names: Sequence[str] = (),
 ) -> str:
+    # This value is only a pre-launch label.  Querying tmux here can consume the
+    # full control recovery budget between two interactive configuration
+    # prompts.  The worker's lease/create path resolves real tmux collisions.
     occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
-    for session_name in list_tmux_session_names():
-        name = str(session_name or "").strip()
-        if name:
-            occupied.add(name)
     for worker in list_registered_tmux_workers():
         session_name = str(getattr(worker, "session_name", "") or "").strip()
         if session_name:
             occupied.add(session_name)
-    occupied.update(
-        list_occupied_tmux_session_names(
-            additional_session_names=sorted(occupied),
-        )
-    )
     return build_session_name(
         worker_id,
         Path(project_dir).expanduser().resolve(),
@@ -463,10 +457,7 @@ def _detailed_design_ba_display_name(
 
 
 def _reviewer_artifact_agent_name(reviewer: ReviewerRuntime) -> str:
-    worker = getattr(reviewer, "worker", None)
-    session_name = str(getattr(worker, "session_name", "") or "").strip()
-    reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
-    return session_name or reviewer_name
+    return resolve_reviewer_artifact_agent_name(reviewer)
 
 
 def _predict_reviewer_display_name(
@@ -1689,7 +1680,7 @@ def run_reviewer_turn_with_recreation(
     current_reviewer = reviewer
     while True:
         baseline_satisfies_contract = _reviewer_outputs_satisfy_contract(current_reviewer)
-        ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
+        ensure_review_artifacts_exist(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
         try:
             run_completion_turn_with_repair(

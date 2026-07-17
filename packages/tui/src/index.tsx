@@ -4,8 +4,9 @@ import {
   App,
   claimBackendShutdownOwnership,
   getLatestBackendCleanupContext,
-  requestBackendPreserveOrphansShutdown,
+  requestBackendCleanupShutdown,
   runBackendCleanupFallback,
+  setInitialBackendCleanupContext,
   stopBackendClient,
 } from './app'
 import { copyToClipboard } from './clipboard'
@@ -64,6 +65,11 @@ function parseStartupArgs(argv: string[]) {
   }
 }
 
+function readOption(argv: string[], name: string) {
+  const index = argv.indexOf(name)
+  return index >= 0 ? String(argv[index + 1] ?? '').trim() : ''
+}
+
 const renderer = await createCliRenderer({
   targetFps: 60,
   exitOnCtrlC: false,
@@ -92,18 +98,38 @@ function exitCodeForSignal(signal: ShutdownSignal) {
   return 1
 }
 
+async function stopBackendAndCleanup(reason: 'signal' | 'runner_failure') {
+  const cleanupContext = getLatestBackendCleanupContext()
+  try {
+    await requestBackendCleanupShutdown(reason)
+  } catch {
+    // The backend may already be unavailable; cleanup-only remains authoritative.
+  }
+  try {
+    await stopBackendClient({ reason, forceKillAfterMs: 30000 })
+  } catch {
+    // Continue with the independent cleanup pass.
+  } finally {
+    try {
+      // Idempotent second pass covers backend disconnects, cleanup probe errors,
+      // and forced termination before the backend's finally block completed.
+      await runBackendCleanupFallback(cleanupContext)
+    } catch {
+      // Exit must still complete when tmux itself is unavailable.
+    }
+  }
+}
+
 async function shutdownFromSignal(signal: ShutdownSignal) {
   if (shutdownStarted) return
   shutdownStarted = true
+  claimBackendShutdownOwnership()
   try {
     renderer.destroy()
   } catch {
     // Renderer may already be shutting down.
   }
-  const stopResult = await stopBackendClient({ reason: 'signal', forceKillAfterMs: 30000 })
-  if (!stopResult.graceful || stopResult.signalEscalatedToSigkill) {
-    await runBackendCleanupFallback(getLatestBackendCleanupContext())
-  }
+  await stopBackendAndCleanup('signal')
   process.exit(exitCodeForSignal(signal))
 }
 
@@ -122,15 +148,8 @@ async function shutdownFromTerminalFailure(failure: StageFailureSnapshot) {
     // A closed stderr must not prevent failure shutdown.
   }
   try {
-    await requestBackendPreserveOrphansShutdown()
-  } catch {
-    // The backend already latches preserve-orphans before emitting runner_failure.
-  }
-  try {
-    await stopBackendClient({ reason: 'runner_failure', forceKillAfterMs: 30000 })
+    await stopBackendAndCleanup('runner_failure')
   } finally {
-    // Failure shutdown deliberately has no cleanup-only fallback: the tmux sessions
-    // are the diagnostic evidence the user was promised would be preserved.
     process.exit(1)
   }
 }
@@ -142,6 +161,11 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
 }
 
 const startup = parseStartupArgs(Bun.argv.slice(2))
+setInitialBackendCleanupContext({
+  projectDir: readOption(startup.initialArgv, '--project-dir'),
+  requirementName: readOption(startup.initialArgv, '--requirement-name'),
+  action: startup.action,
+})
 
 await render(
   () => (

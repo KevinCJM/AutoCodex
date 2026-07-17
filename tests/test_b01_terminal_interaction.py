@@ -53,6 +53,24 @@ class B01TerminalInteractionTests(unittest.TestCase):
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(request.proxy_port, "")
 
+    def test_collect_b01_request_skip_does_not_scan_vendor_catalog(self):
+        args = build_parser().parse_args([])
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            (project_dir / "docs").mkdir()
+            (project_dir / "AGENTS.md").write_text("ok", encoding="utf-8")
+            (project_dir / "docs" / "repo_map.json").write_text("{}", encoding="utf-8")
+            (project_dir / "docs" / "task_routes.json").write_text("{}", encoding="utf-8")
+            (project_dir / "docs" / "pitfalls.json").write_text("{}", encoding="utf-8")
+            with patch("builtins.input", side_effect=[tmpdir, "no"]), patch(
+                "B01_terminal_interaction.get_default_model_for_vendor",
+                side_effect=AssertionError("skip must not scan vendor catalog"),
+            ):
+                request = collect_b01_request(args)
+
+        self.assertFalse(request.run_init)
+        self.assertEqual(request.model, "gpt-5.4")
+
     def test_collect_b01_request_forces_init_when_project_routing_is_missing(self):
         parser = build_parser()
         args = parser.parse_args([])
@@ -164,6 +182,9 @@ class B01TerminalInteractionTests(unittest.TestCase):
         ), patch(
             "B01_terminal_interaction.AgentInitControlCenter.create_new",
             side_effect=AssertionError("空项目不应创建控制中心"),
+        ), patch(
+            "B01_terminal_interaction.AgentRunConfig",
+            side_effect=AssertionError("skip must not resolve an unused agent config"),
         ), patch("sys.stdout", new=stdout):
             exit_code = main([])
         self.assertEqual(exit_code, 0)

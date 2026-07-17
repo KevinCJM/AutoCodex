@@ -246,7 +246,11 @@ class T09TerminalOpsTests(unittest.TestCase):
         ui = BridgeTerminalUI(
             emit_event=emit_event,
             request_prompt=lambda _request: {"value": "ok"},
-            progress_context_provider=lambda: {"action": "stage.a05.start", "stage_seq": 12},
+            progress_context_provider=lambda: {
+                "action": "stage.a05.start",
+                "stage_seq": 12,
+                "runner_id": "runner-a05",
+            },
         )
         monitor = ui.create_progress_monitor(frame_builder=lambda _tick: "running")
         monitor.start()
@@ -255,6 +259,7 @@ class T09TerminalOpsTests(unittest.TestCase):
         self.assertTrue(progress_events)
         self.assertTrue(all(item["action"] == "stage.a05.start" for item in progress_events))
         self.assertTrue(all(item["stage_seq"] == 12 for item in progress_events))
+        self.assertTrue(all(item["runner_id"] == "runner-a05" for item in progress_events))
 
     def test_terminal_ui_is_interactive_when_bridge_ui_is_active(self):
         def emit_event(_event_type: str, _payload: dict[str, object]) -> None:

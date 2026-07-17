@@ -9,10 +9,13 @@ export type FileSnapshot = {
 export type WorkerSnapshot = {
   index?: number
   workerId?: string
+  statePath?: string
+  stateRevision?: number
   workDir: string
   sessionName: string
   status: string
   resultStatus?: string
+  workflowAction?: string
   workflowStage: string
   agentState: string
   healthStatus: string
@@ -199,6 +202,7 @@ export type AppSnapshot = {
   activeStageRunnerId: string
   activeStageSource: string
   activeStageLabel: string
+  activeStageMessage?: string
   activeStageFailure: StageFailureSnapshot | null
   pendingHitl: boolean
   pendingAttention: boolean

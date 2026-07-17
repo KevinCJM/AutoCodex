@@ -32,8 +32,8 @@ test('normalizes runner failure and every orphan attach command', () => {
   expect(report).toContain('阶段: 任务拆分')
   expect(report).toContain('原因: tmux control unavailable')
   expect(report).toContain('失败记录: /tmp/stage.failure.json')
-  expect(report).toContain('tmux attach -t 需求分析师-天哭星')
-  expect(report).toContain("tmux attach -t '审核员 1'")
+  expect(report).not.toContain('保留的智能体现场')
+  expect(report).not.toContain('tmux attach')
 })
 
 test('HITL and recoverable errors are not authoritative terminal failures', () => {

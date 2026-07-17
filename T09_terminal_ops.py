@@ -286,6 +286,7 @@ class BridgeProgressMonitor:
         interval_sec: float,
         action: str = "",
         stage_seq: int = 0,
+        runner_id: str = "",
     ) -> None:
         self.monitor_id = monitor_id
         self.emit_event = emit_event
@@ -293,6 +294,7 @@ class BridgeProgressMonitor:
         self.interval_sec = interval_sec
         self.action = str(action or "").strip()
         self.stage_seq = max(int(stage_seq or 0), 0)
+        self.runner_id = str(runner_id or "").strip()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._tick = 0
@@ -304,6 +306,7 @@ class BridgeProgressMonitor:
             "id": self.monitor_id,
             "action": self.action,
             "stage_seq": self.stage_seq,
+            "runner_id": self.runner_id,
         }
         if extra:
             payload.update(dict(extra))
@@ -489,6 +492,7 @@ class BridgeTerminalUI:
             interval_sec=interval_sec,
             action=str(context.get("action", "") or "").strip(),
             stage_seq=int(context.get("stage_seq", 0) or 0),
+            runner_id=str(context.get("runner_id", context.get("runnerId", "")) or "").strip(),
         )
 
     def attach_external_process(

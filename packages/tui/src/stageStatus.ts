@@ -52,6 +52,14 @@ type ProgressPayload = {
   stageSeq?: unknown
 }
 
+export type ScopedProgressEntry = {
+  line: string
+  action: string
+  stageSeq: number
+  runnerId: string
+  cursorKey: string
+}
+
 function isFailureStatus(status: string): boolean {
   return status === 'failed' || status === 'error'
 }
@@ -197,11 +205,62 @@ export function shouldAcceptProgressEvent(cursor: StageCursor, payload: Progress
   if (action !== cursor.activeAction || stageSeq !== cursor.activeStageSeq) return false
   if (runnerId && cursor.activeRunnerId && runnerId !== cursor.activeRunnerId) return false
   if (
-    cursor.terminalStageSeq === stageSeq
-    && cursor.terminalAction === action
-    && (!runnerId || !cursor.terminalRunnerId || runnerId === cursor.terminalRunnerId)
+    cursor.terminalStatus
+    && (!action || !cursor.terminalAction || cursor.terminalAction === action)
+    && (stageSeq === 0 || cursor.terminalStageSeq === 0 || cursor.terminalStageSeq === stageSeq)
+    && (!runnerId || !cursor.terminalRunnerId || cursor.terminalRunnerId === runnerId)
   ) return false
   return true
+}
+
+export function stageCursorKey(cursor: Pick<StageCursor, 'activeAction' | 'activeStageSeq' | 'activeRunnerId'>): string {
+  return `${cursor.activeAction}\u0000${cursor.activeStageSeq}\u0000${cursor.activeRunnerId}`
+}
+
+export function bindProgressEntry(
+  cursor: StageCursor,
+  payload: ProgressPayload,
+  line: string,
+): ScopedProgressEntry | null {
+  if (!shouldAcceptProgressEvent(cursor, payload)) return null
+  const payloadAction = String(payload.action ?? '').trim()
+  const payloadRunnerId = String(payload.runner_id ?? payload.runnerId ?? '').trim()
+  const payloadStageSeq = normalizeStageSeq(payload.stage_seq ?? payload.stageSeq)
+  const action = cursor.activeAction || payloadAction
+  const stageSeq = cursor.activeStageSeq || payloadStageSeq
+  const runnerId = cursor.activeRunnerId || payloadRunnerId
+  return {
+    line: String(line ?? ''),
+    action,
+    stageSeq,
+    runnerId,
+    cursorKey: stageCursorKey({ activeAction: action, activeStageSeq: stageSeq, activeRunnerId: runnerId }),
+  }
+}
+
+export function progressEntryMatchesCursor(cursor: StageCursor, entry: ScopedProgressEntry): boolean {
+  return entry.cursorKey === stageCursorKey(cursor)
+}
+
+export function shouldResetProgressForStageChange(
+  previous: StageCursor,
+  current: StageCursor,
+  status: string,
+): boolean {
+  if (String(status ?? '').trim().toLowerCase() !== 'running') return true
+  return stageCursorKey(previous) !== stageCursorKey(current)
+}
+
+export function resolveStageMessage(
+  previous: StageCursor,
+  current: StageCursor,
+  previousMessage: string,
+  incomingMessage: unknown,
+): string {
+  const incoming = String(incomingMessage ?? '').trim()
+  if (incoming) return incoming
+  if (stageCursorKey(previous) !== stageCursorKey(current)) return ''
+  return String(previousMessage ?? '').trim()
 }
 
 export function markTerminalStage(cursor: StageCursor): StageCursor {

@@ -19,13 +19,20 @@ export type FileSnapshot = {
 
 export type WorkerSnapshot = {
   index?: number
+  workerId: string
+  statePath: string
+  stateRevision?: number
   workDir: string
   sessionName: string
   status: string
+  resultStatus: string
+  workflowAction: string
   workflowStage: string
   agentState: string
   healthStatus: string
   currentTaskRuntimeStatus: string
+  dispatchState: string
+  dispatchReason: string
   turnState: string
   tmuxControlStatus: string
   tmuxControlError: string
@@ -33,6 +40,10 @@ export type WorkerSnapshot = {
   stageRunnerId: string
   orphanedAt: string
   orphanedReason: string
+  vendor: string
+  model: string
+  resolvedModel: string
+  reasoningEffort: string
   retryCount: number
   note: string
   transcriptPath: string
@@ -85,9 +96,27 @@ export type DevelopmentMilestone = {
 
 export type HitlSnapshot = {
   pending: boolean
+  promptId: string
+  promptType: string
   questionPath: string
   answerPath: string
   summary: string
+  attachCommand: string
+  recoveryKind: string
+  reasonText: string
+  targetPaths: string[]
+}
+
+export type HomeAgentItem = {
+  source: 'control' | StageRoute
+  workerId: string
+  sessionName: string
+  healthStatus: string
+  agentState: string
+  turnState: string
+  agentConfigLabel: string
+  attachCommand: string
+  workDir: string
 }
 
 export type ArtifactItem = {
@@ -141,6 +170,7 @@ export type AppSnapshot = {
   activeStageRunnerId: string
   activeStageSource: string
   activeStageLabel: string
+  activeStageMessage: string
   activeStageFailure: StageFailureSnapshot | null
   pendingHitl: boolean
   pendingAttention: boolean
@@ -218,7 +248,7 @@ export type BridgeEvent = {
   payload: Record<string, unknown>
 }
 
-export type LogKind = 'stage' | 'runtime' | 'warning' | 'error' | 'hitl' | 'plain'
+export type LogKind = 'stage' | 'summary' | 'runtime' | 'warning' | 'error' | 'hitl' | 'plain'
 
 export type LogEntry = {
   id: number

@@ -29,7 +29,12 @@ class WebBackendTests(unittest.TestCase):
         return server, thread
 
     def _stop_server(self, server: WebBackendServer, thread: threading.Thread) -> None:
-        server.shutdown(cleanup_tmux=False)
+        with patch("tmux_core.bridge.backend.cleanup_registered_tmux_workers", return_value=[]), patch.object(
+            server, "_cleanup_visible_tmux_workers", return_value=[]
+        ), patch.object(server, "_cleanup_project_runtime_tmux_workers", return_value=[]), patch.object(
+            server, "_cleanup_current_project_tmux_sessions", return_value=[]
+        ), patch.object(server, "_list_foreign_project_tmux_sessions", return_value=[]):
+            server.shutdown(cleanup_tmux=False)
         thread.join(timeout=2.0)
 
     @staticmethod
@@ -66,6 +71,8 @@ class WebBackendTests(unittest.TestCase):
         self.assertIn('stages', snapshots['payload'])
         self.assertIn('development', snapshots['payload']['stages'])
         self.assertIn('overall-review', snapshots['payload']['stages'])
+        self.assertFalse(bootstrap['payload']['capabilities']['bridge_only_terminal_ui'])
+        self.assertTrue(bootstrap['payload']['capabilities']['web_file_preview'])
 
     def test_web_backend_prompt_response_roundtrip(self):
         server, thread = self._start_server()
@@ -314,6 +321,20 @@ class WebBackendTests(unittest.TestCase):
         self.assertEqual(event_payload['type'], 'log.append')
         self.assertEqual(event_payload['payload']['text'], 'hello\n')
 
+    def test_web_event_hub_never_evicts_authoritative_events_under_log_pressure(self):
+        hub = web_backend_module._EventStreamHub()  # noqa: SLF001
+        subscriber = hub.subscribe()
+        for index in range(256):
+            hub.publish({'type': 'log.append', 'payload': {'text': f'log-{index}'}})
+        hub.publish({
+            'type': 'stage.changed',
+            'payload': {'source': 'runner_failure', 'runner_id': 'runner-1', 'stage_seq': 9},
+        })
+
+        events = [subscriber.get_nowait() for _ in range(257)]
+        self.assertEqual(events[-1]['type'], 'stage.changed')
+        self.assertEqual(events[-1]['payload']['source'], 'runner_failure')
+
     def test_web_backend_suppresses_client_disconnect_tracebacks(self):
         server, thread = self._start_server()
         try:
@@ -361,6 +382,45 @@ class WebBackendTests(unittest.TestCase):
         self.assertIn('[web-backend] sse: http://127.0.0.1:8765/api/events', output)
         self.assertIn('[web-backend] press Ctrl+C to stop', output)
         self.assertIn('[web-backend] shutdown complete', output)
+
+    def test_web_backend_signal_defers_shutdown_to_finally(self):
+        shutdown_calls: list[bool] = []
+        inline_shutdown_counts: list[int] = []
+        handlers: dict[int, object] = {}
+
+        class FakeServer:
+            def __init__(self, *, port: int) -> None:
+                self.host = '127.0.0.1'
+                self.port = int(port)
+
+            def serve_forever(self) -> int:
+                try:
+                    handler = handlers[signal.SIGTERM]
+                    handler(signal.SIGTERM, None)  # type: ignore[operator]
+                except SystemExit:
+                    inline_shutdown_counts.append(len(shutdown_calls))
+                    raise
+                return 0
+
+            def shutdown(self, *, cleanup_tmux: bool) -> list[str]:
+                shutdown_calls.append(bool(cleanup_tmux))
+                return []
+
+        def fake_signal(signum, handler):  # noqa: ANN001
+            handlers[int(signum)] = handler
+
+        with (
+            patch('tmux_core.bridge.web_backend.WebBackendServer', FakeServer),
+            patch('tmux_core.bridge.web_backend.signal.getsignal', return_value=signal.SIG_DFL),
+            patch('tmux_core.bridge.web_backend.signal.signal', side_effect=fake_signal),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as context:
+                web_backend_main(['--port', '8765'])
+
+        self.assertEqual(context.exception.code, 128 + int(signal.SIGTERM))
+        self.assertEqual(inline_shutdown_counts, [0])
+        self.assertEqual(shutdown_calls, [True])
 
 
 if __name__ == '__main__':

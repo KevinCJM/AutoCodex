@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import atexit
 import fcntl
+import errno
 import hashlib
 import json
 import os
@@ -86,8 +88,11 @@ TURN_START_BUSY_PROBE_TIMEOUT_SEC = 8.0
 DEFAULT_PROXY_HOST = "127.0.0.1"
 TMUX_HISTORY_LIMIT_LINES = 10000
 DEFAULT_CAPTURE_TAIL_LINES = 10000
+PASSIVE_REFRESH_RAW_LOG_DELTA_LIMIT_BYTES = 24000
 RESULT_CONTRACT_PRE_SUBMIT_CAPTURE_TAIL_LINES = 240
 SESSION_NAME_CREATE_MAX_RETRIES = 8
+SESSION_NAME_LEASE_LOCK_TIMEOUT_SEC = 5.0
+SESSION_NAME_LEASE_LOCK_POLL_SEC = 0.05
 TERMINAL_ACTIVITY_IDLE_WINDOW_SEC = 1.5
 TURN_ARTIFACT_POST_DONE_GRACE_SEC = 10.0
 TASK_RESULT_POST_DONE_GRACE_SEC = 10.0
@@ -408,6 +413,7 @@ OPENCODE_READY_PROMPT_PATTERNS = (
 )
 OPENCODE_READY_FOOTER_PATTERNS = (
     r"ctrl\+p commands",
+    r"ctrl\+p(?:\s+\S+){1,4}\s+commands\b",
 )
 OPENCODE_BUSY_PATTERNS = (
     r"\besc(?:\s+again\s+to)?\s+interrupt\b",
@@ -421,6 +427,7 @@ OPENCODE_READY_PROMPT_COMPACT_PATTERNS = (
 )
 OPENCODE_READY_FOOTER_COMPACT_PATTERNS = (
     r"ctrl\+pcommands",
+    r"ctrl\+p[\w./~:@%+,\\-]{1,160}commands\b",
 )
 OPENCODE_BUSY_COMPACT_PATTERNS = (
     r"esc(?:againto)?interrupt",
@@ -665,6 +672,10 @@ RUNTIME_NOISE_PATTERNS = (
 
 _LIVE_WORKERS: "weakref.WeakSet[TmuxBatchWorker]" = weakref.WeakSet()
 _LIVE_WORKERS_LOCK = threading.RLock()
+_RUNTIME_SHUTDOWN_CLEANUP_ALLOWED: ContextVar[bool] = ContextVar(
+    "runtime_shutdown_cleanup_allowed",
+    default=False,
+)
 _RESERVED_SESSION_NAMES: set[str] = set()
 _RESERVED_SESSION_NAMES_LOCK = threading.RLock()
 _SESSION_NAME_LEASE_ROOT = Path(tempfile.gettempdir()) / (
@@ -912,6 +923,16 @@ def list_registered_tmux_workers() -> list["TmuxBatchWorker"]:
         return list(_LIVE_WORKERS)
 
 
+@contextmanager
+def allow_runtime_shutdown_cleanup():
+    """Allow only the current cleanup context to probe/kill after shutdown is requested."""
+    token = _RUNTIME_SHUTDOWN_CLEANUP_ALLOWED.set(True)
+    try:
+        yield
+    finally:
+        _RUNTIME_SHUTDOWN_CLEANUP_ALLOWED.reset(token)
+
+
 def list_tmux_session_names(*, backend: Any | None = None) -> tuple[str, ...]:
     runtime_backend = backend or TmuxBackend()
     return tuple(sorted(_list_backend_session_names(runtime_backend)))
@@ -937,9 +958,14 @@ def _session_name_lease_path(session_name: str) -> Path:
 
 
 @contextmanager
-def _session_name_lease_lock():
+def _session_name_lease_lock(*, timeout_sec: float = SESSION_NAME_LEASE_LOCK_TIMEOUT_SEC):
     global _SESSION_NAME_LEASE_LOCK_DEPTH
-    with _SESSION_NAME_LEASE_PROCESS_LOCK:
+    started_at = time.monotonic()
+    timeout = max(float(timeout_sec), 0.0)
+    process_lock_acquired = _SESSION_NAME_LEASE_PROCESS_LOCK.acquire(timeout=timeout)
+    if not process_lock_acquired:
+        raise TimeoutError(f"等待 tmux session lease 进程锁超时: {timeout:.1f}s")
+    try:
         if _SESSION_NAME_LEASE_LOCK_DEPTH > 0:
             _SESSION_NAME_LEASE_LOCK_DEPTH += 1
             try:
@@ -950,13 +976,26 @@ def _session_name_lease_lock():
         _SESSION_NAME_LEASE_ROOT.mkdir(parents=True, exist_ok=True)
         _SESSION_NAME_LEASE_LOCK_PATH.touch(exist_ok=True)
         with _SESSION_NAME_LEASE_LOCK_PATH.open("r+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            deadline = started_at + timeout
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as error:
+                    if error.errno not in {errno.EACCES, errno.EAGAIN}:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(f"等待 tmux session lease 文件锁超时: {timeout:.1f}s") from error
+                    time.sleep(min(SESSION_NAME_LEASE_LOCK_POLL_SEC, remaining))
             _SESSION_NAME_LEASE_LOCK_DEPTH = 1
             try:
                 yield
             finally:
                 _SESSION_NAME_LEASE_LOCK_DEPTH = 0
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        _SESSION_NAME_LEASE_PROCESS_LOCK.release()
 
 
 def _read_session_name_lease(path: Path) -> dict[str, object] | None:
@@ -1014,9 +1053,11 @@ def _release_session_name_lease_locked(session_name: str) -> None:
         return
     payload = _read_session_name_lease(lease_path)
     if payload is not None and str(payload.get("session_name", "")).strip() != session_name_text:
-        return
-    with contextlib.suppress(Exception):
+        raise RuntimeError(f"tmux session lease identity mismatch: {session_name_text}")
+    try:
         lease_path.unlink()
+    except FileNotFoundError:
+        return
 
 
 def list_occupied_tmux_session_names(
@@ -1037,17 +1078,21 @@ def list_occupied_tmux_session_names(
 
 def cleanup_registered_tmux_workers(*, reason: str = "process_exit") -> list[str]:
     cleaned_sessions: list[str] = []
-    for worker in list_registered_tmux_workers():
-        try:
-            if not worker.session_exists():
+    with allow_runtime_shutdown_cleanup():
+        for worker in list_registered_tmux_workers():
+            try:
+                if not worker.session_exists():
+                    continue
+                session_name = worker.request_kill()
+                if session_name:
+                    cleaned_sessions.append(session_name)
+                    worker._log_event("process_cleanup_kill", reason=reason, session_name=session_name)
+            except Exception:
                 continue
-            session_name = worker.request_kill()
-            if session_name:
-                cleaned_sessions.append(session_name)
-                worker._log_event("process_cleanup_kill", reason=reason, session_name=session_name)
-        except Exception:
-            continue
     return sorted(set(cleaned_sessions))
+
+
+atexit.register(cleanup_registered_tmux_workers, reason="process_exit")
 
 
 @dataclass(frozen=True)
@@ -1511,18 +1556,22 @@ class TmuxBackend:
             *,
             last_offset: int = 0,
             tail_bytes: int = 24000,
+            delta_bytes_limit: int | None = None,
     ) -> tuple[str, str, int, float]:
         path = Path(raw_log_path)
         if not path.exists():
             return "", "", 0, 0.0
         size = path.stat().st_size
         start = min(max(last_offset, 0), size)
+        delta_start = start
+        if delta_bytes_limit is not None:
+            delta_start = max(start, size - max(int(delta_bytes_limit), 0))
         with path.open("rb") as file:
-            file.seek(start)
-            delta_bytes = file.read()
+            file.seek(delta_start)
+            delta_bytes = file.read(max(size - delta_start, 0))
             tail_start = max(size - tail_bytes, 0)
             file.seek(tail_start)
-            tail_data = file.read()
+            tail_data = file.read(max(size - tail_start, 0))
         mtime = path.stat().st_mtime
         return (
             delta_bytes.decode("utf-8", errors="replace"),
@@ -1597,6 +1646,7 @@ class HealthSupervisor:
         self._terminal_snapshot_count = 0
         self._stopped = False
         self._stop_event = threading.Event()
+        self._refresh_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name=thread_name, daemon=True)
 
     def start(self) -> None:
@@ -1604,8 +1654,13 @@ class HealthSupervisor:
 
     def stop(self) -> None:
         self._stop_event.set()
+        self._refresh_event.set()
         self._thread.join(timeout=2.0)
         self._stopped = True
+
+    def request_refresh(self) -> None:
+        if not self._stop_event.is_set():
+            self._refresh_event.set()
 
     def is_alive(self) -> bool:
         return self._thread.is_alive() and not self._stop_event.is_set()
@@ -1637,7 +1692,11 @@ class HealthSupervisor:
         return False
 
     def _run(self) -> None:
-        while not self._stop_event.wait(self._next_interval_sec):
+        while not self._stop_event.is_set():
+            self._refresh_event.wait(self._next_interval_sec)
+            self._refresh_event.clear()
+            if self._stop_event.is_set():
+                break
             try:
                 should_stop = self._update_next_interval(self.refresh_callback())
             except Exception:
@@ -1856,7 +1915,7 @@ def runtime_shutdown_requested() -> bool:
 
 
 def raise_if_runtime_shutdown_requested(context: str = "") -> None:
-    if not runtime_shutdown_requested():
+    if _RUNTIME_SHUTDOWN_CLEANUP_ALLOWED.get() or not runtime_shutdown_requested():
         return
     with _RUNTIME_SHUTDOWN_REASON_LOCK:
         reason_text = _RUNTIME_SHUTDOWN_REASON
@@ -2153,6 +2212,7 @@ def load_worker_from_state_path(
         state_path: str | Path,
         *,
         backend: TmuxBackend | None = None,
+        passive_health: bool = False,
 ) -> "TmuxBatchWorker" | None:
     path = Path(state_path).expanduser().resolve()
     if not path.exists() or not path.is_file():
@@ -2178,7 +2238,7 @@ def load_worker_from_state_path(
         or "worker"
     )
     try:
-        return TmuxBatchWorker(
+        worker = TmuxBatchWorker(
             worker_id=worker_id,
             work_dir=work_dir,
             config=AgentRunConfig(
@@ -2193,6 +2253,15 @@ def load_worker_from_state_path(
             existing_pane_id=str(payload.get("pane_id", "")).strip(),
             backend=backend,
         )
+        if passive_health:
+            # A worker reconstructed for passive inspection may inherit an
+            # offset that is many megabytes behind a still-growing
+            # OpenCode-like log. Keep that catch-up read bounded; workers
+            # reconstructed for turn recovery retain the complete delta.
+            worker._passive_health_raw_log_delta_limit_bytes = (  # noqa: SLF001
+                PASSIVE_REFRESH_RAW_LOG_DELTA_LIMIT_BYTES
+            )
+        return worker
     except Exception:
         return None
 
@@ -2528,11 +2597,20 @@ def _reserve_session_name(
         vendor: Vendor,
         instance_id: str = "",
         backend: Any | None = None,
+        excluded_session_names: Sequence[str] = (),
 ) -> str:
     del instance_id
+    del backend
     with _session_name_lease_lock():
-        occupied = _list_backend_session_names(backend)
-        occupied.update(_active_session_name_leases_locked())
+        # Keep this cross-process critical section local-only. Querying tmux can
+        # consume the full control recovery budget; actual tmux conflicts are
+        # detected and renamed by ``create_session`` after the lease is held.
+        occupied = _active_session_name_leases_locked()
+        occupied.update(
+            str(session_name).strip()
+            for session_name in excluded_session_names
+            if str(session_name).strip()
+        )
         for worker in list_registered_tmux_workers():
             session_name = str(getattr(worker, "session_name", "") or "").strip()
             if session_name:
@@ -3751,6 +3829,7 @@ class TmuxBatchWorker:
     ) -> None:
         reserved_session_name = ""
         self._session_name_reserved = False
+        self._deferred_session_name_reservations: set[str] = set()
         self.worker_id = str(worker_id or "").strip() or "worker"
         self.runtime_worker_id = _slugify(self.worker_id, max_len=48)
         self.work_dir = Path(work_dir).expanduser().resolve()
@@ -3795,6 +3874,7 @@ class TmuxBatchWorker:
         self.recoverable = True
         self.last_reply = ""
         self.last_log_offset = 0
+        self._passive_health_raw_log_delta_limit_bytes: int | None = None
         self.last_pane_title = ""
         self.current_command = ""
         self.current_path = ""
@@ -3906,10 +3986,15 @@ class TmuxBatchWorker:
         if callable(add_control_listener):
             add_control_listener(self._persist_tmux_control_state)
         _register_live_worker(self)
+        if not self.state_path.exists():
+            self._write_worker_prepared_state_fast()
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):
-            self._release_session_name_reservation()
+            self._release_session_name_reservation_best_effort(
+                context="worker_destructor",
+                original_error="worker finalized",
+            )
 
     def _tmux(self, *args: str, input_text: str | None = None, timeout_sec: float = 10.0) -> \
     subprocess.CompletedProcess[str]:
@@ -4161,9 +4246,19 @@ class TmuxBatchWorker:
     def _pane_belongs_to_expected_session(self) -> bool:
         if not self.pane_id or not self.session_name:
             return False
-        actual_session_name = str(
-            self.backend.display_message(self.pane_id, "#{session_name}") or ""
-        ).strip()
+        try:
+            actual_session_name = str(
+                self.backend.display_message(self.pane_id, "#{session_name}") or ""
+            ).strip()
+        except TmuxControlUnavailable:
+            raise
+        except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError) as error:
+            raise TmuxControlUnavailable(
+                operation="display-message",
+                error=error,
+                elapsed_sec=float(getattr(error, "timeout", 0.0) or 0.0),
+                attempts=1,
+            ) from error
         return actual_session_name == self.session_name
 
     def _pane_matches_worker_identity(self) -> bool:
@@ -4357,15 +4452,58 @@ class TmuxBatchWorker:
         supervisor.stop()
 
     def _release_session_name_reservation(self) -> None:
-        if not self._session_name_reserved:
-            return
-        _release_reserved_session_name(self.session_name)
-        self._session_name_reserved = False
+        reservation_names = set(self._deferred_session_name_reservations)
+        if self._session_name_reserved and self.session_name:
+            reservation_names.add(self.session_name)
+        first_error: Exception | None = None
+        for session_name in sorted(reservation_names):
+            try:
+                _release_reserved_session_name(session_name)
+            except Exception as error:  # noqa: BLE001
+                self._deferred_session_name_reservations.add(session_name)
+                if first_error is None:
+                    first_error = error
+            else:
+                self._deferred_session_name_reservations.discard(session_name)
+                if session_name == self.session_name:
+                    self._session_name_reserved = False
+        if first_error is not None:
+            raise first_error
+
+    def _release_session_name_reservation_best_effort(
+            self,
+            *,
+            context: str,
+            original_error: BaseException | str,
+    ) -> bool:
+        """Release after a failure without replacing the primary exception."""
+        reservation_names = set(self._deferred_session_name_reservations)
+        if self._session_name_reserved and self.session_name:
+            reservation_names.add(self.session_name)
+        try:
+            self._release_session_name_reservation()
+        except Exception as release_error:  # noqa: BLE001
+            # A mocked or early-failing release may not have recorded the names
+            # itself. Retain every name from this attempt so a later successful
+            # create cleanup or the worker destructor can reclaim it.
+            self._deferred_session_name_reservations.update(reservation_names)
+            with contextlib.suppress(Exception):
+                self._log_event(
+                    "session_name_reservation_release_failed",
+                    context=str(context or "exception_cleanup"),
+                    original_error_type=type(original_error).__name__,
+                    original_error=str(original_error),
+                    release_error_type=type(release_error).__name__,
+                    release_error=str(release_error),
+                    deferred_session_names=sorted(self._deferred_session_name_reservations),
+                )
+            return False
+        return True
 
     def _abort_session_create_if_runtime_shutdown_requested(self, context: str) -> None:
         try:
             raise_if_runtime_shutdown_requested(context)
-        except RuntimeShutdownRequested:
+        except RuntimeShutdownRequested as error:
             with contextlib.suppress(Exception):
                 self._stop_health_supervisor()
             if self.session_name:
@@ -4376,7 +4514,10 @@ class TmuxBatchWorker:
             self.agent_started = False
             self.wrapper_state = WrapperState.NOT_READY
             self.agent_state = AgentRuntimeState.DEAD
-            self._release_session_name_reservation()
+            self._release_session_name_reservation_best_effort(
+                context="runtime_shutdown",
+                original_error=error,
+            )
             raise
 
     def mark_awaiting_reconfiguration(
@@ -4430,15 +4571,25 @@ class TmuxBatchWorker:
         message = _exception_message(error).lower()
         return any(marker in message for marker in _DUPLICATE_SESSION_ERROR_MARKERS)
 
-    def _reserve_conflict_retry_session_name(self, *, retry_count: int, conflict_source: str) -> None:
+    def _reserve_conflict_retry_session_name(
+            self,
+            *,
+            retry_count: int,
+            conflict_source: str,
+            excluded_session_names: Sequence[str] = (),
+    ) -> None:
         old_session_name = self.session_name
-        self._release_session_name_reservation()
+        self._release_session_name_reservation_best_effort(
+            context="session_name_conflict_retry",
+            original_error=f"tmux session name conflict ({conflict_source})",
+        )
         new_session_name = _reserve_session_name(
             worker_id=self.worker_id,
             work_dir=self.work_dir,
             vendor=self.config.vendor,
             instance_id=self.instance_id,
             backend=self.backend,
+            excluded_session_names=excluded_session_names,
         )
         self.session_name = new_session_name
         self._session_name_reserved = True
@@ -4473,23 +4624,39 @@ class TmuxBatchWorker:
         self.current_task_runtime_status = ""
         self._stop_health_supervisor()
         retry_count = 0
+        conflicted_session_names: set[str] = set()
         max_retries = SESSION_NAME_CREATE_MAX_RETRIES
         while True:
             raise_if_runtime_shutdown_requested("creating tmux session")
-            raw_has_session = getattr(self.backend, "has_session", None)
-            session_name_in_use = (
-                bool(raw_has_session(self.session_name))
-                if callable(raw_has_session)
-                else self.session_exists()
-            )
+            try:
+                raw_has_session = getattr(self.backend, "has_session", None)
+                session_name_in_use = (
+                    bool(raw_has_session(self.session_name))
+                    if callable(raw_has_session)
+                    else self.session_exists()
+                )
+            except Exception as error:
+                # The reservation already exists before the first tmux probe.
+                # Probe failures must reclaim it just like create failures, but
+                # cleanup is best-effort so the transport error remains primary.
+                self._release_session_name_reservation_best_effort(
+                    context="session_precheck_failed",
+                    original_error=error,
+                )
+                raise
             if session_name_in_use:
+                conflicted_session_names.add(self.session_name)
                 if retry_count >= max_retries:
-                    self._release_session_name_reservation()
+                    self._release_session_name_reservation_best_effort(
+                        context="precheck_conflict_exhausted",
+                        original_error="tmux session name conflict",
+                    )
                     self._raise_session_name_conflict(retries=retry_count, conflict_source="pre-check")
                 retry_count += 1
                 self._reserve_conflict_retry_session_name(
                     retry_count=retry_count,
                     conflict_source="pre-check",
+                    excluded_session_names=tuple(conflicted_session_names),
                 )
                 continue
             try:
@@ -4509,13 +4676,23 @@ class TmuxBatchWorker:
                 break
             except Exception as error:
                 if isinstance(error, TmuxMutationOutcomeUnknown):
-                    self._release_session_name_reservation()
+                    self._release_session_name_reservation_best_effort(
+                        context="session_create_mutation_unknown",
+                        original_error=error,
+                    )
                     raise
                 if not self._is_session_name_conflict_error(error):
-                    self._release_session_name_reservation()
+                    self._release_session_name_reservation_best_effort(
+                        context="session_create_failed",
+                        original_error=error,
+                    )
                     raise
+                conflicted_session_names.add(self.session_name)
                 if retry_count >= max_retries:
-                    self._release_session_name_reservation()
+                    self._release_session_name_reservation_best_effort(
+                        context="create_conflict_exhausted",
+                        original_error=error,
+                    )
                     self._raise_session_name_conflict(
                         retries=retry_count,
                         conflict_source="create-failure",
@@ -4525,8 +4702,14 @@ class TmuxBatchWorker:
                 self._reserve_conflict_retry_session_name(
                     retry_count=retry_count,
                     conflict_source="create-failure",
+                    excluded_session_names=tuple(conflicted_session_names),
                 )
-        self._release_session_name_reservation()
+        # The tmux mutation has already succeeded. A contended local lease file
+        # must not turn that success into a launch failure that callers may retry.
+        self._release_session_name_reservation_best_effort(
+            context="session_create_succeeded",
+            original_error="tmux session already created",
+        )
         self._tmux("set-option", "-t", self.session_name, "history-limit", str(TMUX_HISTORY_LIMIT_LINES))
         self._tmux("set-option", "-t", self.session_name, "allow-rename", "off")
         self._tmux("set-window-option", "-t", f"{self.session_name}:0", "automatic-rename", "off")
@@ -4549,21 +4732,46 @@ class TmuxBatchWorker:
         self.backend.pipe_log(self.pane_id, self.raw_log_path)
         self._log_event("pipe_log_started", raw_log_path=str(self.raw_log_path))
 
-    def tail_raw_log(self, *, tail_bytes: int = 24000) -> tuple[str, str, int, float]:
-        delta, tail, next_offset, log_mtime = self.backend.tail_raw_log(
-            self.raw_log_path,
-            last_offset=self.last_log_offset,
-            tail_bytes=tail_bytes,
-        )
+    def tail_raw_log(
+            self,
+            *,
+            tail_bytes: int = 24000,
+            delta_bytes_limit: int | None = None,
+    ) -> tuple[str, str, int, float]:
+        if delta_bytes_limit is None:
+            delta, tail, next_offset, log_mtime = self.backend.tail_raw_log(
+                self.raw_log_path,
+                last_offset=self.last_log_offset,
+                tail_bytes=tail_bytes,
+            )
+        else:
+            delta, tail, next_offset, log_mtime = self.backend.tail_raw_log(
+                self.raw_log_path,
+                last_offset=self.last_log_offset,
+                tail_bytes=tail_bytes,
+                delta_bytes_limit=delta_bytes_limit,
+            )
         self.last_log_offset = next_offset
         return delta, tail, next_offset, log_mtime
 
-    def observe(self, *, tail_lines: int = DEFAULT_CAPTURE_TAIL_LINES, tail_bytes: int = 24000) -> WorkerObservation:
+    def observe(
+            self,
+            *,
+            tail_lines: int = DEFAULT_CAPTURE_TAIL_LINES,
+            tail_bytes: int = 24000,
+            raw_log_delta_limit_bytes: int | None = None,
+    ) -> WorkerObservation:
         observed_at = _now_iso()
         session_exists, visible_text, current_command, current_path, pane_title, pane_dead = self._capture_pane_snapshot(
             tail_lines=tail_lines
         )
-        raw_log_delta, raw_log_tail, _, log_mtime = self.tail_raw_log(tail_bytes=tail_bytes)
+        if raw_log_delta_limit_bytes is None:
+            raw_log_delta, raw_log_tail, _, log_mtime = self.tail_raw_log(tail_bytes=tail_bytes)
+        else:
+            raw_log_delta, raw_log_tail, _, log_mtime = self.tail_raw_log(
+                tail_bytes=tail_bytes,
+                delta_bytes_limit=raw_log_delta_limit_bytes,
+            )
         self.last_pane_title = pane_title or self.last_pane_title
         self.current_command = current_command or self.current_command
         self.current_path = current_path or self.current_path
@@ -4593,6 +4801,68 @@ class TmuxBatchWorker:
             raw_log_tail=observation.raw_log_tail,
         )
         return observation
+
+    def _write_worker_prepared_state_fast(self) -> None:
+        """Publish a prelaunch worker without probing tmux or calling overridable hooks."""
+        observed_at = _now_iso()
+        payload: dict[str, object] = {
+            "worker_id": self.worker_id,
+            "runtime_worker_id": self.runtime_worker_id,
+            "session_name": self.session_name,
+            "pane_id": self.pane_id,
+            "runtime_dir": str(self.runtime_dir),
+            "work_dir": str(self.work_dir),
+            "status": WorkerStatus.RUNNING.value,
+            "note": "worker_prepared",
+            "updated_at": observed_at,
+            "config": self.config.to_summary(),
+            "log_path": str(self.log_path),
+            "raw_log_path": str(self.raw_log_path),
+            "transcript_path": str(self.transcript_path),
+            "agent_ready": False,
+            "agent_started": False,
+            "agent_alive": False,
+            "agent_state": AgentRuntimeState.STARTING.value,
+            "last_reply": "",
+            "state_revision": 1,
+            "last_writer": "TmuxBatchWorker.prelaunch",
+            "workflow_stage": "pending",
+            "workflow_round": 0,
+            "health_status": "unknown",
+            "health_note": "session_reserved",
+            "retry_count": 0,
+            "last_log_offset": 0,
+            "auto_recovery_mode": "standard",
+            "recoverable": self.recoverable,
+            "result_status": "pending",
+            "pane_title": "",
+            "current_command": "",
+            "current_path": str(self.work_dir),
+            "last_turn_token": "",
+            "last_prompt_hash": "",
+            "last_heartbeat_at": observed_at,
+            "current_turn_id": "",
+            "current_turn_phase": "",
+            "current_turn_status_path": "",
+            "current_task_status_path": "",
+            "current_task_result_path": "",
+            "current_task_runtime_status": "",
+            "dispatch_state": "",
+            "dispatch_reason": "",
+            "turn_state": TurnState.IDLE.value,
+            "stage_runner_id": self.stage_runner_id,
+            "orphaned_at": "",
+            "orphaned_reason": "",
+            "startup_blocker_kind": "",
+            "startup_blocker_requires_manual": False,
+            "last_terminal_signature": "",
+            "last_terminal_changed_at": "",
+            "terminal_recently_changed": False,
+        }
+        payload.update(self._runtime_metadata)
+        payload.update(self._tmux_control_state_payload())
+        _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
 
     def _write_session_created_state_fast(self) -> None:
         observed_at = _now_iso()
@@ -4740,16 +5010,23 @@ class TmuxBatchWorker:
                     current_task_runtime_status = TASK_STATUS_DONE
                 self.current_task_runtime_status = current_task_runtime_status
             if completed_success:
-                agent_state = AgentRuntimeState.READY.value
-                self.agent_state = AgentRuntimeState.READY
-                self.agent_ready = True
-                self.agent_started = True
-                extra_payload["agent_ready"] = True
-                extra_payload["agent_started"] = True
-                extra_payload["agent_state"] = AgentRuntimeState.READY.value
+                # A validated result completes the turn contract, not the terminal.
+                # Some agents keep rendering/outputting briefly after writing their
+                # result file, so preserve the freshly observed pane state here.
+                with contextlib.suppress(ValueError):
+                    self.agent_state = AgentRuntimeState(agent_state)
+                self.agent_ready = agent_state == AgentRuntimeState.READY.value
+                if agent_state in {
+                    AgentRuntimeState.STARTING.value,
+                    AgentRuntimeState.READY.value,
+                    AgentRuntimeState.BUSY.value,
+                }:
+                    self.agent_started = True
+                extra_payload["agent_ready"] = self.agent_ready
+                extra_payload["agent_started"] = self.agent_started
+                extra_payload["agent_state"] = agent_state
                 extra_payload["current_task_runtime_status"] = current_task_runtime_status
-                if completed_success:
-                    extra_payload.setdefault("result_status", result_status)
+                extra_payload.setdefault("result_status", result_status)
             payload: dict[str, object] = {
                 "worker_id": self.worker_id,
                 "runtime_worker_id": self.runtime_worker_id,
@@ -4854,9 +5131,18 @@ class TmuxBatchWorker:
             _atomic_write_json(self.state_path, payload)
         self._log_event("state_changed", status=status.value, note=note)
         _notify_runtime_state_changed_best_effort()
+        if completed_success and self.health_supervisor is not None:
+            self.health_supervisor.request_refresh()
 
     def _capture_passive_observation(self, *, tail_lines: int = 120) -> WorkerObservation:
         if _is_opencode_like_vendor(self.config.vendor) and self.agent_state == AgentRuntimeState.BUSY:
+            delta_limit = self._passive_health_raw_log_delta_limit_bytes
+            if delta_limit is not None:
+                return self.observe(
+                    tail_lines=tail_lines,
+                    tail_bytes=delta_limit,
+                    raw_log_delta_limit_bytes=delta_limit,
+                )
             return self.observe(tail_lines=tail_lines, tail_bytes=12000)
         observation = self._capture_lightweight_observation()
         if self._should_capture_visible_for_passive_health(observation):
@@ -4950,8 +5236,6 @@ class TmuxBatchWorker:
             agent_state = AgentRuntimeState.BUSY
         else:
             agent_state = observed_agent_state
-        if self.current_task_runtime_status == TASK_STATUS_DONE and agent_state != AgentRuntimeState.DEAD:
-            agent_state = AgentRuntimeState.READY
         self.agent_state = agent_state
         if agent_state in {AgentRuntimeState.READY, AgentRuntimeState.BUSY}:
             self.agent_started = True
@@ -4979,28 +5263,6 @@ class TmuxBatchWorker:
         with self.state_lock:
             previous = self.read_state()
             previous_completed = _worker_state_payload_has_completed_status(previous)
-            if previous_completed and snapshot.agent_state in {
-                AgentRuntimeState.BUSY.value,
-                AgentRuntimeState.STARTING.value,
-            }:
-                self.agent_state = AgentRuntimeState.READY
-                self.agent_ready = True
-                self.agent_started = True
-                if str(previous.get("current_task_runtime_status", "") or "").strip().lower() == TASK_STATUS_DONE:
-                    self.current_task_runtime_status = TASK_STATUS_DONE
-                snapshot = WorkerHealthSnapshot(
-                    session_exists=snapshot.session_exists,
-                    health_status=snapshot.health_status,
-                    health_note=snapshot.health_note,
-                    last_heartbeat_at=snapshot.last_heartbeat_at,
-                    last_log_offset=snapshot.last_log_offset,
-                    current_command=snapshot.current_command,
-                    current_path=snapshot.current_path,
-                    pane_id=snapshot.pane_id,
-                    session_name=snapshot.session_name,
-                    agent_state=AgentRuntimeState.READY.value,
-                    pane_title=snapshot.pane_title,
-                )
             clear_stale_runtime_markers = (
                 snapshot.agent_state == AgentRuntimeState.READY.value
                 and not previous_completed
@@ -5030,12 +5292,18 @@ class TmuxBatchWorker:
                 or str(previous.get("current_path", "")) != snapshot.current_path
                 or str(previous.get("pane_title", "")) != snapshot.pane_title
             )
+            log_offset_changed = int(previous.get("last_log_offset", 0) or 0) != snapshot.last_log_offset
             normalize_completed_runtime_markers = previous_completed and (
-                str(previous.get("agent_state", "")).strip().upper() != AgentRuntimeState.READY.value
-                or str(previous.get("dispatch_state", "")).strip() == "submitted"
+                str(previous.get("dispatch_state", "")).strip() == "submitted"
                 or str(previous.get("current_task_runtime_status", "") or "").strip().lower() in {"", TASK_STATUS_RUNNING}
             )
-            if health_changed or clear_stale_runtime_markers or clear_stale_reconfig_markers or normalize_completed_runtime_markers:
+            if (
+                    health_changed
+                    or log_offset_changed
+                    or clear_stale_runtime_markers
+                    or clear_stale_reconfig_markers
+                    or normalize_completed_runtime_markers
+            ):
                 payload = dict(previous)
                 payload.update(self.runtime_metadata())
                 payload.update(
@@ -5052,6 +5320,7 @@ class TmuxBatchWorker:
                         "current_path": snapshot.current_path,
                         "updated_at": snapshot.last_heartbeat_at or _now_iso(),
                         "last_heartbeat_at": snapshot.last_heartbeat_at,
+                        "last_log_offset": snapshot.last_log_offset,
                     }
                 )
                 if clear_stale_runtime_markers or clear_stale_reconfig_markers:
@@ -5069,13 +5338,12 @@ class TmuxBatchWorker:
                         and snapshot.agent_state != AgentRuntimeState.DEAD.value
                         and snapshot.health_status not in {"missing_session", "pane_dead"}
                 ):
-                    payload["agent_ready"] = True
                     payload["agent_started"] = True
-                    payload["agent_state"] = AgentRuntimeState.READY.value
                     payload["dispatch_state"] = ""
                     payload["dispatch_reason"] = ""
                     if str(payload.get("current_task_runtime_status", "") or "").strip().lower() in {"", TASK_STATUS_RUNNING}:
                         payload["current_task_runtime_status"] = TASK_STATUS_DONE
+                payload["state_revision"] = int(previous.get("state_revision", 0) or 0) + 1
                 _atomic_write_json(self.state_path, payload)
         if health_changed and notify_on_change:
             _notify_runtime_state_changed_best_effort()
@@ -7790,6 +8058,19 @@ class TmuxBatchWorker:
                     startup_blocker_requires_manual=True,
                 )
                 break
+            except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown) as error:
+                last_error = error
+                self.agent_ready = False
+                self.wrapper_state = WrapperState.NOT_READY
+                if self.agent_state == AgentRuntimeState.DEAD:
+                    self.agent_state = AgentRuntimeState.STARTING
+                self._log_event(
+                    "launch_transport_failure",
+                    attempt=attempt,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
+                break
             except Exception as error:
                 last_error = error
                 self.launch_coordinator.record_launch_result(self.config.vendor, success=False)
@@ -8698,9 +8979,6 @@ class TmuxBatchWorker:
                     )
                 finished_at = _now_iso()
                 self.current_task_runtime_status = read_task_status(task_status_path)
-                self.agent_ready = True
-                self.agent_started = True
-                self.agent_state = AgentRuntimeState.READY
                 self.dispatch_state = ""
                 self.dispatch_reason = ""
                 self.wrapper_state = (
@@ -8979,6 +9257,68 @@ class TmuxBatchWorker:
                 return result
             except RuntimeShutdownRequested:
                 self.current_task_runtime_status = read_task_status(task_status_path)
+                raise
+            except AgentStartupInterventionRequired as error:
+                self.current_task_runtime_status = read_task_status(task_status_path)
+                previous = self.read_state()
+                self._log_event(
+                    "turn_startup_intervention_required",
+                    label=label,
+                    blocker_kind=error.blocker_kind,
+                    session_name=error.session_name or self.session_name,
+                    error=str(error),
+                )
+                self._write_state(
+                    WorkerStatus.RUNNING,
+                    note=f"startup_intervention:{label}",
+                    extra={
+                        "label": label,
+                        "result_status": "running",
+                        "current_task_status_path": str(task_status_path),
+                        "current_task_result_path": self.current_task_result_path,
+                        "current_task_runtime_status": self.current_task_runtime_status,
+                        "turn_state": TurnState.PREPARING.value,
+                        "agent_alive": bool(previous.get("agent_alive", True)),
+                        "agent_ready": False,
+                        "agent_state": AgentRuntimeState.STARTING.value,
+                        "startup_blocker_kind": error.blocker_kind,
+                        "startup_blocker_requires_manual": True,
+                    },
+                )
+                raise
+            except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown) as error:
+                finished_at = _now_iso()
+                current_visible = self._safe_turn_failure_diagnostic(error, tail_lines=200)
+                clean_output = "\n".join(
+                    part for part in [str(error).strip(), current_visible.strip()] if part
+                ).strip()
+                self.current_task_runtime_status = read_task_status(task_status_path)
+                error_extra = {
+                    "label": label,
+                    "result_status": "failed",
+                    "retry_count": attempt - 1,
+                    "current_task_status_path": str(task_status_path),
+                    "current_task_result_path": self.current_task_result_path,
+                    "current_task_runtime_status": self.current_task_runtime_status,
+                    "dispatch_state": self.dispatch_state,
+                    "dispatch_reason": self.dispatch_reason,
+                    "turn_state": TurnState.FAILED.value,
+                }
+                error_extra.update(self._turn_failure_runtime_state_extra(clean_output, error=error))
+                self._record_result(
+                    CommandResult(
+                        label=label,
+                        command=submitted_prompt,
+                        exit_code=GENERIC_ERROR_EXIT_CODE,
+                        raw_output=clean_output,
+                        clean_output=clean_output,
+                        started_at=started_at,
+                        finished_at=finished_at,
+                    ),
+                    status=WorkerStatus.FAILED,
+                    note=f"error:{label}",
+                    extra=error_extra,
+                )
                 raise
             except Exception as error:
                 finished_at = _now_iso()

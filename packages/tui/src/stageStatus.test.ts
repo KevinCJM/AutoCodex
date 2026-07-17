@@ -1,10 +1,14 @@
 import { expect, test } from 'bun:test'
 import {
   applyStageChanged,
+  bindProgressEntry,
   EMPTY_STAGE_CURSOR,
   inferBootstrapStatus,
   isNewRunnerGeneration,
   markTerminalStage,
+  progressEntryMatchesCursor,
+  resolveStageMessage,
+  shouldResetProgressForStageChange,
   shouldAcceptProgressEvent,
 } from './stageStatus'
 
@@ -179,4 +183,94 @@ test('explicit restart is confirmed only after a newer runner generation is obse
   }).cursor
   expect(isNewRunnerGeneration(previous, next)).toBe(true)
   expect(isNewRunnerGeneration(previous, { ...previous, activeStageSeq: 8 })).toBe(false)
+})
+
+test('running stage transition clears progress when action or sequence advances under the same root runner', () => {
+  const routing = applyStageChanged(EMPTY_STAGE_CURSOR, {
+    action: 'stage.a01.start', status: 'running', source: 'runner_start', runner_id: 'root', stage_seq: 3,
+  }).cursor
+  const design = applyStageChanged(routing, {
+    action: 'stage.a05.start', status: 'running', source: 'runner_start', runner_id: 'root', stage_seq: 7,
+  }).cursor
+
+  expect(shouldResetProgressForStageChange(routing, design, 'running')).toBe(true)
+  expect(shouldResetProgressForStageChange(design, design, 'running')).toBe(false)
+  expect(shouldResetProgressForStageChange(design, design, 'completed')).toBe(true)
+})
+
+test('progress entries are bound to the active cursor and reject late events from the previous runner', () => {
+  const routing = applyStageChanged(EMPTY_STAGE_CURSOR, {
+    action: 'stage.a01.start', status: 'running', source: 'runner_start', runner_id: 'runner-old', stage_seq: 4,
+  }).cursor
+  const routingProgress = bindProgressEntry(routing, {
+    action: 'stage.a01.start', runner_id: 'runner-old', stage_seq: 4,
+  }, '路由初始化 / 生成中')
+  const design = applyStageChanged(routing, {
+    action: 'stage.a05.start', status: 'running', source: 'runner_start', runner_id: 'runner-new', stage_seq: 5,
+  }).cursor
+
+  expect(routingProgress).not.toBeNull()
+  expect(progressEntryMatchesCursor(routing, routingProgress!)).toBe(true)
+  expect(progressEntryMatchesCursor(design, routingProgress!)).toBe(false)
+  expect(shouldAcceptProgressEvent(design, {
+    action: 'stage.a01.start', runner_id: 'runner-old', stage_seq: 4,
+  })).toBe(false)
+})
+
+test('progress without runner id binds to the authoritative cursor but unscoped late payloads are rejected', () => {
+  const running = applyStageChanged(EMPTY_STAGE_CURSOR, {
+    action: 'stage.a05.start', status: 'running', source: 'runner_start', runner_id: 'runner-1', stage_seq: 8,
+  }).cursor
+  const entry = bindProgressEntry(running, {
+    action: 'stage.a05.start', stage_seq: 8,
+  }, '详细设计 / 生成中')
+  const lateUnscopedEntry = bindProgressEntry(running, {}, '路由初始化 / 生成中')
+  const visibleProgress = new Map([['current', entry]])
+  if (shouldAcceptProgressEvent(running, {})) visibleProgress.delete('current')
+
+  expect(entry).toMatchObject({
+    action: 'stage.a05.start',
+    runnerId: 'runner-1',
+    stageSeq: 8,
+  })
+  expect(progressEntryMatchesCursor(running, entry!)).toBe(true)
+  expect(lateUnscopedEntry).toBeNull()
+  expect(shouldAcceptProgressEvent(running, {})).toBe(false)
+  expect(visibleProgress.get('current')).toBe(entry)
+  expect(progressEntryMatchesCursor(running, entry!)).toBe(true)
+})
+
+test('authoritative stage messages update within a generation and clear when the cursor advances', () => {
+  const routing = applyStageChanged(EMPTY_STAGE_CURSOR, {
+    action: 'stage.a01.start', status: 'running', source: 'runner_start', runner_id: 'root', stage_seq: 2,
+  }).cursor
+  let message = resolveStageMessage(EMPTY_STAGE_CURSOR, routing, '', '解析参数')
+  expect(message).toBe('解析参数')
+
+  message = resolveStageMessage(routing, routing, message, '准备智能体')
+  expect(message).toBe('准备智能体')
+  expect(resolveStageMessage(routing, routing, message, undefined)).toBe('准备智能体')
+  message = resolveStageMessage(routing, routing, message, '等待 tmux')
+  expect(message).toBe('等待 tmux')
+
+  const design = applyStageChanged(routing, {
+    action: 'stage.a05.start', status: 'running', source: 'runner_start', runner_id: 'root', stage_seq: 3,
+  }).cursor
+  expect(resolveStageMessage(routing, design, message, undefined)).toBe('')
+})
+
+test('a rejected old snapshot cannot push its stage message over the active generation', () => {
+  const current = applyStageChanged(EMPTY_STAGE_CURSOR, {
+    action: 'stage.a05.start', status: 'running', source: 'runner_start', runner_id: 'runner-new', stage_seq: 9,
+  }).cursor
+  const stale = applyStageChanged(current, {
+    action: 'stage.a01.start', status: 'running', source: 'runner_start', runner_id: 'runner-old', stage_seq: 2,
+  })
+  let message = '等待 tmux'
+  if (stale.accepted) {
+    message = resolveStageMessage(current, stale.cursor, message, '旧路由消息')
+  }
+
+  expect(stale.accepted).toBe(false)
+  expect(message).toBe('等待 tmux')
 })

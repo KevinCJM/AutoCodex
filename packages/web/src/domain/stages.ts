@@ -20,16 +20,16 @@ export const STAGE_LABELS: Record<StageRoute, string> = {
   'overall-review': '复核',
 }
 
-export const STAGE_META_BY_ACTION: Record<string, { route: StageRoute; label: string }> = {
-  'control.b01.open': { route: 'routing', label: '路由初始化' },
-  'stage.a01.start': { route: 'routing', label: '路由初始化' },
-  'stage.a02.start': { route: 'requirements', label: '需求录入' },
-  'stage.a03.start': { route: 'requirements', label: '需求澄清' },
-  'stage.a04.start': { route: 'review', label: '需求评审' },
-  'stage.a05.start': { route: 'design', label: '详细设计' },
-  'stage.a06.start': { route: 'task-split', label: '任务拆分' },
-  'stage.a07.start': { route: 'development', label: '任务开发' },
-  'stage.a08.start': { route: 'overall-review', label: '复核' },
+export const STAGE_META_BY_ACTION: Record<string, { route: StageRoute; label: string; busyLabel: string }> = {
+  'control.b01.open': { route: 'routing', label: '路由初始化', busyLabel: '路由初始化 / 执行中' },
+  'stage.a01.start': { route: 'routing', label: '路由初始化', busyLabel: '路由初始化 / 执行中' },
+  'stage.a02.start': { route: 'requirements', label: '需求录入', busyLabel: '需求录入 / 执行中' },
+  'stage.a03.start': { route: 'requirements', label: '需求澄清', busyLabel: '需求澄清 / 执行中' },
+  'stage.a04.start': { route: 'review', label: '需求评审', busyLabel: '需求评审 / 审核中' },
+  'stage.a05.start': { route: 'design', label: '详细设计', busyLabel: '详细设计 / 审核中' },
+  'stage.a06.start': { route: 'task-split', label: '任务拆分', busyLabel: '任务拆分 / 审核中' },
+  'stage.a07.start': { route: 'development', label: '任务开发', busyLabel: '任务开发 / 执行中' },
+  'stage.a08.start': { route: 'overall-review', label: '复核', busyLabel: '复核 / 审核中' },
 }
 
 export function stageRouteForAction(action: string): StageRoute | '' {
@@ -38,4 +38,12 @@ export function stageRouteForAction(action: string): StageRoute | '' {
 
 export function routeLabel(route: string): string {
   return STAGE_LABELS[route as StageRoute] ?? route
+}
+
+export function stageLabelForAction(action: string): string {
+  return STAGE_META_BY_ACTION[String(action || '').trim()]?.label ?? ''
+}
+
+export function stageBusyLabel(action: string, fallback = ''): string {
+  return STAGE_META_BY_ACTION[String(action || '').trim()]?.busyLabel || `${fallback || '当前阶段'} / 执行中`
 }

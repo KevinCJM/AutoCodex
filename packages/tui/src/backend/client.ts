@@ -233,7 +233,7 @@ export class BackendClient {
   }
 
   async requestShutdownPolicy(
-    policy: 'cleanup' | 'preserve_orphans',
+    policy: 'cleanup',
     reason: string,
     timeoutMs = BACKEND_SHUTDOWN_POLICY_TIMEOUT_MS,
   ): Promise<boolean> {

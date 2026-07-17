@@ -24,7 +24,10 @@ class _EventStreamHub:
         self._subscribers: set[queue.Queue[dict[str, Any] | None]] = set()
 
     def subscribe(self) -> queue.Queue[dict[str, Any] | None]:
-        subscriber: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=128)
+        # Stage/prompt/snapshot events are protocol state, not telemetry.  The
+        # TUI transport never drops them, so the Web adapter must not evict an
+        # older authoritative event merely because logs/progress were noisy.
+        subscriber: queue.Queue[dict[str, Any] | None] = queue.Queue()
         with self._lock:
             self._subscribers.add(subscriber)
         return subscriber
@@ -38,17 +41,7 @@ class _EventStreamHub:
             subscribers = tuple(self._subscribers)
         for subscriber in subscribers:
             item = dict(message)
-            try:
-                subscriber.put_nowait(item)
-            except queue.Full:
-                try:
-                    subscriber.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    subscriber.put_nowait(item)
-                except queue.Full:
-                    continue
+            subscriber.put_nowait(item)
 
     def close(self) -> None:
         with self._lock:
@@ -311,15 +304,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     def _handle_signal(signum: int, _frame: Any) -> None:
         print(f'[web-backend] signal={signum}, shutting down', flush=True)
-        server.shutdown(cleanup_tmux=True)
         if signum == signal.SIGINT:
             raise KeyboardInterrupt
         raise SystemExit(128 + int(signum))
 
-    previous_sigint = signal.getsignal(signal.SIGINT)
-    previous_sigterm = signal.getsignal(signal.SIGTERM)
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+    handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous_handlers = {item: signal.getsignal(item) for item in handled_signals}
+    for item in handled_signals:
+        signal.signal(item, _handle_signal)
     try:
         print(f'[web-backend] listening on {base_url}', flush=True)
         print(f'[web-backend] healthz: {base_url}/healthz', flush=True)
@@ -329,8 +321,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
-        signal.signal(signal.SIGINT, previous_sigint)
-        signal.signal(signal.SIGTERM, previous_sigterm)
+        for item, previous_handler in previous_handlers.items():
+            signal.signal(item, previous_handler)
         print('[web-backend] shutdown complete', flush=True)
         server.shutdown(cleanup_tmux=True)
 

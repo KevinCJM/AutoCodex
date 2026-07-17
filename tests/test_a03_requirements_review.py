@@ -645,11 +645,11 @@ class A03RequirementsReviewTests(unittest.TestCase):
             "A04_RequirementsReview.build_session_name",
             return_value="需求分析师-天佑星",
         ), patch(
-            "A04_RequirementsReview.list_tmux_session_names",
-            return_value=[],
-        ), patch(
             "A04_RequirementsReview.list_registered_tmux_workers",
             return_value=[],
+        ), patch(
+            "tmux_core.runtime.tmux_runtime._list_backend_session_names",
+            side_effect=AssertionError("display-name prediction must not query tmux"),
         ), patch(
             "A04_RequirementsReview.prompt_review_agent_selection",
             side_effect=fake_prompt_review_agent_selection,
@@ -709,11 +709,11 @@ class A03RequirementsReviewTests(unittest.TestCase):
             "A04_RequirementsReview.build_session_name",
             side_effect=fake_build_session_name,
         ), patch(
-            "A04_RequirementsReview.list_tmux_session_names",
-            return_value=["审核器-天勇星"],
-        ), patch(
             "A04_RequirementsReview.list_registered_tmux_workers",
-            return_value=[],
+            return_value=[SimpleNamespace(session_name="审核器-天勇星")],
+        ), patch(
+            "tmux_core.runtime.tmux_runtime._list_backend_session_names",
+            side_effect=AssertionError("display-name prediction must not query tmux"),
         ), patch(
             "A04_RequirementsReview.prompt_review_agent_selection",
             side_effect=fake_prompt_review_agent_selection,
@@ -1481,10 +1481,12 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 ),
             )
             observed_labels: list[str] = []
+            observed_agent_names: list[list[str]] = []
 
-            def fake_check_reviewer_job(*args, **kwargs):  # noqa: ANN001
+            def fake_check_reviewer_job(agent_names, *args, **kwargs):  # noqa: ANN001
+                observed_agent_names.append(list(agent_names))
                 if len(observed_labels) == 0:
-                    return {"demo-session": "请补齐 JSON"}
+                    return {"R1": "请补齐 JSON"}
                 return {}
 
             def fake_run_reviewer_turn(reviewer_runtime, *, label, prompt):  # noqa: ANN001
@@ -1507,6 +1509,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 )
 
             self.assertEqual(len(observed_labels), 1)
+            self.assertEqual(observed_agent_names[0], ["R1"])
             self.assertIn("requirements_review_fix_R1_round_1_attempt_1", observed_labels[0])
 
     def test_run_requirements_review_stage_passes_and_marks_pre_development_json(self):
@@ -2070,6 +2073,57 @@ class A03RequirementsReviewTests(unittest.TestCase):
             self.assertIs(result, recreated)
             self.assertEqual(call_counter["count"], 2)
             recreate_mock.assert_called_once()
+
+    def test_run_reviewer_turn_preserves_existing_artifacts_before_submit(self):
+        import A04_RequirementsReview as review_module
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            review_md_path, review_json_path = build_reviewer_artifact_paths(root, "需求A", "R1")
+            previous_md = "上一轮仍缺少独立部署边界说明\n"
+            previous_json = json.dumps(
+                [{"task_name": REQUIREMENTS_REVIEW_TASK_NAME, "review_pass": False}],
+                ensure_ascii=False,
+            )
+            review_md_path.write_text(previous_md, encoding="utf-8")
+            review_json_path.write_text(previous_json, encoding="utf-8")
+            reviewer = ReviewerRuntime(
+                reviewer_name="R1",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(
+                    runtime_root=root / ".requirements_review_runtime",
+                    runtime_dir=root / ".requirements_review_runtime" / "worker",
+                ),
+                review_md_path=review_md_path,
+                review_json_path=review_json_path,
+                contract=build_reviewer_completion_contract(
+                    requirement_name="需求A",
+                    reviewer_name="R1",
+                    review_md_path=review_md_path,
+                    review_json_path=review_json_path,
+                ),
+            )
+
+            def fake_run_completion_turn_with_repair(**_kwargs):  # noqa: ANN003
+                self.assertEqual(review_md_path.read_text(encoding="utf-8"), previous_md)
+                self.assertEqual(review_json_path.read_text(encoding="utf-8"), previous_json)
+
+            with patch(
+                "A03_RequirementsReview.ensure_review_artifacts_exist",
+                wraps=review_module.ensure_review_artifacts_exist,
+            ) as ensure_mock, patch(
+                "A03_RequirementsReview.run_completion_turn_with_repair",
+                side_effect=fake_run_completion_turn_with_repair,
+            ):
+                review_module._run_reviewer_turn(
+                    reviewer,
+                    label="requirements_review_fix_R1_round_1_attempt_1",
+                    prompt="repair review artifacts",
+                )
+
+            ensure_mock.assert_called_once_with(review_md_path, review_json_path)
+            self.assertEqual(review_md_path.read_text(encoding="utf-8"), previous_md)
+            self.assertEqual(review_json_path.read_text(encoding="utf-8"), previous_json)
 
     def test_run_reviewer_turn_with_recreation_returns_current_reviewer_on_contract_violation(self):
         with tempfile.TemporaryDirectory() as tmpdir:

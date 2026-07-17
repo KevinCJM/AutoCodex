@@ -53,8 +53,6 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     list_registered_tmux_workers,
-    list_tmux_session_names,
-    list_occupied_tmux_session_names,
 )
 from tmux_core.stage_kernel.detailed_design import (
     DetailedDesignReviewerSpec,
@@ -99,6 +97,7 @@ from tmux_core.stage_kernel.shared_review import (
     collect_reviewer_agent_selections,
     ensure_empty_file,
     ensure_review_artifacts,
+    ensure_review_artifacts_exist,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
     prompt_required_replacement_review_agent_selection,
@@ -109,6 +108,7 @@ from tmux_core.stage_kernel.shared_review import (
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
     render_tmux_start_summary,
+    resolve_reviewer_artifact_agent_name,
     resolve_agent_run_config_with_recovery,
     resolve_stage_agent_config,
     collect_review_limit_hitl_response,
@@ -427,20 +427,13 @@ def _predict_worker_display_name(
     worker_id: str,
     occupied_session_names: Sequence[str] = (),
 ) -> str:
+    # Display-name prediction must remain local-only; actual session creation
+    # performs the authoritative tmux conflict check and rename retry.
     occupied = {str(name).strip() for name in occupied_session_names if str(name).strip()}
-    for session_name in list_tmux_session_names():
-        name = str(session_name or "").strip()
-        if name:
-            occupied.add(name)
     for worker in list_registered_tmux_workers():
         session_name = str(getattr(worker, "session_name", "") or "").strip()
         if session_name:
             occupied.add(session_name)
-    occupied.update(
-        list_occupied_tmux_session_names(
-            additional_session_names=sorted(occupied),
-        )
-    )
     return build_session_name(
         worker_id,
         Path(project_dir).expanduser().resolve(),
@@ -461,10 +454,7 @@ def _task_split_ba_display_name(
 
 
 def _reviewer_artifact_agent_name(reviewer: ReviewerRuntime) -> str:
-    worker = getattr(reviewer, "worker", None)
-    session_name = str(getattr(worker, "session_name", "") or "").strip()
-    reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
-    return session_name or reviewer_name
+    return resolve_reviewer_artifact_agent_name(reviewer)
 
 
 def _reviewer_spec_identity(reviewer_spec: TaskSplitReviewerSpec) -> str:
@@ -1384,7 +1374,7 @@ def _run_reviewer_result_turn(
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
-        ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
+        ensure_review_artifacts_exist(current_reviewer.review_md_path, current_reviewer.review_json_path)
         try:
             run_task_result_turn_with_repair(
                 worker=current_reviewer.worker,
@@ -1505,7 +1495,7 @@ def _run_reviewer_turn_with_resume(
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
-        ensure_review_artifacts(current_reviewer.review_md_path, current_reviewer.review_json_path)
+        ensure_review_artifacts_exist(current_reviewer.review_md_path, current_reviewer.review_json_path)
         baseline_signature = _reviewer_artifact_signature(current_reviewer)
         try:
             run_completion_turn_with_repair(

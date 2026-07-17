@@ -379,6 +379,46 @@ class A08OverallReviewTests(unittest.TestCase):
         self.assertEqual(normalized.review_md_path.name, "需求A_整体代码复核记录_测试工程师-天英星.md")
         self.assertEqual(normalized.review_json_path.name, "需求A_整体复核记录_测试工程师-天英星.json")
 
+    def test_normalize_overall_review_reviewer_runtime_keeps_bound_paths_after_session_rename(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            review_md_path = project_dir / "需求A_整体代码复核记录_开发工程师-天孤星.md"
+            review_json_path = project_dir / "需求A_整体复核记录_开发工程师-天孤星.json"
+            review_md_path.write_text("已有复核问题\n", encoding="utf-8")
+            review_json_path.write_text(
+                json.dumps([{"task_name": "全面复核", "review_pass": False}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="开发工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="开发工程师-天伤星"),
+                review_md_path=review_md_path,
+                review_json_path=review_json_path,
+                contract=build_overall_review_reviewer_completion_contract(
+                    reviewer_name="开发工程师",
+                    task_name="全面复核",
+                    review_md_path=review_md_path,
+                    review_json_path=review_json_path,
+                ),
+            )
+
+            normalized = normalize_overall_review_reviewer_runtime(
+                reviewer,
+                project_dir=project_dir,
+                requirement_name="需求A",
+            )
+
+            self.assertIs(normalized, reviewer)
+            self.assertEqual(normalized.review_md_path, review_md_path)
+            self.assertEqual(normalized.review_json_path, review_json_path)
+            self.assertEqual(review_md_path.read_text(encoding="utf-8"), "已有复核问题\n")
+            self.assertEqual(
+                json.loads(review_json_path.read_text(encoding="utf-8")),
+                [{"task_name": "全面复核", "review_pass": False}],
+            )
+            self.assertFalse((project_dir / "需求A_整体复核记录_开发工程师-天伤星.json").exists())
+
     def test_bind_reviewer_runtime_precreates_empty_review_json(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)

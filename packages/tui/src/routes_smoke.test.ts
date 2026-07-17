@@ -21,24 +21,25 @@ test('route files exist with expected exports', () => {
   }
 })
 
-test('index handles Ctrl+C through graceful backend shutdown', () => {
+test('index cleans tmux for human and terminal-failure shutdown', () => {
   const content = readFileSync(join(import.meta.dir, 'index.tsx'), 'utf8')
   const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
-  expect(content.includes("requestBackendPreserveOrphansShutdown")).toBe(true)
+  expect(content.includes("requestBackendCleanupShutdown")).toBe(true)
+  expect(content.includes("requestBackendPreserveOrphansShutdown")).toBe(false)
   expect(content.includes('exitOnCtrlC: false')).toBe(true)
   expect(content.includes("for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const)")).toBe(true)
-  expect(content.includes("await stopBackendClient({ reason: 'signal', forceKillAfterMs: 30000 })")).toBe(true)
-  expect(content.includes('if (!stopResult.graceful || stopResult.signalEscalatedToSigkill)')).toBe(true)
-  expect(content.includes('await runBackendCleanupFallback(getLatestBackendCleanupContext())')).toBe(true)
+  expect(content.includes("await stopBackendClient({ reason, forceKillAfterMs: 30000 })")).toBe(true)
+  expect(content.includes('await runBackendCleanupFallback(cleanupContext)')).toBe(true)
+  expect(content.includes("projectDir: readOption(startup.initialArgv, '--project-dir')")).toBe(true)
+  expect(content.includes('setInitialBackendCleanupContext({')).toBe(true)
   expect(content.includes('process.exit(exitCodeForSignal(signal))')).toBe(true)
   expect(content.includes("onExitRequest={() => shutdownFromSignal('SIGINT')}")).toBe(true)
   expect(content.includes('onTerminalFailure={shutdownFromTerminalFailure}')).toBe(true)
   expect(content.includes("claimBackendShutdownOwnership()")).toBe(true)
   expect(content.includes("process.stderr.write(formatStageFailureReport(failure))")).toBe(true)
-  expect(content.includes("await stopBackendClient({ reason: 'runner_failure', forceKillAfterMs: 30000 })")).toBe(true)
+  expect(content.includes("await stopBackendAndCleanup('runner_failure')")).toBe(true)
   expect(content.includes('shutdownFromTerminalFailure(failure')).toBe(true)
   expect(content.includes('shutdownFromTerminalFailure(failure: StageFailureSnapshot) {\n  if (shutdownStarted) return')).toBe(true)
-  expect(content.includes('runBackendCleanupFallback(getLatestBackendCleanupContext())', content.indexOf('shutdownFromTerminalFailure'))).toBe(false)
   expect(appContent.includes('onExitRequest?: () => void | Promise<void>')).toBe(true)
   expect(appContent.includes('onTerminalFailure?: (failure: StageFailureSnapshot) => void | Promise<void>')).toBe(true)
   expect(appContent.includes("if (event.name === 'c' && event.ctrl)")).toBe(true)
@@ -178,6 +179,22 @@ test('app keeps terminal stage failures sticky and does not let stale progress e
   expect(content.includes("activeStageFailure: failure")).toBe(true)
 })
 
+test('app normalizes authoritative stage messages and keeps rejected snapshot messages from pushing backward', () => {
+  const content = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  expect(content.includes('payload.active_stage_message ?? payload.activeStageMessage')).toBe(true)
+  expect(content.includes('activeStageMessage: previous.activeStageMessage')).toBe(true)
+  expect(content.includes('activeStageMessage: resolveStageMessage(')).toBe(true)
+  expect(content.includes("currentProgress() || (status() === 'running' ? String(displayAppSnapshot().activeStageMessage || '') : '')")).toBe(true)
+})
+
+test('stage.changed updates its label and clears a stale label when the runner cursor advances', () => {
+  const content = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  expect(content.includes('event.payload.stage_label ?? event.payload.stageLabel')).toBe(true)
+  expect(content.includes("displayAppSnapshot().activeStageLabel,\n        event.payload.stage_label ?? event.payload.stageLabel,\n      ) || '等待中'")).toBe(true)
+  expect(content.includes('stageLabel: activeStageLabel')).toBe(true)
+  expect(content.includes('activeStageLabel,\n        activeStageMessage: resolveStageMessage(')).toBe(true)
+})
+
 test('non-authoritative errors do not advance the stage cursor or app stage', () => {
   const content = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
   const backendDisconnected = content.slice(
@@ -277,9 +294,13 @@ test('app isolates dialog, log, prompt, and content focus in the new shell layou
   expect(content.includes('options={selectOptions()}')).toBe(true)
   expect(content.includes('allowBack={promptAllowsBack(props.active.payload)}')).toBe(true)
   expect(content.includes('backValue={resolvePromptBackValue(props.active.payload)}')).toBe(true)
-  expect(content.includes("import { resolvePromptResponseTransition } from './promptTransition'")).toBe(true)
-  expect(content.includes('const transition = resolvePromptResponseTransition(current.id, prompt())')).toBe(true)
+  expect(content.includes("import { resolvePromptAwareStatus, resolvePromptResponseTransition } from './promptTransition'")).toBe(true)
+  expect(content.includes('const accepted = response.accepted === true')).toBe(true)
+  expect(content.includes('const transition = resolvePromptResponseTransition(current.id, prompt(), true)')).toBe(true)
+  expect(content.includes('if (promptSubmitInFlight.has(current.id)) return')).toBe(true)
+  expect(content.includes("writePromptDraft(current.draftKey, String(value ?? ''))")).toBe(true)
   expect(content.includes('if (transition.clearPrompt) setPrompt(null)')).toBe(true)
+  expect(content.includes('setStatus(resolvePromptAwareStatus(transition.status, Boolean(prompt())))')).toBe(true)
 })
 
 test('app uses structured log entries and block rendering for log readability', () => {

@@ -106,15 +106,15 @@ test('resolveHomeAgentState prioritizes live BUSY over stale failed status', () 
   ).toBe(true)
 })
 
-test('resolveHomeAgentState lets terminal result override stale BUSY', () => {
+test('resolveHomeAgentState keeps explicit BUSY separate from terminal turn result', () => {
   const terminalBusy = worker({
     agentState: 'BUSY',
     status: 'succeeded',
     resultStatus: 'succeeded',
     currentTaskRuntimeStatus: 'done',
   })
-  expect(resolveHomeAgentState(terminalBusy)).toBe('READY')
-  expect(isBusyWorker(terminalBusy)).toBe(false)
+  expect(resolveHomeAgentState(terminalBusy)).toBe('BUSY')
+  expect(isBusyWorker(terminalBusy)).toBe(true)
 })
 
 test('buildHomeAgents shows completed A04 reviewers as READY and active BA feedback as BUSY', () => {
@@ -127,7 +127,7 @@ test('buildHomeAgents shows completed A04 reviewers as READY and active BA feedb
             workerId: 'requirements-review-r1',
             sessionName: '审核器-地会星',
             sessionExists: true,
-            agentState: 'BUSY',
+            agentState: 'READY',
             status: 'succeeded',
             resultStatus: 'succeeded',
             currentTaskRuntimeStatus: 'done',
@@ -136,7 +136,7 @@ test('buildHomeAgents shows completed A04 reviewers as READY and active BA feedb
             workerId: 'requirements-review-r2',
             sessionName: '审核器-地走星',
             sessionExists: true,
-            agentState: 'BUSY',
+            agentState: 'READY',
             status: 'succeeded',
             resultStatus: 'succeeded',
             currentTaskRuntimeStatus: 'done',
@@ -165,7 +165,7 @@ test('buildHomeAgents shows completed A04 reviewers as READY and active BA feedb
   expect(agents.filter((agent) => agent.agentState === 'BUSY')).toHaveLength(1)
 })
 
-test('buildHomeAgents shows completed A05 stale busy workers as READY and active reviewer as BUSY', () => {
+test('buildHomeAgents shows completed A05 ready workers as READY and active reviewer as BUSY', () => {
   const agents = buildHomeAgents(
     [
       {
@@ -175,7 +175,7 @@ test('buildHomeAgents shows completed A05 stale busy workers as READY and active
             workerId: 'requirements-analyst',
             sessionName: '分析师-心月狐',
             sessionExists: true,
-            agentState: 'BUSY',
+            agentState: 'READY',
             status: 'succeeded',
             resultStatus: 'succeeded',
             currentTaskRuntimeStatus: 'done',
@@ -184,7 +184,7 @@ test('buildHomeAgents shows completed A05 stale busy workers as READY and active
             workerId: 'detailed-design-review-开发工程师',
             sessionName: '开发工程师-地遂星',
             sessionExists: true,
-            agentState: 'BUSY',
+            agentState: 'READY',
             status: 'succeeded',
             resultStatus: 'succeeded',
             currentTaskRuntimeStatus: 'done',
@@ -300,6 +300,106 @@ test('buildHomeAgents limits home overview to control and current stage sources 
   )
   expect(agents).toHaveLength(2)
   expect(agents.map((agent) => agent.sessionName)).toEqual(['开发工程师-天猛星', '控制台-当前运行'])
+})
+
+test('buildHomeAgents prefers workflow action and runner metadata over a stale snapshot source', () => {
+  const agents = buildHomeAgents(
+    [
+      {
+        source: 'routing',
+        workers: [worker({
+          workerId: 'detailed-design-review-审核员',
+          sessionName: '审核员-天退星',
+          workflowAction: 'stage.a05.start',
+          stageRunnerId: 'runner-current',
+          sessionExists: true,
+          agentState: 'BUSY',
+        })],
+      },
+      {
+        source: 'design',
+        workers: [worker({
+          workerId: 'detailed-design-review-架构师',
+          sessionName: '架构师-旧代际',
+          workflowAction: 'stage.a05.start',
+          stageRunnerId: 'runner-old',
+          sessionExists: true,
+          agentState: 'BUSY',
+        })],
+      },
+    ],
+    'stage.a05.start',
+    'runner-current',
+  )
+
+  expect(agents).toHaveLength(1)
+  expect(agents[0]).toMatchObject({
+    source: 'design',
+    sessionName: '审核员-天退星',
+    agentState: 'BUSY',
+  })
+})
+
+test('buildHomeAgents keeps legacy source-based workers when action and runner metadata are absent', () => {
+  const agents = buildHomeAgents(
+    [{ source: 'design', workers: [worker({ sessionName: '需求分析师-兼容', sessionExists: true })] }],
+    'stage.a05.start',
+    'runner-current',
+  )
+
+  expect(agents.map((agent) => agent.sessionName)).toEqual(['需求分析师-兼容'])
+})
+
+test('buildHomeAgents constrains every supplied cursor component without partial reclassification', () => {
+  const agents = buildHomeAgents(
+    [
+      {
+        source: 'routing',
+        workers: [
+          worker({
+            sessionName: '审核员-仅动作',
+            workflowAction: 'stage.a05.start',
+            sessionExists: true,
+          }),
+          worker({
+            sessionName: '审核员-仅代际',
+            stageRunnerId: 'runner-current',
+            sessionExists: true,
+          }),
+        ],
+      },
+      {
+        source: 'design',
+        workers: [worker({
+          sessionName: '审核员-兼容来源',
+          workflowAction: 'stage.a04.start',
+          sessionExists: true,
+        })],
+      },
+    ],
+    'stage.a05.start',
+    'runner-current',
+  )
+
+  expect(agents).toEqual([])
+})
+
+test('buildHomeAgents rejects a stale runner even when its legacy source matches the active stage', () => {
+  const agents = buildHomeAgents(
+    [{
+      source: 'design',
+      workers: [worker({
+        sessionName: '审核员-旧代际',
+        stageRunnerId: 'runner-old',
+        sessionExists: true,
+        agentState: 'BUSY',
+      })],
+    }],
+    'stage.a05.start',
+    'runner-current',
+  )
+
+  expect(agents).toEqual([])
 })
 
 test('buildHomeAgents keeps live overall review workers when session probe is temporarily false', () => {
@@ -478,7 +578,7 @@ test('resolveHomeAgentState preserves READY when backend already reports ready',
 test('resolveHomeAgentState keeps explicit live BUSY over idle ready statuses', () => {
   expect(resolveHomeAgentState(worker({ agentState: 'BUSY', status: 'ready', resultStatus: 'ready' }))).toBe('BUSY')
   expect(resolveHomeAgentState(worker({ agentState: 'STARTING', status: 'ready', resultStatus: 'ready' }))).toBe('STARTING')
-  expect(resolveHomeAgentState(worker({ agentState: 'BUSY', status: 'succeeded', resultStatus: 'succeeded' }))).toBe('READY')
+  expect(resolveHomeAgentState(worker({ agentState: 'BUSY', status: 'succeeded', resultStatus: 'succeeded' }))).toBe('BUSY')
 })
 
 test('resolveHomeAgentState promotes running snapshots to BUSY and terminal snapshots to READY', () => {
@@ -580,6 +680,82 @@ test('buildHomeAgents prefers same-timestamp BUSY over stale READY for the same 
     source: 'development',
     sessionName: '开发工程师-地雄星',
     agentState: 'BUSY',
+  })
+})
+
+test('buildHomeAgents prefers the higher state revision over same-timestamp state rank', () => {
+  const agents = buildHomeAgents([
+    {
+      source: 'control',
+      workers: [
+        worker({
+          sessionName: '开发工程师-地雄星',
+          statePath: '/tmp/runtime/worker.state.json',
+          stateRevision: 41,
+          sessionExists: true,
+          agentState: 'BUSY',
+          updatedAt: '2026-04-22T10:00:00+08:00',
+        }),
+      ],
+    },
+    {
+      source: 'development',
+      workers: [
+        worker({
+          sessionName: '开发工程师-地雄星',
+          statePath: '/tmp/runtime/worker.state.json',
+          stateRevision: 42,
+          sessionExists: true,
+          agentState: 'READY',
+          updatedAt: '2026-04-22T10:00:00+08:00',
+        }),
+      ],
+    },
+  ])
+
+  expect(agents).toHaveLength(1)
+  expect(agents[0]).toMatchObject({
+    source: 'development',
+    sessionName: '开发工程师-地雄星',
+    agentState: 'READY',
+  })
+})
+
+test('buildHomeAgents does not compare revisions from different worker state paths', () => {
+  const agents = buildHomeAgents([
+    {
+      source: 'control',
+      workers: [
+        worker({
+          sessionName: '开发工程师-地雄星',
+          statePath: '/tmp/old/worker.state.json',
+          stateRevision: 99,
+          sessionExists: true,
+          agentState: 'BUSY',
+          updatedAt: '2026-04-22T10:00:00+08:00',
+        }),
+      ],
+    },
+    {
+      source: 'development',
+      workers: [
+        worker({
+          sessionName: '开发工程师-地雄星',
+          statePath: '/tmp/new/worker.state.json',
+          stateRevision: 1,
+          sessionExists: true,
+          agentState: 'READY',
+          updatedAt: '2026-04-22T10:00:01+08:00',
+        }),
+      ],
+    },
+  ])
+
+  expect(agents).toHaveLength(1)
+  expect(agents[0]).toMatchObject({
+    source: 'development',
+    sessionName: '开发工程师-地雄星',
+    agentState: 'READY',
   })
 })
 

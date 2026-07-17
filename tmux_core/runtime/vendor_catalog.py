@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -13,6 +14,8 @@ from typing import Any, Callable, Sequence
 
 SCHEMA_VERSION = "1.0"
 SCAN_TIMEOUT_SEC = 12.0
+DEFAULT_CATALOG_CACHE_TTL_SEC = 900.0
+MAX_CACHE_FUTURE_SKEW_SEC = 60.0
 VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode", "mimo", "agy", "deveco")
 NORMALIZED_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 NATIVE_REASONING_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
@@ -312,9 +315,67 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp_path.replace(path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _parse_catalog_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _catalog_cache_ttl_sec() -> float:
+    raw_value = str(os.environ.get("TMUX_VENDOR_CATALOG_TTL_SEC", "")).strip()
+    if not raw_value:
+        return DEFAULT_CATALOG_CACHE_TTL_SEC
+    try:
+        return max(float(raw_value), 0.0)
+    except ValueError:
+        return DEFAULT_CATALOG_CACHE_TTL_SEC
+
+
+def _catalog_snapshot_is_fresh(snapshot: CatalogSnapshot) -> bool:
+    generated_at = _parse_catalog_timestamp(snapshot.generated_at)
+    if generated_at is None:
+        return False
+    age_sec = (datetime.now(timezone.utc) - generated_at).total_seconds()
+    if age_sec < -MAX_CACHE_FUTURE_SKEW_SEC or age_sec > _catalog_cache_ttl_sec():
+        return False
+    cached_by_vendor = {item.vendor_id: item for item in snapshot.vendors}
+    for vendor_id in VENDOR_ORDER:
+        inventory = cached_by_vendor.get(vendor_id)
+        if inventory is None:
+            return False
+        current_binary_path = _resolved_vendor_binary_path(vendor_id)
+        if current_binary_path != str(inventory.binary_path or "").strip():
+            return False
+        if current_binary_path:
+            binary_path = Path(current_binary_path)
+            if not binary_path.is_absolute() or not binary_path.is_file():
+                return False
+            try:
+                if binary_path.stat().st_mtime > generated_at.timestamp() + 1.0:
+                    return False
+            except OSError:
+                return False
+    return True
 
 
 def _load_cached_snapshot() -> CatalogSnapshot | None:
@@ -324,10 +385,26 @@ def _load_cached_snapshot() -> CatalogSnapshot | None:
     payload = _read_json_file(cache_path)
     if not payload:
         return None
+    if str(payload.get("schema_version", "")).strip() != SCHEMA_VERSION:
+        return None
+    generated_at = str(payload.get("generated_at", "")).strip()
+    vendor_payloads = payload.get("vendors", [])
+    if not isinstance(vendor_payloads, list):
+        return None
+    cached_vendor_order = tuple(
+        str(item.get("vendor_id", "")).strip()
+        for item in vendor_payloads
+        if isinstance(item, dict)
+    )
+    if cached_vendor_order != VENDOR_ORDER:
+        return None
     snapshot = CatalogSnapshot.from_dict(payload)
     return CatalogSnapshot(
         schema_version=snapshot.schema_version,
-        generated_at=snapshot.generated_at,
+        # Preserve an invalid/missing timestamp as stale instead of allowing
+        # CatalogSnapshot.from_dict() to replace it with the current time.
+        # Its real models can still serve as refresh fallback evidence.
+        generated_at=generated_at,
         cache_path=str(cache_path),
         vendors=snapshot.vendors,
     )
@@ -1017,8 +1094,18 @@ def _scan_codex_vendor(binary_path: str) -> VendorInventory:
 
 def _scan_opencode_like_vendor(vendor_id: str, binary_path: str, *, pure: bool = False) -> VendorInventory:
     command_prefix = [binary_path, "--pure"] if pure else [binary_path]
-    models_probe = _command_probe([*command_prefix, "models", "--verbose"], timeout_sec=15.0)
-    config_probe = _command_probe([*command_prefix, "debug", "config"])
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{vendor_id}-catalog") as executor:
+        models_future = executor.submit(
+            _command_probe,
+            [*command_prefix, "models", "--verbose"],
+            timeout_sec=15.0,
+        )
+        config_future = executor.submit(
+            _command_probe,
+            [*command_prefix, "debug", "config"],
+        )
+        models_probe = models_future.result()
+        config_probe = config_future.result()
     dynamic_models = (
         _build_opencode_like_models(vendor_id, parse_opencode_verbose_output(models_probe.stdout))
         if models_probe.ok
@@ -1170,42 +1257,70 @@ def _has_reusable_cached_models(inventory: VendorInventory | None) -> bool:
     return all(model.source_kind != SOURCE_LEGACY_FALLBACK for model in inventory.models)
 
 
+def _scan_vendor_inventory(
+    vendor_id: str,
+    binary_path: str,
+    prior_vendor: VendorInventory | None,
+) -> VendorInventory:
+    try:
+        scanner = _SCANNERS[vendor_id]
+        inventory = scanner(binary_path)
+        if (
+            vendor_id == "deveco"
+            and inventory.scan_status != OK_SCAN_STATUS
+            and _has_reusable_cached_models(prior_vendor)
+        ):
+            return _cached_degraded_vendor(
+                vendor_id,
+                prior_vendor,
+                binary_path=binary_path,
+                note=f"scan_status={inventory.scan_status}",
+            )
+        return inventory
+    except Exception as error:  # noqa: BLE001
+        note = f"scan_error={type(error).__name__}"
+        if (
+            _has_reusable_cached_models(prior_vendor)
+            if vendor_id == "deveco"
+            else prior_vendor is not None and bool(prior_vendor.models)
+        ):
+            return _cached_degraded_vendor(vendor_id, prior_vendor, binary_path=binary_path, note=note)
+        return _fallback_vendor(vendor_id, binary_path=binary_path, note=note)
+
+
 def refresh_catalog_snapshot(*, prior_snapshot: CatalogSnapshot | None = None) -> CatalogSnapshot:
     cache_path = catalog_cache_path()
     prior_by_vendor = {item.vendor_id: item for item in prior_snapshot.vendors} if prior_snapshot else {}
+    binary_paths = {
+        vendor_id: _resolved_vendor_binary_path(vendor_id)
+        for vendor_id in VENDOR_ORDER
+    }
+    scan_vendor_ids = [vendor_id for vendor_id in VENDOR_ORDER if binary_paths[vendor_id]]
+    scanned_by_vendor: dict[str, VendorInventory] = {}
+    if scan_vendor_ids:
+        with ThreadPoolExecutor(
+            max_workers=len(scan_vendor_ids),
+            thread_name_prefix="vendor-catalog",
+        ) as executor:
+            futures = {
+                vendor_id: executor.submit(
+                    _scan_vendor_inventory,
+                    vendor_id,
+                    binary_paths[vendor_id],
+                    prior_by_vendor.get(vendor_id),
+                )
+                for vendor_id in scan_vendor_ids
+            }
+            for vendor_id in scan_vendor_ids:
+                scanned_by_vendor[vendor_id] = futures[vendor_id].result()
+
     vendors: list[VendorInventory] = []
     for vendor_id in VENDOR_ORDER:
-        binary_path = _resolved_vendor_binary_path(vendor_id)
+        binary_path = binary_paths[vendor_id]
         if not binary_path:
             vendors.append(_unavailable_vendor(vendor_id, ""))
             continue
-        scanner = _SCANNERS[vendor_id]
-        try:
-            inventory = scanner(binary_path)
-            prior_vendor = prior_by_vendor.get(vendor_id)
-            if (
-                vendor_id == "deveco"
-                and inventory.scan_status != OK_SCAN_STATUS
-                and _has_reusable_cached_models(prior_vendor)
-            ):
-                inventory = _cached_degraded_vendor(
-                    vendor_id,
-                    prior_vendor,
-                    binary_path=binary_path,
-                    note=f"scan_status={inventory.scan_status}",
-                )
-        except Exception as error:  # noqa: BLE001
-            prior_vendor = prior_by_vendor.get(vendor_id)
-            note = f"scan_error={type(error).__name__}"
-            if (
-                _has_reusable_cached_models(prior_vendor)
-                if vendor_id == "deveco"
-                else prior_vendor is not None and bool(prior_vendor.models)
-            ):
-                inventory = _cached_degraded_vendor(vendor_id, prior_vendor, binary_path=binary_path, note=note)
-            else:
-                inventory = _fallback_vendor(vendor_id, binary_path=binary_path, note=note)
-        vendors.append(inventory)
+        vendors.append(scanned_by_vendor[vendor_id])
     snapshot = CatalogSnapshot(
         schema_version=SCHEMA_VERSION,
         generated_at=_now_iso(),
@@ -1221,6 +1336,14 @@ def get_catalog_snapshot(*, force_refresh: bool = False) -> CatalogSnapshot:
     with _CATALOG_LOCK:
         if _CATALOG_SNAPSHOT is None:
             _CATALOG_SNAPSHOT = _load_cached_snapshot()
+        if (
+            not force_refresh
+            and not _CATALOG_REFRESHED
+            and _CATALOG_SNAPSHOT is not None
+            and _catalog_snapshot_is_fresh(_CATALOG_SNAPSHOT)
+        ):
+            _CATALOG_REFRESHED = True
+            return _CATALOG_SNAPSHOT
         if force_refresh or not _CATALOG_REFRESHED:
             _CATALOG_SNAPSHOT = refresh_catalog_snapshot(prior_snapshot=_CATALOG_SNAPSHOT)
             _CATALOG_REFRESHED = True

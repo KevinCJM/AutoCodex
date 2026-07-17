@@ -201,7 +201,7 @@ class A06TaskSplitTests(unittest.TestCase):
         self.assertIsNone(value)
         prompt_mock.assert_called_once()
 
-    def test_predict_worker_display_name_includes_tmux_sessions_in_occupied_pool(self):
+    def test_predict_worker_display_name_is_local_only_during_prompt_configuration(self):
         import A06_TaskSplit as task_split_module
 
         observed: dict[str, set[str]] = {}
@@ -218,11 +218,11 @@ class A06TaskSplitTests(unittest.TestCase):
             "A06_TaskSplit.build_session_name",
             side_effect=fake_build_session_name,
         ), patch(
-            "A06_TaskSplit.list_tmux_session_names",
-            return_value=["审核员-天勇星"],
-        ), patch(
             "A06_TaskSplit.list_registered_tmux_workers",
-            return_value=[],
+            return_value=[SimpleNamespace(session_name="审核员-天勇星")],
+        ), patch(
+            "tmux_core.runtime.tmux_runtime._list_backend_session_names",
+            side_effect=AssertionError("display-name prediction must not query tmux"),
         ):
             session_name = task_split_module._predict_worker_display_name(
                 project_dir=tmpdir,
@@ -1743,6 +1743,78 @@ class A06TaskSplitTests(unittest.TestCase):
                 label="task_split_review_init_测试工程师_round_1",
                 prompt="review",
             )
+
+            self.assertIs(returned, reviewer)
+
+    def test_run_reviewer_result_turn_preserves_existing_artifacts_before_ready_check(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_任务单评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+            previous_md = "- [Error] READY 超时前的有效记录\n"
+            previous_json = [{"task_name": "任务拆分", "review_pass": False}]
+            reviewer.review_md_path.write_text(previous_md, encoding="utf-8")
+            reviewer.review_json_path.write_text(
+                json.dumps(previous_json, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            def assert_preserved_before_ready(**kwargs):  # noqa: ANN001
+                self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), previous_md)
+                self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), previous_json)
+                return {}
+
+            with patch(
+                "A06_TaskSplit.run_task_result_turn_with_repair",
+                side_effect=assert_preserved_before_ready,
+            ):
+                returned = _run_reviewer_result_turn(
+                    reviewer,
+                    label="task_split_reviewer_init_测试工程师",
+                    prompt="init",
+                    result_contract=SimpleNamespace(mode="a06_reviewer_init"),
+                )
+
+            self.assertIs(returned, reviewer)
+
+    def test_run_reviewer_turn_with_resume_preserves_partial_output_before_submit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-天英星"),
+                review_md_path=project_dir / "需求A_任务单评审记录_测试工程师.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师.json",
+                contract=_dummy_contract(),
+            )
+            previous_json = [{"task_name": "任务拆分", "review_pass": False}]
+            reviewer.review_json_path.write_text(
+                json.dumps(previous_json, ensure_ascii=False),
+                encoding="utf-8",
+            )
+
+            def assert_preserved_before_submit(**kwargs):  # noqa: ANN001
+                self.assertTrue(reviewer.review_md_path.exists())
+                self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), "")
+                self.assertEqual(json.loads(reviewer.review_json_path.read_text(encoding="utf-8")), previous_json)
+                return {}
+
+            with patch(
+                "A06_TaskSplit.run_completion_turn_with_repair",
+                side_effect=assert_preserved_before_submit,
+            ):
+                returned = _run_reviewer_turn_with_resume(
+                    reviewer,
+                    label="task_split_review_fix_测试工程师_round_1_attempt_1",
+                    prompt="repair",
+                )
 
             self.assertIs(returned, reviewer)
 

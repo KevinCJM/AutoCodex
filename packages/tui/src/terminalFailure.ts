@@ -101,11 +101,6 @@ export function formatStageFailureReport(failure: StageFailureSnapshot): string 
     `原因: ${failure.message || failure.failureKind || 'unknown error'}`,
   ]
   if (failure.failurePath) lines.push(`失败记录: ${failure.failurePath}`)
-  const attachCommands = failure.orphanedWorkers.map((worker) => worker.attachCommand).filter(Boolean)
-  if (attachCommands.length > 0) {
-    lines.push('保留的智能体现场:')
-    lines.push(...attachCommands.map((command) => `  ${command}`))
-  }
   lines.push('')
   return `${lines.join('\n')}\n`
 }

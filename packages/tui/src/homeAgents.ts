@@ -76,17 +76,16 @@ export function resolveHomeAgentState(worker: WorkerSnapshot): string {
   const resultStatus = String(worker.resultStatus || '').trim().toLowerCase()
   const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
   if (agentState === 'DEAD') return 'DEAD'
+  if (agentState === 'STARTING') return 'STARTING'
+  if (agentState === 'BUSY') return 'BUSY'
+  if (agentState === 'READY') return 'READY'
+  if (healthStatus === 'dead') return 'DEAD'
   if (
     COMPLETED_WORKER_STATUSES.has(runtimeStatus) ||
     COMPLETED_WORKER_STATUSES.has(resultStatus) ||
     COMPLETED_WORKER_STATUSES.has(status)
   ) return 'READY'
-  if (RUNNING_WORKER_STATUSES.has(runtimeStatus) && agentState === 'BUSY') return 'BUSY'
   if (FAILED_WORKER_STATUSES.has(resultStatus) || FAILED_WORKER_STATUSES.has(status)) return 'READY'
-  if (agentState === 'STARTING') return 'STARTING'
-  if (agentState === 'BUSY') return 'BUSY'
-  if (agentState === 'READY') return 'READY'
-  if (healthStatus === 'dead') return 'DEAD'
   if (
     READY_WORKER_STATUSES.has(runtimeStatus) ||
     READY_WORKER_STATUSES.has(resultStatus) ||
@@ -109,6 +108,11 @@ function workerFreshnessTs(worker: WorkerSnapshot): number {
   const updatedAt = Number.isFinite(updatedAtTs) ? updatedAtTs : 0
   const heartbeat = Number.isFinite(heartbeatTs) ? heartbeatTs : 0
   return Math.max(updatedAt, heartbeat)
+}
+
+function workerStateRevision(worker: WorkerSnapshot): number | null {
+  const revision = Number(worker.stateRevision)
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null
 }
 
 function workerHasActiveTurnEvidence(worker: WorkerSnapshot): boolean {
@@ -142,6 +146,35 @@ function allowedHomeSources(activeStage: string): ReadonlySet<HomeAgentItem['sou
   const stageRoute = stageRouteForAction(activeStage)
   if (!stageRoute) return null
   return new Set<HomeAgentItem['source']>(['control', stageRoute as HomeAgentItem['source']])
+}
+
+function resolveWorkerHomeSource(
+  fallbackSource: HomeAgentItem['source'],
+  worker: WorkerSnapshot,
+  activeStage: string,
+  activeRunnerId: string,
+): HomeAgentItem['source'] | null {
+  const scopedSources = allowedHomeSources(activeStage)
+  if (!scopedSources) return fallbackSource
+
+  const workerAction = String(worker.workflowAction || '').trim()
+  const workerRunnerId = String(worker.stageRunnerId || '').trim()
+  const normalizedActiveRunnerId = String(activeRunnerId || '').trim()
+  if (workerAction && workerAction !== activeStage) return null
+  if (workerRunnerId && normalizedActiveRunnerId && workerRunnerId !== normalizedActiveRunnerId) return null
+  const hasVerifiedWorkerCursor = Boolean(
+    workerAction
+    && workerRunnerId
+    && normalizedActiveRunnerId
+    && workerAction === activeStage
+    && workerRunnerId === normalizedActiveRunnerId,
+  )
+
+  if (hasVerifiedWorkerCursor) {
+    const actionSource = stageRouteForAction(workerAction) as HomeAgentItem['source'] | ''
+    if (actionSource) return actionSource
+  }
+  return scopedSources.has(fallbackSource) ? fallbackSource : null
 }
 
 function compareText(left: string, right: string): number {
@@ -260,39 +293,59 @@ function compareHomeAgentEntries(left: HomeAgentSortEntry, right: HomeAgentSortE
 export function buildHomeAgents(
   sources: Array<{ source: HomeAgentItem['source']; workers: WorkerSnapshot[] }>,
   activeStage = '',
+  activeRunnerId = '',
 ): HomeAgentItem[] {
-  const scopedSources = allowedHomeSources(activeStage)
   const deduped = new Map<string, HomeAgentSortEntry>()
   const freshnessBySession = new Map<string, number>()
   const sourceRankBySession = new Map<string, number>()
+  const statePathBySession = new Map<string, string>()
+  const stateRevisionBySession = new Map<string, number | null>()
   for (const source of sources) {
-    if (scopedSources && !scopedSources.has(source.source)) continue
     for (const worker of source.workers) {
+      const effectiveSource = resolveWorkerHomeSource(source.source, worker, activeStage, activeRunnerId)
+      if (!effectiveSource) continue
       if (!isRunningWorker(worker)) continue
       const sessionName = worker.sessionName.trim()
       if (!sessionName) continue
       const nextAgentState = resolveHomeAgentState(worker)
       const freshness = workerFreshnessTs(worker)
       const previousFreshness = freshnessBySession.get(sessionName) ?? 0
-      const sourceRank = SOURCE_RANK[source.source] || 0
+      const sourceRank = SOURCE_RANK[effectiveSource] || 0
       const previousSourceRank = sourceRankBySession.get(sessionName) || 0
       const previousAgentState = String(deduped.get(sessionName)?.item.agentState || '').trim().toUpperCase()
       const previousAgentRank = HOME_AGENT_STATE_RANK[previousAgentState] || 0
       const nextAgentRank = HOME_AGENT_STATE_RANK[nextAgentState] || 0
       if (deduped.has(sessionName)) {
-        if (previousFreshness > freshness) continue
-        if (previousFreshness === freshness) {
-          if (previousAgentRank > nextAgentRank) {
-            continue
-          }
-          if (previousAgentRank === nextAgentRank && previousSourceRank >= sourceRank) {
-            continue
+        const previousStatePath = statePathBySession.get(sessionName) ?? ''
+        const nextStatePath = String(worker.statePath || '').trim()
+        const sameStateStream = (
+          (previousStatePath !== '' && nextStatePath !== '' && previousStatePath === nextStatePath)
+          || (previousStatePath === '' && nextStatePath === '')
+        )
+        const previousRevision = stateRevisionBySession.get(sessionName) ?? null
+        const nextRevision = workerStateRevision(worker)
+        if (
+          sameStateStream
+          && previousRevision !== null
+          && nextRevision !== null
+          && previousRevision !== nextRevision
+        ) {
+          if (previousRevision > nextRevision) continue
+        } else {
+          if (previousFreshness > freshness) continue
+          if (previousFreshness === freshness) {
+            if (previousAgentRank > nextAgentRank) {
+              continue
+            }
+            if (previousAgentRank === nextAgentRank && previousSourceRank >= sourceRank) {
+              continue
+            }
           }
         }
       }
       deduped.set(sessionName, {
         item: {
-          source: source.source,
+          source: effectiveSource,
           sessionName,
           healthStatus: worker.healthStatus || 'unknown',
           agentState: nextAgentState,
@@ -304,6 +357,8 @@ export function buildHomeAgents(
       })
       freshnessBySession.set(sessionName, freshness)
       sourceRankBySession.set(sessionName, sourceRank)
+      statePathBySession.set(sessionName, String(worker.statePath || '').trim())
+      stateRevisionBySession.set(sessionName, workerStateRevision(worker))
     }
   }
   return [...deduped.values()]

@@ -9,6 +9,14 @@ export type StageGenerationCursor = {
   terminalRunnerId: string
 }
 
+export type ScopedProgressEntry = {
+  line: string
+  action: string
+  stageSeq: number
+  runnerId: string
+  cursorKey: string
+}
+
 export const EMPTY_STAGE_GENERATION: StageGenerationCursor = {
   action: '',
   stageSeq: 0,
@@ -31,6 +39,10 @@ function terminal(status: string): boolean {
 
 function failure(status: string): boolean {
   return status === 'failed' || status === 'error'
+}
+
+function authoritativeRunnerSource(source: string): boolean {
+  return source === 'runner_start' || source === 'runner_complete' || source === 'runner_failure'
 }
 
 function shellQuote(value: string): string {
@@ -81,7 +93,7 @@ export function applyStageGeneration(cursor: StageGenerationCursor, payload: Sta
     && (!runnerId || !cursor.runnerId || runnerId === cursor.runnerId)
     && (!action || !cursor.action || action === cursor.action)
   if (sameGeneration && cursor.terminalStatus && !terminal(status)) return result(false)
-  if (sameGeneration && cursor.runnerId && !runnerId && !source.startsWith('runner_')) return result(false)
+  if (sameGeneration && cursor.runnerId && !runnerId && !authoritativeRunnerSource(source)) return result(false)
 
   const next: StageGenerationCursor = {
     action: action || cursor.action,
@@ -105,6 +117,66 @@ export function applyStageGeneration(cursor: StageGenerationCursor, payload: Sta
     next.terminalRunnerId = runnerId || next.runnerId
   }
   return result(true, next)
+}
+
+export function stageCursorKey(cursor: Pick<StageGenerationCursor, 'action' | 'stageSeq' | 'runnerId'>): string {
+  return `${cursor.action}\u0000${cursor.stageSeq}\u0000${cursor.runnerId}`
+}
+
+export function shouldAcceptProgressEvent(cursor: StageGenerationCursor, payload: StagePayload): boolean {
+  const action = String(payload.action ?? '').trim()
+  const stageSeq = normalizeSeq(payload.stage_seq ?? payload.stageSeq)
+  const runnerId = String(payload.runner_id ?? payload.runnerId ?? '').trim()
+  if (!action || stageSeq === 0) return false
+  if (!cursor.action || cursor.stageSeq === 0) return false
+  if (action !== cursor.action || stageSeq !== cursor.stageSeq) return false
+  if (runnerId && cursor.runnerId && runnerId !== cursor.runnerId) return false
+  if (
+    cursor.terminalStatus
+    && (!stageSeq || !cursor.terminalStageSeq || stageSeq === cursor.terminalStageSeq)
+    && (!runnerId || !cursor.terminalRunnerId || runnerId === cursor.terminalRunnerId)
+  ) return false
+  return true
+}
+
+export function bindProgressEntry(
+  cursor: StageGenerationCursor,
+  payload: StagePayload,
+  line: string,
+): ScopedProgressEntry | null {
+  if (!shouldAcceptProgressEvent(cursor, payload)) return null
+  return {
+    line: String(line ?? ''),
+    action: cursor.action,
+    stageSeq: cursor.stageSeq,
+    runnerId: cursor.runnerId,
+    cursorKey: stageCursorKey(cursor),
+  }
+}
+
+export function progressEntryMatchesCursor(cursor: StageGenerationCursor, entry: ScopedProgressEntry): boolean {
+  return entry.cursorKey === stageCursorKey(cursor)
+}
+
+export function shouldResetProgressForStageChange(
+  previous: StageGenerationCursor,
+  current: StageGenerationCursor,
+  status: string,
+): boolean {
+  if (String(status ?? '').trim().toLowerCase() !== 'running') return true
+  return stageCursorKey(previous) !== stageCursorKey(current)
+}
+
+export function resolveStageMessage(
+  previous: StageGenerationCursor,
+  current: StageGenerationCursor,
+  previousMessage: string,
+  incomingMessage: unknown,
+): string {
+  const incoming = String(incomingMessage ?? '').trim()
+  if (incoming) return incoming
+  if (stageCursorKey(previous) !== stageCursorKey(current)) return ''
+  return String(previousMessage ?? '').trim()
 }
 
 export function stagePayloadFromApp(app: AppSnapshot): StagePayload | null {

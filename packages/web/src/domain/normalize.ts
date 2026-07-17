@@ -61,6 +61,7 @@ export const EMPTY_APP: AppSnapshot = {
   activeStageRunnerId: '',
   activeStageSource: '',
   activeStageLabel: '等待中',
+  activeStageMessage: '',
   activeStageFailure: null,
   pendingHitl: false,
   pendingAttention: false,
@@ -73,9 +74,15 @@ export const EMPTY_APP: AppSnapshot = {
 
 export const EMPTY_HITL: HitlSnapshot = {
   pending: false,
+  promptId: '',
+  promptType: '',
   questionPath: '',
   answerPath: '',
   summary: '',
+  attachCommand: '',
+  recoveryKind: '',
+  reasonText: '',
+  targetPaths: [],
 }
 
 export const EMPTY_PROMPT: PromptSnapshot = {
@@ -171,15 +178,27 @@ export function normalizeFileSnapshot(value: unknown): FileSnapshot {
 export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
   const item = objectOf(value)
   const rawArtifactPaths = item.artifact_paths ?? item.artifactPaths
+  const rawStateRevision = item.state_revision ?? item.stateRevision
+  const stateRevision = (
+    typeof rawStateRevision === 'number'
+    || (typeof rawStateRevision === 'string' && rawStateRevision.trim() !== '')
+  ) ? Number(rawStateRevision) : Number.NaN
   return {
     index: num(item.index) || undefined,
+    workerId: str(item.worker_id ?? item.workerId),
+    statePath: str(item.state_path ?? item.statePath),
+    stateRevision: Number.isFinite(stateRevision) ? stateRevision : undefined,
     workDir: str(item.work_dir ?? item.workDir),
     sessionName: str(item.session_name ?? item.sessionName),
     status: str(item.status),
+    resultStatus: str(item.result_status ?? item.resultStatus),
+    workflowAction: str(item.workflow_action ?? item.workflowAction),
     workflowStage: str(item.workflow_stage ?? item.workflowStage),
     agentState: str(item.agent_state ?? item.agentState),
     healthStatus: str(item.health_status ?? item.healthStatus),
     currentTaskRuntimeStatus: str(item.current_task_runtime_status ?? item.currentTaskRuntimeStatus),
+    dispatchState: str(item.dispatch_state ?? item.dispatchState),
+    dispatchReason: str(item.dispatch_reason ?? item.dispatchReason),
     turnState: str(item.turn_state ?? item.turnState),
     tmuxControlStatus: str(item.tmux_control_status ?? item.tmuxControlStatus),
     tmuxControlError: str(item.tmux_control_error ?? item.tmuxControlError),
@@ -192,6 +211,10 @@ export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
     stageRunnerId: str(item.stage_runner_id ?? item.stageRunnerId),
     orphanedAt: str(item.orphaned_at ?? item.orphanedAt),
     orphanedReason: str(item.orphaned_reason ?? item.orphanedReason),
+    vendor: str(item.vendor),
+    model: str(item.model),
+    resolvedModel: str(item.resolved_model ?? item.resolvedModel),
+    reasoningEffort: str(item.reasoning_effort ?? item.reasoningEffort),
     retryCount: num(item.retry_count ?? item.retryCount),
     note: str(item.note),
     transcriptPath: str(item.transcript_path ?? item.transcriptPath),
@@ -255,11 +278,18 @@ export function normalizeControlSnapshot(value: unknown): ControlSnapshot {
 
 export function normalizeHitlSnapshot(value: unknown): HitlSnapshot {
   const item = objectOf(value)
+  const rawTargetPaths = item.target_paths ?? item.targetPaths
   return {
     pending: bool(item.pending),
+    promptId: str(item.prompt_id ?? item.promptId),
+    promptType: str(item.prompt_type ?? item.promptType),
     questionPath: str(item.question_path ?? item.questionPath),
     answerPath: str(item.answer_path ?? item.answerPath),
     summary: str(item.summary),
+    attachCommand: str(item.attach_command ?? item.attachCommand),
+    recoveryKind: str(item.recovery_kind ?? item.recoveryKind),
+    reasonText: str(item.reason_text ?? item.reasonText),
+    targetPaths: Array.isArray(rawTargetPaths) ? rawTargetPaths.map(str) : [],
   }
 }
 
@@ -289,6 +319,7 @@ export function normalizeAppSnapshot(value: unknown): AppSnapshot {
   const activeStageRunnerId = str(item.active_stage_runner_id ?? item.activeStageRunnerId ?? item.runner_id ?? item.runnerId)
   const activeStageSource = str(item.active_stage_source ?? item.activeStageSource ?? item.source)
   const activeStageLabel = str(item.active_stage_label ?? item.activeStageLabel ?? '等待中')
+  const activeStageMessage = str(item.active_stage_message ?? item.activeStageMessage)
   const rawFailure = objectOf(item.active_stage_failure ?? item.activeStageFailure)
   const activeStageFailure = Object.keys(rawFailure).length > 0 ? normalizeStageFailure({
     ...rawFailure,
@@ -310,6 +341,7 @@ export function normalizeAppSnapshot(value: unknown): AppSnapshot {
     activeStageRunnerId,
     activeStageSource,
     activeStageLabel,
+    activeStageMessage,
     activeStageFailure,
     pendingHitl: bool(item.pending_hitl ?? item.pendingHitl),
     pendingAttention: bool(item.pending_attention ?? item.pendingAttention),

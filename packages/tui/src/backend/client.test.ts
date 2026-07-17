@@ -173,7 +173,7 @@ test('BackendClient ignores child exit notification after an intentional stop be
   expect(client.backendDisconnectError).toBeUndefined()
 })
 
-test('BackendClient requests preserve-orphans policy before failure shutdown', async () => {
+test('BackendClient requests cleanup policy before failure shutdown', async () => {
   const client = new BackendClient() as any
   client.process = { stdin: { write: () => undefined } }
   const requests: Array<{ action: string; payload: Record<string, unknown> }> = []
@@ -182,10 +182,10 @@ test('BackendClient requests preserve-orphans policy before failure shutdown', a
     return { accepted: true }
   }
 
-  expect(await client.requestShutdownPolicy('preserve_orphans', 'runner_failure', 10)).toBe(true)
+  expect(await client.requestShutdownPolicy('cleanup', 'runner_failure', 10)).toBe(true)
   expect(requests).toEqual([{
     action: 'app.shutdown',
-    payload: { policy: 'preserve_orphans', reason: 'runner_failure' },
+    payload: { policy: 'cleanup', reason: 'runner_failure' },
   }])
 })
 

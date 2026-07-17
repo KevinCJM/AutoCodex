@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -22,6 +24,7 @@ from tmux_core.runtime.vendor_catalog import (
     SOURCE_PACKAGE_METADATA,
     VendorInventory,
     VENDOR_ORDER,
+    get_catalog_snapshot,
     get_default_model_for_vendor,
     get_model_choices,
     get_vendor_inventory,
@@ -32,6 +35,7 @@ from tmux_core.runtime.vendor_catalog import (
     parse_opencode_verbose_output,
     resolve_launch,
     refresh_catalog_snapshot,
+    reset_catalog_cache_for_tests,
     _build_agy_models,
     _build_opencode_like_config_models,
     _build_opencode_like_models,
@@ -44,6 +48,31 @@ from tmux_core.runtime.vendor_catalog import (
 
 
 class VendorCatalogTests(unittest.TestCase):
+    def setUp(self):
+        reset_catalog_cache_for_tests()
+
+    def tearDown(self):
+        reset_catalog_cache_for_tests()
+
+    @staticmethod
+    def _snapshot_at(generated_at: str) -> CatalogSnapshot:
+        return CatalogSnapshot(
+            schema_version="1.0",
+            generated_at=generated_at,
+            cache_path="/tmp/vendor_catalog.json",
+            vendors=tuple(
+                VendorInventory(
+                    vendor_id=vendor_id,
+                    installed=False,
+                    scan_status="unavailable",
+                    source_kind="unavailable",
+                    confidence="low",
+                    binary_path="",
+                )
+                for vendor_id in VENDOR_ORDER
+            ),
+        )
+
     def test_deveco_is_appended_without_changing_existing_vendor_order(self):
         self.assertEqual(VENDOR_ORDER, ("codex", "claude", "gemini", "opencode", "mimo", "agy", "deveco"))
         self.assertEqual(normalize_vendor_id("DevEco"), "deveco")
@@ -288,12 +317,49 @@ mimo/mimo-v2.5-pro
         with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe) as probe:
             inventory = _scan_mimo_vendor("/usr/bin/mimo")
 
-        self.assertEqual(
+        self.assertCountEqual(
             [call.args[0] for call in probe.call_args_list],
             [["/usr/bin/mimo", "models", "--verbose"], ["/usr/bin/mimo", "debug", "config"]],
         )
         self.assertEqual(inventory.vendor_id, "mimo")
         self.assertEqual(inventory.default_model, "mimo/mimo-v2.5-pro")
+
+    def test_opencode_like_models_and_config_probes_run_concurrently(self):
+        both_started = threading.Event()
+        started_lock = threading.Lock()
+        started_commands: list[tuple[str, ...]] = []
+
+        def concurrent_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001, ARG001
+            command = tuple(argv)
+            with started_lock:
+                started_commands.append(command)
+                if len(started_commands) >= 2:
+                    both_started.set()
+            if not both_started.wait(timeout=5.0):
+                raise RuntimeError("OpenCode-like probes were executed serially")
+            if command[-2:] == ("models", "--verbose"):
+                return SimpleNamespace(
+                    ok=True,
+                    stdout=(
+                        "mimo/mimo-v2.5-pro\n"
+                        '{"id":"mimo-v2.5-pro","providerID":"mimo","name":"MiMo V2.5 Pro",'
+                        '"capabilities":{"reasoning":true},"variants":{}}'
+                    ),
+                )
+            return SimpleNamespace(ok=True, stdout='{"model":"mimo/mimo-v2.5-pro","provider":{}}')
+
+        with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=concurrent_probe):
+            inventory = _scan_mimo_vendor("/usr/bin/mimo")
+
+        self.assertEqual(inventory.scan_status, OK_SCAN_STATUS)
+        self.assertEqual(inventory.default_model, "mimo/mimo-v2.5-pro")
+        self.assertCountEqual(
+            started_commands,
+            [
+                ("/usr/bin/mimo", "models", "--verbose"),
+                ("/usr/bin/mimo", "debug", "config"),
+            ],
+        )
 
     def test_scan_deveco_uses_resolved_binary_pure_commands_and_dynamic_model(self):
         binary_path = "/opt/bin/DevEco"
@@ -311,7 +377,7 @@ mimo/mimo-v2.5-pro
         with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe) as probe:
             inventory = _scan_deveco_vendor(binary_path)
 
-        self.assertEqual(
+        self.assertCountEqual(
             [call.args[0] for call in probe.call_args_list],
             [
                 [binary_path, "--pure", "models", "--verbose"],
@@ -394,6 +460,144 @@ mimo/mimo-v2.5-pro
         self.assertEqual(deveco.binary_path, "/new/bin/deveco")
         self.assertEqual(deveco.model_ids(), ("deveco/cached-model",))
         self.assertEqual(deveco.default_model, "deveco/cached-model")
+
+    def test_refresh_scans_vendors_concurrently_but_preserves_vendor_order(self):
+        concurrent_scan_started = threading.Event()
+        started_lock = threading.Lock()
+        started_vendors: list[str] = []
+
+        def scanner_for(vendor_id: str):
+            def scan(binary_path: str) -> VendorInventory:
+                with started_lock:
+                    started_vendors.append(vendor_id)
+                    if len(started_vendors) >= 2:
+                        concurrent_scan_started.set()
+                if not concurrent_scan_started.wait(timeout=5.0):
+                    raise RuntimeError("vendor scans were executed serially")
+                return VendorInventory(
+                    vendor_id=vendor_id,
+                    installed=True,
+                    scan_status=OK_SCAN_STATUS,
+                    source_kind=SOURCE_DYNAMIC_CLI,
+                    confidence=CONFIDENCE_HIGH,
+                    binary_path=binary_path,
+                    notes=("concurrent_scan",),
+                )
+
+            return scan
+
+        scanners = {vendor_id: scanner_for(vendor_id) for vendor_id in VENDOR_ORDER}
+        with patch(
+            "tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path",
+            side_effect=lambda vendor_id: f"/opt/bin/{vendor_id}",
+        ), patch("tmux_core.runtime.vendor_catalog._SCANNERS", scanners), patch(
+            "tmux_core.runtime.vendor_catalog._save_cached_snapshot"
+        ):
+            snapshot = refresh_catalog_snapshot()
+
+        self.assertEqual(tuple(item.vendor_id for item in snapshot.vendors), VENDOR_ORDER)
+        self.assertTrue(all(item.scan_status == OK_SCAN_STATUS for item in snapshot.vendors))
+        self.assertTrue(all(item.notes == ("concurrent_scan",) for item in snapshot.vendors))
+        self.assertCountEqual(started_vendors, VENDOR_ORDER)
+
+    def test_fresh_disk_cache_is_used_without_refresh_or_vendor_probe(self):
+        fresh_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=fresh_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot"
+        ) as refresh, patch(
+            "tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path",
+            side_effect=lambda _vendor_id: "",
+        ) as resolve_binary, patch(
+            "tmux_core.runtime.vendor_catalog._command_probe"
+        ) as probe:
+            snapshot = get_catalog_snapshot()
+
+        self.assertIs(snapshot, fresh_snapshot)
+        refresh.assert_not_called()
+        self.assertEqual(resolve_binary.call_count, len(VENDOR_ORDER))
+        probe.assert_not_called()
+
+    def test_expired_disk_cache_triggers_refresh(self):
+        expired_snapshot = self._snapshot_at("2000-01-01T00:00:00+00:00")
+        refreshed_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=expired_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot",
+            return_value=refreshed_snapshot,
+        ) as refresh:
+            snapshot = get_catalog_snapshot()
+
+        self.assertIs(snapshot, refreshed_snapshot)
+        refresh.assert_called_once_with(prior_snapshot=expired_snapshot)
+
+    def test_invalid_cache_timestamp_triggers_refresh(self):
+        invalid_snapshot = self._snapshot_at("not-a-timestamp")
+        refreshed_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=invalid_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot",
+            return_value=refreshed_snapshot,
+        ) as refresh:
+            snapshot = get_catalog_snapshot()
+
+        self.assertIs(snapshot, refreshed_snapshot)
+        refresh.assert_called_once_with(prior_snapshot=invalid_snapshot)
+
+    def test_force_refresh_ignores_fresh_disk_cache(self):
+        fresh_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+        refreshed_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=fresh_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot",
+            return_value=refreshed_snapshot,
+        ) as refresh:
+            snapshot = get_catalog_snapshot(force_refresh=True)
+
+        self.assertIs(snapshot, refreshed_snapshot)
+        refresh.assert_called_once_with(prior_snapshot=fresh_snapshot)
+
+    def test_future_cache_timestamp_triggers_refresh(self):
+        future_snapshot = self._snapshot_at(
+            (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        )
+        refreshed_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=future_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot",
+            return_value=refreshed_snapshot,
+        ) as refresh:
+            snapshot = get_catalog_snapshot()
+
+        self.assertIs(snapshot, refreshed_snapshot)
+        refresh.assert_called_once_with(prior_snapshot=future_snapshot)
+
+    def test_fresh_cache_with_missing_executable_triggers_refresh(self):
+        cached_vendors = list(self._snapshot_at(datetime.now(timezone.utc).isoformat()).vendors)
+        cached_vendors[0] = VendorInventory(
+            vendor_id="codex",
+            installed=True,
+            scan_status=OK_SCAN_STATUS,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            binary_path="/definitely/missing/codex",
+        )
+        cached_snapshot = CatalogSnapshot(
+            schema_version="1.0",
+            generated_at=datetime.now(timezone.utc).isoformat(),
+            cache_path="/tmp/vendor_catalog.json",
+            vendors=tuple(cached_vendors),
+        )
+        refreshed_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=cached_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot",
+            return_value=refreshed_snapshot,
+        ) as refresh:
+            snapshot = get_catalog_snapshot()
+
+        self.assertIs(snapshot, refreshed_snapshot)
+        refresh.assert_called_once_with(prior_snapshot=cached_snapshot)
 
     def test_resolve_launch_maps_native_variant_prompt_and_boolean_modes(self):
         catalog = CatalogSnapshot(

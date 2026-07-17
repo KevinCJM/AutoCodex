@@ -14,6 +14,7 @@ from tmux_core.runtime.tmux_runtime import TmuxControlUnavailable, TmuxMutationO
 from A05_DetailedDesign import (
     DetailedDesignReviewerSpec,
     ReviewAgentSelection,
+    ReviewerRuntime,
     RequirementsAnalystHandoff,
     _shutdown_workers,
     _run_parallel_reviewers,
@@ -24,6 +25,8 @@ from A05_DetailedDesign import (
     cleanup_stale_detailed_design_runtime_state,
     build_reviewer_workers,
     build_detailed_design_paths,
+    build_reviewer_artifact_paths,
+    build_reviewer_completion_contract,
     collect_interactive_reviewer_specs,
     create_reviewer_runtime,
     generate_detailed_design_document,
@@ -198,7 +201,7 @@ class A05DetailedDesignTests(unittest.TestCase):
         self.assertEqual(value, 6)
         prompt_mock.assert_called_once()
 
-    def test_predict_worker_display_name_includes_tmux_sessions_in_occupied_pool(self):
+    def test_predict_worker_display_name_is_local_only_during_prompt_configuration(self):
         import A05_DetailedDesign as design_module
 
         observed: dict[str, set[str]] = {}
@@ -215,11 +218,11 @@ class A05DetailedDesignTests(unittest.TestCase):
             "A05_DetailedDesign.build_session_name",
             side_effect=fake_build_session_name,
         ), patch(
-            "A05_DetailedDesign.list_tmux_session_names",
-            return_value=["开发工程师-天孤星"],
-        ), patch(
             "A05_DetailedDesign.list_registered_tmux_workers",
-            return_value=[],
+            return_value=[SimpleNamespace(session_name="开发工程师-天孤星")],
+        ), patch(
+            "tmux_core.runtime.tmux_runtime._list_backend_session_names",
+            side_effect=AssertionError("display-name prediction must not query tmux"),
         ):
             session_name = design_module._predict_worker_display_name(
                 project_dir=tmpdir,
@@ -2004,6 +2007,64 @@ class A05DetailedDesignTests(unittest.TestCase):
             self.assertEqual(state["current_task_runtime_status"], "done")
 
         self.assertIs(returned, reviewer)
+
+    def test_repair_turn_ready_failure_preserves_existing_review_artifacts_without_submitting_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            review_md_path, review_json_path = build_reviewer_artifact_paths(
+                root,
+                "需求A",
+                "测试工程师-天寿星",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师#1",
+                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                worker=_FakeWorker(
+                    session_name="测试工程师-天寿星",
+                    runtime_root=root / ".detailed_design_runtime",
+                    runtime_dir=root / ".detailed_design_runtime" / "reviewer",
+                ),
+                review_md_path=review_md_path,
+                review_json_path=review_json_path,
+                contract=build_reviewer_completion_contract(
+                    reviewer_name="测试工程师#1",
+                    review_md_path=review_md_path,
+                    review_json_path=review_json_path,
+                ),
+            )
+            previous_md = "- [Error] 保留上一轮评审问题\n"
+            previous_json = json.dumps(
+                [{"task_name": "详细设计", "review_pass": False}],
+                ensure_ascii=False,
+            )
+            reviewer.review_md_path.write_text(previous_md, encoding="utf-8")
+            reviewer.review_json_path.write_text(previous_json, encoding="utf-8")
+
+            def fail_before_submit(**_kwargs):  # noqa: ANN003
+                self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), previous_md)
+                self.assertEqual(reviewer.review_json_path.read_text(encoding="utf-8"), previous_json)
+                raise RuntimeError("previous_task_done: agent still busy before repair")
+
+            with patch(
+                "A05_DetailedDesign.run_completion_turn_with_repair",
+                side_effect=fail_before_submit,
+            ):
+                returned = run_reviewer_turn_with_recreation(
+                    reviewer,
+                    project_dir=root,
+                    requirement_name="需求A",
+                    reviewer_spec=DetailedDesignReviewerSpec(
+                        role_name="测试工程师",
+                        role_prompt="边界检查",
+                        reviewer_key="测试工程师#1",
+                    ),
+                    label="detailed_design_review_fix_test",
+                    prompt="repair review artifacts",
+                )
+
+            self.assertIs(returned, reviewer)
+            self.assertEqual(reviewer.review_md_path.read_text(encoding="utf-8"), previous_md)
+            self.assertEqual(reviewer.review_json_path.read_text(encoding="utf-8"), previous_json)
 
     def test_run_reviewer_turn_with_recreation_rejects_invalid_materialized_outputs_after_runtime_failure(self):
         with tempfile.TemporaryDirectory() as tmpdir:

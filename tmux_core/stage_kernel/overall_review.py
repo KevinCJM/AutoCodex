@@ -99,11 +99,13 @@ from tmux_core.stage_kernel.shared_review import (
     describe_reviewer_failure_reason,
     ensure_empty_file,
     ensure_review_artifacts,
+    ensure_review_artifacts_exist,
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
     note_reviewer_failure,
     parse_review_max_rounds,
     prompt_review_max_rounds,
+    resolve_reviewer_artifact_agent_name,
     resolve_stage_agent_config,
     reviewer_requires_manual_model_reconfiguration,
     worker_has_provider_auth_error,
@@ -736,13 +738,40 @@ def normalize_overall_review_reviewer_runtime(
     project_dir: str | Path,
     requirement_name: str,
 ) -> ReviewerRuntime:
-    artifact_reviewer_name = str(getattr(reviewer.worker, "session_name", "") or "").strip() or reviewer.reviewer_name
-    review_md_path, review_json_path = build_overall_review_reviewer_artifact_paths(
-        project_dir,
-        requirement_name,
-        artifact_reviewer_name,
+    project_root = Path(project_dir).expanduser().resolve()
+    safe_requirement_name = sanitize_requirement_name(requirement_name)
+    current_review_md_path = Path(reviewer.review_md_path).expanduser().resolve()
+    current_review_json_path = Path(reviewer.review_json_path).expanduser().resolve()
+    md_prefix = f"{safe_requirement_name}_整体代码复核记录_"
+    json_prefix = f"{safe_requirement_name}_整体复核记录_"
+    md_artifact_name = (
+        current_review_md_path.name[len(md_prefix):-len(".md")]
+        if current_review_md_path.name.startswith(md_prefix) and current_review_md_path.suffix == ".md"
+        else ""
     )
-    ensure_review_artifacts(review_md_path, review_json_path)
+    json_artifact_name = (
+        current_review_json_path.name[len(json_prefix):-len(".json")]
+        if current_review_json_path.name.startswith(json_prefix) and current_review_json_path.suffix == ".json"
+        else ""
+    )
+    already_bound_to_overall_review = (
+        current_review_md_path.parent == project_root
+        and current_review_json_path.parent == project_root
+        and bool(md_artifact_name)
+        and md_artifact_name == json_artifact_name
+    )
+    if already_bound_to_overall_review:
+        review_md_path = current_review_md_path
+        review_json_path = current_review_json_path
+        ensure_review_artifacts_exist(review_md_path, review_json_path)
+    else:
+        artifact_reviewer_name = str(getattr(reviewer.worker, "session_name", "") or "").strip() or reviewer.reviewer_name
+        review_md_path, review_json_path = build_overall_review_reviewer_artifact_paths(
+            project_dir,
+            requirement_name,
+            artifact_reviewer_name,
+        )
+        ensure_review_artifacts(review_md_path, review_json_path)
     current_status_path = Path(getattr(reviewer.contract, "status_path", review_json_path)).expanduser().resolve()
     if (
         reviewer.review_md_path.resolve() == review_md_path.resolve()
@@ -1953,7 +1982,7 @@ def repair_overall_review_outputs(
     return repair_reviewer_round_outputs(
         reviewers,
         key_func=lambda reviewer: reviewer.reviewer_name,
-        artifact_name_func=lambda reviewer: str(reviewer.worker.session_name or reviewer.reviewer_name).strip() or reviewer.reviewer_name,
+        artifact_name_func=resolve_reviewer_artifact_agent_name,
         check_job=lambda reviewer_names: check_reviewer_job(
             reviewer_names,
             directory=project_dir,

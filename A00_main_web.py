@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import signal
 import subprocess
 import sys
 import time
@@ -148,6 +149,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.skip_install:
         ensure_web_dependencies_installed()
 
+    def _handle_signal(signum: int, _frame: object) -> None:
+        if signum == signal.SIGINT:
+            raise KeyboardInterrupt
+        raise SystemExit(128 + int(signum))
+
+    handled_signals = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+    previous_handlers = {item: signal.getsignal(item) for item in handled_signals}
+    for item in handled_signals:
+        signal.signal(item, _handle_signal)
+
     processes: list[tuple[str, subprocess.Popen]] = []
     try:
         backend = _start_process("web-backend", build_backend_command(backend_port=backend_port), cwd=repo_root())
@@ -170,6 +181,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     except KeyboardInterrupt:
         return 130
     finally:
+        for item, previous_handler in previous_handlers.items():
+            signal.signal(item, previous_handler)
         _terminate_processes(processes)
         print("[web-main] shutdown complete", flush=True)
 

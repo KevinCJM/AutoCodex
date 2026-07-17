@@ -167,6 +167,72 @@ test('derives busy footer text from live workers when no progress event is visib
   expect(line).toContain('详细设计 / 审核中')
 })
 
+test('uses current A05 workers after an A01 progress line has been cleared by a running transition', () => {
+  const line = resolveFooterProgressLine(
+    {
+      status: 'running',
+      route: 'home',
+      activeStage: 'stage.a05.start',
+      activeStageLabel: '详细设计',
+      routingWorkers: [worker({ agentState: 'READY' })],
+      requirementsWorkers: [],
+      reviewWorkers: [],
+      designWorkers: [worker({ agentState: 'BUSY', currentTaskRuntimeStatus: 'running' })],
+      taskSplitWorkers: [],
+      developmentWorkers: [],
+      overallReviewWorkers: [],
+    },
+    '',
+    2,
+  )
+
+  expect(line).toContain('详细设计 / 审核中')
+  expect(line).not.toContain('路由初始化')
+})
+
+test('shows authoritative parse prepare and tmux wait messages when no cursor progress exists', () => {
+  const context = {
+    status: 'running',
+    route: 'home',
+    activeStage: 'stage.a01.start',
+    activeStageLabel: '路由初始化',
+    routingWorkers: [],
+    requirementsWorkers: [],
+    reviewWorkers: [],
+    designWorkers: [],
+    taskSplitWorkers: [],
+    developmentWorkers: [],
+    overallReviewWorkers: [],
+  }
+
+  for (const message of ['解析参数', '准备智能体', '等待 tmux']) {
+    expect(resolveFooterProgressLine(context, message, 0)).toBe(message)
+  }
+})
+
+test('replaces a stale tmux wait message once the current-stage worker is busy', () => {
+  const line = resolveFooterProgressLine(
+    {
+      status: 'running',
+      route: 'home',
+      activeStage: 'stage.a05.start',
+      activeStageLabel: '详细设计',
+      routingWorkers: [],
+      requirementsWorkers: [],
+      reviewWorkers: [],
+      designWorkers: [worker({ agentState: 'BUSY', currentTaskRuntimeStatus: 'running' })],
+      taskSplitWorkers: [],
+      developmentWorkers: [],
+      overallReviewWorkers: [],
+    },
+    '等待 tmux',
+    0,
+  )
+
+  expect(line).toContain('详细设计 / 审核中')
+  expect(line).not.toContain('等待 tmux')
+})
+
 test('keeps startup fallback when no live worker is actually running', () => {
   const line = resolveFooterProgressLine(
     {

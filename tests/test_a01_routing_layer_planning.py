@@ -9,6 +9,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import A01_Routing_LayerPlanning as routing_module
+
 from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor, get_model_choices, get_normalized_effort_choices
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
@@ -39,6 +41,7 @@ from A01_Routing_LayerPlanning import (
     split_target_dirs_text,
 )
 from T09_terminal_ops import PromptBackRequested
+from T02_tmux_agents import TmuxControlUnavailable
 from T03_agent_init_workflow import BatchInitResult, DirectoryInitResult, RoutingCleanupResult, RunManifest, RunStore, TargetSelection, WorkerManifestEntry
 
 
@@ -60,6 +63,17 @@ def _write_valid_routing_layer(project_dir: Path) -> None:
 
 
 class RoutingLayerCliTests(unittest.TestCase):
+    def test_cli_keyboard_interrupt_preserves_live_tmux_sessions(self):
+        with patch.object(routing_module, "main", side_effect=KeyboardInterrupt), patch.object(
+            routing_module,
+            "message",
+        ) as emit_message:
+            with self.assertRaises(SystemExit) as raised:
+                routing_module._run_cli_entrypoint()  # noqa: SLF001
+
+        self.assertEqual(raised.exception.code, 130)
+        self.assertIn("已保留", emit_message.call_args.args[0])
+
     def test_terminal_progress_monitor_redraws_in_place_for_tty(self):
         class _TTYBuffer(io.StringIO):
             def isatty(self) -> bool:
@@ -705,6 +719,71 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(request.proxy_port, "")
 
+    def test_collect_cli_request_skip_does_not_scan_or_validate_agent_catalog(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            _write_valid_routing_layer(project_dir)
+            args = build_parser().parse_args(["--project-dir", tmpdir])
+            with patch("A01_Routing_LayerPlanning.prompt_run_init", return_value=False), patch(
+                "A01_Routing_LayerPlanning.get_default_model_for_vendor",
+                side_effect=AssertionError("skip must not scan vendor catalog"),
+            ), patch(
+                "A01_Routing_LayerPlanning.normalize_model_choice",
+                side_effect=AssertionError("skip must not validate an unused model"),
+            ), patch(
+                "A01_Routing_LayerPlanning.normalize_effort_choice",
+                side_effect=AssertionError("skip must not validate unused reasoning effort"),
+            ):
+                request = collect_cli_request(args)
+
+        self.assertFalse(request.run_init)
+        self.assertEqual(request.vendor, "codex")
+        self.assertEqual(request.model, DEFAULT_MODEL_BY_VENDOR["codex"])
+        self.assertEqual(request.reasoning_effort, "high")
+
+    def test_collect_cli_request_parameter_skip_does_not_scan_agent_catalog(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            _write_valid_routing_layer(project_dir)
+            args = build_parser().parse_args(
+                ["--project-dir", tmpdir, "--run-init", "no", "--yes"]
+            )
+            with patch(
+                "A01_Routing_LayerPlanning.get_default_model_for_vendor",
+                side_effect=AssertionError("parameter skip must not scan vendor catalog"),
+            ), patch(
+                "A01_Routing_LayerPlanning.normalize_model_choice",
+                side_effect=AssertionError("parameter skip must not validate an unused model"),
+            ):
+                request = collect_cli_request(args)
+
+        self.assertFalse(request.run_init)
+        self.assertEqual(request.model, DEFAULT_MODEL_BY_VENDOR["codex"])
+
+    def test_prepare_batch_request_skip_returns_without_agent_resolution(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir)
+            _write_valid_routing_layer(project_dir)
+            request = routing_module.CliRequest(
+                project_dir=str(project_dir),
+                target_dirs=(),
+                vendor="codex",
+                model=DEFAULT_MODEL_BY_VENDOR["codex"],
+                reasoning_effort="high",
+                proxy_port="",
+                run_init=False,
+                max_refine_rounds=3,
+                auto_confirm=True,
+            )
+            with patch(
+                "A01_Routing_LayerPlanning.AgentRunConfig",
+                side_effect=AssertionError("skip must not resolve an unused agent config"),
+            ):
+                config, selection = routing_module.prepare_batch_request(request)
+
+        self.assertIsNone(config)
+        self.assertFalse(selection.should_run)
+
     def test_collect_cli_request_can_back_from_run_init_to_project_dir(self):
         parser = build_parser()
         args = parser.parse_args([])
@@ -879,6 +958,9 @@ class RoutingLayerCliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "A01_Routing_LayerPlanning.run_batch_initialization",
             side_effect=AssertionError("空项目不应启动路由初始化"),
+        ), patch(
+            "A01_Routing_LayerPlanning.AgentRunConfig",
+            side_effect=AssertionError("skip must not resolve an unused agent config"),
         ), patch("sys.stdout", new=stdout):
             result = run_routing_stage(["--project-dir", tmpdir, "--yes", "--legacy-cli"])
         self.assertTrue(result.skipped)
@@ -979,6 +1061,70 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertEqual(observed["effort_role_label"], "路由器-天捷星")
         self.assertEqual(observed["proxy_role_label"], "路由器-天捷星")
 
+    def test_collect_cli_request_with_complete_parameters_does_not_predict_role_label(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            Path(tmp_dir, "app.py").write_text("print('ok')\n", encoding="utf-8")
+            args = parser.parse_args(
+                [
+                    "--project-dir",
+                    tmp_dir,
+                    "--vendor",
+                    "codex",
+                    "--model",
+                    "gpt-5.4",
+                    "--effort",
+                    "high",
+                    "--run-init",
+                    "yes",
+                    "--yes",
+                ]
+            )
+            with patch(
+                "A01_Routing_LayerPlanning._predict_routing_role_label",
+                side_effect=AssertionError("complete parameter mode must not query tmux for a label"),
+            ) as predict:
+                request = collect_cli_request(args)
+
+        predict.assert_not_called()
+        self.assertEqual(request.vendor, "codex")
+        self.assertEqual(request.model, "gpt-5.4")
+
+    def test_predict_routing_role_label_does_not_query_tmux_control(self):
+        observed: dict[str, set[str]] = {}
+
+        def fake_build_session_name(_worker_id, _work_dir, _vendor, *, occupied_session_names=(), **_kwargs):
+            observed["occupied"] = {str(item) for item in occupied_session_names}
+            return "路由器-天捷星"
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch(
+            "A01_Routing_LayerPlanning.resolve_target_selection",
+            return_value=TargetSelection(
+                project_dir=tmp_dir,
+                selected_dirs=(tmp_dir,),
+                skipped_dirs=(),
+                forced_dirs=(),
+                project_missing_files=(),
+            ),
+        ), patch(
+            "A01_Routing_LayerPlanning.list_registered_tmux_workers",
+            return_value=[SimpleNamespace(session_name="已有智能体-天勇星")],
+        ), patch(
+            "A01_Routing_LayerPlanning.build_session_name",
+            side_effect=fake_build_session_name,
+        ), patch(
+            "tmux_core.runtime.tmux_runtime._list_backend_session_names",
+            side_effect=AssertionError("prompt label must not query tmux"),
+        ):
+            label = routing_module._predict_routing_role_label(
+                project_dir=tmp_dir,
+                target_dirs=(),
+                run_init=True,
+            )
+
+        self.assertEqual(label, "路由器-天捷星")
+        self.assertIn("已有智能体-天勇星", observed["occupied"])
+
     def test_prompt_proxy_port_allows_custom_input(self):
         with patch("builtins.input", side_effect=["4", "http://127.0.0.1:10900"]):
             proxy_port = prompt_proxy_port("")
@@ -1076,6 +1222,223 @@ class RoutingLayerCliTests(unittest.TestCase):
                     exit_code = main(["--project-dir", tmpdir, "--vendor", "codex", "--model", "gpt-5.4", "--effort", "high", "--run-init", "yes", "--yes"])
         self.assertEqual(exit_code, 0)
         self.assertEqual(start_stop_events, ["init:run_demo", "start", "stop"])
+
+    def test_successful_routing_stage_cleanup_errors_do_not_reverse_success(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir).resolve()
+            (project_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            request = collect_cli_request(
+                parser.parse_args(
+                    [
+                        "--project-dir",
+                        tmp_dir,
+                        "--vendor",
+                        "codex",
+                        "--model",
+                        "gpt-5.4",
+                        "--effort",
+                        "high",
+                        "--run-init",
+                        "yes",
+                        "--yes",
+                    ]
+                )
+            )
+            runtime_dir = project_dir / ".routing_init_runtime" / "run_success"
+            batch_result = BatchInitResult(
+                run_id="run_success",
+                runtime_dir=str(runtime_dir),
+                selection=TargetSelection(
+                    project_dir=str(project_dir),
+                    selected_dirs=(str(project_dir),),
+                    skipped_dirs=(),
+                    forced_dirs=(),
+                    project_missing_files=(),
+                ),
+                config={
+                    "vendor": "codex",
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "high",
+                    "proxy_url": "",
+                },
+                results=[
+                    DirectoryInitResult(
+                        work_dir=str(project_dir),
+                        forced=False,
+                        status="passed",
+                        rounds_used=0,
+                    )
+                ],
+            )
+            loaded_store = SimpleNamespace(
+                manifest=SimpleNamespace(run_id="run_success", runtime_dir=str(runtime_dir), workers=[])
+            )
+
+            for failing_step in ("tmux", "artifacts"):
+                with self.subTest(failing_step=failing_step), patch(
+                    "A01_Routing_LayerPlanning.collect_cli_request",
+                    return_value=request,
+                ), patch(
+                    "A01_Routing_LayerPlanning.run_batch_initialization",
+                    return_value=batch_result,
+                ), patch(
+                    "A01_Routing_LayerPlanning.RunStore.load",
+                    return_value=loaded_store,
+                ), patch(
+                    "A01_Routing_LayerPlanning.kill_run_tmux_sessions",
+                    side_effect=TimeoutError("tmux cleanup timeout") if failing_step == "tmux" else None,
+                    return_value=[] if failing_step == "tmux" else ["routing-session"],
+                ) as kill_sessions, patch(
+                    "A01_Routing_LayerPlanning.cleanup_routing_stage_artifacts",
+                    side_effect=OSError("artifact cleanup failed") if failing_step == "artifacts" else None,
+                    return_value=RoutingCleanupResult(),
+                ) as cleanup_artifacts:
+                    result = run_routing_stage([])
+
+                self.assertEqual(result.exit_code, 0)
+                kill_sessions.assert_called_once()
+                if failing_step == "tmux":
+                    cleanup_artifacts.assert_not_called()
+                    self.assertEqual(result.killed_sessions, ())
+                else:
+                    cleanup_artifacts.assert_called_once()
+                    self.assertEqual(result.killed_sessions, ("routing-session",))
+
+    def test_routing_stage_transport_exception_orphans_prepared_workers_before_reraising(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir).resolve()
+            (project_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            request = collect_cli_request(
+                parser.parse_args(
+                    [
+                        "--project-dir",
+                        tmp_dir,
+                        "--vendor",
+                        "codex",
+                        "--model",
+                        "gpt-5.4",
+                        "--effort",
+                        "high",
+                        "--run-init",
+                        "yes",
+                        "--yes",
+                    ]
+                )
+            )
+            prepared_store = SimpleNamespace(
+                manifest=SimpleNamespace(
+                    run_id="run_interrupted",
+                    runtime_dir=str(project_dir / ".routing_init_runtime" / "run_interrupted"),
+                    workers=[],
+                )
+            )
+            transport_error = TmuxControlUnavailable(
+                operation="list-panes",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            )
+
+            def fail_after_prepare(*, on_workers_prepared, **_kwargs):
+                on_workers_prepared(prepared_store, [], [])
+                raise transport_error
+
+            with patch(
+                "A01_Routing_LayerPlanning.collect_cli_request",
+                return_value=request,
+            ), patch(
+                "A01_Routing_LayerPlanning.run_batch_initialization",
+                side_effect=fail_after_prepare,
+            ), patch(
+                "A01_Routing_LayerPlanning.mark_run_workers_orphaned"
+            ) as mark_orphaned:
+                with self.assertRaises(TmuxControlUnavailable) as raised:
+                    run_routing_stage([])
+
+            self.assertIs(raised.exception, transport_error)
+            mark_orphaned.assert_called_once_with(
+                run_store=prepared_store,
+                reason="routing_stage_interrupted",
+            )
+
+    def test_failed_routing_stage_preserves_tmux_sessions_and_runtime_artifacts(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir).resolve()
+            (project_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            request = collect_cli_request(
+                parser.parse_args(
+                    [
+                        "--project-dir",
+                        tmp_dir,
+                        "--vendor",
+                        "codex",
+                        "--model",
+                        "gpt-5.4",
+                        "--effort",
+                        "high",
+                        "--run-init",
+                        "yes",
+                        "--yes",
+                    ]
+                )
+            )
+            runtime_dir = project_dir / ".routing_init_runtime" / "run_failed"
+            batch_result = BatchInitResult(
+                run_id="run_failed",
+                runtime_dir=str(runtime_dir),
+                selection=TargetSelection(
+                    project_dir=str(project_dir),
+                    selected_dirs=(str(project_dir),),
+                    skipped_dirs=(),
+                    forced_dirs=(str(project_dir),),
+                    project_missing_files=("AGENTS.md",),
+                ),
+                config={
+                    "vendor": "codex",
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "high",
+                    "proxy_url": "",
+                },
+                results=[
+                    DirectoryInitResult(
+                        work_dir=str(project_dir),
+                        forced=True,
+                        status="failed",
+                        rounds_used=0,
+                        session_name="路由器-天哭星",
+                        failure_reason="tmux control unavailable",
+                    )
+                ],
+            )
+            loaded_store = SimpleNamespace(
+                manifest=SimpleNamespace(run_id="run_failed", runtime_dir=str(runtime_dir))
+            )
+            with patch(
+                "A01_Routing_LayerPlanning.collect_cli_request",
+                return_value=request,
+            ), patch(
+                "A01_Routing_LayerPlanning.run_batch_initialization",
+                return_value=batch_result,
+            ), patch(
+                "A01_Routing_LayerPlanning.RunStore.load",
+                return_value=loaded_store,
+            ), patch(
+                "A01_Routing_LayerPlanning.kill_run_tmux_sessions"
+            ) as kill_sessions, patch(
+                "A01_Routing_LayerPlanning.cleanup_routing_stage_artifacts"
+            ) as cleanup_artifacts, patch(
+                "A01_Routing_LayerPlanning.mark_run_workers_orphaned"
+            ) as mark_orphaned:
+                result = run_routing_stage([])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(result.killed_sessions, ())
+        kill_sessions.assert_not_called()
+        cleanup_artifacts.assert_not_called()
+        mark_orphaned.assert_called_once_with(run_store=loaded_store, reason="routing_stage_failed")
 
 
 if __name__ == "__main__":

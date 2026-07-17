@@ -19,12 +19,36 @@ type FooterProgressContext = {
 }
 
 const STARTUP_PROGRESS_PATTERNS = [
+  '解析参数',
+  '准备智能体',
+  '等待 tmux',
   '智能体启动中',
   '启动审核器',
   '初始化审核器',
   '配置审核器',
   '配置审核器模型',
 ] as const
+
+const ACTIVE_TURN_STATUSES = new Set(['preparing', 'submitting', 'submitted', 'waiting_result', 'submission_unknown', 'running', 'pending'])
+const COMPLETED_TURN_STATUSES = new Set(['done', 'ready', 'succeeded', 'completed', 'failed', 'error', 'stale_failed', 'orphaned'])
+
+function isBusyTurnWorker(worker: WorkerSnapshot): boolean {
+  if (!isBusyWorker(worker)) return false
+  const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
+  const resultStatus = String(worker.resultStatus || '').trim().toLowerCase()
+  const status = String(worker.status || '').trim().toLowerCase()
+  const dispatchState = String(worker.dispatchState || '').trim().toLowerCase()
+  const turnState = String(worker.turnState || '').trim().toLowerCase()
+  if (COMPLETED_TURN_STATUSES.has(runtimeStatus)) return false
+  if (ACTIVE_TURN_STATUSES.has(runtimeStatus)) return true
+  if (COMPLETED_TURN_STATUSES.has(turnState)) return false
+  if (ACTIVE_TURN_STATUSES.has(turnState) || ACTIVE_TURN_STATUSES.has(dispatchState)) return true
+  if (COMPLETED_TURN_STATUSES.has(resultStatus)) return false
+  if (ACTIVE_TURN_STATUSES.has(resultStatus)) return true
+  if (COMPLETED_TURN_STATUSES.has(status)) return false
+  if (ACTIVE_TURN_STATUSES.has(status)) return true
+  return true
+}
 
 function stageWorkers(context: FooterProgressContext): WorkerSnapshot[] {
   switch (stageProgressKey(context.route, context.activeStage)) {
@@ -61,7 +85,7 @@ export function resolveFooterProgressLine(
   const explicit = String(explicitProgressLine || '').trim()
   const normalizedStatus = String(context.status || '').trim().toLowerCase()
   if (normalizedStatus !== 'running') return explicit
-  const busyWorkers = stageWorkers(context).filter(isBusyWorker)
+  const busyWorkers = stageWorkers(context).filter(isBusyTurnWorker)
   const busyCount = busyWorkers.length
   if (explicit) {
     const looksLikeStartup = STARTUP_PROGRESS_PATTERNS.some((pattern) => explicit.includes(pattern))

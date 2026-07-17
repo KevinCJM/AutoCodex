@@ -18,6 +18,27 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class StageKernelSharedTests(unittest.TestCase):
+    def test_reviewer_artifact_agent_name_is_stable_after_session_rename(self):
+        cases = (
+            ("需求A_评审记录_开发工程师-天孤星.json", "开发工程师-天孤星"),
+            ("需求A_整体复核记录_测试工程师-女土蝠.json", "测试工程师-女土蝠"),
+        )
+        for filename, expected in cases:
+            with self.subTest(filename=filename):
+                reviewer = SimpleNamespace(
+                    reviewer_name="开发工程师",
+                    worker=SimpleNamespace(session_name="开发工程师-天伤星"),
+                    review_json_path=Path("/tmp") / filename,
+                )
+                self.assertEqual(shared_review.resolve_reviewer_artifact_agent_name(reviewer), expected)
+
+        fallback = SimpleNamespace(
+            reviewer_name="开发工程师",
+            worker=SimpleNamespace(session_name="开发工程师-天伤星"),
+            review_json_path=Path("/tmp/custom.json"),
+        )
+        self.assertEqual(shared_review.resolve_reviewer_artifact_agent_name(fallback), "开发工程师-天伤星")
+
     def test_parallel_reviewer_helpers_preserve_tmux_control_exception_type(self):
         errors = (
             TmuxControlUnavailable(
@@ -99,6 +120,8 @@ class StageKernelSharedTests(unittest.TestCase):
         self.assertIs(detailed_design.ReviewStageProgress, shared_review.ReviewStageProgress)
         self.assertIs(requirements_review.ensure_empty_file, shared_review.ensure_empty_file)
         self.assertIs(detailed_design.ensure_empty_file, shared_review.ensure_empty_file)
+        self.assertIs(requirements_review.ensure_review_artifacts_exist, shared_review.ensure_review_artifacts_exist)
+        self.assertIs(detailed_design.ensure_review_artifacts_exist, shared_review.ensure_review_artifacts_exist)
         self.assertIs(requirements_review.worker_has_provider_auth_error, shared_review.worker_has_provider_auth_error)
         self.assertIs(detailed_design.worker_has_provider_auth_error, shared_review.worker_has_provider_auth_error)
 
@@ -312,6 +335,24 @@ class StageKernelSharedTests(unittest.TestCase):
 
             self.assertEqual(md_path.read_text(encoding="utf-8"), "")
             self.assertEqual(json.loads(json_path.read_text(encoding="utf-8")), [])
+
+    def test_ensure_review_artifacts_exist_preserves_existing_content_and_creates_missing_peer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            md_path = Path(tmpdir) / "review.md"
+            json_path = Path(tmpdir) / "review.json"
+            previous_md = "- [Error] preserve previous review\n"
+            md_path.write_text(previous_md, encoding="utf-8")
+
+            shared_review.ensure_review_artifacts_exist(md_path, json_path)
+
+            self.assertEqual(md_path.read_text(encoding="utf-8"), previous_md)
+            self.assertEqual(json.loads(json_path.read_text(encoding="utf-8")), [])
+
+            previous_json = '[{"task_name": "详细设计", "review_pass": false}]'
+            json_path.write_text(previous_json, encoding="utf-8")
+            shared_review.ensure_review_artifacts_exist(md_path, json_path)
+            self.assertEqual(md_path.read_text(encoding="utf-8"), previous_md)
+            self.assertEqual(json_path.read_text(encoding="utf-8"), previous_json)
 
     def test_resolve_stage_agent_config_accepts_fixed_two_reviewers(self):
         args = type(

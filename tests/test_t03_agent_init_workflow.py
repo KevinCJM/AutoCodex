@@ -6,6 +6,7 @@ import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from T02_tmux_agents import (
@@ -13,6 +14,8 @@ from T02_tmux_agents import (
     AgentRuntimeState,
     AgentStartupInterventionRequired,
     CommandResult,
+    TmuxControlUnavailable,
+    TmuxMutationOutcomeUnknown,
     WorkerResult,
 )
 from T03_agent_init_workflow import (
@@ -48,6 +51,8 @@ from T03_agent_init_workflow import (
     has_complete_routing_layer,
     load_routing_audit_decision,
     load_existing_run,
+    kill_run_tmux_sessions,
+    mark_run_workers_orphaned,
     missing_routing_layer_files,
     normalize_audit_output,
     prepare_revise_audit_output,
@@ -92,6 +97,7 @@ class FakeWorker:
         existing_runtime_dir=None,
         existing_session_name="",
         existing_pane_id="",
+        runtime_metadata=None,
     ):
         self.worker_id = worker_id
         self.work_dir = Path(work_dir)
@@ -107,23 +113,25 @@ class FakeWorker:
         self.transcript_path = self.runtime_dir / "transcript.md"
         self.results = []
         self.script = list(self.scripts.get(str(self.work_dir), []))
-        self._write_state(
-            {
-                "session_name": self.session_name,
-                "pane_id": self.pane_id,
-                "runtime_dir": str(self.runtime_dir),
-                "workflow_stage": "pending",
-                "workflow_round": 0,
-                "result_status": "pending",
-                "agent_state": "STARTING",
-                "retry_count": 0,
-                "last_log_offset": 0,
-                "log_path": str(self.log_path),
-                "raw_log_path": str(self.raw_log_path),
-                "state_path": str(self.state_path),
-                "transcript_path": str(self.transcript_path),
-            }
-        )
+        self._runtime_metadata = dict(runtime_metadata or {})
+        state_payload = {
+            "session_name": self.session_name,
+            "pane_id": self.pane_id,
+            "runtime_dir": str(self.runtime_dir),
+            "work_dir": str(self.work_dir),
+            "workflow_stage": "pending",
+            "workflow_round": 0,
+            "result_status": "pending",
+            "agent_state": "STARTING",
+            "retry_count": 0,
+            "last_log_offset": 0,
+            "log_path": str(self.log_path),
+            "raw_log_path": str(self.raw_log_path),
+            "state_path": str(self.state_path),
+            "transcript_path": str(self.transcript_path),
+        }
+        state_payload.update(self._runtime_metadata)
+        self._write_state(state_payload)
 
     def _write_state(self, payload):
         self.state_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -132,7 +140,7 @@ class FakeWorker:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
     def runtime_metadata(self):
-        return {
+        payload = {
             "worker_id": self.worker_id,
             "session_name": self.session_name,
             "pane_id": self.pane_id,
@@ -143,6 +151,8 @@ class FakeWorker:
             "state_path": str(self.state_path),
             "transcript_path": str(self.transcript_path),
         }
+        payload.update(self._runtime_metadata)
+        return payload
 
     def session_exists(self):
         return self.alive_sessions.get(self.session_name, False)
@@ -463,6 +473,172 @@ class AgentInitWorkflowTests(unittest.TestCase):
             self.assertTrue((project_dir / ROUTING_AUDIT_STATUS_FILE).exists())
             self.assertTrue((project_dir / ROUTING_AUDIT_RECORD_FILE).exists())
             self.assertTrue(runtime_dir.exists())
+
+    def test_kill_run_tmux_sessions_keeps_cleanup_best_effort(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir()
+            entries = []
+            for session_name in ("session-a", "session-b", "session-c"):
+                runtime_dir = (Path(tmpdir) / session_name).resolve()
+                runtime_dir.mkdir()
+                state_path = runtime_dir / "worker.state.json"
+                state_path.write_text(
+                    json.dumps(
+                        {
+                            "session_name": session_name,
+                            "runtime_dir": str(runtime_dir),
+                            "work_dir": str(project_dir),
+                            "project_dir": str(project_dir),
+                            "workflow_action": "stage.a01.start",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                entries.append(
+                    SimpleNamespace(
+                        session_name=session_name,
+                        runtime_dir=str(runtime_dir),
+                        work_dir=str(project_dir),
+                        state_path=str(state_path),
+                    )
+                )
+
+            controller = SimpleNamespace()
+            killed: list[str] = []
+
+            def kill_session(session_name: str, *, missing_ok: bool) -> str:  # noqa: ARG001
+                if session_name == "session-b":
+                    raise TmuxControlUnavailable(
+                        operation="kill-session",
+                        error="timeout",
+                        elapsed_sec=60.0,
+                        attempts=4,
+                    )
+                killed.append(session_name)
+                return session_name
+
+            controller.session_matches_context = lambda *_args, **_kwargs: True
+            controller.session_exists = lambda _session_name: True
+            controller.kill_session = kill_session
+            events: list[tuple[str, dict[str, object]]] = []
+            store = SimpleNamespace(
+                manifest=SimpleNamespace(project_dir=str(project_dir), workers=entries),
+                append_event=lambda event, **payload: events.append((event, payload)),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "session-b"):
+                kill_run_tmux_sessions(run_store=store, runtime_controller=controller)
+
+            self.assertEqual(killed, ["session-a", "session-c"])
+            self.assertEqual(events[-1][0], "routing_tmux_cleanup")
+            self.assertEqual(events[-1][1]["errors"][0]["session_name"], "session-b")
+
+    def test_kill_run_tmux_sessions_refuses_same_name_session_with_unproven_identity(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir()
+            runtime_dir = (Path(tmpdir) / "runtime").resolve()
+            runtime_dir.mkdir()
+            state_path = runtime_dir / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "reused-name",
+                        "runtime_dir": str(runtime_dir),
+                        "work_dir": str(project_dir),
+                        "project_dir": str(project_dir),
+                        "workflow_action": "stage.a01.start",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            kill_calls: list[str] = []
+            controller = SimpleNamespace(
+                session_matches_context=lambda *_args, **_kwargs: False,
+                session_exists=lambda _session_name: True,
+                kill_session=lambda session_name, **_kwargs: kill_calls.append(session_name),
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            store = SimpleNamespace(
+                manifest=SimpleNamespace(
+                    project_dir=str(project_dir),
+                    workers=[
+                        SimpleNamespace(
+                            session_name="reused-name",
+                            runtime_dir=str(runtime_dir),
+                            work_dir=str(project_dir),
+                            state_path=str(state_path),
+                        )
+                    ],
+                ),
+                append_event=lambda event, **payload: events.append((event, payload)),
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "reused-name"):
+                kill_run_tmux_sessions(run_store=store, runtime_controller=controller)
+
+            self.assertEqual(kill_calls, [])
+            self.assertIn("identity 无法证明", events[-1][1]["errors"][0]["error"])
+
+    def test_mark_run_workers_orphaned_updates_live_state_without_tmux_probe(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "routing-worker",
+                        "session_name": "routing-session",
+                        "agent_state": "READY",
+                        "agent_alive": True,
+                        "turn_state": "waiting_result",
+                        "state_revision": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            events: list[tuple[str, dict[str, object]]] = []
+            store = SimpleNamespace(
+                manifest=SimpleNamespace(
+                    workers=[SimpleNamespace(state_path=str(state_path), session_name="routing-session")]
+                ),
+                append_event=lambda event, **payload: events.append((event, payload)),
+            )
+
+            class LiveWorker:
+                session_name = "routing-session"
+
+                def __init__(self):
+                    self.state_path = state_path
+                    self.metadata: dict[str, object] = {}
+
+                def set_runtime_metadata(self, **metadata):  # noqa: ANN003
+                    self.metadata.update(metadata)
+
+                def mark_orphaned(self, reason: str) -> None:
+                    payload = json.loads(state_path.read_text(encoding="utf-8"))
+                    payload.update(
+                        {
+                            "turn_state": "orphaned",
+                            "orphaned_reason": reason,
+                            "state_revision": int(payload.get("state_revision", 0)) + 1,
+                        }
+                    )
+                    payload.update(self.metadata)
+                    state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            live_worker = LiveWorker()
+            with patch("T03_agent_init_workflow.list_registered_tmux_workers", return_value=[live_worker]):
+                orphaned = mark_run_workers_orphaned(run_store=store, reason="routing failed")
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(orphaned, ("routing-session",))
+            self.assertEqual(payload["turn_state"], "orphaned")
+            self.assertEqual(payload["orphaned_reason"], "routing failed")
+            self.assertEqual(payload["orphaned_stage_action"], "stage.a01.start")
+            self.assertEqual(payload["state_revision"], 4)
+            self.assertEqual(live_worker.metadata["orphaned_stage_action"], "stage.a01.start")
+            self.assertEqual(events[-1][0], "routing_workers_orphaned")
 
     def test_resolve_target_selection_forces_project_dir_when_missing(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1339,6 +1515,107 @@ class AgentInitWorkflowTests(unittest.TestCase):
             self.assertEqual(result.results[0].status, "failed")
             self.assertIn("worker init failed", result.results[0].failure_reason)
 
+    def test_run_batch_initialization_propagates_tmux_control_unavailable(self):
+        class ControlFailureWorker(FakeWorker):
+            def run_turn(self, **kwargs):  # noqa: ANN003
+                raise TmuxControlUnavailable(
+                    operation="list-panes",
+                    error="timeout",
+                    elapsed_sec=60.0,
+                    attempts=4,
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+
+            with self.assertRaises(TmuxControlUnavailable):
+                run_batch_initialization(
+                    selection=selection,
+                    config=config,
+                    runtime_root=Path(tmpdir) / "runtime",
+                    worker_factory=ControlFailureWorker,
+                )
+
+    def test_run_batch_initialization_does_not_wait_for_slow_worker_after_fatal_transport(self):
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+        slow_finished = threading.Event()
+        queued_started = threading.Event()
+
+        def controlled_worker_run(*, worker, **_kwargs):  # noqa: ANN003
+            if worker.work_dir.name == "slow":
+                slow_started.set()
+                release_slow.wait(timeout=5.0)
+                slow_finished.set()
+                return DirectoryInitResult(
+                    work_dir=str(worker.work_dir),
+                    forced=False,
+                    status="failed",
+                    rounds_used=0,
+                )
+            if worker.work_dir.name == "queued":
+                queued_started.set()
+                raise AssertionError("queued worker should have been cancelled")
+            if not slow_started.wait(timeout=2.0):
+                raise AssertionError("slow worker did not start")
+            raise TmuxControlUnavailable(
+                operation="list-panes",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            slow_dir = project_dir / "slow"
+            queued_dir = project_dir / "queued"
+            slow_dir.mkdir(parents=True)
+            queued_dir.mkdir()
+            selection = resolve_target_selection(
+                project_dir=project_dir,
+                target_dirs=(slow_dir, queued_dir),
+                run_init=True,
+            )
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            outcome: list[BaseException] = []
+            caller_finished = threading.Event()
+
+            def invoke_batch() -> None:
+                try:
+                    with patch(
+                        "T03_agent_init_workflow.run_directory_initialization_with_worker",
+                        side_effect=controlled_worker_run,
+                    ):
+                        run_batch_initialization(
+                            selection=selection,
+                            config=config,
+                            runtime_root=Path(tmpdir) / "runtime",
+                            max_workers=2,
+                            worker_factory=FakeWorker,
+                        )
+                except BaseException as error:  # noqa: BLE001
+                    outcome.append(error)
+                finally:
+                    caller_finished.set()
+
+            caller = threading.Thread(target=invoke_batch, name="routing-fatal-caller")
+            caller.start()
+            try:
+                self.assertTrue(slow_started.wait(timeout=2.0))
+                returned_before_slow_worker = caller_finished.wait(timeout=1.0)
+            finally:
+                release_slow.set()
+                caller.join(timeout=5.0)
+
+            self.assertTrue(returned_before_slow_worker)
+            self.assertTrue(slow_finished.wait(timeout=2.0))
+            self.assertEqual(len(outcome), 1)
+            self.assertIsInstance(outcome[0], TmuxControlUnavailable)
+            self.assertFalse(queued_started.is_set())
+
     def test_prepare_live_workers_writes_manifest_immediately(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = (Path(tmpdir) / "project").resolve()
@@ -1362,6 +1639,43 @@ class AgentInitWorkflowTests(unittest.TestCase):
             self.assertEqual(manifest["workers"][0]["work_dir"], str(project_dir))
             self.assertEqual(manifest["workers"][0]["result_status"], "pending")
             self.assertEqual(manifest["workers"][0]["agent_state"], AgentRuntimeState.STARTING.value)
+            worker_state = json.loads(live_workers[0].worker.state_path.read_text(encoding="utf-8"))
+            self.assertEqual(worker_state["project_dir"], str(project_dir))
+            self.assertEqual(worker_state["workflow_action"], "stage.a01.start")
+            self.assertEqual(live_workers[0].worker.runtime_metadata()["project_dir"], str(project_dir))
+            self.assertEqual(
+                live_workers[0].worker.runtime_metadata()["workflow_action"],
+                "stage.a01.start",
+            )
+
+    def test_prepare_live_workers_reraises_transport_exceptions(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            config = AgentRunConfig(vendor="codex", model="gpt-5")
+            errors = (
+                TmuxControlUnavailable(
+                    operation="list-panes",
+                    error="timeout",
+                    elapsed_sec=60.0,
+                    attempts=4,
+                ),
+                TmuxMutationOutcomeUnknown(operation="new-session", error="timeout"),
+            )
+            for error in errors:
+                with self.subTest(error=type(error).__name__):
+                    def failing_factory(**_kwargs):
+                        raise error
+
+                    with self.assertRaises(type(error)) as raised:
+                        prepare_live_workers(
+                            selection=selection,
+                            config=config,
+                            runtime_root=Path(tmpdir) / type(error).__name__,
+                            worker_factory=failing_factory,
+                        )
+                    self.assertIs(raised.exception, error)
 
     def test_run_store_write_manifest_allows_concurrent_loaded_instances(self):
         with tempfile.TemporaryDirectory() as tmpdir:

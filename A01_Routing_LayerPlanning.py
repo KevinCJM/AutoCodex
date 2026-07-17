@@ -24,10 +24,8 @@ from tmux_core.runtime.vendor_catalog import (
 )
 from T02_tmux_agents import (
     AgentRunConfig,
-    TmuxRuntimeController,
     Vendor,
     build_session_name,
-    cleanup_registered_tmux_workers,
     list_registered_tmux_workers,
     worker_state_is_prelaunch_active,
 )
@@ -37,8 +35,10 @@ from T03_agent_init_workflow import (
     DirectoryInitResult,
     LiveWorkerHandle,
     RunStore,
+    TargetSelection,
     cleanup_routing_stage_artifacts,
     kill_run_tmux_sessions,
+    mark_run_workers_orphaned,
     project_has_business_files,
     routing_layer_readiness_issues,
     resolve_existing_directory,
@@ -236,11 +236,10 @@ def _predict_routing_role_label(
         )
         focus_dir = selection.selected_dirs[0] if selection.selected_dirs else selection.project_dir
         focus_path = Path(focus_dir).expanduser().resolve()
+        # This is only an interactive label.  Do not synchronously query tmux
+        # between vendor/model/effort prompts; launch-time conflict handling is
+        # authoritative and can rename the session safely.
         occupied_session_names: set[str] = set()
-        try:
-            occupied_session_names.update(TmuxRuntimeController().list_sessions())
-        except Exception:
-            pass
         for worker in list_registered_tmux_workers():
             session_name = str(getattr(worker, "session_name", "") or "").strip()
             if session_name:
@@ -466,8 +465,10 @@ def _collect_interactive_cli_request(
             if step == 3:
                 if not run_init:
                     vendor = normalize_vendor_choice(vendor or "codex")
-                    model = normalize_model_choice(vendor, model or get_default_model_for_vendor(vendor))
-                    reasoning_effort = normalize_effort_choice(vendor, model, reasoning_effort or "high")
+                    # No routing worker will be launched. Keep stable display
+                    # defaults without paying for dynamic vendor discovery.
+                    model = model or DEFAULT_MODEL_BY_VENDOR[vendor]
+                    reasoning_effort = reasoning_effort or "high"
                     proxy_port = ""
                     step = 7
                     continue
@@ -574,11 +575,13 @@ def collect_cli_request(
         target_dirs = tuple()
 
     if run_init:
-        routing_role_label = _predict_routing_role_label(
-            project_dir=project_dir,
-            target_dirs=target_dirs,
-            run_init=run_init,
-        )
+        routing_role_label = ""
+        if not args.vendor or not args.model:
+            routing_role_label = _predict_routing_role_label(
+                project_dir=project_dir,
+                target_dirs=target_dirs,
+                run_init=run_init,
+            )
         vendor = normalize_vendor_choice(args.vendor) if args.vendor else prompt_vendor("codex", role_label=routing_role_label)
         model_default = get_default_model_for_vendor(vendor)
         model = normalize_model_choice(
@@ -595,8 +598,10 @@ def collect_cli_request(
         proxy_port = args.proxy_port or ("" if parameter_mode else prompt_proxy_port("", role_label=routing_role_label))
     else:
         vendor = normalize_vendor_choice(args.vendor or "codex")
-        model = normalize_model_choice(vendor, args.model or get_default_model_for_vendor(vendor))
-        reasoning_effort = normalize_effort_choice(vendor, model, args.effort or "high")
+        # These values are informational only because selection.should_run is
+        # false. Dynamic validation would synchronously scan every vendor.
+        model = str(args.model or DEFAULT_MODEL_BY_VENDOR[vendor]).strip()
+        reasoning_effort = str(args.effort or "high").strip() or "high"
         proxy_port = args.proxy_port or ""
     max_refine_rounds = int(args.max_refine_rounds or 3)
     if max_refine_rounds < 1:
@@ -615,18 +620,28 @@ def collect_cli_request(
     )
 
 
-def prepare_batch_request(request: CliRequest) -> tuple[AgentRunConfig, object]:
-    config = AgentRunConfig(
+def resolve_batch_selection(request: CliRequest) -> TargetSelection:
+    return resolve_target_selection(
+        project_dir=request.project_dir,
+        target_dirs=request.target_dirs,
+        run_init=request.run_init,
+    )
+
+
+def prepare_agent_run_config(request: CliRequest) -> AgentRunConfig:
+    return AgentRunConfig(
         vendor=request.vendor,
         model=request.model,
         reasoning_effort=request.reasoning_effort,
         proxy_url=request.proxy_port,
     )
-    selection = resolve_target_selection(
-        project_dir=request.project_dir,
-        target_dirs=request.target_dirs,
-        run_init=request.run_init,
-    )
+
+
+def prepare_batch_request(request: CliRequest) -> tuple[AgentRunConfig | None, TargetSelection]:
+    selection = resolve_batch_selection(request)
+    if not selection.should_run:
+        return None, selection
+    config = prepare_agent_run_config(request)
     return config, selection
 
 
@@ -648,14 +663,18 @@ def render_preflight_summary(request: CliRequest, config: AgentRunConfig, select
     return "\n".join(lines)
 
 
-def render_noop_summary(request: CliRequest, config: AgentRunConfig, selection) -> str:
+def render_noop_summary(request: CliRequest, config: AgentRunConfig | None, selection) -> str:
+    vendor = config.vendor.value if config is not None else normalize_vendor_choice(request.vendor)
+    model = config.model if config is not None else str(request.model or DEFAULT_MODEL_BY_VENDOR[vendor]).strip()
+    reasoning_effort = config.reasoning_effort if config is not None else str(request.reasoning_effort or "high").strip()
+    proxy_url = config.proxy_url if config is not None else str(request.proxy_port or "").strip()
     lines = [
         "无需执行 AGENT初始化。",
         f"project_dir: {selection.project_dir}",
-        f"vendor: {config.vendor.value}",
-        f"model: {config.model}",
-        f"reasoning_effort: {config.reasoning_effort}",
-        f"proxy_url: {config.proxy_url or '(none)'}",
+        f"vendor: {vendor}",
+        f"model: {model}",
+        f"reasoning_effort: {reasoning_effort}",
+        f"proxy_url: {proxy_url or '(none)'}",
     ]
     if selection.skipped_dirs:
         lines.append(f"skipped_dirs: {', '.join(selection.skipped_dirs)}")
@@ -931,7 +950,7 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
     request: CliRequest | None = None
     while True:
         request = collect_cli_request(args, initial_request=request, start_step=6 if request is not None else 0)
-        config, selection = prepare_batch_request(request)
+        selection = resolve_batch_selection(request)
 
         if not selection.should_run:
             if selection.project_missing_files and not project_has_business_files(selection.project_dir):
@@ -945,6 +964,8 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
                 exit_code=0,
                 cleanup_result=RoutingCleanupResult(),
             )
+
+        config = prepare_agent_run_config(request)
 
         preflight_summary = render_preflight_summary(request, config, selection)
         force_confirmation = bool(selection.project_missing_files)
@@ -964,9 +985,11 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
         break
 
     progress_monitor: TerminalProgressMonitor | None = None
+    prepared_run_store: RunStore | None = None
 
     def handle_workers_prepared(run_store: RunStore, live_workers, immediate_results) -> None:
-        nonlocal progress_monitor
+        nonlocal prepared_run_store, progress_monitor
+        prepared_run_store = run_store
         message(
             render_runtime_start_summary(
                 run_store=run_store,
@@ -984,12 +1007,23 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
             progress_monitor.start()
 
     try:
+        message("路由初始化 / 准备智能体", flush=True)
         batch_result = run_batch_initialization(
             selection=selection,
             config=config,
             max_refine_rounds=request.max_refine_rounds,
             on_workers_prepared=handle_workers_prepared,
         )
+    except BaseException:
+        if prepared_run_store is not None:
+            try:
+                mark_run_workers_orphaned(
+                    run_store=prepared_run_store,
+                    reason="routing_stage_interrupted",
+                )
+            except Exception:
+                pass
+        raise
     finally:
         if progress_monitor is not None:
             progress_monitor.stop()
@@ -998,12 +1032,30 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
         run_id=batch_result.run_id,
         runtime_root=Path(batch_result.runtime_dir).parent,
     )
-    killed_sessions = kill_run_tmux_sessions(run_store=run_store)
-    cleanup_result = cleanup_routing_stage_artifacts(batch_result=batch_result)
     exit_code = determine_exit_code(batch_result)
     if exit_code == 0:
+        killed_sessions = []
+        cleanup_result = RoutingCleanupResult()
+        try:
+            killed_sessions = kill_run_tmux_sessions(run_store=run_store)
+        except Exception as error:  # noqa: BLE001
+            message(f"路由初始化已成功，但 tmux 清理未完成，现场已保留: {error}")
+        else:
+            try:
+                cleanup_result = cleanup_routing_stage_artifacts(batch_result=batch_result)
+            except Exception as error:  # noqa: BLE001
+                message(f"路由初始化已成功，但运行产物清理未完成: {error}")
         message(render_requirements_stage_placeholder(killed_sessions, cleanup_result))
     else:
+        killed_sessions = []
+        cleanup_result = RoutingCleanupResult()
+        try:
+            mark_run_workers_orphaned(
+                run_store=run_store,
+                reason="routing_stage_failed",
+            )
+        except Exception:
+            pass
         message(render_routing_failure_summary(batch_result, killed_sessions, cleanup_result))
     return RoutingStageResult(
         project_dir=request.project_dir,
@@ -1022,11 +1074,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     return run_routing_stage(list(launch)).exit_code
 
 
-if __name__ == "__main__":
+def _run_cli_entrypoint() -> None:
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        cleaned_sessions = cleanup_registered_tmux_workers(reason="keyboard_interrupt")
-        if cleaned_sessions:
-            message(f"\n已清理 tmux 会话: {', '.join(cleaned_sessions)}")
+        message("\n已中断路由初始化；存活的 tmux 会话已保留用于现场检查。")
         raise SystemExit(130)
+
+
+if __name__ == "__main__":
+    _run_cli_entrypoint()

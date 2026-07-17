@@ -12,6 +12,7 @@ import T02_tmux_agents as runtime_module
 from T02_tmux_agents import (
     AgentRunConfig,
     AgentRuntimeState,
+    AgentStartupInterventionRequired,
     CommandResult,
     TaskResultContract,
     TmuxBackend,
@@ -23,9 +24,14 @@ from T02_tmux_agents import (
     TurnFileResult,
     TurnState,
     WorkerStatus,
+    RuntimeShutdownRequested,
+    allow_runtime_shutdown_cleanup,
     assess_worker_resume,
     clear_runtime_shutdown_request,
+    cleanup_registered_tmux_workers,
     get_current_stage_runner_id,
+    raise_if_runtime_shutdown_requested,
+    request_runtime_shutdown,
     stage_runner_context,
 )
 
@@ -33,6 +39,42 @@ from T02_tmux_agents import (
 class TmuxRuntimeResilienceTests(unittest.TestCase):
     def setUp(self) -> None:
         clear_runtime_shutdown_request()
+
+    def test_cleanup_context_bypasses_shutdown_only_for_current_context(self):
+        request_runtime_shutdown("unit-test")
+        with self.assertRaises(RuntimeShutdownRequested):
+            raise_if_runtime_shutdown_requested("outside cleanup")
+
+        with allow_runtime_shutdown_cleanup():
+            raise_if_runtime_shutdown_requested("inside cleanup")
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(raise_if_runtime_shutdown_requested, "runner thread")
+                with self.assertRaises(RuntimeShutdownRequested):
+                    future.result()
+
+        with self.assertRaises(RuntimeShutdownRequested):
+            raise_if_runtime_shutdown_requested("after cleanup")
+
+    def test_registered_worker_cleanup_runs_after_shutdown_request(self):
+        class FakeWorker:
+            session_name = "owned-session"
+
+            def session_exists(self):
+                raise_if_runtime_shutdown_requested("cleanup session probe")
+                return True
+
+            def request_kill(self):
+                raise_if_runtime_shutdown_requested("cleanup kill")
+                return self.session_name
+
+            def _log_event(self, *_args, **_kwargs):
+                return None
+
+        request_runtime_shutdown("unit-test")
+        with mock.patch.object(runtime_module, "list_registered_tmux_workers", return_value=[FakeWorker()]):
+            cleaned = cleanup_registered_tmux_workers(reason="unit-test")
+
+        self.assertEqual(cleaned, ["owned-session"])
 
     def test_read_probe_recovers_and_publishes_control_state(self):
         backend = TmuxBackend()
@@ -415,6 +457,114 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
 
         self.assertEqual(snapshot.agent_state, AgentRuntimeState.DEAD.value)
         self.assertEqual(snapshot.health_status, "pane_dead")
+
+    def test_task_done_does_not_override_observed_busy_health(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            TmuxBackend, "list_sessions", return_value=[]
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="done-but-busy-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.current_task_runtime_status = "done"
+            snapshot = worker._build_passive_health_snapshot(  # noqa: SLF001
+                runtime_module.WorkerObservation(
+                    visible_text="Working",
+                    raw_log_delta="",
+                    raw_log_tail="",
+                    current_command="codex",
+                    current_path=tmp_dir,
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-15T15:00:00",
+                    pane_title="⠋ TmuxCodingTeam",
+                )
+            )
+
+        self.assertEqual(snapshot.agent_state, AgentRuntimeState.BUSY.value)
+        self.assertEqual(worker.current_task_runtime_status, "done")
+
+    def test_completed_turn_health_refresh_persists_current_busy_state_and_revision(self):
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            TmuxBackend, "list_sessions", return_value=[]
+        ):
+            worker = TmuxBatchWorker(
+                worker_id="completed-refresh-busy-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.READY
+            worker.current_task_runtime_status = "done"
+            worker.state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": worker.worker_id,
+                        "session_name": worker.session_name,
+                        "pane_id": worker.pane_id,
+                        "work_dir": str(worker.work_dir),
+                        "status": "succeeded",
+                        "result_status": "succeeded",
+                        "turn_state": TurnState.SUCCEEDED.value,
+                        "current_task_runtime_status": "done",
+                        "agent_state": AgentRuntimeState.READY.value,
+                        "agent_started": True,
+                        "agent_alive": True,
+                        "health_status": "alive",
+                        "state_revision": 3,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            observation = runtime_module.WorkerObservation(
+                visible_text="esc interrupt",
+                raw_log_delta="",
+                raw_log_tail="",
+                current_command="codex",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-07-15T15:00:01",
+                pane_title="⠋ TmuxCodingTeam",
+            )
+            busy_snapshot = runtime_module.WorkerHealthSnapshot(
+                session_exists=True,
+                health_status="alive",
+                health_note="alive",
+                last_heartbeat_at=observation.observed_at,
+                last_log_offset=0,
+                current_command="codex",
+                current_path=tmp_dir,
+                pane_id=worker.pane_id,
+                session_name=worker.session_name,
+                agent_state=AgentRuntimeState.BUSY.value,
+                pane_title=observation.pane_title,
+            )
+            with mock.patch.object(worker, "_capture_passive_observation", return_value=observation), mock.patch.object(
+                worker,
+                "_build_passive_health_snapshot",
+                return_value=busy_snapshot,
+            ), mock.patch.object(worker, "is_agent_alive", return_value=True):
+                refreshed = worker._refresh_health_state_nonintrusive(notify_on_change=False)  # noqa: SLF001
+            state = worker.read_state()
+
+        self.assertEqual(refreshed.agent_state, AgentRuntimeState.BUSY.value)
+        self.assertEqual(state["agent_state"], AgentRuntimeState.BUSY.value)
+        self.assertFalse(state["agent_ready"])
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["turn_state"], TurnState.SUCCEEDED.value)
+        self.assertEqual(state["current_task_runtime_status"], "done")
+        self.assertEqual(state["state_revision"], 4)
 
     def test_stage_runner_context_owns_new_and_reused_worker(self):
         with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
@@ -969,6 +1119,79 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
         self.assertIn("diagnostic unavailable: secondary diagnostic failure", result.clean_output)
         self.assertEqual(worker.record_calls, 1)
         self.assertEqual(state["turn_state"], TurnState.FAILED.value)
+
+    def test_run_turn_records_and_reraises_typed_runtime_failures(self):
+        failures = (
+            TmuxControlUnavailable(
+                operation="list-panes",
+                error="timeout",
+                elapsed_sec=60.0,
+                attempts=4,
+            ),
+            TmuxMutationOutcomeUnknown(operation="paste-buffer", error="timeout"),
+        )
+
+        class TypedFailureWorker(TmuxBatchWorker):
+            failure: Exception
+
+            def is_agent_alive(self, observation=None):  # noqa: ANN001, ARG002
+                return True
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.READY
+
+            def _ensure_agent_ready_for_turn_start(self, **kwargs):  # noqa: ANN003
+                raise self.failure
+
+        for index, failure in enumerate(failures):
+            with self.subTest(error=type(failure).__name__), tempfile.TemporaryDirectory() as tmp_dir:
+                worker = TypedFailureWorker(
+                    worker_id=f"typed-failure-{index}",
+                    work_dir=tmp_dir,
+                    config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                    runtime_root=Path(tmp_dir) / "runtime",
+                )
+                worker.failure = failure
+
+                with self.assertRaises(type(failure)) as raised:
+                    worker.run_turn(label="typed_failure", prompt="hello", timeout_sec=0.1)
+
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(len(worker.results), 1)
+                self.assertEqual(worker.read_state()["turn_state"], TurnState.FAILED.value)
+
+    def test_run_turn_reraises_startup_intervention_without_poisoning_results(self):
+        class StartupInterventionWorker(TmuxBatchWorker):
+            def is_agent_alive(self, observation=None):  # noqa: ANN001, ARG002
+                return True
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.STARTING
+
+            def _ensure_agent_ready_for_turn_start(self, **kwargs):  # noqa: ANN003
+                raise AgentStartupInterventionRequired(
+                    blocker_kind="deveco_login",
+                    session_name=self.session_name,
+                    state_path=str(self.state_path),
+                    message="login required",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = StartupInterventionWorker(
+                worker_id="startup-intervention",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+
+            with self.assertRaises(AgentStartupInterventionRequired):
+                worker.run_turn(label="startup_intervention", prompt="hello", timeout_sec=0.1)
+
+            state = worker.read_state()
+        self.assertEqual(worker.results, [])
+        self.assertEqual(state["status"], WorkerStatus.RUNNING.value)
+        self.assertEqual(state["result_status"], "running")
+        self.assertEqual(state["startup_blocker_kind"], "deveco_login")
 
 
 if __name__ == "__main__":

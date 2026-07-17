@@ -183,6 +183,23 @@ def reviewer_artifact_signature(reviewer: ReviewerRuntime) -> tuple[object, ...]
     return tuple(signatures)
 
 
+def resolve_reviewer_artifact_agent_name(reviewer: ReviewerRuntime | object) -> str:
+    """Return the immutable reviewer suffix encoded in the bound JSON path."""
+    review_json_path = getattr(reviewer, "review_json_path", None)
+    if review_json_path is not None and str(review_json_path).strip():
+        stem = Path(review_json_path).expanduser().stem
+        for marker in ("_整体复核记录_", "_评审记录_"):
+            if marker not in stem:
+                continue
+            artifact_name = stem.rsplit(marker, 1)[-1].strip()
+            if artifact_name:
+                return artifact_name
+    worker = getattr(reviewer, "worker", None)
+    session_name = str(getattr(worker, "session_name", "") or "").strip()
+    reviewer_name = str(getattr(reviewer, "reviewer_name", "") or "").strip()
+    return session_name or reviewer_name
+
+
 def reviewer_worker_needs_terminal_success_normalization(reviewer: ReviewerRuntime) -> bool:
     state = _review_worker_state(reviewer.worker)
     if state:
@@ -1032,6 +1049,19 @@ def ensure_review_artifacts(md_path: str | Path, json_path: str | Path) -> tuple
     review_json = Path(json_path).expanduser().resolve()
     review_json.parent.mkdir(parents=True, exist_ok=True)
     review_json.write_text("[]", encoding="utf-8")
+    return review_md, review_json
+
+
+def ensure_review_artifacts_exist(md_path: str | Path, json_path: str | Path) -> tuple[Path, Path]:
+    """Create missing review artifacts without truncating an earlier result."""
+    review_md = Path(md_path).expanduser().resolve()
+    review_json = Path(json_path).expanduser().resolve()
+    review_md.parent.mkdir(parents=True, exist_ok=True)
+    review_json.parent.mkdir(parents=True, exist_ok=True)
+    if not review_md.exists():
+        review_md.write_text("", encoding="utf-8")
+    if not review_json.exists():
+        review_json.write_text("[]", encoding="utf-8")
     return review_md, review_json
 
 

@@ -12,6 +12,7 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
       active_stage_runner_id: 'runner-9',
       active_stage_source: 'runner_failure',
       active_stage_label: '任务开发',
+      active_stage_message: 'M1-T1 评审第 1 轮',
       active_stage_failure: {
         action: 'stage.a07.start',
         status: 'failed',
@@ -31,9 +32,19 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
         requirement_name: '需求A',
         files: [{ label: '任务单', path: '/tmp/task.md', exists: true, updated_at: 'now', summary: 'ok' }],
         workers: [{
+          worker_id: 'development-developer',
+          state_path: '/tmp/worker.state.json',
+          state_revision: 42,
           session_name: 'dev-1',
+          result_status: 'failed',
+          workflow_action: 'stage.a07.start',
           health_status: 'alive',
+          dispatch_state: 'submitted',
+          dispatch_reason: 'review',
           turn_state: 'orphaned',
+          vendor: 'deveco',
+          model: 'deveco/GLM-5.1',
+          reasoning_effort: 'max',
           tmux_control_unavailable_since: '2026-07-14T10:00:00+08:00',
           artifact_paths: ['/tmp/out.md'],
         }],
@@ -42,7 +53,17 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
       },
     },
     control: { control_id: 'run_1', workers: [] },
-    hitl: { pending: true, question_path: '/tmp/q.md', summary: 'question' },
+    hitl: {
+      pending: true,
+      prompt_id: 'hitl-1',
+      prompt_type: 'multiline',
+      question_path: '/tmp/q.md',
+      summary: 'question',
+      attach_command: 'tmux attach -t dev-1',
+      recovery_kind: 'agent_startup_intervention',
+      reason_text: '需要登录',
+      target_paths: ['/tmp/target.md'],
+    },
     artifacts: { items: [{ path: '/tmp/out.md', updated_at: 'now', summary: 'out' }] },
     prompt: { pending: false },
   })
@@ -50,13 +71,33 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
   expect(snapshots.app.projectDir).toBe('/tmp/project')
   expect(snapshots.app.availableRuns[0]?.runId).toBe('run_1')
   expect(snapshots.app.activeStageRunnerId).toBe('runner-9')
+  expect(snapshots.app.activeStageMessage).toBe('M1-T1 评审第 1 轮')
   expect(snapshots.app.activeStageFailure?.message).toBe('failed safely')
   expect(snapshots.app.activeStageFailure?.orphanedWorkers[0]?.attachCommand).toBe('tmux attach -t dev-1')
   expect(snapshots.stages.development.workers[0]?.sessionName).toBe('dev-1')
   expect(snapshots.stages.development.workers[0]?.turnState).toBe('orphaned')
+  expect(snapshots.stages.development.workers[0]).toMatchObject({
+    workerId: 'development-developer',
+    statePath: '/tmp/worker.state.json',
+    stateRevision: 42,
+    resultStatus: 'failed',
+    workflowAction: 'stage.a07.start',
+    dispatchState: 'submitted',
+    dispatchReason: 'review',
+    vendor: 'deveco',
+    model: 'deveco/GLM-5.1',
+    reasoningEffort: 'max',
+  })
   expect(snapshots.stages.development.workers[0]?.tmuxUnavailableSince).toBe('2026-07-14T10:00:00+08:00')
   expect(snapshots.stages.development.milestones[0]?.tasks[0]?.completed).toBe(true)
   expect(snapshots.hitl.questionPath).toBe('/tmp/q.md')
+  expect(snapshots.hitl).toMatchObject({
+    promptId: 'hitl-1',
+    attachCommand: 'tmux attach -t dev-1',
+    recoveryKind: 'agent_startup_intervention',
+    reasonText: '需要登录',
+    targetPaths: ['/tmp/target.md'],
+  })
 })
 
 test('normalizePromptSnapshot preserves prompt payload for refresh recovery', () => {
