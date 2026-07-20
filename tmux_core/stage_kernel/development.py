@@ -87,6 +87,7 @@ from tmux_core.stage_kernel.agent_intervention import (
     AGENT_INTERVENTION_RECHECK,
     AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
+    AgentInterventionActionSelected,
     request_worker_manual_intervention,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
@@ -1765,7 +1766,11 @@ def _run_developer_result_turn(
                 return current_developer, fallback_payload
             if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
                 raise
-            if not _worker_has_stale_busy_without_contract(current_developer.worker) and try_resume_worker(current_developer.worker, timeout_sec=60.0):
+            if (
+                not is_agent_ready_timeout_error(error)
+                and not _worker_has_stale_busy_without_contract(current_developer.worker)
+                and try_resume_worker(current_developer.worker, timeout_sec=60.0)
+            ):
                 continue
             if is_agent_ready_timeout_error(error):
                 if replace_dead_developer is not None:
@@ -2458,13 +2463,40 @@ def _run_single_reviewer_initialization(
                 pre_submit_observation_tail_bytes=A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES,
                 stage_label="任务开发",
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
+                propagate_file_intervention_action=True,
             )
             return current_reviewer
+        except AgentInterventionActionSelected as selected_action:
+            reviewer_display_name = str(
+                current_reviewer.worker.session_name or current_reviewer.reviewer_name
+            ).strip() or current_reviewer.reviewer_name
+            if selected_action.decision == AGENT_INTERVENTION_WORKER_DEAD:
+                _kill_development_reviewer_best_effort(current_reviewer)
+                message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                return None
+            if selected_action.decision != AGENT_INTERVENTION_RECREATE:
+                raise
+            replacement = _recreate_development_reviewer_from_hitl(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                reviewer=current_reviewer,
+                reviewer_spec=reviewer_spec,
+                progress=progress,
+                force_model_change=False,
+                reason_text=selected_action.reason_text,
+            )
+            if replacement is not None:
+                current_reviewer = replacement
+            continue
         except Exception as error:  # noqa: BLE001
             reviewer_display_name = str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name
             if isinstance(error, (TmuxControlUnavailable, TmuxMutationOutcomeUnknown)):
                 raise
-            if not _worker_has_stale_busy_without_contract(current_reviewer.worker) and try_resume_worker(current_reviewer.worker, timeout_sec=60.0):
+            if (
+                not is_agent_ready_timeout_error(error)
+                and not _worker_has_stale_busy_without_contract(current_reviewer.worker)
+                and try_resume_worker(current_reviewer.worker, timeout_sec=60.0)
+            ):
                 continue
             if is_worker_death_error(error) and _reviewer_requires_reconfiguration_from_error(error, current_reviewer.worker):
                 reason_text = _reviewer_reconfiguration_reason(reviewer_display_name, error, current_reviewer.worker)
@@ -3351,8 +3383,44 @@ def run_reviewer_turn_with_recreation(
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
                 task_name=task_name,
                 requirement_name=requirement_name,
+                propagate_file_intervention_action=True,
             )
             return current_reviewer
+        except AgentInterventionActionSelected as selected_action:
+            reviewer_display_name = str(
+                current_reviewer.worker.session_name or current_reviewer.reviewer_name
+            ).strip() or current_reviewer.reviewer_name
+            if selected_action.decision == AGENT_INTERVENTION_WORKER_DEAD:
+                _kill_development_reviewer_best_effort(current_reviewer)
+                message(f"{reviewer_display_name} 已按死亡处理，当前阶段将忽略该审核智能体。")
+                return None
+            if selected_action.decision != AGENT_INTERVENTION_RECREATE:
+                raise
+            replacement = _recreate_development_reviewer_from_hitl(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                reviewer=current_reviewer,
+                reviewer_spec=reviewer_spec,
+                progress=progress,
+                force_model_change=False,
+                reason_text=selected_action.reason_text,
+            )
+            if replacement is None:
+                continue
+            initialized = _run_single_reviewer_initialization(
+                replacement,
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                paths=paths,
+                reviewer_specs_by_name=reviewer_specs_by_name,
+                progress=progress,
+                can_skip_ready_timeout=can_skip_ready_timeout,
+                ready_timeout_skip_budget=ready_timeout_skip_budget,
+            )
+            if initialized is None:
+                return None
+            current_reviewer = initialized
+            continue
         except Exception as error:  # noqa: BLE001
             outputs_materialized = _wait_for_reviewer_materialized_outputs(current_reviewer, task_name)
             if (
@@ -3601,7 +3669,6 @@ def run_reviewer_turn_with_recreation(
                 reviewer_spec=reviewer_spec,
                 progress=progress,
                 force_model_change=False,
-                reuse_existing_selection=True,
             )
             if replacement is None:
                 continue

@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from T02_tmux_agents import AgentStartupInterventionRequired
+from T02_tmux_agents import AgentRuntimeInterventionRequired, AgentStartupInterventionRequired
 from T05_hitl_runtime import (
     HITL_STATUS_COMPLETED,
     HITL_STATUS_ERROR,
@@ -99,7 +99,16 @@ class _FakeWorker:
         self.ensure_ready_calls += 1
         return None
 
-    def run_turn(self, *, label, prompt, completion_contract, timeout_sec):  # noqa: ANN001
+    def run_turn(
+        self,
+        *,
+        label,
+        prompt,
+        completion_contract,
+        timeout_sec,
+        runtime_intervention_handler=None,
+    ):  # noqa: ANN001
+        _ = runtime_intervention_handler
         self.turn_calls += 1
         self.behavior(self, label, prompt, completion_contract, timeout_sec)
         completion_contract.validator(completion_contract.status_path)
@@ -534,6 +543,97 @@ class HitlRuntimeTests(unittest.TestCase):
         self.assertEqual(worker.run_attempts, 2)
         self.assertEqual(worker.turn_calls, 1)
         self.assertEqual(handled, [(worker, worker.ensure_error), (worker, worker.turn_error)])
+
+    def test_run_hitl_agent_loop_handles_runtime_intervention_inside_same_turn(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_path = root / "output.md"
+            question_path = root / "question.md"
+            record_path = root / "record.md"
+            stage_status_path = root / "status.json"
+            turns_root = root / "turns"
+
+            def behavior(worker, label, prompt, completion_contract, timeout_sec):  # noqa: ANN001
+                _ = worker, label, prompt, timeout_sec
+                output_path.write_text("最终正文\n", encoding="utf-8")
+                _write_stage_status(
+                    stage_status_path,
+                    stage="demo_stage",
+                    turn_id=completion_contract.turn_id,
+                    hitl_round=1,
+                    status=HITL_STATUS_COMPLETED,
+                    output_path=output_path,
+                    question_path=None,
+                    record_path=None,
+                    summary="done",
+                )
+                _write_turn_status(
+                    completion_contract.status_path,
+                    turn_id=completion_contract.turn_id,
+                    phase="demo_phase",
+                    stage_status_path=stage_status_path,
+                    artifact_paths=[output_path],
+                )
+
+            class RuntimeInterventionWorker(_FakeWorker):
+                def __init__(self):
+                    super().__init__(behavior, runtime_dir=root / "runtime")
+                    self.ensure_attempts = 0
+                    self.ensure_error = AgentRuntimeInterventionRequired(
+                        blocker_kind="opencode_permission",
+                        session_name="opencode-hitl-session",
+                        state_path=str(root / "runtime" / "worker.state.json"),
+                        message="Agent runtime requires manual intervention before turn",
+                    )
+                    self.runtime_error = AgentRuntimeInterventionRequired(
+                        blocker_kind="opencode_permission",
+                        session_name="opencode-hitl-session",
+                        state_path=str(root / "runtime" / "worker.state.json"),
+                        message="Agent runtime requires manual intervention",
+                    )
+
+                def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ANN001
+                    _ = timeout_sec
+                    self.ensure_attempts += 1
+                    if self.ensure_attempts == 1:
+                        raise self.ensure_error
+
+                def run_turn(self, *, runtime_intervention_handler=None, **kwargs):  # noqa: ANN003
+                    self.turn_calls += 1
+                    if not callable(runtime_intervention_handler):
+                        raise self.runtime_error
+                    runtime_intervention_handler(self, self.runtime_error)
+                    self.behavior(
+                        self,
+                        kwargs["label"],
+                        kwargs["prompt"],
+                        kwargs["completion_contract"],
+                        kwargs["timeout_sec"],
+                    )
+                    kwargs["completion_contract"].validator(kwargs["completion_contract"].status_path)
+                    return type("CommandResult", (), {"ok": True, "clean_output": "", "exit_code": 0})()
+
+            worker = RuntimeInterventionWorker()
+            handled: list[tuple[object, AgentRuntimeInterventionRequired]] = []
+            result = run_hitl_agent_loop(
+                worker=worker,
+                stage_name="demo_stage",
+                output_path=output_path,
+                question_path=question_path,
+                record_path=record_path,
+                stage_status_path=stage_status_path,
+                turns_root=turns_root,
+                initial_prompt_builder=lambda context: f"initial::{context.turn_id}",
+                hitl_prompt_builder=lambda human_msg, context: f"followup::{human_msg}::{context.turn_id}",
+                label_prefix="demo_turn",
+                turn_phase="demo_phase",
+                startup_intervention_handler=lambda live_worker, error: handled.append((live_worker, error)),
+            )
+
+        self.assertEqual(result.decision.status, HITL_STATUS_COMPLETED)
+        self.assertEqual(worker.ensure_attempts, 2)
+        self.assertEqual(worker.turn_calls, 1)
+        self.assertEqual(handled, [(worker, worker.ensure_error), (worker, worker.runtime_error)])
 
     def test_run_hitl_agent_loop_invokes_optional_hitl_callbacks_without_protocol_change(self):
         with tempfile.TemporaryDirectory() as tmpdir:

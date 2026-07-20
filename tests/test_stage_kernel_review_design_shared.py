@@ -398,8 +398,21 @@ class StageKernelSharedTests(unittest.TestCase):
             )
             args = type("Args", (), {"agent_config": str(config_path), "main_agent": "", "reviewer_agent": []})()
 
-            development = shared_review.resolve_stage_agent_config(args, stage_key="development")
-            design = shared_review.resolve_stage_agent_config(args, stage_key="detailed_design")
+            with patch.object(
+                shared_review,
+                "get_default_model_for_vendor",
+                return_value="test-default",
+            ), patch.object(
+                shared_review,
+                "normalize_model_choice",
+                side_effect=lambda vendor, model: model,
+            ), patch.object(
+                shared_review,
+                "normalize_effort_choice",
+                side_effect=lambda vendor, model, effort: effort,
+            ):
+                development = shared_review.resolve_stage_agent_config(args, stage_key="development")
+                design = shared_review.resolve_stage_agent_config(args, stage_key="detailed_design")
 
         self.assertEqual(development.main.vendor, "gemini")
         self.assertEqual(development.main.model, "flash")

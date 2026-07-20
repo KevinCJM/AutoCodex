@@ -42,6 +42,7 @@ from T11_tui_backend import (
 from T10_tui_protocol import build_request
 from T09_terminal_ops import BridgePromptRequest
 from tmux_core.runtime.tmux_runtime import (
+    AgentRuntimeInterventionRequired,
     AgentStartupInterventionRequired,
     clear_runtime_shutdown_request,
     get_current_stage_runner_id,
@@ -234,6 +235,85 @@ class T11TuiBackendTests(unittest.TestCase):
             self.assertEqual(server._pending_prompts, {})  # noqa: SLF001
             self.assertIsNone(server._pending_prompt)  # noqa: SLF001
 
+    def test_resolving_authoritative_prompt_republishes_previous_prompt_with_new_revision(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        events: list[dict[str, object]] = []
+        events_lock = threading.Lock()
+        responses: dict[str, dict[str, object]] = {}
+
+        def record_event(message):  # noqa: ANN001
+            if message.get("kind") != "event":
+                return
+            with events_lock:
+                events.append(dict(message))
+
+        def prompt_events() -> list[dict[str, object]]:
+            with events_lock:
+                return [item for item in events if item.get("type") == "prompt.request"]
+
+        def wait_for_prompt_count(expected: int) -> list[dict[str, object]]:
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                current = prompt_events()
+                if len(current) >= expected:
+                    return current
+                time.sleep(0.005)
+            return prompt_events()
+
+        server.subscribe_events(record_event)
+
+        def request_prompt(key: str) -> None:
+            responses[key] = server._prompt_broker.request(  # noqa: SLF001
+                BridgePromptRequest(
+                    prompt_type="select",
+                    payload={"title": f"选择 {key}", "options": []},
+                )
+            )
+
+        with patch.object(server, "_schedule_snapshot_update"):
+            first_thread = threading.Thread(target=request_prompt, args=("first",))
+            first_thread.start()
+            first_events = wait_for_prompt_count(1)
+            self.assertEqual(len(first_events), 1)
+
+            second_thread = threading.Thread(target=request_prompt, args=("second",))
+            second_thread.start()
+            opened_events = wait_for_prompt_count(2)
+            self.assertEqual(len(opened_events), 2)
+            first_id = str(opened_events[0]["payload"]["id"])
+            second_id = str(opened_events[1]["payload"]["id"])
+
+            self.assertEqual(server.resolve_prompt(second_id, {"value": "second"}), {"accepted": True})
+            second_thread.join(timeout=2.0)
+            republished_events = wait_for_prompt_count(3)
+
+            self.assertFalse(second_thread.is_alive())
+            self.assertEqual([item["payload"]["id"] for item in republished_events], [first_id, second_id, first_id])
+            revisions = [int(item["payload"]["prompt_revision"]) for item in republished_events]
+            self.assertEqual(revisions, sorted(revisions))
+            self.assertEqual(len(set(revisions)), 3)
+            self.assertEqual(responses["second"]["value"], "second")
+
+            prompt_snapshot = server.build_prompt_snapshot()
+            self.assertTrue(prompt_snapshot["pending"])
+            self.assertEqual(prompt_snapshot["prompt_id"], first_id)
+            self.assertEqual(prompt_snapshot["prompt_revision"], revisions[-1])
+
+            server._emit_snapshot_update(include_prompt=True)  # noqa: SLF001
+            with events_lock:
+                snapshot_events = [item for item in events if item.get("type") == "snapshot.prompt"]
+            self.assertTrue(snapshot_events)
+            self.assertEqual(snapshot_events[-1]["payload"], prompt_snapshot)
+
+            self.assertEqual(server.resolve_prompt(first_id, {"value": "first"}), {"accepted": True})
+            first_thread.join(timeout=2.0)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertEqual(responses["first"]["value"], "first")
+        empty_snapshot = server.build_prompt_snapshot()
+        self.assertFalse(empty_snapshot["pending"])
+        self.assertGreater(empty_snapshot["prompt_revision"], revisions[-1])
+
     def test_prompt_broker_publish_failure_cleans_open_prompt_and_does_not_wait(self):
         server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
 
@@ -393,7 +473,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(app["pending_attention_since"], "2026-05-12T21:40:00+08:00")
         self.assertEqual(app["active_stage_status"], "awaiting-input")
 
-    def test_task_split_active_analyst_contract_normalizes_ready_to_busy_and_app_running(self):
+    def test_task_split_active_contract_keeps_ready_agent_ready_and_app_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir).resolve()
             requirement_name = "需求A"
@@ -438,7 +518,7 @@ class T11TuiBackendTests(unittest.TestCase):
                 artifacts={"items": []},
             )
 
-        self.assertEqual(task_split["workers"][0]["agent_state"], "BUSY")
+        self.assertEqual(task_split["workers"][0]["agent_state"], "READY")
         self.assertEqual(task_split["workers"][0]["current_task_runtime_status"], "running")
         self.assertEqual(app["active_stage_status"], "running")
 
@@ -930,6 +1010,96 @@ class T11TuiBackendTests(unittest.TestCase):
             )
 
         self.assertTrue(pending)
+
+    def test_manual_reconfiguration_error_does_not_hitch_on_unrelated_pending_prompt(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        unrelated = PendingPromptState(
+            prompt_id="prompt-unrelated",
+            prompt_type="select",
+            payload={
+                "title": "请选择需求",
+                "recovery_kind": "requirement_selection",
+            },
+        )
+        server._pending_prompts[unrelated.prompt_id] = unrelated  # noqa: SLF001
+        server._pending_prompt = unrelated  # noqa: SLF001
+
+        with patch.object(server, "_current_stage_workers_without_runtime_io", return_value=[]):
+            pending = server._manual_reconfiguration_error_pending(  # noqa: SLF001
+                action="stage.a07.start",
+                error=RuntimeError("tmux pane died while running"),
+            )
+
+        self.assertFalse(pending)
+
+    def test_manual_reconfiguration_error_can_reuse_matching_action_prompt(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        matching = PendingPromptState(
+            prompt_id="prompt-manual",
+            prompt_type="select",
+            payload={
+                "recovery_kind": "manual_reconfiguration",
+                "workflow_action": "stage.a07.start",
+                "session_name": "开发工程师-天罡星",
+            },
+        )
+        server._pending_prompts[matching.prompt_id] = matching  # noqa: SLF001
+        server._pending_prompt = matching  # noqa: SLF001
+
+        with patch.object(server, "_current_stage_workers_without_runtime_io", return_value=[]):
+            pending = server._manual_reconfiguration_error_pending(  # noqa: SLF001
+                action="stage.a07.start",
+                error=RuntimeError("tmux pane died while running"),
+            )
+
+        self.assertTrue(pending)
+
+    def test_manual_reconfiguration_opens_own_prompt_when_unrelated_prompt_is_pending(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        unrelated = PendingPromptState(
+            prompt_id="prompt-unrelated",
+            prompt_type="select",
+            payload={"title": "请选择需求", "recovery_kind": "requirement_selection"},
+        )
+        server._pending_prompts[unrelated.prompt_id] = unrelated  # noqa: SLF001
+        server._pending_prompt = unrelated  # noqa: SLF001
+        worker = {
+            "worker_id": "development-developer",
+            "session_name": "开发工程师-天罡星",
+            "health_status": "awaiting_reconfig",
+            "note": "awaiting_reconfig",
+        }
+
+        with patch.object(
+            server,
+            "_current_stage_workers_without_runtime_io",
+            return_value=[worker],
+        ), patch.object(
+            server,
+            "_filter_workers_for_current_context",
+            side_effect=lambda workers, _action: list(workers),
+        ), patch.object(
+            server,
+            "_persist_runner_awaiting_input",
+            return_value=True,
+        ), patch.object(
+            server._prompt_broker,
+            "request",
+            return_value={"value": "retry_after_manual_reconfiguration"},
+        ) as request_prompt, patch.object(server, "_schedule_snapshot_update"):
+            server._await_manual_reconfiguration_recovery(  # noqa: SLF001
+                request_id="",
+                action="stage.a07.start",
+                stage_seq=7,
+                error=RuntimeError("awaiting_reconfig"),
+                respond=False,
+            )
+
+        request_prompt.assert_called_once()
+        request = request_prompt.call_args.args[0]
+        self.assertEqual(request.payload["recovery_kind"], "manual_reconfiguration")
+        self.assertEqual(request.payload["workflow_action"], "stage.a07.start")
+        self.assertEqual(request.payload["session_name"], "开发工程师-天罡星")
 
     def test_stage_a08_ready_worker_with_stale_reconfig_note_is_not_inferred_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2599,7 +2769,7 @@ class T11TuiBackendTests(unittest.TestCase):
 
         self.assertEqual(status, "")
 
-    def test_stage_a07_ready_worker_with_submitted_task_contract_displays_busy(self):
+    def test_stage_a07_ready_worker_with_submitted_task_contract_stays_ready(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             paths = build_development_paths(project_dir, "需求A")
@@ -2642,14 +2812,14 @@ class T11TuiBackendTests(unittest.TestCase):
                 encoding="utf-8",
             )
             server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
-            server._tmux_runtime.session_exists = lambda _session_name: True  # noqa: SLF001
+            server._tmux_runtime = SimpleNamespace(session_exists=lambda _session_name: True, backend=None)  # noqa: SLF001
             server._set_context(project_dir=str(project_dir), requirement_name="需求A", action="stage.a07.start")  # noqa: SLF001
 
             with patch("tmux_core.bridge.backend.load_worker_from_state_path", return_value=None):
                 snapshot = server._build_development_snapshot()  # noqa: SLF001
                 status = server._infer_runtime_stage_status("stage.a07.start")  # noqa: SLF001
 
-        self.assertEqual(snapshot["workers"][0]["agent_state"], "BUSY")
+        self.assertEqual(snapshot["workers"][0]["agent_state"], "READY")
         self.assertEqual(snapshot["workers"][0]["current_task_runtime_status"], "running")
         self.assertEqual(snapshot["workers"][0]["dispatch_state"], "submitted")
         self.assertEqual(status, "running")
@@ -4736,7 +4906,7 @@ class T11TuiBackendTests(unittest.TestCase):
         emit_snapshot.assert_not_called()
         restore_runner.assert_not_called()
         schedule_snapshot.assert_called_once()
-        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl"})
+        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl", "prompt"})
         self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
 
     def test_prompt_open_schedules_lightweight_snapshot_without_sync_emit(self):
@@ -4754,7 +4924,7 @@ class T11TuiBackendTests(unittest.TestCase):
 
         emit_snapshot.assert_not_called()
         schedule_snapshot.assert_called_once()
-        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl"})
+        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl", "prompt"})
         self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
 
     def test_plain_prompt_open_marks_stage_awaiting_input(self):
@@ -4795,7 +4965,7 @@ class T11TuiBackendTests(unittest.TestCase):
             server._handle_prompt_resolved("prompt_plain", {"value": "5"})  # noqa: SLF001
 
         schedule_snapshot.assert_called_once()
-        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl"})
+        self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl", "prompt"})
         self.assertTrue(schedule_snapshot.call_args.kwargs["update_display_stage"])
 
     def test_prompt_resolved_restores_live_owner_runner_to_running(self):
@@ -5294,6 +5464,59 @@ class T11TuiBackendTests(unittest.TestCase):
                 )
             )
             self.assertFalse(any(item.get("kind") == "event" and item.get("type") == "error" for item in messages))
+
+    def test_runtime_intervention_subclass_uses_runtime_recovery_prompt(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str((Path(tmpdir) / "runtime-worker.state.json").resolve())
+            error = AgentRuntimeInterventionRequired(
+                blocker_kind="codex_approval",
+                session_name="开发工程师-运行期介入",
+                state_path=state_path,
+                message="Agent runtime requires manual intervention",
+            )
+            checked_blockers: list[str] = []
+            recovered_worker = SimpleNamespace(
+                runtime_intervention_is_resolved=lambda blocker_kind: checked_blockers.append(blocker_kind) or True
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+
+            with patch.object(
+                server,
+                "_current_stage_workers_without_runtime_io",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_current_stage_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_persist_runner_awaiting_input",
+                return_value=True,
+            ), patch.object(
+                server._prompt_broker,
+                "request",
+                return_value={"value": "recheck_after_manual_intervention"},
+            ) as request_prompt, patch(
+                "T11_tui_backend.load_worker_from_state_path",
+                return_value=recovered_worker,
+            ), patch(
+                "T11_tui_backend.try_resume_worker",
+            ) as resume_worker:
+                server._await_agent_ready_timeout_recovery(  # noqa: SLF001
+                    request_id="",
+                    action="stage.a07.start",
+                    stage_seq=7,
+                    error=error,
+                    respond=False,
+                )
+
+        request_prompt.assert_called_once()
+        prompt = request_prompt.call_args.args[0]
+        self.assertEqual(prompt.payload["recovery_kind"], "agent_runtime_intervention")
+        self.assertEqual(prompt.payload["title"], "HITL: 智能体运行期权限介入")
+        self.assertIn("运行期权限确认", prompt.payload["prompt_text"])
+        self.assertEqual(checked_blockers, ["codex_approval"])
+        resume_worker.assert_not_called()
 
     def test_prompt_shutdown_marks_runner_interrupted_without_generic_error(self):
         clear_runtime_shutdown_request()
@@ -8307,6 +8530,40 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["state_revision"], 17)
         self.assertTrue(snapshot["session_exists"])
 
+    def test_persisted_missing_session_overrides_stale_alive_busy_snapshot(self):
+        from tmux_core.bridge.backend import _read_worker_state_snapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "development-review-审核员",
+                        "session_name": "审核员-天异星",
+                        "status": "running",
+                        "result_status": "running",
+                        "current_task_runtime_status": "running",
+                        "turn_state": "failed",
+                        "agent_state": "BUSY",
+                        "agent_alive": True,
+                        "agent_started": True,
+                        "session_exists": False,
+                        "health_status": "alive",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            snapshot = _read_worker_state_snapshot(
+                state_path,
+                trust_persisted_session=True,
+            )
+
+        self.assertFalse(snapshot["session_exists"])
+        self.assertEqual(snapshot["agent_state"], "DEAD")
+        self.assertEqual(snapshot["health_status"], "dead")
+        self.assertEqual(snapshot["current_task_runtime_status"], "running")
+
     def test_runtime_stage_change_marks_previous_forward_stage_completed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
@@ -10339,7 +10596,7 @@ class T11TuiBackendTests(unittest.TestCase):
             snapshot = server._build_routing_snapshot()  # noqa: SLF001
         self.assertEqual(snapshot["workers"][0]["session_name"], "sess-routing")
         self.assertTrue(snapshot["workers"][0]["session_exists"])
-        self.assertEqual(snapshot["workers"][0]["agent_state"], "BUSY")
+        self.assertEqual(snapshot["workers"][0]["agent_state"], "READY")
         self.assertEqual(snapshot["workers"][0]["current_task_runtime_status"], "running")
 
     def test_manifest_backed_prelaunch_routing_worker_with_missing_session_stays_starting(self):
@@ -11211,6 +11468,7 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertIn("snapshot.app", event_types)
         self.assertIn("snapshot.control", event_types)
         self.assertIn("snapshot.hitl", event_types)
+        self.assertIn("snapshot.prompt", event_types)
         self.assertIn("snapshot.artifacts", event_types)
 
 

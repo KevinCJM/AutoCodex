@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tmux_core.runtime.contracts import (
     TaskResultContract,
@@ -18,6 +19,11 @@ from tmux_core.runtime.contracts import (
 from tmux_core.runtime.tmux_runtime import (
     TASK_RESULT_CONTRACT_ERROR_PREFIX,
     TURN_ARTIFACT_CONTRACT_ERROR_PREFIX,
+)
+from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECREATE,
+    AGENT_INTERVENTION_WORKER_DEAD,
+    AgentInterventionActionSelected,
 )
 from tmux_core.stage_kernel.turn_output_goals import (
     CompletionTurnGoal,
@@ -587,6 +593,59 @@ class TurnOutputGoalsTests(unittest.TestCase):
             )
 
             self.assertEqual(worker.prompts, ["评审 prompt"])
+
+    def test_completion_file_intervention_propagates_selected_recreate_or_dead_action(self):
+        for decision in (AGENT_INTERVENTION_RECREATE, AGENT_INTERVENTION_WORKER_DEAD):
+            with self.subTest(decision=decision), tempfile.TemporaryDirectory() as tmp_dir:
+                root = Path(tmp_dir)
+                review_json = root / "review.json"
+                review_md = root / "review.md"
+                review_json.write_text("[]\n", encoding="utf-8")
+                review_md.write_text("", encoding="utf-8")
+
+                def validator(status_path: Path) -> TurnFileResult:
+                    raise ValueError(f"{status_path.name} 未包含当前任务")
+
+                contract = TurnFileContract(
+                    turn_id="reviewer-turn",
+                    phase="任务开发",
+                    status_path=review_json,
+                    validator=validator,
+                    kind="review_round",
+                    tracked_artifacts={"review_json": review_json, "review_md": review_md},
+                )
+                worker = _FakeTaskWorker(
+                    [
+                        lambda **_kwargs: SimpleNamespace(
+                            ok=False,
+                            clean_output=f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: runtime_stalled",
+                        )
+                    ]
+                )
+                with patch(
+                    "tmux_core.stage_kernel.turn_output_goals.request_file_noncompliance_intervention",
+                    return_value=decision,
+                ) as request_hitl:
+                    with self.assertRaises(AgentInterventionActionSelected) as raised:
+                        run_completion_turn_with_repair(
+                            worker=worker,
+                            label="reviewer_turn",
+                            prompt="评审 prompt",
+                            completion_contract=contract,
+                            turn_goal=CompletionTurnGoal(
+                                goal_id="reviewer_round",
+                                outcomes={"review_pass": OutcomeGoal(status="review_pass")},
+                                max_repair_attempts=0,
+                            ),
+                            stage_label="任务开发",
+                            role_label="测试工程师-鬼金羊",
+                            propagate_file_intervention_action=True,
+                        )
+
+                self.assertEqual(raised.exception.decision, decision)
+                self.assertEqual(raised.exception.recovery_kind, "file_noncompliance")
+                self.assertEqual(raised.exception.attempts_used, 0)
+                self.assertTrue(request_hitl.call_args.kwargs["allow_recreate"])
 
 
 if __name__ == "__main__":

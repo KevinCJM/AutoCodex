@@ -24,7 +24,7 @@ from tmux_core.stage_kernel.role_orchestration import (
     run_main_phase,
     run_reviewer_phase,
 )
-from tmux_core.runtime.tmux_runtime import AgentStartupInterventionRequired
+from tmux_core.runtime.tmux_runtime import AgentRuntimeInterventionRequired, AgentStartupInterventionRequired
 
 
 class _FakeWorker:
@@ -84,6 +84,80 @@ class _LaggingRefreshWorker(_FakeWorker):
     def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
         _ = timeout_sec
         self.ensure_calls += 1
+
+
+class _IdleVisibleCodexWorker(_FakeWorker):
+    def __init__(self, health_state: str) -> None:
+        super().__init__(health_state)
+        self.health_state = health_state
+        self.mark_ready_calls = 0
+        self.persisted_state: dict[str, object] = {
+            "status": "running",
+            "result_status": "pending",
+            "agent_state": health_state,
+            "health_status": "alive",
+            "turn_state": "idle",
+            "current_task_runtime_status": "",
+            "dispatch_state": "",
+        }
+
+    def refresh_health(self, notify_on_change: bool = True):  # noqa: ARG002
+        return SimpleNamespace(agent_state=self.health_state)
+
+    def read_state(self):
+        return dict(self.persisted_state)
+
+    def observe(self, tail_lines: int = 120):  # noqa: ARG002
+        return SimpleNamespace(
+            session_exists=True,
+            pane_dead=False,
+            current_command="node",
+            current_path="/tmp/project",
+            visible_text="\n".join(
+                (
+                    "› Find and fix a bug in @filename",
+                    "gpt-5.6-sol xhigh · ~/project",
+                )
+            ),
+            raw_log_tail="• Starting MCP servers (4/6): codex_apps, notion",
+            pane_title="⠙ project",
+            observed_at="2026-07-20T14:27:12",
+        )
+
+    def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001
+        if observation is not None and task_running_override is False:
+            return "READY"
+        return self.health_state
+
+    def _observation_indicates_ready_or_idle_surface(self, observation):  # noqa: ANN001
+        return bool(observation.visible_text)
+
+    def _mark_agent_ready_from_observation(self, observation, *, note="agent_ready"):  # noqa: ANN001
+        _ = observation, note
+        self.mark_ready_calls += 1
+        self.state = "READY"
+        self.persisted_state.update(
+            {
+                "status": "ready",
+                "result_status": "ready",
+                "agent_state": "READY",
+                "agent_ready": True,
+                "agent_started": True,
+            }
+        )
+
+    def _try_mark_turn_start_ready_from_current_observation(self, *, label: str, delayed: bool) -> bool:
+        _ = label, delayed
+        observation = self.observe()
+        if not self._observation_indicates_ready_or_idle_surface(observation):
+            return False
+        self._mark_agent_ready_from_observation(observation)
+        return True
+
+    def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
+        _ = timeout_sec
+        self.ensure_calls += 1
+        raise AssertionError("idle Codex surface must not trigger ensure_agent_ready")
 
 
 class _CompletedBusyWorker(_FakeWorker):
@@ -191,6 +265,23 @@ class _StartupInterventionWorker(_DeathAwareFakeWorker):
         raise self.startup_error
 
 
+class _RuntimeInterventionWorker(_DeathAwareFakeWorker):
+    def __init__(self) -> None:
+        super().__init__("STARTING", launched=True)
+        self.session_name = "审核员-运行期介入"
+        self.runtime_error = AgentRuntimeInterventionRequired(
+            blocker_kind="opencode_permission",
+            session_name=self.session_name,
+            state_path=self.state_path,
+            message="OpenCode permission requires manual intervention",
+        )
+
+    def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
+        _ = timeout_sec
+        self.ensure_calls += 1
+        raise self.runtime_error
+
+
 class RoleOrchestrationTests(unittest.TestCase):
     def test_manual_intervention_noninteractive_uses_explicit_default_without_prompt(self):
         with mock.patch(
@@ -264,7 +355,7 @@ class RoleOrchestrationTests(unittest.TestCase):
                 worker=worker,
                 reason_text="review_pass=false 但评审 markdown 为空",
                 attempts_used=2,
-                target_paths=("/tmp/review.md", "/tmp/review.json"),
+                target_paths=("/tmp/review.md", "/tmp/review.json", "/tmp/review.json"),
                 allow_recreate=True,
             )
 
@@ -277,6 +368,14 @@ class RoleOrchestrationTests(unittest.TestCase):
             extra_payload["target_paths"],
             [str(Path("/tmp/review.md").resolve()), str(Path("/tmp/review.json").resolve())],
         )
+        self.assertEqual(
+            [value for value, _ in prompt.call_args.kwargs["options"]],
+            [
+                AGENT_INTERVENTION_RECHECK,
+                AGENT_INTERVENTION_RECREATE,
+                AGENT_INTERVENTION_WORKER_DEAD,
+            ],
+        )
 
     def test_ensure_main_ready_prefers_refresh_health_state(self):
         main = SimpleNamespace(worker=_HealthAwareWorker("BUSY", health_state="READY"))
@@ -284,6 +383,23 @@ class RoleOrchestrationTests(unittest.TestCase):
         ensure_main_ready(main)
 
         self.assertEqual(main.worker.ensure_calls, 0)
+
+    def test_ensure_main_ready_normalizes_idle_codex_surface_over_lagging_health(self):
+        for health_state in ("BUSY", "STARTING"):
+            with self.subTest(health_state=health_state):
+                worker = _IdleVisibleCodexWorker(health_state)
+                main = SimpleNamespace(worker=worker)
+
+                with mock.patch(
+                    "tmux_core.stage_kernel.role_orchestration.time.sleep",
+                    side_effect=AssertionError("idle Codex surface must not enter ready stabilization"),
+                ):
+                    ensure_main_ready(main)
+
+                self.assertEqual(worker.ensure_calls, 0)
+                self.assertGreaterEqual(worker.mark_ready_calls, 1)
+                self.assertEqual(worker.read_state()["agent_state"], "READY")
+                self.assertEqual(worker.read_state()["status"], "ready")
 
     def test_ensure_main_ready_recovers_non_ready_main_and_reviewers(self):
         main = SimpleNamespace(worker=_FakeWorker("BUSY"))
@@ -539,6 +655,27 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual(worker.ensure_calls, 1)
         recover.assert_called_once()
         replace_main.assert_not_called()
+
+    def test_runtime_intervention_during_ready_check_uses_same_manual_recovery_path(self):
+        worker = _RuntimeInterventionWorker()
+        main = SimpleNamespace(worker=worker)
+
+        def recover_runtime(live_worker, *, error, stage_label, role_label):  # noqa: ANN001
+            self.assertIs(live_worker, worker)
+            self.assertIs(error, worker.runtime_error)
+            self.assertEqual(stage_label, "阶段调度")
+            self.assertEqual(role_label, "审核员")
+            live_worker.state = "READY"
+
+        with mock.patch(
+            "tmux_core.stage_kernel.role_orchestration.wait_for_worker_startup_intervention",
+            side_effect=recover_runtime,
+        ) as recover:
+            ensure_main_ready(main, main_label="审核员")
+
+        self.assertEqual(worker.ensure_calls, 1)
+        self.assertEqual(worker.state, "READY")
+        recover.assert_called_once()
 
     def test_run_main_phase_noninteractive_recreates_main_without_prompt(self):
         main = SimpleNamespace(worker=_ReadyDeathWorker(session_name="开发工程师-柳土獐"))

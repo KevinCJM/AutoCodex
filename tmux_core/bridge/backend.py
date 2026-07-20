@@ -31,7 +31,6 @@ from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from tmux_core.requirements_scope import resolve_requirement_name_from_prompt_response
 from tmux_core.runtime.tmux_runtime import (
-    AgentStartupInterventionRequired,
     RuntimeShutdownRequested,
     TMUX_IDENTITY_REQUIREMENT_NAME_OPTION,
     TMUX_IDENTITY_RUNTIME_DIR_OPTION,
@@ -44,6 +43,7 @@ from tmux_core.runtime.tmux_runtime import (
     clear_runtime_shutdown_request,
     cleanup_registered_tmux_workers,
     is_agent_ready_timeout_error,
+    is_agent_runtime_intervention_error,
     is_agent_startup_intervention_error,
     is_runtime_shutdown_error,
     is_worker_death_error,
@@ -118,7 +118,6 @@ from B01_terminal_interaction import (
     render_control_help,
 )
 from T03_agent_init_workflow import (
-    ACTIVE_ROUTING_WORKFLOW_STAGES,
     ROUTING_RUNTIME_ROOT_NAME,
     RunStore,
     list_routing_run_manifest_paths,
@@ -151,7 +150,7 @@ class PromptBroker:
         self,
         emit_event: Callable[[str, dict[str, Any]], None],
         *,
-        on_prompt_open: Callable[[str, BridgePromptRequest], None] | None = None,
+        on_prompt_open: Callable[[str, BridgePromptRequest], Mapping[str, Any] | None] | None = None,
         on_prompt_resolved: Callable[[str, Mapping[str, Any] | None], None] | None = None,
     ) -> None:
         self._emit_event = emit_event
@@ -181,15 +180,20 @@ class PromptBroker:
         try:
             # Establish all server-side prompt/scope state before making the id
             # visible to a client that may respond on another thread immediately.
+            open_metadata: dict[str, Any] = {}
             if self._on_prompt_open is not None:
-                self._on_prompt_open(prompt_id, request)
+                callback_result = self._on_prompt_open(prompt_id, request)
+                if isinstance(callback_result, Mapping):
+                    open_metadata = dict(callback_result)
+            event_payload = {
+                **request.payload,
+                "id": prompt_id,
+                "prompt_type": request.prompt_type,
+                **open_metadata,
+            }
             self._emit_event(
                 "prompt.request",
-                {
-                    "id": prompt_id,
-                    "prompt_type": request.prompt_type,
-                    **request.payload,
-                },
+                event_payload,
             )
         except BaseException:
             # Publishing failed before request() reached its blocking wait. Close
@@ -1605,24 +1609,11 @@ def _worker_snapshot_has_stale_ready_task_result_contract(snapshot: Mapping[str,
 
 
 def _normalize_stage_active_contract_worker_snapshot(snapshot: Mapping[str, Any], *, action: str) -> dict[str, Any]:
-    normalized = dict(snapshot)
-    if str(action or "").strip() not in {"stage.a06.start", "stage.a07.start"}:
-        return normalized
-    if str(action or "").strip() == "stage.a07.start" and _worker_snapshot_has_stale_ready_task_result_contract(normalized):
-        return normalized
-    if (
-        str(normalized.get("agent_state", "") or normalized.get("agentState", "")).strip().upper() == "READY"
-        and _worker_snapshot_has_active_contract_marker(normalized)
-        and _worker_snapshot_is_actively_running(normalized)
-    ):
-        normalized["agent_state"] = "BUSY"
-        if "agentState" in normalized:
-            normalized["agentState"] = "BUSY"
-        if "agent_ready" in normalized:
-            normalized["agent_ready"] = False
-        if "agentReady" in normalized:
-            normalized["agentReady"] = False
-    return normalized
+    _ = action
+    # Agent state describes the currently observed terminal surface. An
+    # unresolved result contract stays visible through turn/runtime fields;
+    # it must never rewrite an observed READY terminal to BUSY.
+    return dict(snapshot)
 
 
 def _worker_snapshot_is_stale_missing_session_live_noise(
@@ -1748,32 +1739,9 @@ def _worker_snapshot_is_actively_running(snapshot: Mapping[str, Any]) -> bool:
     return agent_state in {"BUSY", "STARTING"}
 
 
-def _routing_worker_snapshot_has_active_turn(snapshot: Mapping[str, Any]) -> bool:
-    workflow_stage = str(snapshot.get("workflow_stage", "") or snapshot.get("workflowStage", "") or "").strip()
-    status = str(snapshot.get("status", "") or snapshot.get("result_status", "") or "").strip()
-    current_task_runtime_status = str(
-        snapshot.get("current_task_runtime_status", "") or snapshot.get("currentTaskRuntimeStatus", "") or ""
-    ).strip().lower()
-    turn_status_path = str(
-        snapshot.get("turn_status_path", "") or snapshot.get("current_turn_status_path", "") or ""
-    ).strip()
-    if workflow_stage not in ACTIVE_ROUTING_WORKFLOW_STAGES:
-        return False
-    if status not in {"running", "pending"}:
-        return False
-    return current_task_runtime_status == "running" or bool(turn_status_path)
-
-
 def _normalize_routing_worker_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
-    normalized = dict(snapshot)
-    if (
-        str(normalized.get("agent_state", "") or normalized.get("agentState", "") or "").strip().upper() == "READY"
-        and _routing_worker_snapshot_has_active_turn(normalized)
-    ):
-        normalized["agent_state"] = "BUSY"
-        if "agentState" in normalized:
-            normalized["agentState"] = "BUSY"
-    return normalized
+    # Routing turn progress and terminal health are independent lifecycles.
+    return dict(snapshot)
 
 
 def _read_worker_state_snapshot(
@@ -1829,15 +1797,21 @@ def _read_worker_state_snapshot(
                 artifact_paths.append(item)
     session_name = str(_state_or_identity("session_name")).strip()
     session_exists = bool(recovered_identity.get("session_exists", False))
+    persisted_session_exists = state.get("session_exists")
+    persisted_session_known = isinstance(persisted_session_exists, bool)
     if prelaunch_active:
         session_exists = False
     elif trust_persisted_session and session_name and not terminal_dead_or_failed:
         # Runtime state writes must reach the UI without waiting for N serial
-        # tmux probes. Health supervision publishes any later liveness change.
-        session_exists = bool(state.get("agent_alive", False)) or (
-            health_status_for_identity == "alive"
-            and agent_state_for_identity in {"STARTING", "READY", "BUSY"}
-        )
+        # tmux probes. A health/lifecycle write can, however, persist an
+        # authoritative false value; stale alive evidence must not revive it.
+        if persisted_session_known:
+            session_exists = bool(persisted_session_exists)
+        else:
+            session_exists = bool(state.get("agent_alive", False)) or (
+                health_status_for_identity == "alive"
+                and agent_state_for_identity in {"STARTING", "READY", "BUSY"}
+            )
     elif session_name and session_context_resolver is not None:
         with contextlib.suppress(Exception):
             session_exists = bool(session_context_resolver(session_name, state, state_path)) or session_exists
@@ -1946,6 +1920,8 @@ class BridgeCore:
         self._response_emitter: Callable[[Mapping[str, Any]], None] | None = None
         self._response_emission_lock = threading.Lock()
         self._emitted_response_ids: dict[str, None] = {}
+        self._pending_prompt_lock = threading.RLock()
+        self._prompt_revision = 0
         self._pending_prompt: PendingPromptState | None = None
         self._pending_prompts: dict[str, PendingPromptState] = {}
         self._last_resolved_hitl = ResolvedHitlState()
@@ -2071,7 +2047,35 @@ class BridgeCore:
             payload["hitl_round"] = hitl_round
         self.emit_event("log.append", payload)
 
-    def _handle_prompt_open(self, prompt_id: str, request: BridgePromptRequest) -> None:
+    def _next_prompt_revision_locked(self) -> int:
+        self._prompt_revision += 1
+        return self._prompt_revision
+
+    def _current_pending_prompt_locked(self) -> PendingPromptState | None:
+        current = self._pending_prompt
+        if current is not None:
+            registered = self._pending_prompts.get(current.prompt_id)
+            if registered is current or not self._pending_prompts:
+                return current
+        if not self._pending_prompts:
+            return None
+        latest_prompt_id = next(reversed(self._pending_prompts))
+        return self._pending_prompts[latest_prompt_id]
+
+    @staticmethod
+    def _build_prompt_request_payload(
+        prompt: PendingPromptState,
+        *,
+        prompt_revision: int,
+    ) -> dict[str, Any]:
+        return {
+            **prompt.payload,
+            "id": prompt.prompt_id,
+            "prompt_type": prompt.prompt_type,
+            "prompt_revision": max(int(prompt_revision or 0), 0),
+        }
+
+    def _handle_prompt_open(self, prompt_id: str, request: BridgePromptRequest) -> Mapping[str, Any]:
         owner_runner_id = str(getattr(self._runner_local, "runner_id", "") or "").strip()
         if not owner_runner_id:
             with self._display_state_lock:
@@ -2083,8 +2087,10 @@ class BridgeCore:
             created_at=_iso_now(),
             owner_runner_id=owner_runner_id,
         )
-        self._pending_prompts[pending.prompt_id] = pending
-        self._pending_prompt = pending
+        with self._pending_prompt_lock:
+            self._pending_prompts[pending.prompt_id] = pending
+            self._pending_prompt = pending
+            prompt_revision = self._next_prompt_revision_locked()
         self._attention_manager.start_prompt(
             prompt_id=prompt_id,
             prompt_type=request.prompt_type,
@@ -2125,15 +2131,17 @@ class BridgeCore:
             self.emit_event("snapshot.hitl", hitl_snapshot)
         stage_routes = self._stage_routes_for_action(self._display_action or self._context.current_action)
         self._schedule_flow_snapshot_update(
-            sections={"app", "hitl"},
+            sections={"app", "hitl", "prompt"},
             stage_routes=stage_routes,
         )
+        return {"prompt_revision": prompt_revision}
 
     def _handle_prompt_resolved(self, prompt_id: str, payload: Mapping[str, Any] | None = None) -> None:
         prompt_id_text = str(prompt_id).strip()
-        current = self._pending_prompts.get(prompt_id_text)
-        if current is None and self._pending_prompt is not None and self._pending_prompt.prompt_id == prompt_id_text:
-            current = self._pending_prompt
+        with self._pending_prompt_lock:
+            current = self._pending_prompts.get(prompt_id_text)
+            if current is None and self._pending_prompt is not None and self._pending_prompt.prompt_id == prompt_id_text:
+                current = self._pending_prompt
         routing_snapshot_changed = False
         resolved_payload = dict(payload or {})
         prompt_shutdown = bool(str(resolved_payload.get("__prompt_broker_shutdown__", "")).strip())
@@ -2144,16 +2152,46 @@ class BridgeCore:
         # Do not remove pending/attention state until every scope-critical
         # callback above has succeeded. PromptBroker will release its claim and
         # allow the same response to be retried when an exception escapes.
-        self._pending_prompts.pop(prompt_id_text, None)
-        if self._pending_prompt is not None and self._pending_prompt.prompt_id == prompt_id_text:
-            self._pending_prompt = None
-        latest_pending = self._latest_pending_prompt()
-        self._pending_prompt = latest_pending
+        with self._pending_prompt_lock:
+            authoritative_before = self._current_pending_prompt_locked()
+            removed = self._pending_prompts.pop(prompt_id_text, None)
+            removed_fallback = bool(
+                self._pending_prompt is not None
+                and self._pending_prompt.prompt_id == prompt_id_text
+            )
+            if removed_fallback:
+                self._pending_prompt = None
+            latest_pending = self._current_pending_prompt_locked()
+            self._pending_prompt = latest_pending
+            prompt_state_changed = removed is not None or removed_fallback
+            prompt_revision = (
+                self._next_prompt_revision_locked()
+                if prompt_state_changed
+                else self._prompt_revision
+            )
+            republish_latest = bool(
+                prompt_state_changed
+                and authoritative_before is not None
+                and authoritative_before.prompt_id == prompt_id_text
+                and latest_pending is not None
+            )
         self._attention_manager.resolve_prompt(prompt_id)
+        if republish_latest and latest_pending is not None:
+            # A previously hidden prompt is authoritative again. Re-publish it
+            # before unblocking the resolved workflow so clients cannot remain
+            # on the just-resolved prompt. A reconnect can always recover from
+            # snapshot.prompt if the best-effort event delivery itself fails.
+            self._best_effort_emit_event(
+                "prompt.request",
+                self._build_prompt_request_payload(
+                    latest_pending,
+                    prompt_revision=prompt_revision,
+                ),
+            )
         if current is not None and not prompt_shutdown and not _prompt_is_hitl(current.payload):
             self._restore_active_runner_after_prompt_resolution(current)
         self._schedule_flow_snapshot_update(
-            sections={"app", "hitl"},
+            sections={"app", "hitl", "prompt"},
             stage_routes=("routing",) if routing_snapshot_changed else (),
             update_display_stage=True,
         )
@@ -2335,17 +2373,16 @@ class BridgeCore:
             self._snapshot_refresh_worker_health = previous_refresh_worker_health
 
     def _iter_pending_prompts(self) -> list[PendingPromptState]:
-        if self._pending_prompts:
-            return list(self._pending_prompts.values())
-        if self._pending_prompt is not None:
-            return [self._pending_prompt]
-        return []
+        with self._pending_prompt_lock:
+            if self._pending_prompts:
+                return list(self._pending_prompts.values())
+            if self._pending_prompt is not None:
+                return [self._pending_prompt]
+            return []
 
     def _latest_pending_prompt(self) -> PendingPromptState | None:
-        prompts = self._iter_pending_prompts()
-        if not prompts:
-            return None
-        return prompts[-1]
+        with self._pending_prompt_lock:
+            return self._current_pending_prompt_locked()
 
     def _remember_resolved_hitl_prompt(self, prompt: PendingPromptState) -> None:
         if not _prompt_is_hitl(prompt.payload):
@@ -5679,6 +5716,7 @@ class BridgeCore:
         include_app: bool = False,
         include_control: bool = False,
         include_hitl: bool = False,
+        include_prompt: bool = False,
         include_artifacts: bool = False,
         stage_routes: Sequence[str] | None = None,
         include_all_stages: bool = False,
@@ -5780,6 +5818,8 @@ class BridgeCore:
                 self.emit_event("snapshot.control", control_snapshot or {})
             if include_hitl:
                 self.emit_event("snapshot.hitl", hitl_snapshot or {"pending": False})
+            if include_prompt:
+                self.emit_event("snapshot.prompt", self.build_prompt_snapshot())
             if include_artifacts:
                 self.emit_event("snapshot.artifacts", artifacts_snapshot or {"items": []})
         finally:
@@ -5790,6 +5830,7 @@ class BridgeCore:
             include_app=True,
             include_control=True,
             include_hitl=True,
+            include_prompt=True,
             include_artifacts=True,
             include_all_stages=True,
         )
@@ -5872,6 +5913,7 @@ class BridgeCore:
                 include_app="app" in sections,
                 include_control="control" in sections,
                 include_hitl="hitl" in sections,
+                include_prompt="prompt" in sections,
                 include_artifacts="artifacts" in sections,
                 stage_routes=tuple(sorted(stage_routes)),
                 refresh_worker_health=refresh_worker_health,
@@ -6091,8 +6133,14 @@ class BridgeCore:
             fallback_stage_seq=stage_seq,
         )
         message_text = str(error or "").strip()
-        startup_intervention = is_agent_startup_intervention_error(error)
-        recovery_kind = "agent_startup_intervention" if startup_intervention else "agent_ready_timeout"
+        runtime_intervention = is_agent_runtime_intervention_error(error)
+        startup_intervention = is_agent_startup_intervention_error(error) and not runtime_intervention
+        if runtime_intervention:
+            recovery_kind = "agent_runtime_intervention"
+        elif startup_intervention:
+            recovery_kind = "agent_startup_intervention"
+        else:
+            recovery_kind = "agent_ready_timeout"
         workers = self._filter_workers_for_current_context(
             self._current_stage_workers_without_runtime_io(final_action or action),
             final_action or action,
@@ -6108,12 +6156,23 @@ class BridgeCore:
         session_name = str(getattr(error, "session_name", "") or current_worker.get("session_name", "")).strip()
         role_label = session_name.split("-", 1)[0] if session_name else "当前智能体"
         attach_command = f"tmux attach -t {session_name}" if session_name else ""
-        title = "HITL: 智能体启动需要人工介入" if startup_intervention else "HITL: 智能体启动超时"
+        if runtime_intervention:
+            title = "HITL: 智能体运行期权限介入"
+            intervention_message = "检测到智能体运行期需要人工处理，已转为 HITL，系统不会标记为失败。"
+            prompt_text = "请先进入原 tmux 会话处理运行期权限确认，然后重新检查。"
+        elif startup_intervention:
+            title = "HITL: 智能体启动需要人工介入"
+            intervention_message = "检测到智能体启动需要人工处理，已转为 HITL，系统不会标记为失败。"
+            prompt_text = "请先进入原 tmux 会话处理该 AGENT，然后重新检查。"
+        else:
+            title = "HITL: 智能体启动超时"
+            intervention_message = "检测到智能体启动超时，已转为 HITL，系统不会标记为失败。"
+            prompt_text = "请先进入原 tmux 会话检查该 AGENT，然后重新检查。"
         self.emit_event(
             "log.append",
             {
                 "text": (
-                    "检测到智能体启动需要人工处理，已转为 HITL，系统不会标记为失败。\n"
+                    f"{intervention_message}\n"
                     + (f"{attach_command}\n" if attach_command else "")
                 ),
                 "log_kind": "warning",
@@ -6141,7 +6200,7 @@ class BridgeCore:
                     prompt_type="select",
                     payload={
                         "title": title,
-                        "prompt_text": "请先进入原 tmux 会话处理该 AGENT，然后重新检查。",
+                        "prompt_text": prompt_text,
                         "options": [
                             {
                                 "value": "recheck_after_manual_intervention",
@@ -6162,7 +6221,14 @@ class BridgeCore:
             backend = getattr(self._tmux_runtime, "backend", None)
             recovered_worker = load_worker_from_state_path(state_path, backend=backend) if state_path else None
             if recovered_worker is not None:
-                recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
+                if runtime_intervention:
+                    checker = getattr(recovered_worker, "runtime_intervention_is_resolved", None)
+                    if callable(checker):
+                        recovered = bool(checker(str(getattr(error, "blocker_kind", "") or "")))
+                    else:
+                        recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
+                else:
+                    recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
         finally:
             self._pending_prompt_display_state = None
         if recovered:
@@ -6198,7 +6264,7 @@ class BridgeCore:
             or "awaiting_reconfig" in lowered
         ):
             return False
-        if self._iter_pending_prompts():
+        if self._matching_manual_reconfiguration_prompt(action=action, session_name="") is not None:
             return True
         workers = self._filter_workers_for_current_context(
             self._current_stage_workers_without_runtime_io(action),
@@ -6207,6 +6273,32 @@ class BridgeCore:
         if any(_is_recoverable_reconfig_snapshot(worker) for worker in workers):
             return True
         return "重新选择" in message or "awaiting_reconfig" in lowered
+
+    def _matching_manual_reconfiguration_prompt(
+        self,
+        *,
+        action: str,
+        session_name: str,
+    ) -> PendingPromptState | None:
+        normalized_action = str(action or "").strip()
+        normalized_session = str(session_name or "").strip()
+        current_runner_id = str(getattr(self._runner_local, "runner_id", "") or "").strip()
+        for prompt in reversed(self._iter_pending_prompts()):
+            payload = prompt.payload
+            if str(payload.get("recovery_kind", "") or "").strip() != "manual_reconfiguration":
+                continue
+            prompt_session = str(payload.get("session_name", "") or "").strip()
+            if normalized_session and prompt_session != normalized_session:
+                continue
+            prompt_action = str(payload.get("workflow_action", payload.get("action", "")) or "").strip()
+            if prompt_action and normalized_action and prompt_action != normalized_action:
+                continue
+            if not normalized_session and (not prompt_action or prompt_action != normalized_action):
+                continue
+            if current_runner_id and prompt.owner_runner_id and prompt.owner_runner_id != current_runner_id:
+                continue
+            return prompt
+        return None
 
     @staticmethod
     def _is_requirement_concurrency_conflict(error: BaseException) -> bool:
@@ -6385,6 +6477,7 @@ class BridgeCore:
         session_name = str(current_worker.get("session_name", "")).strip()
         worker_id = str(current_worker.get("worker_id", "")).strip()
         role_label = session_name.split("-", 1)[0] if session_name else (worker_id or "当前智能体")
+        runner_id = str(getattr(self._runner_local, "runner_id", "") or "").strip()
         prompt_payload = {
             "title": "HITL: 智能体需要人工重配",
             "prompt_text": "请先手动更换模型或处理该 AGENT，然后选择继续尝试。",
@@ -6397,6 +6490,10 @@ class BridgeCore:
             "default_value": "retry_after_manual_reconfiguration",
             "is_hitl": True,
             "recovery_kind": "manual_reconfiguration",
+            "workflow_action": str(action or "").strip(),
+            "stage_runner_id": runner_id,
+            "project_dir": self._resolve_project_dir(),
+            "requirement_name": self._resolve_requirement_name(),
             "session_name": session_name,
             "role_label": role_label,
             "attach_command": _prompt_attach_command(current_worker),
@@ -6416,7 +6513,7 @@ class BridgeCore:
             "preferred_status": "awaiting-input",
             "preferred_action": action,
             "preferred_stage_seq": stage_seq,
-            "preferred_runner_id": str(getattr(self._runner_local, "runner_id", "") or "").strip(),
+            "preferred_runner_id": runner_id,
             "source": "runner_start",
             "message": message_text,
             "force": True,
@@ -6426,7 +6523,11 @@ class BridgeCore:
             stage_seq=stage_seq,
             message=message_text,
         )
-        if self._iter_pending_prompts():
+        matching_prompt = self._matching_manual_reconfiguration_prompt(
+            action=action,
+            session_name=session_name,
+        )
+        if matching_prompt is not None:
             self._emit_display_stage_state(**pending_display_state)
         else:
             self._pending_prompt_display_state = pending_display_state
@@ -6745,6 +6846,16 @@ class BridgeCore:
                                 stage_routes=self._stage_routes_for_action(final_action or action),
                                 refresh_worker_health=False,
                             )
+                    return
+                if is_agent_runtime_intervention_error(error):
+                    self._await_agent_ready_timeout_recovery(
+                        request_id=request_id,
+                        action=final_action or action,
+                        stage_seq=final_stage_seq,
+                        error=error,
+                        respond=respond,
+                    )
+                    self._mark_runner_execution_terminal(runner_id, source="awaiting_input")
                     return
                 if is_agent_startup_intervention_error(error):
                     self._await_agent_ready_timeout_recovery(
@@ -7506,19 +7617,23 @@ class BridgeCore:
             cls._add_preview_path(allowed, prompt.payload.get(key, ""))
 
     def build_prompt_snapshot(self) -> dict[str, Any]:
-        prompt = self._latest_pending_prompt()
+        with self._pending_prompt_lock:
+            prompt = self._current_pending_prompt_locked()
+            prompt_revision = self._prompt_revision
         if prompt is None:
             return {
                 "pending": False,
                 "prompt_id": "",
                 "prompt_type": "",
                 "payload": {},
+                "prompt_revision": prompt_revision,
             }
         return {
             "pending": True,
             "prompt_id": prompt.prompt_id,
             "prompt_type": prompt.prompt_type,
             "payload": dict(prompt.payload),
+            "prompt_revision": prompt_revision,
         }
 
     def _allowed_file_preview_paths(

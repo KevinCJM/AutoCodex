@@ -11,6 +11,7 @@ from unittest import mock
 import T02_tmux_agents as runtime_module
 from T02_tmux_agents import (
     AgentRunConfig,
+    AgentRuntimeInterventionRequired,
     AgentRuntimeState,
     AgentStartupInterventionRequired,
     CommandResult,
@@ -676,6 +677,7 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
             )
             worker.agent_state = AgentRuntimeState.READY
             worker.agent_started = True
+            worker.session_exists = lambda: True
             worker._write_session_created_state_fast()  # noqa: SLF001
             orphaned = worker.read_state()
             orphaned.update(
@@ -734,6 +736,12 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
                 self.agent_state = AgentRuntimeState.READY
                 self.current_command = "codex"
                 self.current_path = str(self.work_dir)
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
 
             def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
                 return runtime_module.WorkerObservation(
@@ -1065,6 +1073,7 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
                 self.record_calls = 0
+                self.primary_failed = False
 
             def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ANN001, ARG002
                 self.pane_id = "%1"
@@ -1075,6 +1084,9 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
 
             def _ensure_agent_ready_for_turn_start(self, **kwargs):  # noqa: ANN003
                 self.ensure_agent_ready(timeout_sec=float(kwargs.get("timeout_sec", 0.0)))
+
+            def session_exists(self):
+                return True
 
             def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
                 return runtime_module.WorkerObservation(
@@ -1091,10 +1103,13 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
                 )
 
             def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.primary_failed = True
                 raise RuntimeError("primary turn failure")
 
             def target_exists(self, target=None):  # noqa: ANN001, ARG002
-                raise RuntimeError("secondary diagnostic failure")
+                if self.primary_failed:
+                    raise RuntimeError("secondary diagnostic failure")
+                return True
 
             def _turn_failure_runtime_state_extra(self, clean_output, *, error=None):  # noqa: ANN001, ARG002
                 return {}
@@ -1192,6 +1207,300 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
         self.assertEqual(state["status"], WorkerStatus.RUNNING.value)
         self.assertEqual(state["result_status"], "running")
         self.assertEqual(state["startup_blocker_kind"], "deveco_login")
+
+    def test_runtime_intervention_is_distinct_from_startup_and_preserves_submitted_turn(self):
+        class FakeCodexConfig:
+            vendor = runtime_module.Vendor.CODEX
+            model = "gpt-test"
+
+            def build_launch_command(self, _work_dir):  # noqa: ANN001
+                return "codex"
+
+            def to_summary(self):
+                return {"vendor": "codex", "model": self.model}
+
+            def expected_current_commands(self):
+                return ("codex", "node")
+
+        class RuntimeInterventionWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):  # noqa: ANN003
+                self.send_attempts = 0
+                super().__init__(**kwargs)
+
+            def is_agent_alive(self, observation=None):  # noqa: ANN001, ARG002
+                return True
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return self.agent_state
+
+            def _ensure_agent_ready_for_turn_start(self, **kwargs):  # noqa: ANN003
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return runtime_module.WorkerObservation(
+                    visible_text="ready",
+                    raw_log_delta="",
+                    raw_log_tail="ready",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-18T00:00:00",
+                    pane_title="TmuxCodingTeam",
+                )
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.send_attempts += 1
+
+            def _wait_for_turn_reply(self, **kwargs):  # noqa: ANN003
+                raise AgentRuntimeInterventionRequired(
+                    blocker_kind="opencode_permission",
+                    session_name=self.session_name,
+                    state_path=str(self.state_path),
+                    message="Agent runtime requires manual intervention",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            TmuxBackend, "list_sessions", return_value=[]
+        ):
+            worker = RuntimeInterventionWorker(
+                worker_id="runtime-intervention-after-submit",
+                work_dir=tmp_dir,
+                config=FakeCodexConfig(),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+
+            with self.assertRaises(AgentRuntimeInterventionRequired) as raised:
+                worker.run_turn(label="runtime_intervention", prompt="hello", timeout_sec=0.1)
+
+            state = worker.read_state()
+
+        self.assertNotIsInstance(raised.exception, AgentStartupInterventionRequired)
+        self.assertEqual(worker.send_attempts, 1)
+        self.assertEqual(worker.results, [])
+        self.assertEqual(state["status"], WorkerStatus.RUNNING.value)
+        self.assertEqual(state["turn_state"], TurnState.WAITING_RESULT.value)
+        self.assertEqual(state["dispatch_state"], "submitted")
+        self.assertEqual(state["startup_blocker_kind"], "opencode_permission")
+
+    def test_speculative_timeout_finalization_does_not_swallow_runtime_intervention(self):
+        worker = object.__new__(TmuxBatchWorker)
+        runtime_error = AgentRuntimeInterventionRequired(
+            blocker_kind="opencode_permission",
+            session_name="opencode-timeout-finalize",
+            state_path="/tmp/opencode-timeout-finalize.state.json",
+            message="Agent runtime requires manual intervention",
+        )
+        worker.wait_for_task_result = mock.Mock(side_effect=runtime_error)
+        contract = mock.Mock()
+        contract.phase = "timeout-finalize"
+
+        with self.assertRaises(AgentRuntimeInterventionRequired) as raised:
+            worker._try_finalize_task_result_after_prompt_timeout(  # noqa: SLF001
+                contract=contract,
+                task_status_path=None,
+                result_path=Path("/tmp/opencode-timeout-finalize.result.json"),
+                baseline_visible="",
+                baseline_raw_log_tail="",
+                prompt_submission_observed=True,
+            )
+
+        self.assertIs(raised.exception, runtime_error)
+
+    def test_runtime_permission_handler_freezes_business_timeout_without_resending_prompt(self):
+        class FakeOpenCodeConfig:
+            vendor = runtime_module.Vendor.OPENCODE
+            model = "test/model"
+
+            def build_launch_command(self, _work_dir):  # noqa: ANN001
+                return "opencode"
+
+            def to_summary(self):
+                return {"vendor": "opencode", "model": self.model}
+
+            def expected_current_commands(self):
+                return ("opencode", "node")
+
+        class FakeClock:
+            def __init__(self):
+                self.value = 100.0
+
+            def monotonic(self):
+                return self.value
+
+        class PermissionWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):  # noqa: ANN003
+                self.send_attempts = 0
+                self.pause_delta = -1.0
+                super().__init__(**kwargs)
+
+            def is_agent_alive(self, observation=None):  # noqa: ANN001, ARG002
+                return True
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                if observation is None:
+                    return self.agent_state
+                return self.detector.classify_agent_state(observation)
+
+            def _ensure_agent_ready_for_turn_start(self, **kwargs):  # noqa: ANN003
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "node"
+                self.current_path = str(self.work_dir)
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return runtime_module.WorkerObservation(
+                    visible_text="Ask anything...\nctrl+p commands",
+                    raw_log_delta="",
+                    raw_log_tail="Ask anything...\nctrl+p commands",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-18T00:00:00",
+                    pane_title="OpenCode",
+                )
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.send_attempts += 1
+
+            def _wait_for_turn_reply(self, **kwargs):  # noqa: ANN003
+                permission = runtime_module.WorkerObservation(
+                    visible_text="Permission required\nAllow once\nAllow always\nReject",
+                    raw_log_delta="",
+                    raw_log_tail="old ready output only",
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-18T00:00:01",
+                    pane_title="OpenCode",
+                )
+                before = self._business_monotonic()
+                self._handle_runtime_intervention_if_needed(permission, context="等待智能体回复")
+                self.pause_delta = self._business_monotonic() - before
+                self.agent_state = AgentRuntimeState.READY
+                self.agent_ready = True
+                return "done"
+
+        clock = FakeClock()
+        handled: list[AgentRuntimeInterventionRequired] = []
+
+        def handle_runtime(_worker, error):  # noqa: ANN001
+            handled.append(error)
+            clock.value += 120.0
+
+        with tempfile.TemporaryDirectory() as tmp_dir, mock.patch.object(
+            TmuxBackend, "list_sessions", return_value=[]
+        ), mock.patch.object(runtime_module.time, "monotonic", side_effect=clock.monotonic):
+            worker = PermissionWorker(
+                worker_id="runtime-permission-timeout-pause",
+                work_dir=tmp_dir,
+                config=FakeOpenCodeConfig(),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            result = worker.run_turn(
+                label="permission_pause",
+                prompt="hello",
+                timeout_sec=1.0,
+                runtime_intervention_handler=handle_runtime,
+            )
+            state = worker.read_state()
+
+        self.assertTrue(result.ok)
+        self.assertEqual(worker.send_attempts, 1)
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(handled[0].blocker_kind, "opencode_permission")
+        self.assertAlmostEqual(worker.pause_delta, 0.0)
+        self.assertEqual(state["startup_blocker_kind"], "")
+
+    def test_runtime_intervention_handler_is_scoped_to_one_turn(self):
+        worker = object.__new__(TmuxBatchWorker)
+        worker._runtime_intervention_handler = None  # noqa: SLF001
+        handlers_seen: list[object] = []
+
+        def fake_run_turn_impl(**_kwargs):  # noqa: ANN003
+            handlers_seen.append(worker._runtime_intervention_handler)  # noqa: SLF001
+            return mock.sentinel.command_result
+
+        worker._run_turn_impl = mock.Mock(side_effect=fake_run_turn_impl)  # type: ignore[method-assign]  # noqa: SLF001
+        first_handler = mock.sentinel.first_runtime_handler
+
+        first_result = worker.run_turn(
+            label="first",
+            prompt="first prompt",
+            runtime_intervention_handler=first_handler,
+        )
+        second_result = worker.run_turn(label="second", prompt="second prompt")
+
+        self.assertIs(first_result, mock.sentinel.command_result)
+        self.assertIs(second_result, mock.sentinel.command_result)
+        self.assertEqual(handlers_seen, [first_handler, None])
+        self.assertIsNone(worker._runtime_intervention_handler)  # noqa: SLF001
+
+        worker._run_turn_impl = mock.Mock(side_effect=RuntimeError("turn failed"))  # type: ignore[method-assign]  # noqa: SLF001
+        with self.assertRaisesRegex(RuntimeError, "turn failed"):
+            worker.run_turn(
+                label="failing",
+                prompt="failing prompt",
+                runtime_intervention_handler=mock.sentinel.failing_runtime_handler,
+            )
+        self.assertIsNone(worker._runtime_intervention_handler)  # noqa: SLF001
+
+    def test_opencode_permission_intervention_uses_current_visible_surface_only(self):
+        detector = runtime_module.OpenCodeOutputDetector()
+        permission_surface = "Permission required\nAllow once\nAllow always\nReject"
+        ready_surface = "Ask anything...\nctrl+p commands"
+
+        def observation(*, visible_text: str, raw_log_tail: str):
+            return runtime_module.WorkerObservation(
+                visible_text=visible_text,
+                raw_log_delta="",
+                raw_log_tail=raw_log_tail,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-07-18T00:00:00",
+                pane_title="OpenCode",
+            )
+
+        active_permission = observation(
+            visible_text=permission_surface,
+            raw_log_tail=ready_surface,
+        )
+        stale_permission = observation(
+            visible_text=ready_surface,
+            raw_log_tail=permission_surface,
+        )
+        worker = object.__new__(TmuxBatchWorker)
+        worker.config = mock.Mock(vendor=runtime_module.Vendor.OPENCODE)
+        worker.session_name = "审核员-权限确认"
+        worker.state_path = Path("/tmp/opencode-permission.state.json")
+
+        error = worker._runtime_permission_intervention(  # noqa: SLF001
+            active_permission,
+            context="等待结果",
+        )
+
+        self.assertIsInstance(error, AgentRuntimeInterventionRequired)
+        self.assertEqual(error.blocker_kind, "opencode_permission")
+        self.assertIsNone(
+            worker._runtime_permission_intervention(stale_permission, context="等待结果")  # noqa: SLF001
+        )
+        self.assertEqual(detector.classify_agent_state(active_permission), AgentRuntimeState.STARTING)
+        self.assertEqual(detector.classify_agent_state(stale_permission), AgentRuntimeState.READY)
 
 
 if __name__ == "__main__":

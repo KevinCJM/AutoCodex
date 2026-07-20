@@ -11,7 +11,19 @@ from unittest.mock import Mock, patch
 
 import A01_Routing_LayerPlanning as routing_module
 
-from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor, get_model_choices, get_normalized_effort_choices
+from tmux_core.runtime.vendor_catalog import (
+    CatalogSnapshot,
+    CONFIDENCE_HIGH,
+    ModelInventory,
+    OK_SCAN_STATUS,
+    ReasoningInventory,
+    SCHEMA_VERSION,
+    SOURCE_DYNAMIC_CLI,
+    VendorInventory,
+    get_default_model_for_vendor,
+    get_model_choices,
+    get_normalized_effort_choices,
+)
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
     TerminalProgressMonitor,
@@ -60,6 +72,13 @@ def _write_valid_routing_layer(project_dir: Path) -> None:
         json.dumps({"pitfalls": [{"id": "P01", "title": "risk"}]}, ensure_ascii=False),
         encoding="utf-8",
     )
+
+
+def _first_catalog_model(vendor_id: str) -> str:
+    models = get_model_choices(vendor_id)
+    if not models:
+        raise AssertionError(f"{vendor_id} test catalog has no models")
+    return models[0].model_id
 
 
 class RoutingLayerCliTests(unittest.TestCase):
@@ -120,7 +139,9 @@ class RoutingLayerCliTests(unittest.TestCase):
             normalize_vendor_choice("kimi")
 
     def test_normalize_model_and_effort_support_numeric_aliases(self):
-        self.assertEqual("gpt-5.4", normalize_model_choice("codex", "1"))
+        codex_model = _first_catalog_model("codex")
+        codex_efforts = get_normalized_effort_choices("codex", codex_model)
+        self.assertEqual(codex_model, normalize_model_choice("codex", "1"))
         self.assertEqual("sonnet", normalize_model_choice("claude", "1"))
         default_opencode_model = get_default_model_for_vendor("opencode")
         opencode_reasoning_model = next(
@@ -129,9 +150,9 @@ class RoutingLayerCliTests(unittest.TestCase):
             if len(item.reasoning.normalized_reasoning_levels) > 1
         )
         self.assertEqual(default_opencode_model, normalize_model_choice("opencode", "1"))
-        self.assertEqual("medium", normalize_effort_choice("codex", "gpt-5.4", "2"))
+        self.assertEqual(codex_efforts[1], normalize_effort_choice("codex", codex_model, "2"))
         self.assertEqual("medium", normalize_effort_choice("opencode", opencode_reasoning_model, "2"))
-        self.assertEqual("max", normalize_effort_choice("codex", "gpt-5.4", "5"))
+        self.assertEqual(codex_efforts[4], normalize_effort_choice("codex", codex_model, "5"))
 
     def test_prompt_model_uses_scanned_opencode_models(self):
         opencode_models = get_model_choices("opencode")
@@ -142,6 +163,77 @@ class RoutingLayerCliTests(unittest.TestCase):
                 model = prompt_model("opencode", DEFAULT_MODEL_BY_VENDOR["opencode"])
         self.assertEqual(model, opencode_models[1].model_id)
         self.assertNotIn("自定义输入 provider/model", stdout.getvalue())
+
+    def test_prompt_model_pins_one_refreshed_opencode_snapshot(self):
+        live_model = ModelInventory(
+            vendor_id="opencode",
+            model_id="live/current-model",
+            display_name="Current Model",
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            reasoning=ReasoningInventory(
+                vendor_id="opencode",
+                model_id="live/current-model",
+                source_kind=SOURCE_DYNAMIC_CLI,
+                confidence=CONFIDENCE_HIGH,
+                reasoning_control_mode="implicit_default",
+                supports_reasoning=True,
+                normalized_reasoning_levels=("low", "high"),
+            ),
+        )
+        snapshot = CatalogSnapshot(
+            schema_version=SCHEMA_VERSION,
+            generated_at="2026-07-18T00:00:00+00:00",
+            cache_path="/tmp/catalog.json",
+            vendors=(
+                VendorInventory(
+                    vendor_id="opencode",
+                    installed=True,
+                    scan_status=OK_SCAN_STATUS,
+                    source_kind=SOURCE_DYNAMIC_CLI,
+                    confidence=CONFIDENCE_HIGH,
+                    binary_path="/usr/bin/opencode",
+                    models=(live_model,),
+                    default_model=live_model.model_id,
+                ),
+            ),
+        )
+
+        with patch(
+            "A01_Routing_LayerPlanning.ensure_vendor_catalog_current",
+            return_value=snapshot,
+        ) as ensure, patch(
+            "A01_Routing_LayerPlanning.prompt_select_option",
+            return_value=live_model.model_id,
+        ) as select:
+            selected = prompt_model("opencode", "stale/removed-model")
+
+        self.assertEqual(selected, live_model.model_id)
+        ensure.assert_called_once_with("opencode")
+        self.assertEqual(select.call_args.kwargs["options"][0][0], live_model.model_id)
+        self.assertNotIn("stale/removed-model", str(select.call_args.kwargs["options"]))
+
+    def test_opencode_default_alias_is_rejected_when_dynamic_catalog_is_empty(self):
+        snapshot = CatalogSnapshot(
+            schema_version=SCHEMA_VERSION,
+            generated_at="2026-07-18T00:00:00+00:00",
+            cache_path="/tmp/catalog.json",
+            vendors=(
+                VendorInventory(
+                    vendor_id="opencode",
+                    installed=True,
+                    scan_status="degraded",
+                    source_kind="none",
+                    confidence="low",
+                    binary_path="/usr/bin/opencode",
+                    models=(),
+                    default_model="",
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(ValueError, "已扫描模型: none"):
+            normalize_model_choice("opencode", "default", catalog=snapshot)
 
     def test_mimo_model_and_effort_normalization_use_catalog(self):
         mimo_model = SimpleNamespace(model_id="mimo/mimo-v2.5-pro")
@@ -679,6 +771,7 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertFalse(run_store.update_called)
 
     def test_collect_cli_request_uses_project_arg_without_prompting_for_path(self):
+        codex_model = _first_catalog_model("codex")
         with tempfile.TemporaryDirectory() as tmpdir:
             parser = build_parser()
             args = parser.parse_args(
@@ -688,7 +781,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                     "--vendor",
                     "codex",
                     "--model",
-                    "gpt-5.4",
+                    codex_model,
                     "--effort",
                     "high",
                     "--run-init",
@@ -840,6 +933,7 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertEqual(vendor_prompt.call_count, 2)
 
     def test_collect_cli_request_with_project_dir_only_prompts_target_dirs_and_effort(self):
+        codex_model = _first_catalog_model("codex")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             _write_valid_routing_layer(project_dir)
@@ -860,7 +954,7 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertTrue(request.run_init)
         self.assertEqual(request.target_dirs, ())
         self.assertEqual(request.vendor, "codex")
-        self.assertEqual(request.model, "gpt-5.4")
+        self.assertEqual(request.model, codex_model)
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(request.proxy_port, "")
 
@@ -968,6 +1062,8 @@ class RoutingLayerCliTests(unittest.TestCase):
         self.assertIn("当前项目未检测到业务文件，跳过路由层初始化。", stdout.getvalue())
 
     def test_prompt_functions_print_vendor_model_effort_and_proxy_lists(self):
+        codex_models = get_model_choices("codex")
+        codex_model = _first_catalog_model("codex")
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             with patch("builtins.input", side_effect=["1", "1", "5", "2"]):
@@ -977,17 +1073,20 @@ class RoutingLayerCliTests(unittest.TestCase):
                 proxy_port = prompt_proxy_port("")
         output = stdout.getvalue()
         self.assertEqual(vendor, "codex")
-        self.assertEqual(model, "gpt-5.4")
+        self.assertEqual(model, codex_model)
         self.assertEqual(effort, "max")
         self.assertEqual(proxy_port, "10900")
         self.assertIn("选择厂商", output)
         self.assertIn("选择 codex 模型", output)
-        self.assertIn("选择 gpt-5.4 推理强度", output)
+        self.assertIn(f"选择 {codex_model} 推理强度", output)
         self.assertIn("选择代理端口", output)
-        self.assertIn("gpt-5.4-mini", output)
+        self.assertIn(codex_models[1].model_id, output)
+        self.assertIn("opencode | installed=", output)
+        self.assertIn("models=refresh-on-selection", output)
         self.assertIn("xhigh", output)
 
     def test_prompt_functions_include_role_label_when_provided(self):
+        codex_model = _first_catalog_model("codex")
         stdout = io.StringIO()
         with redirect_stdout(stdout):
             with patch("builtins.input", side_effect=["1", "1", "5", "2"]):
@@ -997,12 +1096,12 @@ class RoutingLayerCliTests(unittest.TestCase):
                 proxy_port = prompt_proxy_port("", role_label="审核器-R1")
         output = stdout.getvalue()
         self.assertEqual(vendor, "codex")
-        self.assertEqual(model, "gpt-5.4")
+        self.assertEqual(model, codex_model)
         self.assertEqual(effort, "max")
         self.assertEqual(proxy_port, "10900")
         self.assertIn("为 审核器-R1 选择厂商", output)
         self.assertIn("为 审核器-R1 选择 codex 模型", output)
-        self.assertIn("为 审核器-R1 选择 gpt-5.4 推理强度", output)
+        self.assertIn(f"为 审核器-R1 选择 {codex_model} 推理强度", output)
         self.assertIn("为 审核器-R1 选择代理端口", output)
 
     def test_collect_cli_request_scopes_routing_init_selection_prompts_to_router(self):
@@ -1063,6 +1162,7 @@ class RoutingLayerCliTests(unittest.TestCase):
 
     def test_collect_cli_request_with_complete_parameters_does_not_predict_role_label(self):
         parser = build_parser()
+        codex_model = _first_catalog_model("codex")
         with tempfile.TemporaryDirectory() as tmp_dir:
             Path(tmp_dir, "app.py").write_text("print('ok')\n", encoding="utf-8")
             args = parser.parse_args(
@@ -1072,7 +1172,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                     "--vendor",
                     "codex",
                     "--model",
-                    "gpt-5.4",
+                    codex_model,
                     "--effort",
                     "high",
                     "--run-init",
@@ -1088,7 +1188,7 @@ class RoutingLayerCliTests(unittest.TestCase):
 
         predict.assert_not_called()
         self.assertEqual(request.vendor, "codex")
-        self.assertEqual(request.model, "gpt-5.4")
+        self.assertEqual(request.model, codex_model)
 
     def test_predict_routing_role_label_does_not_query_tmux_control(self):
         observed: dict[str, set[str]] = {}
@@ -1139,6 +1239,7 @@ class RoutingLayerCliTests(unittest.TestCase):
 
     def test_main_starts_and_stops_terminal_progress_monitor(self):
         parser = build_parser()
+        codex_model = _first_catalog_model("codex")
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
             request_args = parser.parse_args(
@@ -1148,7 +1249,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                     "--vendor",
                     "codex",
                     "--model",
-                    "gpt-5.4",
+                    codex_model,
                     "--effort",
                     "high",
                     "--run-init",
@@ -1168,7 +1269,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                 ),
                 config={
                     "vendor": "codex",
-                    "model": "gpt-5.4",
+                    "model": codex_model,
                     "reasoning_effort": "high",
                     "proxy_url": "",
                     "reasoning_note": "reasoning_effort=high",
@@ -1219,12 +1320,13 @@ class RoutingLayerCliTests(unittest.TestCase):
             ):
                 stdout = io.StringIO()
                 with patch("sys.stdout", stdout):
-                    exit_code = main(["--project-dir", tmpdir, "--vendor", "codex", "--model", "gpt-5.4", "--effort", "high", "--run-init", "yes", "--yes"])
+                    exit_code = main(["--project-dir", tmpdir, "--vendor", "codex", "--model", codex_model, "--effort", "high", "--run-init", "yes", "--yes"])
         self.assertEqual(exit_code, 0)
         self.assertEqual(start_stop_events, ["init:run_demo", "start", "stop"])
 
     def test_successful_routing_stage_cleanup_errors_do_not_reverse_success(self):
         parser = build_parser()
+        codex_model = _first_catalog_model("codex")
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir).resolve()
             (project_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
@@ -1236,7 +1338,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        codex_model,
                         "--effort",
                         "high",
                         "--run-init",
@@ -1258,7 +1360,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                 ),
                 config={
                     "vendor": "codex",
-                    "model": "gpt-5.4",
+                    "model": codex_model,
                     "reasoning_effort": "high",
                     "proxy_url": "",
                 },
@@ -1307,6 +1409,7 @@ class RoutingLayerCliTests(unittest.TestCase):
 
     def test_routing_stage_transport_exception_orphans_prepared_workers_before_reraising(self):
         parser = build_parser()
+        codex_model = _first_catalog_model("codex")
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir).resolve()
             (project_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
@@ -1318,7 +1421,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        codex_model,
                         "--effort",
                         "high",
                         "--run-init",
@@ -1365,6 +1468,7 @@ class RoutingLayerCliTests(unittest.TestCase):
 
     def test_failed_routing_stage_preserves_tmux_sessions_and_runtime_artifacts(self):
         parser = build_parser()
+        codex_model = _first_catalog_model("codex")
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir).resolve()
             (project_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
@@ -1376,7 +1480,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        codex_model,
                         "--effort",
                         "high",
                         "--run-init",
@@ -1398,7 +1502,7 @@ class RoutingLayerCliTests(unittest.TestCase):
                 ),
                 config={
                     "vendor": "codex",
-                    "model": "gpt-5.4",
+                    "model": codex_model,
                     "reasoning_effort": "high",
                     "proxy_url": "",
                 },

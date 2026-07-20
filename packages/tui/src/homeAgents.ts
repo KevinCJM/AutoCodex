@@ -2,6 +2,7 @@ import { stageRouteForAction } from './stageRegistry'
 import type { HomeAgentItem, WorkerSnapshot } from './types'
 
 const LIVE_WORKER_HEALTH_STATUSES = new Set(['alive', 'observe_error', 'provider_auth_error'])
+const DEAD_WORKER_HEALTH_STATUSES = new Set(['dead', 'missing_session', 'pane_dead'])
 const RUNNING_WORKER_STATUSES = new Set(['running', 'busy', 'submitted', 'submitting'])
 const COMPLETED_WORKER_STATUSES = new Set(['done', 'succeeded', 'completed'])
 const READY_WORKER_STATUSES = new Set(['done', 'succeeded', 'completed', 'ready', 'idle'])
@@ -77,9 +78,9 @@ export function resolveHomeAgentState(worker: WorkerSnapshot): string {
   const runtimeStatus = String(worker.currentTaskRuntimeStatus || '').trim().toLowerCase()
   if (agentState === 'DEAD') return 'DEAD'
   if (agentState === 'STARTING') return 'STARTING'
+  if (DEAD_WORKER_HEALTH_STATUSES.has(healthStatus)) return 'DEAD'
   if (agentState === 'BUSY') return 'BUSY'
   if (agentState === 'READY') return 'READY'
-  if (healthStatus === 'dead') return 'DEAD'
   if (
     COMPLETED_WORKER_STATUSES.has(runtimeStatus) ||
     COMPLETED_WORKER_STATUSES.has(resultStatus) ||

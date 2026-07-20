@@ -1823,7 +1823,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
         self.assertEqual(entry.agent_state, AgentRuntimeState.DEAD.value)
         self.assertEqual(entry.health_status, "missing_session")
 
-    def test_run_store_marks_ready_agent_busy_while_routing_turn_is_active(self):
+    def test_run_store_keeps_ready_agent_ready_while_routing_turn_is_active(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = (Path(tmpdir) / "project").resolve()
             project_dir.mkdir(parents=True)
@@ -1877,7 +1877,7 @@ class AgentInitWorkflowTests(unittest.TestCase):
             )
 
         self.assertIsNotNone(entry)
-        self.assertEqual(entry.agent_state, AgentRuntimeState.BUSY.value)
+        self.assertEqual(entry.agent_state, AgentRuntimeState.READY.value)
         self.assertEqual(entry.current_task_runtime_status, "running")
 
     def test_run_store_load_maps_legacy_worker_manifest_phase_to_agent_state(self):

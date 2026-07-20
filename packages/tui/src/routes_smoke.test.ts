@@ -299,7 +299,10 @@ test('app isolates dialog, log, prompt, and content focus in the new shell layou
   expect(content.includes('const transition = resolvePromptResponseTransition(current.id, prompt(), true)')).toBe(true)
   expect(content.includes('if (promptSubmitInFlight.has(current.id)) return')).toBe(true)
   expect(content.includes("writePromptDraft(current.draftKey, String(value ?? ''))")).toBe(true)
-  expect(content.includes('if (transition.clearPrompt) setPrompt(null)')).toBe(true)
+  expect(content.includes("if (event.type === 'snapshot.prompt')")).toBe(true)
+  expect(content.includes('promptSyncUpdateFromSnapshot(event.payload, \'live\', buildPromptDraftKey)')).toBe(true)
+  expect(content.includes('promptSyncState = dismissPromptSyncState(promptSyncState, current.id)')).toBe(true)
+  expect(content.includes('setPrompt(promptSyncState.prompt)')).toBe(true)
   expect(content.includes('setStatus(resolvePromptAwareStatus(transition.status, Boolean(prompt())))')).toBe(true)
 })
 

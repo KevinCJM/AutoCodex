@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import threading
 import unittest
@@ -7,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import tmux_core.runtime.vendor_catalog as vendor_catalog_module
 from tmux_core.runtime.vendor_catalog import (
     CatalogSnapshot,
     CONFIDENCE_HIGH,
@@ -18,12 +20,15 @@ from tmux_core.runtime.vendor_catalog import (
     REASONING_MODEL_FAMILY_ROUTING,
     REASONING_NATIVE,
     ReasoningInventory,
+    SCHEMA_VERSION,
     SOURCE_CACHE_FALLBACK,
     SOURCE_CONFIG_FILE,
     SOURCE_DYNAMIC_CLI,
     SOURCE_PACKAGE_METADATA,
     VendorInventory,
     VENDOR_ORDER,
+    ensure_vendor_catalog_current,
+    ensure_vendor_catalogs_current,
     get_catalog_snapshot,
     get_default_model_for_vendor,
     get_model_choices,
@@ -35,6 +40,7 @@ from tmux_core.runtime.vendor_catalog import (
     parse_opencode_verbose_output,
     resolve_launch,
     refresh_catalog_snapshot,
+    refresh_vendor_catalog,
     reset_catalog_cache_for_tests,
     _build_agy_models,
     _build_opencode_like_config_models,
@@ -43,6 +49,7 @@ from tmux_core.runtime.vendor_catalog import (
     _scan_agy_vendor,
     _scan_deveco_vendor,
     _scan_mimo_vendor,
+    _scan_opencode_vendor,
     _resolved_vendor_binary_path,
 )
 
@@ -57,7 +64,7 @@ class VendorCatalogTests(unittest.TestCase):
     @staticmethod
     def _snapshot_at(generated_at: str) -> CatalogSnapshot:
         return CatalogSnapshot(
-            schema_version="1.0",
+            schema_version=SCHEMA_VERSION,
             generated_at=generated_at,
             cache_path="/tmp/vendor_catalog.json",
             vendors=tuple(
@@ -180,6 +187,63 @@ kimi-code/kimi-for-coding
         parsed = parse_opencode_debug_config_output(payload)
         self.assertEqual(parsed["model"], "kimi-code/kimi-for-coding")
         self.assertIn("kimi-code", parsed["provider"])
+
+    def test_opencode_dynamic_models_exclude_config_only_entries(self):
+        def fake_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001, ARG001
+            if argv == ["/usr/bin/opencode", "models", "--verbose"]:
+                return SimpleNamespace(
+                    ok=True,
+                    stdout=(
+                        "live/provider-model\n"
+                        '{"id":"provider-model","providerID":"live","name":"Live Model",'
+                        '"capabilities":{"reasoning":true},"variants":{}}'
+                    ),
+                )
+            if argv == ["/usr/bin/opencode", "debug", "config"]:
+                return SimpleNamespace(
+                    ok=True,
+                    stdout=json.dumps(
+                        {
+                            "model": "stale/removed-model",
+                            "provider": {
+                                "live": {"models": {"provider-model": {"name": "Live Model"}}},
+                                "stale": {"models": {"removed-model": {"name": "Removed Model"}}},
+                            },
+                        }
+                    ),
+                )
+            return SimpleNamespace(ok=False, stdout="")
+
+        with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe):
+            inventory = _scan_opencode_vendor("/usr/bin/opencode")
+
+        self.assertEqual(inventory.model_ids(), ("live/provider-model",))
+        self.assertEqual(inventory.default_model, "live/provider-model")
+        self.assertIn("configured_default_unavailable", inventory.notes)
+        self.assertTrue(all(model.source_kind == SOURCE_DYNAMIC_CLI for model in inventory.models))
+
+    def test_opencode_does_not_synthesize_supported_models_from_config_when_dynamic_probe_fails(self):
+        def fake_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001, ARG001
+            if argv == ["/usr/bin/opencode", "debug", "config"]:
+                return SimpleNamespace(
+                    ok=True,
+                    stdout='{"model":"stale/removed-model","provider":{"stale":{"models":{"removed-model":{}}}}}',
+                )
+            return SimpleNamespace(ok=False, stdout="")
+
+        with patch("tmux_core.runtime.vendor_catalog._command_probe", side_effect=fake_probe):
+            inventory = _scan_opencode_vendor("/usr/bin/opencode")
+
+        self.assertEqual(inventory.scan_status, DEGRADED_SCAN_STATUS)
+        self.assertEqual(inventory.models, ())
+        self.assertEqual(inventory.default_model, "")
+        catalog = CatalogSnapshot(
+            SCHEMA_VERSION,
+            "2026-07-18T00:00:00+00:00",
+            "/tmp/catalog.json",
+            (inventory,),
+        )
+        self.assertEqual(get_default_model_for_vendor("opencode", catalog=catalog), "")
 
     def test_mimo_vendor_normalization_and_fallback_default(self):
         self.assertEqual("mimo", normalize_vendor_id("mimo"))
@@ -364,7 +428,8 @@ mimo/mimo-v2.5-pro
     def test_scan_deveco_uses_resolved_binary_pure_commands_and_dynamic_model(self):
         binary_path = "/opt/bin/DevEco"
 
-        def fake_probe(argv, *, timeout_sec=12.0):  # noqa: ANN001
+        def fake_probe(argv, *, timeout_sec=12.0, env_overrides=None):  # noqa: ANN001
+            self.assertEqual(env_overrides, {"DEVECO_DISABLE_AUTOUPDATE": "1"})
             if argv == [binary_path, "--pure", "models", "--verbose"]:
                 return SimpleNamespace(
                     ok=True,
@@ -387,7 +452,7 @@ mimo/mimo-v2.5-pro
         self.assertEqual(inventory.vendor_id, "deveco")
         self.assertEqual(inventory.default_model, "deveco/GLM-current")
         self.assertEqual(inventory.model_ids(), ("deveco/GLM-current",))
-        catalog = CatalogSnapshot("1.0", "2026-07-11T00:00:00+00:00", "/tmp/catalog.json", (inventory,))
+        catalog = CatalogSnapshot(SCHEMA_VERSION, "2026-07-11T00:00:00+00:00", "/tmp/catalog.json", (inventory,))
         resolution = resolve_launch("deveco", "default", "high", catalog=catalog)
         self.assertEqual(resolution.executable_path, binary_path)
 
@@ -401,7 +466,7 @@ mimo/mimo-v2.5-pro
         self.assertEqual(inventory.scan_status, DEGRADED_SCAN_STATUS)
         self.assertEqual(inventory.models, ())
         self.assertEqual(inventory.default_model, "")
-        catalog = CatalogSnapshot("1.0", "2026-07-11T00:00:00+00:00", "/tmp/catalog.json", (inventory,))
+        catalog = CatalogSnapshot(SCHEMA_VERSION, "2026-07-11T00:00:00+00:00", "/tmp/catalog.json", (inventory,))
         self.assertEqual(get_default_model_for_vendor("deveco", catalog=catalog), "")
         with self.assertRaises(ValueError):
             resolve_launch("deveco", "default", "high", catalog=catalog)
@@ -411,13 +476,13 @@ mimo/mimo-v2.5-pro
             vendor_id="deveco",
             model_id="deveco/cached-model",
             display_name="Cached Model",
-            source_kind=SOURCE_CONFIG_FILE,
-            confidence=CONFIDENCE_MEDIUM,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
             reasoning=ReasoningInventory(
                 vendor_id="deveco",
                 model_id="deveco/cached-model",
-                source_kind=SOURCE_CONFIG_FILE,
-                confidence=CONFIDENCE_MEDIUM,
+                source_kind=SOURCE_DYNAMIC_CLI,
+                confidence=CONFIDENCE_HIGH,
                 reasoning_control_mode="implicit_default",
                 supports_reasoning=True,
                 normalized_reasoning_levels=("high",),
@@ -427,13 +492,13 @@ mimo/mimo-v2.5-pro
             vendor_id="deveco",
             installed=True,
             scan_status=OK_SCAN_STATUS,
-            source_kind=SOURCE_CONFIG_FILE,
-            confidence=CONFIDENCE_MEDIUM,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
             binary_path="/old/bin/deveco",
             models=(cached_model,),
             default_model=cached_model.model_id,
         )
-        prior = CatalogSnapshot("1.0", "2026-07-10T00:00:00+00:00", "/tmp/old.json", (prior_inventory,))
+        prior = CatalogSnapshot(SCHEMA_VERSION, "2026-07-10T00:00:00+00:00", "/tmp/old.json", (prior_inventory,))
         degraded = VendorInventory(
             vendor_id="deveco",
             installed=True,
@@ -517,6 +582,242 @@ mimo/mimo-v2.5-pro
         refresh.assert_not_called()
         self.assertEqual(resolve_binary.call_count, len(VENDOR_ORDER))
         probe.assert_not_called()
+
+    def test_in_process_snapshot_rechecks_ttl_after_first_access(self):
+        fresh_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+        refreshed_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=fresh_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog._catalog_snapshot_is_fresh",
+            side_effect=[True, False],
+        ), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot",
+            return_value=refreshed_snapshot,
+        ) as refresh:
+            first = get_catalog_snapshot()
+            second = get_catalog_snapshot()
+
+        self.assertIs(first, fresh_snapshot)
+        self.assertIs(second, refreshed_snapshot)
+        refresh.assert_called_once_with(prior_snapshot=fresh_snapshot)
+
+    def test_refresh_vendor_catalog_scans_only_selected_vendor_and_preserves_order(self):
+        old_snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+        refreshed_model = ModelInventory(
+            vendor_id="opencode",
+            model_id="live/provider-model",
+            display_name="Live Model",
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            reasoning=ReasoningInventory(
+                vendor_id="opencode",
+                model_id="live/provider-model",
+                source_kind=SOURCE_DYNAMIC_CLI,
+                confidence=CONFIDENCE_HIGH,
+                reasoning_control_mode="implicit_default",
+                supports_reasoning=True,
+                normalized_reasoning_levels=("high",),
+            ),
+        )
+        refreshed_inventory = VendorInventory(
+            vendor_id="opencode",
+            installed=True,
+            scan_status=OK_SCAN_STATUS,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            binary_path="/usr/bin/opencode",
+            models=(refreshed_model,),
+            default_model=refreshed_model.model_id,
+        )
+
+        with patch("tmux_core.runtime.vendor_catalog.get_catalog_snapshot", return_value=old_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path",
+            return_value="/usr/bin/opencode",
+        ) as resolve_binary, patch(
+            "tmux_core.runtime.vendor_catalog._scan_vendor_inventory",
+            return_value=refreshed_inventory,
+        ) as scan, patch("tmux_core.runtime.vendor_catalog._save_cached_snapshot"):
+            refreshed = refresh_vendor_catalog("opencode")
+
+        self.assertEqual(tuple(item.vendor_id for item in refreshed.vendors), VENDOR_ORDER)
+        self.assertEqual(refreshed.generated_at, old_snapshot.generated_at)
+        self.assertEqual(refreshed.vendor("opencode").model_ids(), ("live/provider-model",))
+        self.assertTrue(all(
+            refreshed.vendor(vendor_id) is old_snapshot.vendor(vendor_id)
+            for vendor_id in VENDOR_ORDER
+            if vendor_id != "opencode"
+        ))
+        resolve_binary.assert_called_once_with("opencode")
+        scan.assert_called_once()
+
+    def test_public_inventory_getter_refreshes_selected_dynamic_vendor(self):
+        snapshot = self._snapshot_at(datetime.now(timezone.utc).isoformat())
+
+        with patch(
+            "tmux_core.runtime.vendor_catalog.ensure_vendor_catalog_current",
+            return_value=snapshot,
+        ) as ensure:
+            inventory = get_vendor_inventory("opencode")
+
+        self.assertIs(inventory, snapshot.vendor("opencode"))
+        ensure.assert_called_once_with("opencode")
+
+    def test_focused_failure_does_not_overwrite_concurrent_successful_full_refresh(self):
+        unavailable_snapshot = self._snapshot_at("2000-01-01T00:00:00+00:00")
+        prior_inventory = VendorInventory(
+            vendor_id="opencode",
+            installed=True,
+            scan_status=OK_SCAN_STATUS,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            binary_path="/usr/bin/opencode",
+            models=(),
+            default_model="",
+        )
+        old_snapshot = CatalogSnapshot(
+            schema_version=SCHEMA_VERSION,
+            generated_at=unavailable_snapshot.generated_at,
+            cache_path=unavailable_snapshot.cache_path,
+            vendors=tuple(
+                prior_inventory if item.vendor_id == "opencode" else item
+                for item in unavailable_snapshot.vendors
+            ),
+        )
+        successful_inventory = VendorInventory(
+            vendor_id="opencode",
+            installed=True,
+            scan_status=OK_SCAN_STATUS,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            binary_path="/usr/bin/opencode",
+            models=(),
+            default_model="",
+        )
+        self.assertEqual(prior_inventory, successful_inventory)
+        self.assertIsNot(prior_inventory, successful_inventory)
+        full_snapshot = CatalogSnapshot(
+            schema_version=SCHEMA_VERSION,
+            generated_at="2026-07-18T00:00:00+00:00",
+            cache_path="/tmp/vendor_catalog.json",
+            vendors=tuple(
+                successful_inventory if item.vendor_id == "opencode" else item
+                for item in old_snapshot.vendors
+            ),
+        )
+        degraded_inventory = VendorInventory(
+            vendor_id="opencode",
+            installed=True,
+            scan_status=DEGRADED_SCAN_STATUS,
+            source_kind="none",
+            confidence="low",
+            binary_path="/usr/bin/opencode",
+            models=(),
+            default_model="",
+        )
+
+        def finish_after_full_refresh(_vendor_id, _binary_path, _prior_vendor):  # noqa: ANN001
+            vendor_catalog_module._CATALOG_SNAPSHOT = full_snapshot  # noqa: SLF001
+            return degraded_inventory
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=old_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path",
+            return_value="/usr/bin/opencode",
+        ), patch(
+            "tmux_core.runtime.vendor_catalog._scan_vendor_inventory",
+            side_effect=finish_after_full_refresh,
+        ), patch("tmux_core.runtime.vendor_catalog._save_cached_snapshot"):
+            refreshed = refresh_vendor_catalog("opencode")
+
+        self.assertIs(refreshed.vendor("opencode"), successful_inventory)
+        self.assertEqual(refreshed.generated_at, full_snapshot.generated_at)
+
+    def test_selected_dynamic_vendor_refresh_avoids_stale_full_catalog_scan(self):
+        stale_snapshot = self._snapshot_at("2000-01-01T00:00:00+00:00")
+        refreshed_inventory = VendorInventory(
+            vendor_id="deveco",
+            installed=True,
+            scan_status=OK_SCAN_STATUS,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            binary_path="/usr/bin/deveco",
+            models=(),
+            default_model="",
+        )
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=stale_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog.refresh_catalog_snapshot",
+        ) as full_refresh, patch(
+            "tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path",
+            return_value="/usr/bin/deveco",
+        ), patch(
+            "tmux_core.runtime.vendor_catalog._scan_vendor_inventory",
+            return_value=refreshed_inventory,
+        ) as selected_scan, patch("tmux_core.runtime.vendor_catalog._save_cached_snapshot"):
+            snapshot = ensure_vendor_catalog_current("deveco", max_age_sec=0)
+
+        full_refresh.assert_not_called()
+        selected_scan.assert_called_once()
+        self.assertIs(snapshot.vendor("deveco"), refreshed_inventory)
+
+    def test_selected_vendor_refresh_latch_reuses_one_probe_within_window(self):
+        stale_snapshot = self._snapshot_at("2000-01-01T00:00:00+00:00")
+        refreshed_inventory = VendorInventory(
+            vendor_id="opencode",
+            installed=True,
+            scan_status=OK_SCAN_STATUS,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            binary_path="/usr/bin/opencode",
+            models=(),
+            default_model="",
+        )
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=stale_snapshot), patch(
+            "tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path",
+            return_value="/usr/bin/opencode",
+        ), patch(
+            "tmux_core.runtime.vendor_catalog._scan_vendor_inventory",
+            return_value=refreshed_inventory,
+        ) as selected_scan, patch("tmux_core.runtime.vendor_catalog._save_cached_snapshot"):
+            first = ensure_vendor_catalog_current("opencode")
+            second = ensure_vendor_catalog_current("opencode")
+
+        self.assertIs(first, second)
+        selected_scan.assert_called_once()
+
+    def test_multiple_selected_vendor_refreshes_run_concurrently(self):
+        snapshot = self._snapshot_at("2000-01-01T00:00:00+00:00")
+        barrier = threading.Barrier(2, timeout=2.0)
+        refreshed = {
+            vendor_id: VendorInventory(
+                vendor_id=vendor_id,
+                installed=True,
+                scan_status=OK_SCAN_STATUS,
+                source_kind=SOURCE_DYNAMIC_CLI,
+                confidence=CONFIDENCE_HIGH,
+                binary_path=f"/usr/bin/{vendor_id}",
+                models=(),
+                default_model="",
+            )
+            for vendor_id in ("opencode", "deveco")
+        }
+
+        def scan_one(vendor_id, _binary_path, _prior_vendor):  # noqa: ANN001
+            barrier.wait()
+            return refreshed[vendor_id]
+
+        with patch("tmux_core.runtime.vendor_catalog._load_cached_snapshot", return_value=snapshot), patch(
+            "tmux_core.runtime.vendor_catalog._resolved_vendor_binary_path",
+            side_effect=lambda vendor_id: f"/usr/bin/{vendor_id}",
+        ), patch(
+            "tmux_core.runtime.vendor_catalog._scan_vendor_inventory",
+            side_effect=scan_one,
+        ) as scan, patch("tmux_core.runtime.vendor_catalog._save_cached_snapshot"):
+            merged = ensure_vendor_catalogs_current(("opencode", "deveco"), max_age_sec=0)
+
+        self.assertIs(merged.vendor("opencode"), refreshed["opencode"])
+        self.assertIs(merged.vendor("deveco"), refreshed["deveco"])
+        self.assertEqual(scan.call_count, 2)
 
     def test_expired_disk_cache_triggers_refresh(self):
         expired_snapshot = self._snapshot_at("2000-01-01T00:00:00+00:00")

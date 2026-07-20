@@ -15,8 +15,11 @@ from pathlib import Path
 from typing import Sequence
 
 from tmux_core.runtime.vendor_catalog import (
+    CatalogSnapshot,
     LEGACY_DEFAULT_MODEL_BY_VENDOR,
     VENDOR_ORDER as CATALOG_VENDOR_ORDER,
+    ensure_vendor_catalog_current,
+    get_catalog_snapshot,
     get_default_model_for_vendor,
     get_model_choices,
     get_normalized_effort_choices,
@@ -142,10 +145,16 @@ def normalize_vendor_choice(value: str | None) -> str:
     return text
 
 
-def normalize_model_choice(vendor: str, value: str | None) -> str:
+def normalize_model_choice(
+    vendor: str,
+    value: str | None,
+    *,
+    catalog: CatalogSnapshot | None = None,
+) -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
-    inventory = get_vendor_inventory(normalized_vendor)
-    models = tuple(item.model_id for item in get_model_choices(normalized_vendor))
+    snapshot = catalog or ensure_vendor_catalog_current(normalized_vendor)
+    inventory = get_vendor_inventory(normalized_vendor, catalog=snapshot)
+    models = tuple(item.model_id for item in get_model_choices(normalized_vendor, catalog=snapshot))
     text = str(value or "").strip()
     if not text:
         raise ValueError("模型不能为空")
@@ -154,8 +163,8 @@ def normalize_model_choice(vendor: str, value: str | None) -> str:
         if 1 <= index <= len(models):
             return models[index - 1]
     if normalized_vendor in {"opencode", "mimo", "agy", "deveco"} and text == "default":
-        resolved_default = get_default_model_for_vendor(normalized_vendor)
-        if resolved_default:
+        resolved_default = get_default_model_for_vendor(normalized_vendor, catalog=snapshot)
+        if resolved_default in models:
             return resolved_default
     if text in models:
         return text
@@ -165,10 +174,17 @@ def normalize_model_choice(vendor: str, value: str | None) -> str:
     raise ValueError(f"{normalized_vendor} 不支持的模型: {value}; 已扫描模型: {available or 'none'}")
 
 
-def normalize_effort_choice(vendor: str, model: str, value: str | None) -> str:
+def normalize_effort_choice(
+    vendor: str,
+    model: str,
+    value: str | None,
+    *,
+    catalog: CatalogSnapshot | None = None,
+) -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
-    normalized_model = normalize_model_choice(normalized_vendor, model)
-    allowed = get_normalized_effort_choices(normalized_vendor, normalized_model)
+    snapshot = catalog or ensure_vendor_catalog_current(normalized_vendor)
+    normalized_model = normalize_model_choice(normalized_vendor, model, catalog=snapshot)
+    allowed = get_normalized_effort_choices(normalized_vendor, normalized_model, catalog=snapshot)
     text = str(value or "").strip().lower()
     if text.isdigit():
         index = int(text)
@@ -255,18 +271,28 @@ def _predict_routing_role_label(
 
 
 def prompt_vendor(default: str = "codex", *, role_label: str = "") -> str:
+    # Vendor identity/status can use the last snapshot.  The selected dynamic
+    # vendor is refreshed immediately before its model list is shown.
+    snapshot = get_catalog_snapshot(allow_stale=True)
     options = []
-    installed_defaults = [vendor for vendor in VENDOR_CHOICES if get_vendor_inventory(vendor).installed]
+    installed_defaults = [vendor for vendor in VENDOR_CHOICES if snapshot.vendor(vendor).installed]
     actual_default = normalize_vendor_choice(default if default in VENDOR_CHOICES else "codex")
     if actual_default not in installed_defaults and installed_defaults:
         actual_default = installed_defaults[0]
     for vendor in VENDOR_CHOICES:
-        inventory = get_vendor_inventory(vendor)
-        label = (
-            f"{vendor} | installed={'yes' if inventory.installed else 'no'}"
-            f" | default={inventory.default_model or 'unknown'}"
-            f" | models={len(inventory.models)}"
-        )
+        inventory = snapshot.vendor(vendor)
+        if vendor in {"opencode", "deveco"}:
+            label = (
+                f"{vendor} | installed={'yes' if inventory.installed else 'no'}"
+                " | models=refresh-on-selection | catalog=dynamic-cli"
+            )
+        else:
+            label = (
+                f"{vendor} | installed={'yes' if inventory.installed else 'no'}"
+                f" | default={inventory.default_model or 'unknown'}"
+                f" | models={len(inventory.models)}"
+                f" | catalog={inventory.scan_status}/{inventory.source_kind}"
+            )
         options.append((vendor, label))
     scoped_title = _role_scoped_text("选择厂商", role_label)
     candidate = prompt_select_option(
@@ -280,24 +306,25 @@ def prompt_vendor(default: str = "codex", *, role_label: str = "") -> str:
 
 def prompt_model(vendor: str, default: str | None = None, *, role_label: str = "") -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
-    inventory = get_vendor_inventory(normalized_vendor)
+    snapshot = ensure_vendor_catalog_current(normalized_vendor)
+    inventory = get_vendor_inventory(normalized_vendor, catalog=snapshot)
     if not inventory.installed:
         raise ValueError(f"{normalized_vendor} 未安装，无法选择模型")
-    models = get_model_choices(normalized_vendor)
+    models = get_model_choices(normalized_vendor, catalog=snapshot)
     if not models:
         raise ValueError(f"{normalized_vendor} 没有可用模型")
     model_ids = tuple(item.model_id for item in models)
     actual_default = ""
     for candidate in (
         default,
-        get_default_model_for_vendor(normalized_vendor),
+        get_default_model_for_vendor(normalized_vendor, catalog=snapshot),
         DEFAULT_MODEL_BY_VENDOR.get(normalized_vendor),
         model_ids[0] if model_ids else "",
     ):
         if not str(candidate or "").strip():
             continue
         try:
-            actual_default = normalize_model_choice(normalized_vendor, candidate)
+            actual_default = normalize_model_choice(normalized_vendor, candidate, catalog=snapshot)
             break
         except ValueError:
             continue
@@ -313,22 +340,26 @@ def prompt_model(vendor: str, default: str | None = None, *, role_label: str = "
         )
         for item in models
     ]
-    scoped_title = _role_scoped_text(f"选择 {normalized_vendor} 模型", role_label)
+    catalog_suffix = ""
+    if inventory.scan_status != "ok":
+        catalog_suffix = f" [{inventory.scan_status}/{inventory.source_kind}]"
+    scoped_title = _role_scoped_text(f"选择 {normalized_vendor} 模型{catalog_suffix}", role_label)
     candidate = prompt_select_option(
         title=scoped_title,
         options=options,
         default_value=actual_default,
         prompt_text=scoped_title,
     )
-    return normalize_model_choice(normalized_vendor, candidate)
+    return normalize_model_choice(normalized_vendor, candidate, catalog=snapshot)
 
 
 def prompt_effort(vendor: str, model: str, default: str = "high", *, role_label: str = "") -> str:
     normalized_vendor = normalize_vendor_choice(vendor)
-    normalized_model = normalize_model_choice(normalized_vendor, model)
-    allowed = get_normalized_effort_choices(normalized_vendor, normalized_model)
+    snapshot = ensure_vendor_catalog_current(normalized_vendor)
+    normalized_model = normalize_model_choice(normalized_vendor, model, catalog=snapshot)
+    allowed = get_normalized_effort_choices(normalized_vendor, normalized_model, catalog=snapshot)
     try:
-        actual_default = normalize_effort_choice(normalized_vendor, normalized_model, default)
+        actual_default = normalize_effort_choice(normalized_vendor, normalized_model, default, catalog=snapshot)
     except ValueError:
         actual_default = "high" if "high" in allowed else allowed[0]
     scoped_title = _role_scoped_text(f"选择 {normalized_model} 推理强度", role_label)
@@ -338,7 +369,7 @@ def prompt_effort(vendor: str, model: str, default: str = "high", *, role_label:
         default_value=actual_default,
         prompt_text=scoped_title,
     )
-    return normalize_effort_choice(normalized_vendor, normalized_model, candidate)
+    return normalize_effort_choice(normalized_vendor, normalized_model, candidate, catalog=snapshot)
 
 
 def prompt_proxy_port(default: str = "", *, role_label: str = "") -> str:

@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -15,8 +16,10 @@ from typing import Any, Callable, Sequence
 SCHEMA_VERSION = "1.0"
 SCAN_TIMEOUT_SEC = 12.0
 DEFAULT_CATALOG_CACHE_TTL_SEC = 900.0
+SELECTED_VENDOR_REFRESH_TTL_SEC = 60.0
 MAX_CACHE_FUTURE_SKEW_SEC = 60.0
 VENDOR_ORDER: tuple[str, ...] = ("codex", "claude", "gemini", "opencode", "mimo", "agy", "deveco")
+AUTHORITATIVE_DYNAMIC_MODEL_VENDORS = frozenset({"opencode", "deveco"})
 NORMALIZED_EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 NATIVE_REASONING_ORDER: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
 LEGACY_DEFAULT_MODEL_BY_VENDOR: dict[str, str] = {
@@ -74,7 +77,11 @@ REASONING_UNSUPPORTED = "unsupported"
 REASONING_MODEL_FAMILY_ROUTING = "model_family_routing"
 _CATALOG_LOCK = threading.RLock()
 _CATALOG_SNAPSHOT: "CatalogSnapshot | None" = None
-_CATALOG_REFRESHED = False
+_SELECTED_VENDOR_REFRESHED_AT: dict[str, float] = {}
+_VENDOR_REFRESH_LOCKS = {
+    vendor_id: threading.Lock()
+    for vendor_id in VENDOR_ORDER
+}
 
 
 @dataclass(frozen=True)
@@ -277,7 +284,16 @@ def normalize_effort(value: str | None) -> str:
     return text
 
 
-def _command_probe(argv: list[str], *, timeout_sec: float = SCAN_TIMEOUT_SEC) -> ProbeResult:
+def _command_probe(
+    argv: list[str],
+    *,
+    timeout_sec: float = SCAN_TIMEOUT_SEC,
+    env_overrides: dict[str, str] | None = None,
+) -> ProbeResult:
+    probe_env = None
+    if env_overrides:
+        probe_env = dict(os.environ)
+        probe_env.update({str(key): str(value) for key, value in env_overrides.items()})
     try:
         completed = subprocess.run(
             argv,
@@ -285,6 +301,7 @@ def _command_probe(argv: list[str], *, timeout_sec: float = SCAN_TIMEOUT_SEC) ->
             text=True,
             capture_output=True,
             timeout=timeout_sec,
+            env=probe_env,
         )
     except subprocess.TimeoutExpired as error:
         return ProbeResult(
@@ -352,6 +369,8 @@ def _catalog_cache_ttl_sec() -> float:
 
 
 def _catalog_snapshot_is_fresh(snapshot: CatalogSnapshot) -> bool:
+    if snapshot.schema_version != SCHEMA_VERSION:
+        return False
     generated_at = _parse_catalog_timestamp(snapshot.generated_at)
     if generated_at is None:
         return False
@@ -418,10 +437,10 @@ def _save_cached_snapshot(snapshot: CatalogSnapshot) -> None:
 
 
 def reset_catalog_cache_for_tests() -> None:
-    global _CATALOG_SNAPSHOT, _CATALOG_REFRESHED
+    global _CATALOG_SNAPSHOT
     with _CATALOG_LOCK:
         _CATALOG_SNAPSHOT = None
-        _CATALOG_REFRESHED = False
+        _SELECTED_VENDOR_REFRESHED_AT.clear()
 
 
 def _resolved_binary_path(binary_name: str) -> str:
@@ -660,6 +679,7 @@ def _fallback_vendor(vendor_id: str, *, binary_path: str, note: str, models: Seq
 
 
 def _cached_degraded_vendor(vendor_id: str, prior_vendor: VendorInventory, *, binary_path: str, note: str) -> VendorInventory:
+    cached_models = prior_vendor.models
     return VendorInventory(
         vendor_id=vendor_id,
         installed=bool(binary_path),
@@ -667,8 +687,8 @@ def _cached_degraded_vendor(vendor_id: str, prior_vendor: VendorInventory, *, bi
         source_kind=SOURCE_CACHE_FALLBACK,
         confidence=prior_vendor.confidence or CONFIDENCE_LOW,
         binary_path=binary_path,
-        models=prior_vendor.models,
-        default_model=prior_vendor.default_model,
+        models=cached_models,
+        default_model=_resolve_default_model(cached_models, preferred=prior_vendor.default_model),
         notes=tuple(dict.fromkeys([*prior_vendor.notes, "cache_retained", note])),
     )
 
@@ -1094,15 +1114,22 @@ def _scan_codex_vendor(binary_path: str) -> VendorInventory:
 
 def _scan_opencode_like_vendor(vendor_id: str, binary_path: str, *, pure: bool = False) -> VendorInventory:
     command_prefix = [binary_path, "--pure"] if pure else [binary_path]
+    probe_env = {"DEVECO_DISABLE_AUTOUPDATE": "1"} if vendor_id == "deveco" else None
+    models_probe_kwargs: dict[str, Any] = {"timeout_sec": 15.0}
+    config_probe_kwargs: dict[str, Any] = {}
+    if probe_env:
+        models_probe_kwargs["env_overrides"] = probe_env
+        config_probe_kwargs["env_overrides"] = probe_env
     with ThreadPoolExecutor(max_workers=2, thread_name_prefix=f"{vendor_id}-catalog") as executor:
         models_future = executor.submit(
             _command_probe,
             [*command_prefix, "models", "--verbose"],
-            timeout_sec=15.0,
+            **models_probe_kwargs,
         )
         config_future = executor.submit(
             _command_probe,
             [*command_prefix, "debug", "config"],
+            **config_probe_kwargs,
         )
         models_probe = models_future.result()
         config_probe = config_future.result()
@@ -1112,20 +1139,31 @@ def _scan_opencode_like_vendor(vendor_id: str, binary_path: str, *, pure: bool =
         else ()
     )
     config_payload = parse_opencode_debug_config_output(config_probe.stdout) if config_probe.ok else {}
-    config_models = _build_opencode_like_config_models(vendor_id, config_payload)
-    models = _unique_models([*dynamic_models, *config_models])
-    default_model = str(config_payload.get("model", "")).strip()
-    if not models and default_model:
+    config_models = (
+        ()
+        if vendor_id in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS
+        else _build_opencode_like_config_models(vendor_id, config_payload)
+    )
+    # `models --verbose` is the availability contract.  `debug config` may
+    # contain removed provider/model definitions, so OpenCode and DevEco must
+    # never promote config-only entries into the supported-model list.
+    models = (
+        dynamic_models
+        if vendor_id in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS
+        else _unique_models([*dynamic_models, *config_models])
+    )
+    configured_default_model = str(config_payload.get("model", "")).strip()
+    if not models and configured_default_model and vendor_id not in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS:
         models = _unique_models(
             [
                 _build_model(
                     vendor_id,
-                    default_model,
+                    configured_default_model,
                     source_kind=SOURCE_CONFIG_FILE,
                     confidence=CONFIDENCE_MEDIUM,
                     reasoning=ReasoningInventory(
                         vendor_id=vendor_id,
-                        model_id=default_model,
+                        model_id=configured_default_model,
                         source_kind=SOURCE_CONFIG_FILE,
                         confidence=CONFIDENCE_MEDIUM,
                         reasoning_control_mode=REASONING_IMPLICIT_DEFAULT,
@@ -1141,17 +1179,20 @@ def _scan_opencode_like_vendor(vendor_id: str, binary_path: str, *, pure: bool =
             ]
         )
     if not models:
-        fallback_models = () if vendor_id in {"opencode", "deveco"} else None
+        fallback_models = () if vendor_id in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS else None
         return _fallback_vendor(
             vendor_id,
             binary_path=binary_path,
             note=f"{vendor_id}_catalog_probe_failed",
             models=fallback_models,
         )
-    notes = []
-    if default_model:
-        notes.append(f"default_model={default_model}")
-    default_model = _resolve_default_model(models, preferred=default_model)
+    notes: list[str] = []
+    model_ids = {item.model_id for item in models}
+    if configured_default_model:
+        notes.append(f"configured_default_model={configured_default_model}")
+        if configured_default_model not in model_ids:
+            notes.append("configured_default_unavailable")
+    default_model = _resolve_default_model(models, preferred=configured_default_model)
     return VendorInventory(
         vendor_id=vendor_id,
         installed=True,
@@ -1254,7 +1295,7 @@ _SCANNERS: dict[str, Callable[[str], VendorInventory]] = {
 def _has_reusable_cached_models(inventory: VendorInventory | None) -> bool:
     if inventory is None or not inventory.models:
         return False
-    return all(model.source_kind != SOURCE_LEGACY_FALLBACK for model in inventory.models)
+    return all(model.source_kind == SOURCE_DYNAMIC_CLI for model in inventory.models)
 
 
 def _scan_vendor_inventory(
@@ -1266,7 +1307,7 @@ def _scan_vendor_inventory(
         scanner = _SCANNERS[vendor_id]
         inventory = scanner(binary_path)
         if (
-            vendor_id == "deveco"
+            vendor_id in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS
             and inventory.scan_status != OK_SCAN_STATUS
             and _has_reusable_cached_models(prior_vendor)
         ):
@@ -1274,14 +1315,18 @@ def _scan_vendor_inventory(
                 vendor_id,
                 prior_vendor,
                 binary_path=binary_path,
-                note=f"scan_status={inventory.scan_status}",
+                note=";".join(
+                    item
+                    for item in (f"scan_status={inventory.scan_status}", *inventory.notes)
+                    if item
+                ),
             )
         return inventory
     except Exception as error:  # noqa: BLE001
         note = f"scan_error={type(error).__name__}"
         if (
             _has_reusable_cached_models(prior_vendor)
-            if vendor_id == "deveco"
+            if vendor_id in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS
             else prior_vendor is not None and bool(prior_vendor.models)
         ):
             return _cached_degraded_vendor(vendor_id, prior_vendor, binary_path=binary_path, note=note)
@@ -1328,25 +1373,27 @@ def refresh_catalog_snapshot(*, prior_snapshot: CatalogSnapshot | None = None) -
         vendors=tuple(vendors),
     )
     _save_cached_snapshot(snapshot)
+    refreshed_at = time.monotonic()
+    for inventory in snapshot.vendors:
+        if (
+            inventory.vendor_id in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS
+            and inventory.scan_status == OK_SCAN_STATUS
+            and inventory.source_kind == SOURCE_DYNAMIC_CLI
+        ):
+            _SELECTED_VENDOR_REFRESHED_AT[inventory.vendor_id] = refreshed_at
     return snapshot
 
 
-def get_catalog_snapshot(*, force_refresh: bool = False) -> CatalogSnapshot:
-    global _CATALOG_SNAPSHOT, _CATALOG_REFRESHED
+def get_catalog_snapshot(*, force_refresh: bool = False, allow_stale: bool = False) -> CatalogSnapshot:
+    global _CATALOG_SNAPSHOT
     with _CATALOG_LOCK:
         if _CATALOG_SNAPSHOT is None:
             _CATALOG_SNAPSHOT = _load_cached_snapshot()
-        if (
-            not force_refresh
-            and not _CATALOG_REFRESHED
-            and _CATALOG_SNAPSHOT is not None
-            and _catalog_snapshot_is_fresh(_CATALOG_SNAPSHOT)
-        ):
-            _CATALOG_REFRESHED = True
+        if allow_stale and not force_refresh and _CATALOG_SNAPSHOT is not None:
             return _CATALOG_SNAPSHOT
-        if force_refresh or not _CATALOG_REFRESHED:
-            _CATALOG_SNAPSHOT = refresh_catalog_snapshot(prior_snapshot=_CATALOG_SNAPSHOT)
-            _CATALOG_REFRESHED = True
+        if not force_refresh and _CATALOG_SNAPSHOT is not None and _catalog_snapshot_is_fresh(_CATALOG_SNAPSHOT):
+            return _CATALOG_SNAPSHOT
+        _CATALOG_SNAPSHOT = refresh_catalog_snapshot(prior_snapshot=_CATALOG_SNAPSHOT)
         if _CATALOG_SNAPSHOT is None:
             _CATALOG_SNAPSHOT = CatalogSnapshot(
                 schema_version=SCHEMA_VERSION,
@@ -1357,9 +1404,112 @@ def get_catalog_snapshot(*, force_refresh: bool = False) -> CatalogSnapshot:
         return _CATALOG_SNAPSHOT
 
 
+def _refresh_vendor_catalog_with_vendor_lock(normalized_vendor: str) -> CatalogSnapshot:
+    global _CATALOG_SNAPSHOT
+
+    with _CATALOG_LOCK:
+        snapshot = get_catalog_snapshot(allow_stale=True)
+        binary_path = _resolved_vendor_binary_path(normalized_vendor)
+        prior_vendor = snapshot.vendor(normalized_vendor)
+    # Do not hold the global catalog lock while a CLI subprocess is running.
+    # Different selected vendors can therefore refresh concurrently.
+    inventory = (
+        _scan_vendor_inventory(normalized_vendor, binary_path, prior_vendor)
+        if binary_path
+        else _unavailable_vendor(normalized_vendor, "")
+    )
+    with _CATALOG_LOCK:
+        current_snapshot = _CATALOG_SNAPSHOT or get_catalog_snapshot(allow_stale=True)
+        current_inventory = current_snapshot.vendor(normalized_vendor)
+        inventory_to_publish = inventory
+        if (
+            current_inventory is not prior_vendor
+            and current_inventory.scan_status == OK_SCAN_STATUS
+            and inventory.scan_status != OK_SCAN_STATUS
+        ):
+            # A concurrent full refresh produced stronger evidence while this
+            # focused probe was in flight.  Never let a later transient
+            # failure downgrade that successful catalog.
+            inventory_to_publish = current_inventory
+        refreshed_vendors = tuple(
+            inventory_to_publish if item.vendor_id == normalized_vendor else item
+            for item in current_snapshot.vendors
+        )
+        _CATALOG_SNAPSHOT = CatalogSnapshot(
+            schema_version=SCHEMA_VERSION,
+            # A one-vendor refresh must not make every untouched vendor look
+            # freshly scanned.  Keep the full-catalog timestamp; the
+            # per-process selection latch below tracks this focused probe.
+            generated_at=current_snapshot.generated_at,
+            cache_path=str(catalog_cache_path()),
+            vendors=refreshed_vendors,
+        )
+        _save_cached_snapshot(_CATALOG_SNAPSHOT)
+        # Latch both success and degraded results for the short selection
+        # window so model validation and effort selection reuse one snapshot.
+        _SELECTED_VENDOR_REFRESHED_AT[normalized_vendor] = time.monotonic()
+        return _CATALOG_SNAPSHOT
+
+
+def refresh_vendor_catalog(vendor_id: str) -> CatalogSnapshot:
+    """Refresh one selected vendor without paying for another full catalog scan."""
+
+    normalized_vendor = normalize_vendor_id(vendor_id)
+    with _VENDOR_REFRESH_LOCKS[normalized_vendor]:
+        return _refresh_vendor_catalog_with_vendor_lock(normalized_vendor)
+
+
+def ensure_vendor_catalog_current(
+    vendor_id: str,
+    *,
+    max_age_sec: float = SELECTED_VENDOR_REFRESH_TTL_SEC,
+) -> CatalogSnapshot:
+    """Return a current snapshot, re-probing selected dynamic vendors at most once per short window."""
+
+    normalized_vendor = normalize_vendor_id(vendor_id)
+    if normalized_vendor not in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS:
+        return get_catalog_snapshot()
+    snapshot = get_catalog_snapshot(allow_stale=True)
+    vendor_lock = _VENDOR_REFRESH_LOCKS[normalized_vendor]
+    with vendor_lock:
+        with _CATALOG_LOCK:
+            refreshed_at = _SELECTED_VENDOR_REFRESHED_AT.get(normalized_vendor)
+            if refreshed_at is not None and time.monotonic() - refreshed_at <= max(float(max_age_sec), 0.0):
+                return _CATALOG_SNAPSHOT or snapshot
+        return _refresh_vendor_catalog_with_vendor_lock(normalized_vendor)
+
+
+def ensure_vendor_catalogs_current(
+    vendor_ids: Sequence[str],
+    *,
+    max_age_sec: float = SELECTED_VENDOR_REFRESH_TTL_SEC,
+) -> CatalogSnapshot:
+    """Refresh multiple selected dynamic catalogs concurrently and return the merged snapshot."""
+
+    normalized_vendors = tuple(dict.fromkeys(normalize_vendor_id(item) for item in vendor_ids))
+    if not normalized_vendors:
+        return get_catalog_snapshot()
+    with ThreadPoolExecutor(
+        max_workers=len(normalized_vendors),
+        thread_name_prefix="selected-vendor-catalog",
+    ) as executor:
+        futures = tuple(
+            executor.submit(
+                ensure_vendor_catalog_current,
+                vendor_id,
+                max_age_sec=max_age_sec,
+            )
+            for vendor_id in normalized_vendors
+        )
+        for future in futures:
+            future.result()
+    return get_catalog_snapshot(allow_stale=True)
+
+
 def get_vendor_inventory(vendor_id: str, *, catalog: CatalogSnapshot | None = None) -> VendorInventory:
-    snapshot = catalog or get_catalog_snapshot()
-    return snapshot.vendor(vendor_id)
+    normalized_vendor = normalize_vendor_id(vendor_id)
+    snapshot = catalog or ensure_vendor_catalog_current(normalized_vendor)
+    return snapshot.vendor(normalized_vendor)
 
 
 def get_default_model_for_vendor(vendor_id: str, *, catalog: CatalogSnapshot | None = None) -> str:
@@ -1367,7 +1517,7 @@ def get_default_model_for_vendor(vendor_id: str, *, catalog: CatalogSnapshot | N
     if inventory.default_model:
         return inventory.default_model
     normalized_vendor = normalize_vendor_id(vendor_id)
-    if normalized_vendor == "deveco":
+    if normalized_vendor in AUTHORITATIVE_DYNAMIC_MODEL_VENDORS:
         return ""
     return LEGACY_DEFAULT_MODEL_BY_VENDOR[normalized_vendor]
 
@@ -1431,7 +1581,7 @@ def resolve_launch(
     catalog: CatalogSnapshot | None = None,
 ) -> LaunchResolution:
     normalized_vendor = normalize_vendor_id(vendor_id)
-    snapshot = catalog or get_catalog_snapshot()
+    snapshot = catalog or ensure_vendor_catalog_current(normalized_vendor)
     inventory = snapshot.vendor(normalized_vendor)
     model = _resolve_model_choice(normalized_vendor, requested_model, inventory)
     normalized_effort = normalize_effort(requested_effort or model.reasoning.default_normalized_effort)

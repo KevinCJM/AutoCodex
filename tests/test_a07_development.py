@@ -91,6 +91,7 @@ from tmux_core.stage_kernel.agent_intervention import (
     AGENT_INTERVENTION_RECHECK,
     AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
+    AgentInterventionActionSelected,
 )
 
 
@@ -770,6 +771,120 @@ class A07DevelopmentTests(unittest.TestCase):
         prompt_recovery.assert_called_once()
         self.assertIsNone(result)
 
+    def test_reviewer_file_intervention_dead_is_consumed_without_second_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("claude", "opus", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-鬼金羊"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-鬼金羊.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-鬼金羊.json",
+                contract=_dummy_contract(),
+            )
+            selected = AgentInterventionActionSelected(
+                decision=AGENT_INTERVENTION_WORKER_DEAD,
+                recovery_kind="file_noncompliance",
+                reason_text="指定文件连续 2 次修复后仍不符合要求。",
+                attempts_used=2,
+                target_paths=(reviewer.review_md_path, reviewer.review_json_path),
+            )
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=selected,
+            ) as run_turn, patch(
+                "A07_Development._prompt_development_reviewer_recovery",
+            ) as second_prompt, patch(
+                "A07_Development._wait_for_reviewer_materialized_outputs",
+            ) as late_output_wait:
+                result = run_reviewer_turn_with_recreation(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M3-T1",
+                    reviewer_spec=reviewer_spec,
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                    label="development_review_M3-T1_测试工程师",
+                    allow_existing_outputs=False,
+                )
+
+        self.assertIsNone(result)
+        self.assertTrue(reviewer.worker.killed)
+        self.assertTrue(run_turn.call_args.kwargs["propagate_file_intervention_action"])
+        second_prompt.assert_not_called()
+        late_output_wait.assert_not_called()
+
+    def test_reviewer_file_intervention_recreate_is_consumed_without_second_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            old_reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("claude", "opus", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-鬼金羊"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-鬼金羊.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-鬼金羊.json",
+                contract=_dummy_contract(),
+            )
+            new_reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=old_reviewer.selection,
+                worker=_FakeWorker(session_name="测试工程师-新星"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-新星.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-新星.json",
+                contract=_dummy_contract(),
+            )
+            selected = AgentInterventionActionSelected(
+                decision=AGENT_INTERVENTION_RECREATE,
+                recovery_kind="file_noncompliance",
+                reason_text="指定文件连续 2 次修复后仍不符合要求。",
+                attempts_used=2,
+                target_paths=(old_reviewer.review_md_path, old_reviewer.review_json_path),
+            )
+
+            with patch(
+                "A07_Development.run_completion_turn_with_repair",
+                side_effect=[selected, None],
+            ) as run_turn, patch(
+                "A07_Development._recreate_development_reviewer_from_hitl",
+                return_value=new_reviewer,
+            ) as recreate, patch(
+                "A07_Development._run_single_reviewer_initialization",
+                return_value=new_reviewer,
+            ) as initialize, patch(
+                "A07_Development._prompt_development_reviewer_recovery",
+            ) as second_prompt:
+                result = run_reviewer_turn_with_recreation(
+                    old_reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    task_name="M3-T1",
+                    reviewer_spec=reviewer_spec,
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                    label="development_review_M3-T1_测试工程师",
+                    allow_existing_outputs=False,
+                )
+
+        self.assertIs(result, new_reviewer)
+        self.assertEqual(run_turn.call_count, 2)
+        recreate.assert_called_once()
+        initialize.assert_called_once()
+        second_prompt.assert_not_called()
+
     def test_reviewer_turn_provider_runtime_blocker_noninteractive_fails_clearly(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -905,6 +1020,50 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertTrue(reviewer.worker.killed)
         prompt_recovery.assert_called_once()
         recreate_runtime.assert_not_called()
+
+    def test_reviewer_init_file_intervention_dead_is_consumed_without_second_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            paths = build_development_paths(project_dir, "需求A")
+            reviewer_spec = DevelopmentReviewerSpec(
+                role_name="测试工程师",
+                role_prompt="测试视角",
+                reviewer_key="测试工程师",
+            )
+            reviewer = ReviewerRuntime(
+                reviewer_name="测试工程师",
+                selection=ReviewAgentSelection("claude", "opus", "high", ""),
+                worker=_FakeWorker(session_name="测试工程师-鬼金羊"),
+                review_md_path=project_dir / "需求A_代码评审记录_测试工程师-鬼金羊.md",
+                review_json_path=project_dir / "需求A_评审记录_测试工程师-鬼金羊.json",
+                contract=_dummy_contract(),
+            )
+            selected = AgentInterventionActionSelected(
+                decision=AGENT_INTERVENTION_WORKER_DEAD,
+                recovery_kind="file_noncompliance",
+                reason_text="初始化结果连续 2 次修复后仍不符合要求。",
+                attempts_used=2,
+                target_paths=(reviewer.review_md_path, reviewer.review_json_path),
+            )
+
+            with patch(
+                "A07_Development.run_task_result_turn_with_repair",
+                side_effect=selected,
+            ) as run_turn, patch(
+                "A07_Development._prompt_development_reviewer_recovery",
+            ) as second_prompt:
+                result = _run_single_reviewer_initialization(
+                    reviewer,
+                    project_dir=project_dir,
+                    requirement_name="需求A",
+                    paths=paths,
+                    reviewer_specs_by_name={"测试工程师": reviewer_spec},
+                )
+
+        self.assertIsNone(result)
+        self.assertTrue(reviewer.worker.killed)
+        self.assertTrue(run_turn.call_args.kwargs["propagate_file_intervention_action"])
+        second_prompt.assert_not_called()
 
     def test_single_reviewer_initialization_recheck_clears_awaiting_state(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2674,7 +2833,9 @@ class A07DevelopmentTests(unittest.TestCase):
             ), patch(
                 "A07_Development.prompt_agent_ready_timeout_recovery",
                 return_value=AGENT_READY_TIMEOUT_SKIP,
-            ) as prompt_recovery, patch("A07_Development.recreate_development_reviewer_runtime") as recreate_runtime:
+            ) as prompt_recovery, patch(
+                "A07_Development.try_resume_worker",
+            ) as resume_worker, patch("A07_Development.recreate_development_reviewer_runtime") as recreate_runtime:
                 result = _run_single_reviewer_initialization(
                     reviewer,
                     project_dir=project_dir,
@@ -2696,6 +2857,7 @@ class A07DevelopmentTests(unittest.TestCase):
         prompt_recovery.assert_called_once()
         self.assertTrue(prompt_recovery.call_args.kwargs["can_skip"])
         self.assertTrue(prompt_recovery.call_args.kwargs["allow_recreate"])
+        resume_worker.assert_not_called()
         recreate_runtime.assert_not_called()
 
     def test_run_single_reviewer_initialization_noninteractive_skips_after_ready_timeout(self):
@@ -3123,7 +3285,9 @@ class A07DevelopmentTests(unittest.TestCase):
         ), patch(
             "A07_Development.prompt_agent_ready_timeout_recovery",
             return_value=AGENT_READY_TIMEOUT_RETRY,
-        ) as prompt_recovery, patch("A07_Development.recreate_developer_runtime") as recreate_runtime:
+        ) as prompt_recovery, patch(
+            "A07_Development.try_resume_worker",
+        ) as resume_worker, patch("A07_Development.recreate_developer_runtime") as recreate_runtime:
             returned, payload = _run_developer_result_turn(
                 developer,
                 label="developer_ready_timeout_retry",
@@ -3136,6 +3300,7 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 2)
         prompt_recovery.assert_called_once()
         self.assertFalse(prompt_recovery.call_args.kwargs["can_skip"])
+        resume_worker.assert_not_called()
         recreate_runtime.assert_not_called()
 
     def test_tmux_control_failure_propagates_without_developer_or_reviewer_redispatch(self):

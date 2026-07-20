@@ -12,7 +12,6 @@ from unittest import mock
 from pathlib import Path
 
 import T02_tmux_agents as runtime_module
-from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor, get_model_choices
 from T02_tmux_agents import (
     AgentRuntimeState,
     AgentStartupInterventionRequired,
@@ -32,6 +31,7 @@ from T02_tmux_agents import (
     WorkerStatus,
     TIMEOUT_EXIT_CODE,
     PromptSubmissionRejectedError,
+    PromptSubmissionUnconfirmedError,
     TaskResultContract,
     TmuxBackend,
     TmuxBatchWorker,
@@ -77,6 +77,28 @@ from tmux_core.stage_kernel.role_orchestration import ensure_reviewers_ready
 
 
 class TmuxAgentsTests(unittest.TestCase):
+    @staticmethod
+    def _resolved_test_config(
+            *,
+            vendor: str = "gemini",
+            model: str = "flash",
+            reasoning_effort: str = "",
+    ) -> AgentRunConfig:
+        resolution = SimpleNamespace(
+            resolved_model=model,
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test",
+            confidence="high",
+            native_reasoning_level=reasoning_effort,
+            normalized_effort=reasoning_effort or "high",
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor}",
+        )
+        with mock.patch("tmux_core.runtime.tmux_runtime.resolve_launch", return_value=resolution):
+            return AgentRunConfig(vendor=vendor, model=model, reasoning_effort=reasoning_effort)
+
     @staticmethod
     def _health_snapshot(*, agent_state: str, health_status: str = "alive") -> WorkerHealthSnapshot:
         return WorkerHealthSnapshot(
@@ -1029,6 +1051,84 @@ QUEUED
             self.assertEqual(worker.agent_state, AgentRuntimeState.STARTING)
             self.assertEqual(worker.read_state()["startup_blocker_kind"], "deveco_login")
 
+    def test_launch_agent_short_ready_timeout_with_live_node_process_stays_launch_pending(self):
+        class SlowStartingWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_texts: list[tuple[str, int | None]] = []
+                self.observe_calls = 0
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def _ensure_health_supervisor_started(self):
+                return None
+
+            def _wait_for_shell_ready(self, timeout_sec=10.0):  # noqa: ARG002
+                return None
+
+            def _send_text(self, text: str, enter_count: int | None = None) -> None:
+                self.sent_texts.append((text, enter_count))
+
+            def observe(self, *, tail_lines=220, tail_bytes=24000):  # noqa: ARG002
+                self.observe_calls += 1
+                surface = "Starting MCP servers (1/2)"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta=surface,
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T14:27:00",
+                    pane_title="FasterGainLoss",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "Starting MCP servers (1/2)"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = SlowStartingWorker(
+                worker_id="codex-slow-starting-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            startup_slot = mock.MagicMock()
+            startup_slot.__enter__.return_value = None
+            startup_slot.__exit__.return_value = False
+            monotonic_values = iter((0.0, 0.01, 0.2))
+            with mock.patch.object(
+                worker.launch_coordinator,
+                "startup_slot",
+                return_value=startup_slot,
+            ), mock.patch.object(
+                worker.launch_coordinator,
+                "record_launch_result",
+            ) as record_launch_result, mock.patch.object(
+                worker,
+                "_business_monotonic",
+                side_effect=lambda: next(monotonic_values),
+            ), mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "Timed out waiting for agent ready"):
+                    worker.launch_agent(timeout_sec=0.1)
+            state = worker.read_state()
+
+        record_launch_result.assert_not_called()
+        self.assertEqual(worker.observe_calls, 1)
+        self.assertEqual(len(worker.sent_texts), 1)
+        self.assertEqual(worker.sent_texts[0][1], 1)
+        self.assertEqual(worker.current_command, "node")
+        self.assertEqual(state["note"], "launch_pending")
+        self.assertEqual(state["status"], WorkerStatus.RUNNING.value)
+        self.assertEqual(state["agent_state"], AgentRuntimeState.STARTING.value)
+        self.assertEqual(state["health_status"], "alive")
+        self.assertNotEqual(state["note"], "awaiting_reconfig")
+        self.assertNotEqual(state["agent_state"], AgentRuntimeState.DEAD.value)
+
     def test_supported_vendor_state_classification_is_deterministic(self):
         cases = (
             (
@@ -1282,6 +1382,21 @@ QUEUED
                 pane_title="✳ Execute command and report results",
             )
             self.assertEqual(worker.get_agent_state(completed_ready_observation), AgentRuntimeState.READY)
+
+            stale_busy_title_ready_observation = WorkerObservation(
+                visible_text=completed_ready_surface,
+                raw_log_delta="cursor redraw",
+                raw_log_tail="old task footer · esc to interrupt",
+                current_command="claude.exe",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:04",
+                pane_title="✶ Claude Code",
+            )
+            worker.current_task_runtime_status = TASK_STATUS_RUNNING
+            self.assertEqual(worker.get_agent_state(stale_busy_title_ready_observation), AgentRuntimeState.READY)
 
             ready_with_draft_surface = """
 ⏺ 审核通过
@@ -1916,30 +2031,42 @@ workspace (/directory)                                                     branc
     def test_build_launch_command_variants_include_expected_flags(self):
         work_dir = Path("/tmp/project")
 
-        codex_cmd = AgentRunConfig(vendor=Vendor.CODEX, model="gpt-5.4", reasoning_effort="xhigh").build_launch_command(work_dir)
+        codex_cmd = self._resolved_test_config(
+            vendor="codex",
+            model="gpt-5.4",
+            reasoning_effort="xhigh",
+        ).build_launch_command(work_dir)
         self.assertIn("codex --model", codex_cmd)
         self.assertIn("--cd /tmp/project", codex_cmd)
 
-        claude_cmd = AgentRunConfig(vendor=Vendor.CLAUDE, model="sonnet", reasoning_effort="max").build_launch_command(work_dir)
+        claude_cmd = self._resolved_test_config(
+            vendor="claude",
+            model="sonnet",
+            reasoning_effort="max",
+        ).build_launch_command(work_dir)
         self.assertIn("claude --model", claude_cmd)
         self.assertIn("--effort max", claude_cmd)
 
-        gemini_cmd = AgentRunConfig(vendor=Vendor.GEMINI, model="auto", reasoning_effort="medium").build_launch_command(work_dir)
+        gemini_cmd = self._resolved_test_config(
+            vendor="gemini",
+            model="flash",
+            reasoning_effort="medium",
+        ).build_launch_command(work_dir)
         self.assertIn("gemini --model flash", gemini_cmd)
         self.assertIn("--model flash", gemini_cmd)
 
-        opencode_default_cmd = AgentRunConfig(vendor=Vendor.OPENCODE, model="default").build_launch_command(work_dir)
+        opencode_default_model = "test/default"
+        opencode_default_cmd = self._resolved_test_config(
+            vendor="opencode",
+            model=opencode_default_model,
+        ).build_launch_command(work_dir)
         self.assertIn("opencode /tmp/project --pure", opencode_default_cmd)
-        self.assertIn(f"--model {get_default_model_for_vendor('opencode')}", opencode_default_cmd)
+        self.assertIn(f"--model {opencode_default_model}", opencode_default_cmd)
         self.assertNotIn("--dangerously-skip-permissions", opencode_default_cmd)
 
-        mapped_opencode_model = next(
-            item.model_id
-            for item in get_model_choices("opencode")
-            if item.reasoning.reasoning_control_mode == "mapped"
-        )
-        opencode_model_cmd = AgentRunConfig(
-            vendor=Vendor.OPENCODE,
+        mapped_opencode_model = "test/mapped-model"
+        opencode_model_cmd = self._resolved_test_config(
+            vendor="opencode",
             model=mapped_opencode_model,
             reasoning_effort="max",
         ).build_launch_command(work_dir)
@@ -6633,6 +6760,9 @@ workspace (/directory)                                                     branc
 
     def test_run_turn_ready_only_finalizes_claude_ready_after_surface_change_without_prompt_echo(self):
         class ReadyOnlyClaudeWorker(TmuxBatchWorker):
+            def session_exists(self):
+                return True
+
             def target_exists(self, target=None):
                 return True
 
@@ -6652,6 +6782,8 @@ workspace (/directory)                                                     branc
 
             def observe(self, *, tail_lines=500, tail_bytes=24000):
                 prompt_sent = bool(getattr(self, "sent_text", ""))
+                if prompt_sent:
+                    self.ready_after_submit_observes = getattr(self, "ready_after_submit_observes", 0) + 1
                 surface = (
                     "\n".join(
                         [
@@ -6675,7 +6807,7 @@ workspace (/directory)                                                     branc
                     session_exists=True,
                     log_mtime=0.0,
                     observed_at="2026-04-24T00:00:03",
-                    pane_title="✳ Understand service independence refactoring architecture",
+                    pane_title="✶ Understand service independence refactoring architecture",
                 )
 
             def capture_visible(self, tail_lines=500):
@@ -6693,16 +6825,16 @@ workspace (/directory)                                                     branc
             )
             worker.pane_id = "%1"
             contract = TaskResultContract(
-                turn_id="a08_reviewer_init",
-                phase="a08_reviewer_init",
-                task_kind="a08_reviewer_init",
-                mode="a08_reviewer_init",
+                turn_id="a07_reviewer_init",
+                phase="a07_reviewer_init",
+                task_kind="a07_reviewer_init",
+                mode="a07_reviewer_init",
                 expected_statuses=("ready",),
                 optional_artifacts={"requirements_clear": requirements_clear},
             )
 
             result = worker.run_turn(
-                label="overall_review_reviewer_init_architect",
+                label="development_reviewer_init_tester",
                 prompt="只返回 完成",
                 result_contract=contract,
                 timeout_sec=1.0,
@@ -6713,12 +6845,171 @@ workspace (/directory)                                                     branc
             self.assertTrue(result_path.exists())
             self.assertEqual(json.loads(result_path.read_text(encoding="utf-8"))["status"], "ready")
             self.assertEqual(json.loads(Path(worker.current_task_status_path).read_text(encoding="utf-8")), {"status": "done"})
+            self.assertGreaterEqual(worker.ready_after_submit_observes, 2)
+
+    def test_ready_only_claude_does_not_finalize_one_frame_ready_override_of_busy_title(self):
+        class TransientReadyClaudeWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.after_submit_observes = 0
+
+            def target_exists(self, target=None):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):
+                self.after_submit_observes += 1
+                if self.after_submit_observes == 1:
+                    surface = "✶ Nesting… (8s · thinking with high effort)\n❯\nesc to interrupt"
+                elif self.after_submit_observes == 2:
+                    surface = "❯ 继续审计 M2-T2"
+                else:
+                    surface = "✶ Nesting… (9s · thinking with high effort)\n❯\nesc to interrupt"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="cursor redraw",
+                    raw_log_tail="old task footer · esc to interrupt",
+                    current_command="claude",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-24T00:00:03",
+                    pane_title="✶ Understand service independence refactoring architecture",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            task_status_path = root / "task_status.json"
+            write_task_status(task_status_path, status=TASK_STATUS_RUNNING)
+            result_path = root / "result.json"
+            worker = TransientReadyClaudeWorker(
+                worker_id="transient-ready-only-claude-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="claude", model="sonnet"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_command = "claude"
+            worker.current_task_runtime_status = TASK_STATUS_RUNNING
+            contract = TaskResultContract(
+                turn_id="a07_reviewer_init",
+                phase="a07_reviewer_init",
+                task_kind="a07_reviewer_init",
+                mode="a07_reviewer_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+            )
+            baseline_observation = WorkerObservation(
+                visible_text="❯",
+                raw_log_delta="",
+                raw_log_tail="❯",
+                current_command="claude",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:02",
+                pane_title="✳ Claude Code",
+            )
+
+            with mock.patch("tmux_core.runtime.tmux_runtime.FILE_CONTRACT_POLL_INTERVAL_SEC", 0.005):
+                with self.assertRaises(TimeoutError):
+                    worker._wait_for_ready_task_result_after_submit(  # noqa: SLF001
+                        contract=contract,
+                        task_status_path=task_status_path,
+                        result_path=result_path,
+                        timeout_sec=0.05,
+                        prompt="初始化测试工程师",
+                        baseline_observation=baseline_observation,
+                    )
+
+            self.assertFalse(result_path.exists())
+            self.assertGreaterEqual(worker.after_submit_observes, 3)
+
+    def test_claude_busy_timeout_fallback_requires_stable_ready_override(self):
+        class BusyFallbackClaudeWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.fallback_probes = 0
+
+            def _probe_agent_liveness_for_file_wait(self):
+                self.fallback_probes += 1
+                return WorkerObservation(
+                    visible_text="✶ Nesting… (9s · thinking with high effort)\n❯\nesc to interrupt",
+                    raw_log_delta="cursor redraw",
+                    raw_log_tail="old task footer · esc to interrupt",
+                    current_command="claude",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-04-24T00:00:04",
+                    pane_title="✶ Understand service independence refactoring architecture",
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            task_status_path = root / "task_status.json"
+            write_task_status(task_status_path, status=TASK_STATUS_RUNNING)
+            result_path = root / "result.json"
+            worker = BusyFallbackClaudeWorker(
+                worker_id="busy-timeout-fallback-claude-result-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="claude", model="sonnet"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.current_command = "claude"
+            worker.current_task_runtime_status = TASK_STATUS_RUNNING
+            contract = TaskResultContract(
+                turn_id="a07_reviewer_init",
+                phase="a07_reviewer_init",
+                task_kind="a07_reviewer_init",
+                mode="a07_reviewer_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+            )
+            transient_ready_observation = WorkerObservation(
+                visible_text="❯ 继续审计 M2-T2",
+                raw_log_delta="cursor redraw",
+                raw_log_tail="old task footer · esc to interrupt",
+                current_command="claude",
+                current_path=tmp_dir,
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-04-24T00:00:03",
+                pane_title="✶ Understand service independence refactoring architecture",
+            )
+
+            with mock.patch("tmux_core.runtime.tmux_runtime.FILE_CONTRACT_POLL_INTERVAL_SEC", 0.0):
+                result = worker._try_finalize_task_result_from_ready_agent_after_busy_timeout(  # noqa: SLF001
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    prompt_submission_observed=True,
+                    observation=transient_ready_observation,
+                )
+
+            self.assertIsNone(result)
+            self.assertEqual(worker.fallback_probes, 1)
+            self.assertFalse(result_path.exists())
+            self.assertEqual(json.loads(task_status_path.read_text(encoding="utf-8")), {"status": "running"})
 
     def test_run_turn_ready_only_finalizes_after_busy_to_ready_without_prompt_echo(self):
         class BusyThenReadyWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
                 super().__init__(**kwargs)
                 self.after_submit_observes = 0
+
+            def session_exists(self):
+                return True
 
             def target_exists(self, target=None):
                 return True
@@ -6769,7 +7060,7 @@ workspace (/directory)                                                     branc
             worker = BusyThenReadyWorker(
                 worker_id="busy-then-ready-result-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -6791,6 +7082,189 @@ workspace (/directory)                                                     branc
 
             self.assertTrue(result.ok)
             self.assertEqual(json.loads(Path(worker.current_task_status_path).read_text(encoding="utf-8")), {"status": "done"})
+
+    def test_run_turn_ready_only_retries_enter_once_when_prompt_remains_in_codex_composer(self):
+        class StuckComposerThenBusyWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_texts: list[str] = []
+                self.keys: list[str] = []
+                self.after_enter_observes = 0
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.agent_started = True
+                self.agent_ready = True
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "FasterGainLoss"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_texts.append(text)
+
+            def send_special_key(self, key: str) -> None:
+                self.keys.append(key)
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                if not self.sent_texts:
+                    surface = "› Continue\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                    title = "FasterGainLoss"
+                elif not self.keys:
+                    surface = f"› {self.sent_texts[-1]}\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                    title = "⠙ FasterGainLoss"
+                elif self.after_enter_observes == 0:
+                    self.after_enter_observes += 1
+                    surface = "• Working (0s • esc to interrupt)"
+                    title = "⠙ FasterGainLoss"
+                else:
+                    surface = "› Continue\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                    title = "FasterGainLoss"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T14:28:00",
+                    pane_title=title,
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            worker = StuckComposerThenBusyWorker(
+                worker_id="ready-only-stuck-composer-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            contract = TaskResultContract(
+                turn_id="a07_developer_init",
+                phase="a07_developer_init",
+                task_kind="a07_developer_init",
+                mode="a07_developer_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+            )
+
+            result = worker.run_turn(
+                label="development_developer_init",
+                prompt="基于 AGENTS.md 和项目背景说明了解当前项目代码架构和背景",
+                result_contract=contract,
+                timeout_sec=2.0,
+                prompt_submit_timeout_sec=2.0,
+            )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(worker.sent_texts), 1)
+        self.assertEqual(worker.keys, ["Enter"])
+        self.assertGreaterEqual(worker.after_enter_observes, 1)
+
+    def test_run_turn_ready_only_stuck_composer_never_repastes_or_synthesizes_result(self):
+        class PermanentlyStuckComposerWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_texts: list[str] = []
+                self.keys: list[str] = []
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.agent_started = True
+                self.agent_ready = True
+                self.wrapper_state = WrapperState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "FasterGainLoss"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_texts.append(text)
+
+            def send_special_key(self, key: str) -> None:
+                self.keys.append(key)
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                surface = (
+                    f"› {self.sent_texts[-1]}\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                    if self.sent_texts
+                    else "› Continue\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                )
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T14:28:00",
+                    pane_title="⠙ FasterGainLoss" if self.sent_texts else "FasterGainLoss",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return (
+                    f"› {self.sent_texts[-1]}"
+                    if self.sent_texts
+                    else "› Continue"
+                )
+
+            def _infer_prompt_submission_from_busy_agent_after_timeout(self):
+                return False
+
+            def _wait_for_task_result_while_agent_busy_after_timeout(self, **kwargs):  # noqa: ANN003
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            requirements_clear = root / "需求澄清.md"
+            requirements_clear.write_text("已澄清\n", encoding="utf-8")
+            worker = PermanentlyStuckComposerWorker(
+                worker_id="ready-only-permanently-stuck-composer-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            contract = TaskResultContract(
+                turn_id="a07_developer_init",
+                phase="a07_developer_init",
+                task_kind="a07_developer_init",
+                mode="a07_developer_init",
+                expected_statuses=("ready",),
+                optional_artifacts={"requirements_clear": requirements_clear},
+            )
+
+            result = worker.run_turn(
+                label="development_developer_init_stuck",
+                prompt="基于 AGENTS.md 和项目背景说明了解当前项目代码架构和背景",
+                result_contract=contract,
+                timeout_sec=1.2,
+                prompt_submit_timeout_sec=1.2,
+            )
+            result_path_exists = Path(worker.current_task_result_path).exists()
+            final_state = worker.read_state()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(len(worker.sent_texts), 1)
+        self.assertEqual(worker.keys, ["Enter"])
+        self.assertFalse(result_path_exists)
+        self.assertEqual(final_state["retry_count"], 1)
 
     def test_run_turn_finalizes_completed_result_when_busy_timeout_lands_on_ready_agent(self):
         class ReadyAfterBusyTimeoutWorker(TmuxBatchWorker):
@@ -7591,6 +8065,171 @@ workspace (/directory)                                                     branc
 
         self.assertGreaterEqual(worker.observe_calls, 1)
 
+    def test_wait_for_prompt_submission_retries_enter_once_for_visible_idle_prompt_then_requires_busy(self):
+        prompt = "基于 AGENTS.md 和项目背景说明了解当前项目代码架构和背景"
+
+        class VisibleIdlePromptWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+                self.keys: list[str] = []
+
+            def observe(self, *, tail_lines=320, tail_bytes=24000):  # noqa: ARG002
+                self.observe_calls += 1
+                if self.observe_calls == 1:
+                    surface = f"› {prompt}\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                    title = "FasterGainLoss"
+                else:
+                    surface = "• Working (0s • esc to interrupt)"
+                    title = "⠋ FasterGainLoss"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T14:28:00",
+                    pane_title=title,
+                )
+
+            def send_special_key(self, key: str) -> None:
+                self.keys.append(key)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = VisibleIdlePromptWorker(
+                worker_id="codex-visible-idle-prompt-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            monotonic_values = iter((0.0, 0.0, 0.1, 1.1, 1.2))
+            with mock.patch.object(
+                worker,
+                "_business_monotonic",
+                side_effect=lambda: next(monotonic_values),
+            ), mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                observation = worker._wait_for_prompt_submission(prompt=prompt, timeout_sec=2.0)
+
+        self.assertEqual(observation.pane_title, "⠋ FasterGainLoss")
+        self.assertEqual(worker.observe_calls, 2)
+        self.assertEqual(worker.keys, ["Enter"])
+
+    def test_wait_for_prompt_submission_raw_log_prompt_does_not_press_enter_before_busy(self):
+        prompt = "只存在于 raw log 的历史 prompt"
+
+        class RawLogOnlyPromptWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+                self.keys: list[str] = []
+
+            def observe(self, *, tail_lines=320, tail_bytes=24000):  # noqa: ARG002
+                self.observe_calls += 1
+                if self.observe_calls == 1:
+                    surface = "› Continue\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                    raw_log_delta = prompt
+                    title = "FasterGainLoss"
+                else:
+                    surface = "• Working (0s • esc to interrupt)"
+                    raw_log_delta = ""
+                    title = "⠋ FasterGainLoss"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta=raw_log_delta,
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T14:28:00",
+                    pane_title=title,
+                )
+
+            def send_special_key(self, key: str) -> None:
+                self.keys.append(key)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = RawLogOnlyPromptWorker(
+                worker_id="codex-raw-log-only-prompt-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            monotonic_values = iter((0.0, 0.0, 0.1, 0.2))
+            with mock.patch.object(
+                worker,
+                "_business_monotonic",
+                side_effect=lambda: next(monotonic_values),
+            ), mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                observation = worker._wait_for_prompt_submission(prompt=prompt, timeout_sec=1.0)
+
+        self.assertEqual(observation.pane_title, "⠋ FasterGainLoss")
+        self.assertEqual(worker.observe_calls, 2)
+        self.assertEqual(worker.keys, [])
+
+    def test_wait_for_prompt_submission_visible_ready_prompt_sends_enter_once_then_is_unconfirmed(self):
+        prompt = "始终停留在 READY 输入框中的 prompt"
+
+        class StuckReadyPromptWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+                self.keys: list[str] = []
+
+            def observe(self, *, tail_lines=320, tail_bytes=24000):  # noqa: ARG002
+                self.observe_calls += 1
+                surface = f"› {prompt}\n  gpt-5.6-sol xhigh · ~/FasterGainLoss"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T14:28:00",
+                    pane_title="FasterGainLoss",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return f"› {prompt}"
+
+            def send_special_key(self, key: str) -> None:
+                self.keys.append(key)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = StuckReadyPromptWorker(
+                worker_id="codex-stuck-ready-prompt-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            monotonic_values = iter((0.0, 0.0, 0.1, 0.6, 0.7, 1.1))
+            with mock.patch.object(
+                worker,
+                "_business_monotonic",
+                side_effect=lambda: next(monotonic_values),
+            ), mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                with self.assertRaises(PromptSubmissionUnconfirmedError):
+                    worker._wait_for_prompt_submission(prompt=prompt, timeout_sec=1.0)
+
+        self.assertEqual(worker.observe_calls, 2)
+        self.assertEqual(worker.keys, ["Enter"])
+
     def test_wait_for_prompt_submission_rejects_codex_no_active_thread_with_prompt_echo(self):
         class NoActiveThreadPromptWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -7699,7 +8338,7 @@ workspace (/directory)                                                     branc
             worker = StaleNoActiveThreadPromptWorker(
                 worker_id="codex-stale-no-active-tail-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -8021,6 +8660,9 @@ workspace (/directory)                                                     branc
             def target_exists(self, target=None):
                 return True
 
+            def session_exists(self):
+                return True
+
             def pane_dead(self):
                 return False
 
@@ -8029,6 +8671,20 @@ workspace (/directory)                                                     branc
 
             def capture_visible(self, tail_lines=500):  # noqa: ARG002
                 return "Working (esc to interrupt)"
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="Working (esc to interrupt)",
+                    raw_log_delta="",
+                    raw_log_tail="Working (esc to interrupt)",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T15:00:00",
+                    pane_title="⠙ project",
+                )
 
             def _wait_for_agent_ready(self, timeout_sec=60.0):
                 self.wait_called += 1
@@ -8039,7 +8695,7 @@ workspace (/directory)                                                     branc
             worker = ProcessingWorker(
                 worker_id="processing-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                config=self._resolved_test_config(vendor="codex", model="gpt-5"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -8145,8 +8801,13 @@ workspace (/directory)                                                     branc
             worker.state_path.parent.mkdir(parents=True, exist_ok=True)
             worker.state_path.write_text("{}", encoding="utf-8")
 
-            with self.assertRaisesRegex(RuntimeError, "tmux pane missing"):
-                worker.ensure_agent_ready(timeout_sec=0.1)
+            with mock.patch.object(worker, "session_exists", return_value=False), mock.patch.object(
+                worker,
+                "target_exists",
+                return_value=False,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "tmux pane missing"):
+                    worker.ensure_agent_ready(timeout_sec=0.1)
 
         self.assertTrue(is_worker_death_error("原因: tmux pane missing"))
 
@@ -8652,7 +9313,7 @@ Do you trust the files in this folder?
             worker = TmuxBatchWorker(
                 worker_id="gemini-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="gemini", model="flash"),
+                config=self._resolved_test_config(),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             observation = WorkerObservation(
@@ -9640,7 +10301,7 @@ Do you trust the files in this folder?
             worker = TmuxBatchWorker(
                 worker_id="ops-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="gemini", model="flash"),
+                config=self._resolved_test_config(),
                 runtime_root=Path(tmp_dir) / "runtime",
                 backend=backend,
             )
@@ -9650,10 +10311,108 @@ Do you trust the files in this folder?
             self.assertFalse(worker.agent_ready)
             self.assertTrue(worker.recoverable)
             self.assertEqual(worker.agent_state, AgentRuntimeState.STARTING)
+            restart_state = worker.read_state()
+            self.assertEqual(restart_state["agent_state"], AgentRuntimeState.STARTING.value)
+            self.assertFalse(restart_state["agent_alive"])
+            self.assertFalse(restart_state["session_exists"])
+            self.assertEqual(restart_state["health_status"], "unknown")
+            self.assertEqual(restart_state["note"], "manual_restart_requested")
+            self.assertEqual(restart_state["result_status"], "pending")
+            self.assertEqual(restart_state["turn_state"], "idle")
+            self.assertEqual(restart_state["dispatch_state"], "")
+            self.assertTrue(worker_state_is_prelaunch_active(restart_state))
             session_name = worker.request_kill()
             self.assertEqual(session_name, worker.session_name)
             self.assertFalse(worker.recoverable)
             self.assertEqual(worker.agent_state, AgentRuntimeState.DEAD)
+            killed_state = worker.read_state()
+            self.assertEqual(killed_state["agent_state"], AgentRuntimeState.DEAD.value)
+            self.assertFalse(killed_state["agent_alive"])
+            self.assertFalse(killed_state["session_exists"])
+            self.assertEqual(killed_state["health_status"], "dead")
+            self.assertEqual(killed_state["health_note"], "manual_kill_requested")
+            self.assertEqual(killed_state["status"], WorkerStatus.FAILED.value)
+            self.assertEqual(killed_state["result_status"], WorkerStatus.FAILED.value)
+            self.assertEqual(killed_state["turn_state"], "failed")
+            self.assertEqual(killed_state["dispatch_state"], "")
+
+    def test_worker_kill_preserves_completed_turn_result_while_marking_agent_dead(self):
+        class FakeBackend:
+            def has_session(self, session_name):
+                return True
+
+            def kill_session(self, session_name):
+                self.last_killed = session_name
+
+            def run(self, *args, **kwargs):
+                raise AssertionError("unexpected tmux run")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="completed-ops-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(),
+                runtime_root=Path(tmp_dir) / "runtime",
+                backend=FakeBackend(),
+            )
+            state = worker.read_state()
+            state.update(
+                {
+                    "status": "succeeded",
+                    "result_status": "succeeded",
+                    "turn_state": "succeeded",
+                    "current_task_runtime_status": "done",
+                    "agent_started": True,
+                    "agent_alive": True,
+                    "agent_state": "READY",
+                    "health_status": "alive",
+                }
+            )
+            worker.state_path.write_text(json.dumps(state), encoding="utf-8")
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.READY
+
+            worker.request_kill()
+            killed_state = worker.read_state()
+
+        self.assertEqual(killed_state["status"], WorkerStatus.SUCCEEDED.value)
+        self.assertEqual(killed_state["result_status"], WorkerStatus.SUCCEEDED.value)
+        self.assertEqual(killed_state["turn_state"], "succeeded")
+        self.assertEqual(killed_state["current_task_runtime_status"], TASK_STATUS_DONE)
+        self.assertEqual(killed_state["agent_state"], AgentRuntimeState.DEAD.value)
+        self.assertEqual(killed_state["health_status"], "dead")
+
+    def test_submitted_turn_wakes_idle_health_supervisor(self):
+        class FakeBackend:
+            def has_session(self, _session_name):
+                return False
+
+            def run(self, *args, **kwargs):
+                raise AssertionError("unexpected tmux run")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            worker = TmuxBatchWorker(
+                worker_id="health-wake-worker",
+                work_dir=root,
+                config=self._resolved_test_config(),
+                runtime_root=root / "runtime",
+                backend=FakeBackend(),
+            )
+            request_refresh = mock.Mock()
+            worker.health_supervisor = SimpleNamespace(request_refresh=request_refresh)
+            with mock.patch.object(worker, "_write_state"):
+                worker._mark_turn_submitted_busy(  # noqa: SLF001
+                    label="demo",
+                    started_at="2026-07-19T08:00:00+08:00",
+                    task_status_path=root / "task.json",
+                    result_path=root / "result.json",
+                    attempt=1,
+                    completion_contract=None,
+                )
+                worker._mark_turn_waiting_result(label="demo")  # noqa: SLF001
+
+        self.assertEqual(request_refresh.call_count, 2)
 
     def test_cleanup_registered_tmux_workers_kills_live_sessions(self):
         class FakeBackend:
@@ -9682,7 +10441,7 @@ Do you trust the files in this folder?
             worker_a = TmuxBatchWorker(
                 worker_id="cleanup-a",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.4"),
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4"),
                 runtime_root=Path(tmp_dir) / "runtime-a",
                 backend=backend,
                 existing_session_name="session-a",
@@ -9690,7 +10449,7 @@ Do you trust the files in this folder?
             worker_b = TmuxBatchWorker(
                 worker_id="cleanup-b",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="gemini", model="flash"),
+                config=self._resolved_test_config(),
                 runtime_root=Path(tmp_dir) / "runtime-b",
                 backend=backend,
                 existing_session_name="session-b",
@@ -9699,7 +10458,12 @@ Do you trust the files in this folder?
                 worker_a.session_name: str(worker_a.runtime_dir),
                 worker_b.session_name: str(worker_b.runtime_dir),
             }
-            cleaned = cleanup_registered_tmux_workers(reason="unit_test")
+            with mock.patch.object(
+                runtime_module,
+                "list_registered_tmux_workers",
+                return_value=[worker_a, worker_b],
+            ):
+                cleaned = cleanup_registered_tmux_workers(reason="unit_test")
             self.assertEqual(sorted(cleaned), ["session-a", "session-b"])
             self.assertEqual(sorted(backend.killed), ["session-a", "session-b"])
             self.assertFalse(worker_a.recoverable)
@@ -10679,11 +11443,14 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             def session_exists(self):
                 return False
 
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return False
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             worker = MissingLaunchedSessionWorker(
                 worker_id="missing-launched-session-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="opencode", model="opencode/big-pickle"),
+                config=self._resolved_test_config(vendor="opencode", model="opencode/big-pickle"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -10695,6 +11462,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
         self.assertEqual(snapshot.health_status, "missing_session")
         self.assertEqual(state["agent_state"], AgentRuntimeState.DEAD.value)
         self.assertEqual(state["health_status"], "missing_session")
+        self.assertFalse(state["session_exists"])
 
     def test_lightweight_liveness_probe_handles_missing_target_and_display_failures(self):
         class MissingSessionWorker(TmuxBatchWorker):
@@ -11328,7 +12096,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = TmuxBatchWorker(
                 worker_id="gemini-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="gemini", model="flash"),
+                config=self._resolved_test_config(),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             observation = WorkerObservation(
@@ -12077,7 +12845,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = ResumeReadyMimoWorker(
                 worker_id="resume-ready-awaiting-reconfig-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="mimo", model="xiaomi/mimo-v2.5-pro"),
+                config=self._resolved_test_config(vendor="mimo", model="xiaomi/mimo-v2.5-pro"),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
@@ -12090,6 +12858,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
                     "dispatch_state": "delayed",
                     "dispatch_reason": "prompt_confirm_timeout:slow prompt echo",
                     "health_status": "awaiting_reconfig",
+                    "health_note": "ready_timeout:Timed out waiting for agent ready",
                     "agent_state": "BUSY",
                     "current_command": "node",
                     "agent_role": "reviewer",
@@ -12111,6 +12880,81 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
         self.assertEqual(state["role_name"], "审核员")
         self.assertEqual(state["reviewer_key"], "审核员")
         self.assertEqual(state["role_prompt"], "审核角色")
+
+    def test_try_resume_worker_never_auto_clears_manual_or_non_timeout_reconfiguration(self):
+        class ReadySurfaceWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_calls = 0
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                self.observe_calls += 1
+                surface = "Ask anything...\nctrl+p commands"
+                return WorkerObservation(
+                    visible_text=surface,
+                    raw_log_delta="",
+                    raw_log_tail=surface,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-20T15:00:00",
+                    pane_title="OpenCode",
+                )
+
+        cases = (
+            {
+                "name": "manual_permission",
+                "health_note": "OpenCode permission requires manual intervention",
+                "startup_blocker_kind": "opencode_permission",
+                "startup_blocker_requires_manual": True,
+            },
+            {
+                "name": "model_reconfiguration",
+                "health_note": "需要重新选择模型",
+                "startup_blocker_kind": "",
+                "startup_blocker_requires_manual": False,
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]), tempfile.TemporaryDirectory() as tmp_dir:
+                worker = ReadySurfaceWorker(
+                    worker_id=f"resume-blocked-{case['name']}",
+                    work_dir=tmp_dir,
+                    config=self._resolved_test_config(vendor="opencode", model="test/model"),
+                    runtime_root=Path(tmp_dir) / "runtime",
+                )
+                worker.pane_id = "%1"
+                worker.agent_started = True
+                worker.current_command = "node"
+                worker._write_state(  # noqa: SLF001
+                    WorkerStatus.RUNNING,
+                    note="awaiting_reconfig",
+                    extra={
+                        "health_status": "awaiting_reconfig",
+                        "health_note": case["health_note"],
+                        "agent_state": "READY",
+                        "current_command": "node",
+                        "startup_blocker_kind": case["startup_blocker_kind"],
+                        "startup_blocker_requires_manual": case["startup_blocker_requires_manual"],
+                    },
+                )
+
+                resumed = try_resume_worker(worker, timeout_sec=0.1)
+                state = worker.read_state()
+
+                self.assertFalse(resumed)
+                self.assertEqual(worker.observe_calls, 0)
+                self.assertEqual(state["note"], "awaiting_reconfig")
+                self.assertEqual(state["health_note"], case["health_note"])
+                self.assertEqual(state["startup_blocker_kind"], case["startup_blocker_kind"])
 
     def test_wait_for_task_result_does_not_finalize_ready_contract_when_tmux_title_is_stale_busy(self):
         class StaleBusyTaskResultWorker(TmuxBatchWorker):
@@ -13140,7 +13984,7 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker = TmuxBatchWorker(
                 worker_id="plain-prompt-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="gemini", model="flash"),
+                config=self._resolved_test_config(),
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             task_status_path = Path(tmp_dir) / "task_runtime.json"

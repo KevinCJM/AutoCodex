@@ -33,7 +33,14 @@ import { resolveFooterProgressLine } from './footerProgress'
 import { buildHomeAgents } from './homeAgents'
 import { promptAllowsBack, resolvePromptBackValue, withPromptBackOption } from './promptBack'
 import { writePromptDraft } from './promptMemory'
-import { promptStateFromSnapshot } from './promptSnapshot'
+import {
+  dismissPromptSyncState,
+  EMPTY_PROMPT_SYNC_STATE,
+  promptSyncUpdateFromRequest,
+  promptSyncUpdateFromSnapshot,
+  reconcilePromptSyncState,
+  type PromptSyncUpdate,
+} from './promptSnapshot'
 import { resolvePromptAwareStatus, resolvePromptResponseTransition } from './promptTransition'
 import {
   applyStageChanged,
@@ -1041,6 +1048,7 @@ export function App(props: StartupOptions) {
   const [status, setStatus] = createSignal('booting')
   const [stageCursor, setStageCursor] = createSignal(EMPTY_STAGE_CURSOR)
   const [prompt, setPrompt] = createSignal<PromptState | null>(null)
+  let promptSyncState = EMPTY_PROMPT_SYNC_STATE
   const [promptSubmitRevision, setPromptSubmitRevision] = createSignal(0)
   const promptSubmitInFlight = new Set<string>()
   const [localDialog, setLocalDialog] = createSignal<LocalDialogState | null>(null)
@@ -1436,13 +1444,27 @@ export function App(props: StartupOptions) {
     return authoritativeFailure
   }
 
+  const applyBackendPromptUpdate = (update: PromptSyncUpdate, reportOpen = false): boolean => {
+    const transition = reconcilePromptSyncState(promptSyncState, update)
+    if (!transition.accepted) return false
+    const previousPromptId = promptSyncState.prompt?.id ?? ''
+    promptSyncState = transition.state
+    setPrompt(transition.state.prompt)
+    if (!transition.state.prompt) return true
+    const nextFocus = isOverlayPromptType(transition.state.prompt.promptType) ? 'dialog' : 'prompt'
+    setStatus('awaiting-input')
+    setShellFocus(nextFocus)
+    if (reportOpen && transition.state.prompt.id !== previousPromptId) {
+      reportPresence('prompt-open', nextFocus)
+    }
+    return true
+  }
+
   const applyBootstrapSnapshots = (payload: Record<string, unknown>) => {
     const snapshots = (payload.snapshots as Record<string, unknown>) ?? {}
-    const restoredPrompt = promptStateFromSnapshot(snapshots.prompt, buildPromptDraftKey)
-    if (restoredPrompt) {
-      const nextFocus = isOverlayPromptType(restoredPrompt.promptType) ? 'dialog' : 'prompt'
-      setPrompt(restoredPrompt)
-      setShellFocus(nextFocus)
+    const promptUpdate = promptSyncUpdateFromSnapshot(snapshots.prompt, 'bootstrap', buildPromptDraftKey)
+    if (promptUpdate) {
+      applyBackendPromptUpdate(promptUpdate)
     }
     let bootstrapFailure: StageFailureSnapshot | null = null
     if (snapshots.app && typeof snapshots.app === 'object') {
@@ -1522,17 +1544,13 @@ export function App(props: StartupOptions) {
       return
     }
     if (event.type === 'prompt.request') {
-      const promptType = String(event.payload.prompt_type ?? 'text')
-      const nextFocus = isOverlayPromptType(promptType) ? 'dialog' : 'prompt'
-      setPrompt({
-        id: String(event.payload.id ?? ''),
-        promptType,
-        payload: event.payload,
-        draftKey: buildPromptDraftKey(promptType, event.payload),
-      })
-      setStatus('awaiting-input')
-      setShellFocus(nextFocus)
-      reportPresence('prompt-open', nextFocus)
+      const update = promptSyncUpdateFromRequest(event.payload, buildPromptDraftKey)
+      if (update) applyBackendPromptUpdate(update, true)
+      return
+    }
+    if (event.type === 'snapshot.prompt') {
+      const update = promptSyncUpdateFromSnapshot(event.payload, 'live', buildPromptDraftKey)
+      if (update) applyBackendPromptUpdate(update, true)
       return
     }
     if (event.type === 'stage.changed') {
@@ -1776,15 +1794,16 @@ export function App(props: StartupOptions) {
     promptSubmitInFlight.add(current.id)
 
     const preserveRejectedPrompt = (message: string, kind: 'warning' | 'error') => {
-      if (!prompt()) setPrompt(current)
-      const retained = prompt() ?? current
-      if (retained.id === current.id && !isOverlayPromptType(current.promptType)) {
-        writePromptDraft(current.draftKey, String(value ?? ''))
+      const retained = prompt()
+      if (retained) {
+        if (retained.id === current.id && !isOverlayPromptType(current.promptType)) {
+          writePromptDraft(current.draftKey, String(value ?? ''))
+        }
+        const transition = resolvePromptResponseTransition(current.id, retained, false)
+        setStatus(transition.nextStatus)
+        setShellFocus(transition.nextShellFocus)
+        setPromptSubmitRevision((previous) => previous + 1)
       }
-      const transition = resolvePromptResponseTransition(current.id, retained, false)
-      setStatus(transition.nextStatus)
-      setShellFocus(transition.nextShellFocus)
-      setPromptSubmitRevision((previous) => previous + 1)
       appendStructuredLog(
         buildLogEntry({
           kind,
@@ -1803,7 +1822,10 @@ export function App(props: StartupOptions) {
         return
       }
       const transition = resolvePromptResponseTransition(current.id, prompt(), true)
-      if (transition.clearPrompt) setPrompt(null)
+      if (transition.clearPrompt) {
+        promptSyncState = dismissPromptSyncState(promptSyncState, current.id)
+        setPrompt(promptSyncState.prompt)
+      }
       setStatus(transition.nextStatus)
       setShellFocus(transition.nextShellFocus)
     } catch (error) {

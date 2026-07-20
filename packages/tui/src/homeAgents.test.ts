@@ -83,6 +83,41 @@ test('isRunningWorker keeps prelaunch STARTING workers before tmux session exist
   expect(isRunningWorker(worker({ sessionExists: false, agentState: 'STARTING', healthStatus: 'unknown' }))).toBe(true)
 })
 
+test('resolveHomeAgentState trusts terminal health over stale BUSY while preserving transient probe failures', () => {
+  const missingBusyWorker = worker({
+    sessionExists: false,
+    agentState: 'BUSY',
+    healthStatus: 'missing_session',
+    currentTaskRuntimeStatus: 'running',
+  })
+
+  expect(resolveHomeAgentState(missingBusyWorker)).toBe('DEAD')
+  expect(resolveHomeAgentState(worker({ sessionExists: false, agentState: 'BUSY', healthStatus: 'alive' }))).toBe('BUSY')
+  expect(resolveHomeAgentState(worker({ sessionExists: false, agentState: 'STARTING' }))).toBe('STARTING')
+})
+
+test('buildHomeAgents shows persisted missing-session health as DEAD', () => {
+  const agents = buildHomeAgents([
+    {
+      source: 'development',
+      workers: [
+        worker({
+          workerId: 'development-review-审核员',
+          sessionName: '审核员-天异星',
+          sessionExists: false,
+          agentState: 'BUSY',
+          healthStatus: 'missing_session',
+          currentTaskRuntimeStatus: 'running',
+        }),
+      ],
+    },
+  ])
+
+  expect(agents).toHaveLength(1)
+  expect(agents[0]?.agentState).toBe('DEAD')
+  expect(agents[0]?.healthStatus).toBe('missing_session')
+})
+
 test('resolveHomeAgentState prioritizes live BUSY over stale failed status', () => {
   expect(
     resolveHomeAgentState(

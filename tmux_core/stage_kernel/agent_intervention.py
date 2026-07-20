@@ -1,15 +1,58 @@
 from __future__ import annotations
 
+import inspect
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from T09_terminal_ops import message, prompt_select_option, terminal_ui_is_interactive
-from tmux_core.runtime.tmux_runtime import AgentStartupInterventionRequired, try_resume_worker
+from tmux_core.runtime.tmux_runtime import (
+    AgentInterventionRequired,
+    AgentRuntimeInterventionRequired,
+    AgentStartupInterventionRequired,
+    try_resume_worker,
+)
 
 AGENT_INTERVENTION_RECHECK = "recheck_after_manual_intervention"
 AGENT_INTERVENTION_RECREATE = "recreate_after_manual_intervention"
 AGENT_INTERVENTION_WORKER_DEAD = "worker_dead_after_manual_intervention"
+
+
+class AgentInterventionActionSelected(RuntimeError):
+    """Propagate an already selected HITL action without opening another prompt."""
+
+    def __init__(
+        self,
+        *,
+        decision: str,
+        recovery_kind: str,
+        reason_text: str,
+        attempts_used: int = 0,
+        target_paths: Sequence[str | Path] = (),
+    ) -> None:
+        self.decision = str(decision or "").strip()
+        self.recovery_kind = str(recovery_kind or "").strip()
+        self.reason_text = str(reason_text or "").strip()
+        self.attempts_used = max(0, int(attempts_used or 0))
+        self.target_paths = _normalize_target_paths(target_paths)
+        super().__init__(
+            f"HITL action already selected: recovery_kind={self.recovery_kind} "
+            f"decision={self.decision} reason={self.reason_text}"
+        )
+
+
+def _normalize_target_paths(target_paths: Sequence[str | Path]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in target_paths:
+        if not str(item or "").strip():
+            continue
+        path_text = str(Path(item).expanduser().resolve())
+        if path_text in seen:
+            continue
+        seen.add(path_text)
+        normalized.append(path_text)
+    return tuple(normalized)
 
 
 def _session_name(worker: object | None) -> str:
@@ -79,7 +122,7 @@ def render_worker_intervention_summary(
     reason = str(reason_text or "").strip()
     if reason:
         lines.append(f"原因: {reason}")
-    paths = [str(Path(item).expanduser().resolve()) for item in target_paths if str(item or "").strip()]
+    paths = list(_normalize_target_paths(target_paths))
     if paths:
         lines.append("需要检查的文件:")
         lines.extend(f"- {item}" for item in paths)
@@ -102,12 +145,13 @@ def request_worker_manual_intervention(
 ) -> str:
     role_text = str(role_label or "").strip() or "智能体"
     stage_text = str(stage_label or "").strip() or "当前阶段"
+    normalized_target_paths = _normalize_target_paths(target_paths)
     summary = render_worker_intervention_summary(
         stage_label=stage_text,
         role_label=role_text,
         worker=worker,
         reason_text=reason_text,
-        target_paths=target_paths,
+        target_paths=normalized_target_paths,
     )
     if mark_worker_state:
         _mark_awaiting_manual(worker, reason_text=summary)
@@ -145,7 +189,7 @@ def request_worker_manual_intervention(
                 "session_name": _session_name(worker),
                 "worker_state": _worker_state(worker),
                 "attach_command": _attach_command(worker),
-                "target_paths": [str(Path(item).expanduser().resolve()) for item in target_paths if str(item or "").strip()],
+                "target_paths": list(normalized_target_paths),
                 "reason_text": str(reason_text or "").strip(),
             },
         )
@@ -160,9 +204,28 @@ def run_worker_turn_with_startup_recovery(
     on_intervention: Callable[[AgentStartupInterventionRequired], None] | None = None,
 ) -> Any:
     """Keep startup HITL inside the current stage stack and reuse the same live worker."""
+    effective_run_turn_kwargs = dict(run_turn_kwargs)
+    run_turn = getattr(worker, "run_turn")
+    try:
+        run_turn_parameters = inspect.signature(run_turn).parameters
+    except (TypeError, ValueError):
+        run_turn_parameters = {}
+    # Only pass the optional callback when the callable explicitly declares it.
+    # A generic **kwargs wrapper may delegate to a legacy worker that rejects
+    # the argument, turning a recoverable startup intervention into failure.
+    if "runtime_intervention_handler" in run_turn_parameters:
+        effective_run_turn_kwargs.setdefault(
+            "runtime_intervention_handler",
+            lambda current_worker, error: wait_for_worker_runtime_intervention(
+                current_worker,
+                error=error,
+                stage_label=stage_label,
+                role_label=role_label,
+            ),
+        )
     while True:
         try:
-            return worker.run_turn(**dict(run_turn_kwargs))
+            return run_turn(**effective_run_turn_kwargs)
         except AgentStartupInterventionRequired as error:
             if on_intervention is not None:
                 on_intervention(error)
@@ -174,13 +237,52 @@ def run_worker_turn_with_startup_recovery(
             )
 
 
-def wait_for_worker_startup_intervention(
+def wait_for_worker_runtime_intervention(
     worker: object,
     *,
-    error: AgentStartupInterventionRequired,
+    error: AgentRuntimeInterventionRequired,
     stage_label: str,
     role_label: str,
 ) -> None:
+    current_reason = str(error)
+    while True:
+        decision = request_worker_manual_intervention(
+            stage_label=stage_label or "智能体运行",
+            role_label=role_label or _session_name(worker) or "智能体",
+            worker=worker,
+            reason_text=current_reason,
+            allow_recreate=False,
+            allow_worker_dead=True,
+            recovery_kind="agent_runtime_intervention",
+            mark_worker_state=False,
+        )
+        if decision == AGENT_INTERVENTION_WORKER_DEAD:
+            raise RuntimeError(f"tmux pane died during runtime intervention: {current_reason}")
+        if decision != AGENT_INTERVENTION_RECHECK:
+            continue
+        resolved = getattr(worker, "runtime_intervention_is_resolved", None)
+        if callable(resolved) and bool(resolved(error.blocker_kind)):
+            return
+        current_reason = (
+            "人工处理后权限确认页面仍然可见；请继续在原 tmux 会话完成授权或拒绝。"
+        )
+
+
+def wait_for_worker_startup_intervention(
+    worker: object,
+    *,
+    error: AgentInterventionRequired,
+    stage_label: str,
+    role_label: str,
+) -> None:
+    if isinstance(error, AgentRuntimeInterventionRequired):
+        wait_for_worker_runtime_intervention(
+            worker,
+            error=error,
+            stage_label=stage_label,
+            role_label=role_label,
+        )
+        return
     current_reason = str(error)
     while True:
         decision = request_worker_manual_intervention(

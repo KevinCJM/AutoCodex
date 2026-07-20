@@ -29,7 +29,9 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
 )
 from tmux_core.stage_kernel.agent_intervention import (
+    AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
+    AgentInterventionActionSelected,
     request_file_noncompliance_intervention,
     run_worker_turn_with_startup_recovery,
 )
@@ -459,6 +461,7 @@ def run_task_result_turn_with_repair(
     role_label: str = "",
     task_name: str = "",
     requirement_name: str = "",
+    propagate_file_intervention_action: bool = False,
 ) -> dict[str, object]:
     repair_budget = turn_goal.max_repair_attempts if turn_goal is not None else 0
     repair_prompt_builder = (
@@ -577,7 +580,19 @@ def run_task_result_turn_with_repair(
                     reason_text=str(terminal_error),
                     attempts_used=repair_budget,
                     target_paths=target_paths,
+                    allow_recreate=propagate_file_intervention_action,
                 )
+                if propagate_file_intervention_action and decision in {
+                    AGENT_INTERVENTION_RECREATE,
+                    AGENT_INTERVENTION_WORKER_DEAD,
+                }:
+                    raise AgentInterventionActionSelected(
+                        decision=decision,
+                        recovery_kind="file_noncompliance",
+                        reason_text=str(terminal_error),
+                        attempts_used=repair_budget,
+                        target_paths=target_paths,
+                    ) from terminal_error
                 if decision == AGENT_INTERVENTION_WORKER_DEAD:
                     raise RuntimeError(f"tmux pane died after manual file intervention: {terminal_error}") from terminal_error
                 observation = observe_task_result_state(active_result_contract, result_path)
@@ -648,6 +663,7 @@ def run_completion_turn_with_repair(
     role_label: str = "",
     task_name: str = "",
     requirement_name: str = "",
+    propagate_file_intervention_action: bool = False,
 ) -> None:
     repair_budget = turn_goal.max_repair_attempts if turn_goal is not None else 0
     repair_prompt_builder = (
@@ -734,7 +750,19 @@ def run_completion_turn_with_repair(
                     reason_text=str(terminal_error),
                     attempts_used=repair_budget,
                     target_paths=tuple(observation.artifact_paths.values()),
+                    allow_recreate=propagate_file_intervention_action,
                 )
+                if propagate_file_intervention_action and decision in {
+                    AGENT_INTERVENTION_RECREATE,
+                    AGENT_INTERVENTION_WORKER_DEAD,
+                }:
+                    raise AgentInterventionActionSelected(
+                        decision=decision,
+                        recovery_kind="file_noncompliance",
+                        reason_text=str(terminal_error),
+                        attempts_used=repair_budget,
+                        target_paths=tuple(observation.artifact_paths.values()),
+                    ) from terminal_error
                 if decision == AGENT_INTERVENTION_WORKER_DEAD:
                     raise RuntimeError(f"tmux pane died after manual file intervention: {terminal_error}") from terminal_error
                 observation = observe_completion_state(completion_contract)

@@ -867,7 +867,12 @@
         "TurnFileResult",
         "Vendor",
         "VENDOR_ORDER",
-        "scan_vendor_catalog"
+        "get_catalog_snapshot",
+        "refresh_catalog_snapshot",
+        "refresh_vendor_catalog",
+        "ensure_vendor_catalog_current",
+        "ensure_vendor_catalogs_current",
+        "resolve_launch"
       ],
       "first_read_selectors": [
         {
@@ -1359,7 +1364,8 @@
         }
       ],
       "key_symbols": [
-        "needs_code_confirmation"
+        "promptSyncUpdateFromSnapshot",
+        "reconcilePromptSyncState"
       ],
       "first_read_selectors": [
         {
@@ -1449,9 +1455,13 @@
           "type": "literal",
           "path": "packages/tui/src/promptTransition.test.ts"
         },
-      {
-        "type": "literal",
-        "path": "packages/tui/src/routes_smoke.test.ts"
+        {
+          "type": "literal",
+          "path": "packages/tui/src/promptSnapshot.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/routes_smoke.test.ts"
       },
       {
         "type": "literal",
@@ -1528,9 +1538,13 @@
           "type": "literal",
           "path": "packages/tui/src/promptTransition.test.ts"
         },
-      {
-        "type": "literal",
-        "path": "packages/tui/src/routes_smoke.test.ts"
+        {
+          "type": "literal",
+          "path": "packages/tui/src/promptSnapshot.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/routes_smoke.test.ts"
       },
       {
         "type": "literal",
@@ -1580,8 +1594,10 @@
       "packages/tui/src/backend/client.ts",
       "packages/tui/src/footerProgress.test.ts",
       "packages/tui/src/footerProgress.ts",
-      "packages/tui/src/promptTransition.test.ts",
-      "packages/tui/src/promptTransition.ts",
+          "packages/tui/src/promptTransition.test.ts",
+          "packages/tui/src/promptTransition.ts",
+          "packages/tui/src/promptSnapshot.test.ts",
+          "packages/tui/src/promptSnapshot.ts",
           "packages/tui/src/homeAgents.ts",
           "packages/tui/src/homeAgents.test.ts",
           "packages/tui/src/routes/HomeRoute.tsx",

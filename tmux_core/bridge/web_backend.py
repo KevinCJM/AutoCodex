@@ -14,7 +14,11 @@ from typing import Any, Mapping, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from tmux_core.bridge.backend import BridgeCore
-from tmux_core.runtime.vendor_catalog import VENDOR_ORDER, get_catalog_snapshot, get_default_model_for_vendor
+from tmux_core.runtime.vendor_catalog import (
+    VENDOR_ORDER,
+    ensure_vendor_catalogs_current,
+    get_default_model_for_vendor,
+)
 from T12_requirements_common import build_output_path, list_existing_requirements, resolve_existing_directory
 
 
@@ -86,7 +90,10 @@ class WebBackendServer(BridgeCore):
         return int(self._httpd.server_address[1])
 
     def build_agent_catalog(self) -> dict[str, Any]:
-        snapshot = get_catalog_snapshot()
+        # The Web catalog exposes both dynamic vendors at once, so refresh
+        # them concurrently before serializing.  This matches the TUI's
+        # selected-vendor freshness contract without two serial CLI waits.
+        snapshot = ensure_vendor_catalogs_current(("opencode", "deveco"))
         vendors: list[dict[str, Any]] = []
         for vendor_id in VENDOR_ORDER:
             inventory = snapshot.vendor(vendor_id)

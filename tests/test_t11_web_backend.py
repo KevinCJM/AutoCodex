@@ -138,7 +138,7 @@ class WebBackendTests(unittest.TestCase):
         )
         server, thread = self._start_server()
         try:
-            with patch('tmux_core.bridge.web_backend.get_catalog_snapshot', return_value=fake_snapshot):
+            with patch('tmux_core.bridge.web_backend.ensure_vendor_catalogs_current', return_value=fake_snapshot):
                 payload = self._get_json(server, '/api/agent-catalog')
         finally:
             self._stop_server(server, thread)
@@ -160,6 +160,51 @@ class WebBackendTests(unittest.TestCase):
         self.assertNotIn('binary_path', str(catalog))
         self.assertNotIn('executable_path', str(catalog))
         self.assertNotIn('/private/test/bin/deveco', str(catalog))
+
+    def test_web_catalog_refreshes_dynamic_vendors_before_exposing_models(self):
+        def model(model_id: str, source_kind: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                model_id=model_id,
+                display_name=model_id,
+                source_kind=source_kind,
+                confidence='high',
+                synthetic=False,
+                reasoning=SimpleNamespace(
+                    normalized_reasoning_levels=('high',),
+                    default_normalized_effort='high',
+                ),
+            )
+
+        def inventory(vendor_id: str, catalog_model: SimpleNamespace) -> SimpleNamespace:
+            return SimpleNamespace(
+                vendor_id=vendor_id,
+                installed=True,
+                scan_status='ok',
+                source_kind=catalog_model.source_kind,
+                confidence='high',
+                default_model=catalog_model.model_id,
+                models=(catalog_model,),
+            )
+
+        refreshed = {
+            vendor_id: inventory(vendor_id, model(f'{vendor_id}/current', 'dynamic_cli'))
+            for vendor_id in web_backend_module.VENDOR_ORDER
+        }
+        refreshed['opencode'] = inventory('opencode', model('live/supported', 'dynamic_cli'))
+        refreshed_snapshot = SimpleNamespace(
+            generated_at='2026-07-18T00:00:00+08:00',
+            vendor=lambda vendor_id: refreshed[vendor_id],
+        )
+
+        with patch(
+            'tmux_core.bridge.web_backend.ensure_vendor_catalogs_current',
+            return_value=refreshed_snapshot,
+        ) as ensure:
+            catalog = WebBackendServer.build_agent_catalog(SimpleNamespace())
+
+        ensure.assert_called_once_with(('opencode', 'deveco'))
+        opencode = next(item for item in catalog['vendors'] if item['vendor_id'] == 'opencode')
+        self.assertEqual([item['model_id'] for item in opencode['models']], ['live/supported'])
 
     def test_web_backend_lists_existing_requirements(self):
         with tempfile.TemporaryDirectory() as tmpdir:

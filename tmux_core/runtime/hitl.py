@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import uuid
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from typing import Callable, Mapping, Sequence
 
 from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
 from tmux_core.runtime.tmux_runtime import (
+    AgentInterventionRequired,
     AgentStartupInterventionRequired,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     is_turn_artifact_contract_error,
@@ -701,7 +703,7 @@ def run_hitl_agent_loop(
     max_contract_repair_attempts: int = DEFAULT_HITL_CONTRACT_REPAIR_ATTEMPTS,
     fresh_completion_paths: Sequence[str | Path] = (),
     fresh_completion_start_round: int = 1,
-    startup_intervention_handler: Callable[[object, AgentStartupInterventionRequired], None] | None = None,
+    startup_intervention_handler: Callable[[object, AgentInterventionRequired], None] | None = None,
 ) -> HitlLoopResult:
     output_file = Path(output_path).expanduser().resolve()
     question_file = Path(question_path).expanduser().resolve()
@@ -734,7 +736,7 @@ def run_hitl_agent_loop(
                 on_worker_started(worker)
             break
         except Exception as error:  # noqa: BLE001
-            if isinstance(error, AgentStartupInterventionRequired) and startup_intervention_handler is not None:
+            if isinstance(error, AgentInterventionRequired) and startup_intervention_handler is not None:
                 startup_intervention_handler(worker, error)
                 continue
             if replace_dead_worker is None or not is_worker_death_error(error):
@@ -790,11 +792,26 @@ def run_hitl_agent_loop(
             if on_agent_turn_started is not None:
                 on_agent_turn_started(context, turn_worker)
             try:
+                turn_kwargs: dict[str, object] = {
+                    "label": f"{label_prefix}_round_{hitl_round}",
+                    "prompt": prompt,
+                    "completion_contract": contract,
+                    "timeout_sec": timeout_sec,
+                }
+                if startup_intervention_handler is not None:
+                    with_runtime_handler = False
+                    try:
+                        parameters = inspect.signature(turn_worker.run_turn).parameters.values()
+                    except (TypeError, ValueError):
+                        parameters = ()
+                    with_runtime_handler = any(
+                        parameter.name == "runtime_intervention_handler"
+                        for parameter in parameters
+                    )
+                    if with_runtime_handler:
+                        turn_kwargs["runtime_intervention_handler"] = startup_intervention_handler
                 result = turn_worker.run_turn(
-                    label=f"{label_prefix}_round_{hitl_round}",
-                    prompt=prompt,
-                    completion_contract=contract,
-                    timeout_sec=timeout_sec,
+                    **turn_kwargs,
                 )
             except Exception as error:  # noqa: BLE001
                 if isinstance(error, AgentStartupInterventionRequired) and startup_intervention_handler is not None:
