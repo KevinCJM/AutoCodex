@@ -108,6 +108,7 @@ class TerminalUI(Protocol):
         question_path: str | Path | None = None,
         answer_path: str | Path | None = None,
         is_hitl: bool = False,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str: ...
 
     def clear_pending_tty_input(self) -> None: ...
@@ -191,10 +192,12 @@ class StdioTerminalUI:
         question_path: str | Path | None = None,
         answer_path: str | Path | None = None,
         is_hitl: bool = False,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str:
         _ = question_path
         _ = answer_path
         _ = is_hitl
+        _ = extra_payload
         while True:
             self.message(title)
             self.message("输入完成后单独输入 END 或 EOF 提交。")
@@ -441,6 +444,7 @@ class BridgeTerminalUI:
         question_path: str | Path | None = None,
         answer_path: str | Path | None = None,
         is_hitl: bool = False,
+        extra_payload: Mapping[str, Any] | None = None,
     ) -> str:
         while True:
             request_payload = _apply_prompt_metadata(
@@ -452,6 +456,12 @@ class BridgeTerminalUI:
                     "is_hitl": bool(is_hitl),
                 }
             )
+            if extra_payload:
+                protected_keys = set(request_payload)
+                for key, value in extra_payload.items():
+                    key_text = str(key)
+                    if key_text not in protected_keys:
+                        request_payload[key_text] = value
             payload = self._request_prompt(
                 BridgePromptRequest(
                     prompt_type="multiline",
@@ -657,14 +667,28 @@ def collect_multiline_input(
     question_path: str | Path | None = None,
     answer_path: str | Path | None = None,
     is_hitl: bool = False,
+    extra_payload: Mapping[str, Any] | None = None,
 ) -> str:
-    return get_terminal_ui().prompt_multiline(
-        title=title,
-        empty_retry_message=empty_retry_message,
-        question_path=question_path,
-        answer_path=answer_path,
-        is_hitl=is_hitl,
-    )
+    terminal_ui = get_terminal_ui()
+    try:
+        return terminal_ui.prompt_multiline(
+            title=title,
+            empty_retry_message=empty_retry_message,
+            question_path=question_path,
+            answer_path=answer_path,
+            is_hitl=is_hitl,
+            extra_payload=extra_payload,
+        )
+    except TypeError:
+        if extra_payload:
+            raise
+        return terminal_ui.prompt_multiline(
+            title=title,
+            empty_retry_message=empty_retry_message,
+            question_path=question_path,
+            answer_path=answer_path,
+            is_hitl=is_hitl,
+        )
 
 
 def clear_pending_tty_input() -> None:

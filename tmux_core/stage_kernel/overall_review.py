@@ -44,6 +44,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     load_worker_from_state_path,
+    normalize_graphify_config,
     try_resume_worker,
 )
 from tmux_core.stage_kernel.development import (
@@ -88,6 +89,7 @@ from tmux_core.stage_kernel.stage_audit import (
 )
 from tmux_core.stage_kernel.shared_review import (
     MAX_REVIEWER_REPAIR_ATTEMPTS,
+    ReviewLimitHitlConfig,
     ReviewRoundPolicy,
     ReviewAgentHandoff,
     ReviewAgentSelection,
@@ -101,13 +103,20 @@ from tmux_core.stage_kernel.shared_review import (
     ensure_review_artifacts,
     ensure_review_artifacts_exist,
     is_recoverable_startup_failure,
+    inherit_legacy_handoff_ponytail_mode,
+    inherit_legacy_handoff_graphify_mode,
     mark_worker_awaiting_reconfiguration,
     note_reviewer_failure,
     parse_review_max_rounds,
     prompt_review_max_rounds,
+    refresh_graphify_workers_for_checkpoint,
     resolve_reviewer_artifact_agent_name,
+    resolve_main_ponytail_mode,
     resolve_stage_agent_config,
+    render_review_limit_force_hitl_prompt,
+    render_review_limit_human_reply_prompt,
     reviewer_requires_manual_model_reconfiguration,
+    run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
     worker_has_provider_runtime_error,
 )
@@ -136,6 +145,7 @@ from T12_requirements_common import (
 OVERALL_REVIEW_TASK_NAME = "全面复核"
 PLACEHOLDER_NEXT_STEP = "下一步进入测试阶段（功能测试 + 全面回归，待接入）"
 MAX_OVERALL_REVIEW_ROUNDS = 5
+MAX_OVERALL_REVIEW_HITL_ROUNDS = 8
 
 
 @dataclass(frozen=True)
@@ -158,6 +168,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")
+    parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--developer-role-prompt", default="", help="开发工程师自定义角色定义提示词")
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=<key>,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖复核角色列表")
@@ -227,6 +241,63 @@ def build_overall_review_paths(project_dir: str | Path, requirement_name: str) -
     paths["merged_review_path"] = project_root / f"{safe_name}_整体代码复核记录.md"
     paths["state_path"] = project_root / f"{safe_name}_复核阶段状态.json"
     return paths
+
+
+def build_overall_review_limit_hitl_config(paths: dict[str, Path]) -> ReviewLimitHitlConfig:
+    return ReviewLimitHitlConfig(
+        stage_label="整体复核超限",
+        artifact_label="整体复核",
+        primary_output_path=paths["developer_output_path"],
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        merged_review_path=paths["merged_review_path"],
+        output_summary_path=paths["developer_output_path"],
+        continue_output_label="工程师开发内容.md",
+    )
+
+
+def build_overall_review_limit_force_hitl_prompt(
+    *,
+    paths: dict[str, Path],
+    review_msg: str,
+    review_limit: int,
+    review_rounds_used: int,
+) -> str:
+    return render_review_limit_force_hitl_prompt(
+        config=build_overall_review_limit_hitl_config(paths),
+        review_limit=review_limit,
+        review_rounds_used=review_rounds_used,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(
+            paths["original_requirement_path"],
+            paths["requirements_clear_path"],
+            paths["detailed_design_path"],
+            paths["task_md_path"],
+            paths["task_json_path"],
+            paths["state_path"],
+        ),
+    ) + f"\n## 当前整体复核记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
+
+
+def build_overall_review_limit_human_reply_prompt(
+    *,
+    paths: dict[str, Path],
+    review_msg: str,
+    human_msg: str,
+) -> str:
+    return render_review_limit_human_reply_prompt(
+        config=build_overall_review_limit_hitl_config(paths),
+        human_msg=human_msg,
+        hitl_record_md=paths["hitl_record_path"],
+        extra_inputs=(
+            paths["original_requirement_path"],
+            paths["requirements_clear_path"],
+            paths["detailed_design_path"],
+            paths["task_md_path"],
+            paths["task_json_path"],
+            paths["state_path"],
+        ),
+    ) + f"\n## 当前整体复核记录\n[REVIEW MSG START]\n{review_msg}\n[REVIEW MSG END]\n"
 
 
 def build_overall_review_reviewer_artifact_paths(
@@ -484,6 +555,13 @@ def _selection_from_runtime_state(payload: dict[str, object]) -> ReviewAgentSele
         model=model,
         reasoning_effort=str(config_payload.get("reasoning_effort", "high")).strip() or "high",
         proxy_url=str(config_payload.get("proxy_url", "")).strip(),
+        ponytail_mode=str(config_payload.get("ponytail_mode", "") or "off").strip() or "off",
+        graphify_mode=str(config_payload.get("graphify_mode", "") or "off").strip() or "off",
+        graphify_config=(
+            dict(config_payload.get("graphify_config", {}))
+            if isinstance(config_payload.get("graphify_config", {}), dict)
+            else {}
+        ),
     )
 
 
@@ -907,10 +985,25 @@ def build_reviewer_workers(
         progress.set_phase("复核阶段 / 启动审核器")
     reviewers: list[ReviewerRuntime] = []
     predicted_session_names: set[str] = set()
+    agent_config = resolve_stage_agent_config(args, stage_key="overall_review")
+
+    def handoff_mode_matches(item: ReviewAgentHandoff) -> bool:
+        reviewer_key = str(item.reviewer_key or item.role_name).strip()
+        desired = (reviewer_selections_by_name or {}).get(reviewer_key) or agent_config.reviewer_selection(reviewer_key)
+        expected_ponytail_mode = desired.ponytail_mode if desired is not None else agent_config.ponytail_mode
+        expected_graphify_mode = desired.graphify_mode if desired is not None else agent_config.graphify_mode
+        expected_graphify_config = desired.graphify_config if desired is not None else agent_config.graphify_config
+        return (
+            str(getattr(item.selection, "ponytail_mode", "") or "off").strip() == expected_ponytail_mode
+            and str(getattr(item.selection, "graphify_mode", "") or "off").strip() == expected_graphify_mode
+            and normalize_graphify_config(getattr(item.selection, "graphify_config", {}))
+            == normalize_graphify_config(expected_graphify_config)
+        )
+
     live_handoffs_by_key = {
         item.reviewer_key: item
         for item in reviewer_handoff
-        if _is_live_reviewer_handoff(item)
+        if _is_live_reviewer_handoff(item) and handoff_mode_matches(item)
     }
     if live_handoffs_by_key:
         message("复用仍存活的任务开发审核智能体进入复核阶段")
@@ -1002,6 +1095,52 @@ def build_overall_review_refine_result_contract(paths: dict[str, Path]) -> TaskR
             "task_md": paths["task_md_path"],
             "task_json": paths["task_json_path"],
         },
+    )
+
+
+def build_overall_review_limit_hitl_result_contract(
+    paths: dict[str, Path],
+    *,
+    mode: str,
+) -> TaskResultContract:
+    expected_statuses = ("hitl", "completed")
+    outcome_artifacts = {
+        "hitl": {
+            "requires": ("ask_human",),
+            "optional": ("hitl_record",),
+        },
+        "completed": {
+            "requires": ("developer_output",),
+            "optional": ("hitl_record",),
+        },
+    }
+    if mode == "a08_overall_review_limit_force_hitl":
+        expected_statuses = ("hitl",)
+        outcome_artifacts = {
+            "hitl": {
+                "requires": ("ask_human",),
+                "optional": ("hitl_record",),
+            },
+        }
+    return TaskResultContract(
+        turn_id=mode,
+        phase=mode,
+        task_kind=mode,
+        mode=mode,
+        expected_statuses=expected_statuses,
+        stage_name="复核阶段",
+        optional_artifacts={
+            "ask_human": paths["ask_human_path"],
+            "hitl_record": paths["hitl_record_path"],
+            "developer_output": paths["developer_output_path"],
+            "original_requirement": paths["original_requirement_path"],
+            "requirements_clear": paths["requirements_clear_path"],
+            "detailed_design": paths["detailed_design_path"],
+            "task_md": paths["task_md_path"],
+            "task_json": paths["task_json_path"],
+            "state": paths["state_path"],
+        },
+        outcome_artifacts=outcome_artifacts,
     )
 
 
@@ -1306,6 +1445,19 @@ def build_overall_review_turn_goal(*, mode: str, paths: dict[str, Path]) -> Task
                 what_just_dev=str(paths["developer_output_path"].resolve()),
             ),
         )
+    if mode == "a08_overall_review_limit_force_hitl":
+        return TaskTurnGoal(
+            goal_id=mode,
+            outcomes={"hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",))},
+        )
+    if mode == "a08_overall_review_limit_human_reply":
+        return TaskTurnGoal(
+            goal_id=mode,
+            outcomes={
+                "hitl": OutcomeGoal(status="hitl", required_aliases=("ask_human",)),
+                "completed": OutcomeGoal(status="completed", required_aliases=("developer_output",)),
+            },
+        )
     raise RuntimeError(f"未知复核阶段 turn goal: {mode}")
 
 
@@ -1588,6 +1740,110 @@ def refine_overall_review_code(
             metadata={"trigger": "refine_overall_review_code"},
         )
     return current_developer, code_change
+
+
+def run_overall_review_limit_hitl_loop(
+    developer: DeveloperRuntime,
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    paths: dict[str, Path],
+    review_msg: str,
+    review_limit: int,
+    review_rounds_used: int,
+    progress: ReviewStageProgress | None = None,
+    human_input_provider=None,
+    audit_context: StageAuditRunContext | None = None,
+) -> object:
+    if audit_context is not None:
+        record_before_cleanup(
+            audit_context,
+            {"ask_human": paths["ask_human_path"]},
+            metadata={"trigger": "overall_review_limit_hitl_prepare"},
+        )
+    ensure_empty_file(paths["ask_human_path"])
+
+    def audit_hitl_question(hitl_round: int, ask_human_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_question",
+            source_paths={"ask_human": ask_human_file},
+            hitl_round_index=hitl_round,
+            metadata={"trigger": "overall_review_limit_hitl"},
+        )
+
+    def audit_hitl_answer(hitl_round: int, human_msg: str, hitl_record_file: Path) -> None:
+        if audit_context is None:
+            return
+        append_stage_audit_record(
+            audit_context,
+            event_type="hitl_answer",
+            source_paths={"human_answer": "", "hitl_record": hitl_record_file},
+            hitl_round_index=hitl_round,
+            metadata={
+                "trigger": "overall_review_limit_hitl",
+                "human_answer_source": "runtime_payload",
+            },
+            snapshot_overrides={"human_answer": human_msg},
+        )
+
+    def initial_turn() -> object:
+        nonlocal developer
+        developer = _run_overall_review_developer_turn(
+            developer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            label="overall_review_limit_hitl",
+            prompt=build_overall_review_limit_force_hitl_prompt(
+                paths=paths,
+                review_msg=review_msg,
+                review_limit=review_limit,
+                review_rounds_used=review_rounds_used,
+            ),
+            result_contract=build_overall_review_limit_hitl_result_contract(
+                paths,
+                mode="a08_overall_review_limit_force_hitl",
+            ),
+            paths=paths,
+            progress=progress,
+        )
+        return developer
+
+    def human_reply_turn(human_msg: str) -> object:
+        nonlocal developer
+        developer = _run_overall_review_developer_turn(
+            developer,
+            project_dir=project_dir,
+            requirement_name=requirement_name,
+            label="overall_review_limit_human_reply",
+            prompt=build_overall_review_limit_human_reply_prompt(
+                paths=paths,
+                review_msg=review_msg,
+                human_msg=human_msg,
+            ),
+            result_contract=build_overall_review_limit_hitl_result_contract(
+                paths,
+                mode="a08_overall_review_limit_human_reply",
+            ),
+            paths=paths,
+            progress=progress,
+        )
+        return developer
+
+    return run_review_limit_hitl_cycle(
+        stage_label="整体复核超限",
+        ask_human_path=paths["ask_human_path"],
+        hitl_record_path=paths["hitl_record_path"],
+        initial_turn=initial_turn,
+        human_reply_turn=human_reply_turn,
+        human_input_provider=human_input_provider,
+        progress=progress,
+        max_hitl_rounds=MAX_OVERALL_REVIEW_HITL_ROUNDS,
+        on_hitl_question=audit_hitl_question,
+        on_hitl_answer=audit_hitl_answer,
+    )
 
 
 def _run_single_overall_review_reviewer_init(
@@ -2049,6 +2305,27 @@ def run_overall_review_stage(
 ) -> OverallReviewStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if developer_handoff is not None:
+        inherit_legacy_handoff_ponytail_mode(
+            args,
+            getattr(developer_handoff.selection, "ponytail_mode", "off"),
+        )
+        inherit_legacy_handoff_graphify_mode(
+            args,
+            getattr(developer_handoff.selection, "graphify_mode", "off"),
+        )
+    elif reviewer_handoff:
+        inherit_legacy_handoff_ponytail_mode(
+            args,
+            getattr(reviewer_handoff[0].selection, "ponytail_mode", "off"),
+        )
+        inherit_legacy_handoff_graphify_mode(
+            args,
+            getattr(reviewer_handoff[0].selection, "graphify_mode", "off"),
+        )
+    agent_config = resolve_stage_agent_config(args, stage_key="overall_review")
+    main_ponytail_mode = resolve_main_ponytail_mode(args, agent_config=agent_config)
+    main_graphify_mode = agent_config.graphify_mode
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     requirement_name = str(args.requirement_name).strip() if args.requirement_name else prompt_requirement_name_selection(project_dir, "").requirement_name
@@ -2077,11 +2354,49 @@ def run_overall_review_stage(
         )
         paths = ensure_overall_review_inputs(project_dir=project_dir, requirement_name=requirement_name)
         active_code_context = _build_overall_review_active_code_context(project_dir)
-        explicit_live_developer_handoff = developer_handoff if _is_live_developer_handoff(developer_handoff) else None
-        explicit_live_reviewer_handoffs = tuple(item for item in reviewer_handoff if _is_live_reviewer_handoff(item))
+        def developer_mode_matches(item: DevelopmentAgentHandoff | None) -> bool:
+            return bool(
+                item is not None
+                and str(getattr(item.selection, "ponytail_mode", "") or "off").strip() == main_ponytail_mode
+                and str(getattr(item.selection, "graphify_mode", "") or "off").strip() == main_graphify_mode
+                and normalize_graphify_config(getattr(item.selection, "graphify_config", {}))
+                == normalize_graphify_config(agent_config.graphify_config)
+            )
+
+        def reviewer_mode_matches(item: ReviewAgentHandoff) -> bool:
+            reviewer_key = str(item.reviewer_key or item.role_name).strip()
+            desired = agent_config.reviewer_selection(reviewer_key)
+            expected_ponytail_mode = desired.ponytail_mode if desired is not None else agent_config.ponytail_mode
+            expected_graphify_mode = desired.graphify_mode if desired is not None else agent_config.graphify_mode
+            expected_graphify_config = desired.graphify_config if desired is not None else agent_config.graphify_config
+            return (
+                str(getattr(item.selection, "ponytail_mode", "") or "off").strip() == expected_ponytail_mode
+                and str(getattr(item.selection, "graphify_mode", "") or "off").strip() == expected_graphify_mode
+                and normalize_graphify_config(getattr(item.selection, "graphify_config", {}))
+                == normalize_graphify_config(expected_graphify_config)
+            )
+
+        explicit_live_developer_handoff = (
+            developer_handoff
+            if _is_live_developer_handoff(developer_handoff) and developer_mode_matches(developer_handoff)
+            else None
+        )
+        explicit_live_reviewer_handoffs = tuple(
+            item for item in reviewer_handoff
+            if _is_live_reviewer_handoff(item) and reviewer_mode_matches(item)
+        )
         discovered_developer_handoff, discovered_reviewer_handoffs = discover_live_development_handoffs(
             project_dir=project_dir,
             requirement_name=requirement_name,
+        )
+        discovered_developer_handoff = (
+            discovered_developer_handoff
+            if developer_mode_matches(discovered_developer_handoff)
+            else None
+        )
+        discovered_reviewer_handoffs = tuple(
+            item for item in discovered_reviewer_handoffs
+            if reviewer_mode_matches(item)
         )
         live_developer_handoff = _prefer_handoff(explicit_live_developer_handoff, discovered_developer_handoff)
         live_reviewer_handoffs = _merge_preferred_reviewer_handoffs(
@@ -2116,11 +2431,12 @@ def run_overall_review_stage(
                 project_dir=project_dir,
                 progress=progress,
                 allow_back_first_prompt=developer_plan_allow_back,
+                ponytail_stage_key="overall_review",
             )
 
         reviewer_specs_prompted = stdin_is_interactive() and not effective_reviewer_handoffs and not any(
             str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
-        ) and not resolve_stage_agent_config(args).reviewer_order
+        ) and not resolve_stage_agent_config(args, stage_key="overall_review").reviewer_order
         reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
             reviewer_specs_prompted,
@@ -2132,7 +2448,6 @@ def run_overall_review_stage(
             allow_back_first_prompt=reviewer_specs_allow_back,
         )
         reviewer_specs_by_name = {str(item.reviewer_key or item.role_name).strip(): item for item in reviewer_specs}
-        agent_config = resolve_stage_agent_config(args)
         reviewer_selections_by_name = dict(agent_config.reviewers or {})
         live_reviewer_keys = {str(item.reviewer_key).strip() for item in live_reviewer_handoffs if str(item.reviewer_key).strip()}
         missing_reviewer_specs = [
@@ -2162,6 +2477,9 @@ def run_overall_review_stage(
                     ),
                     allow_back_first_prompt=reviewer_selection_allow_back,
                     stage_key="overall_review_reviewer_selection",
+                    default_ponytail_mode=agent_config.ponytail_mode,
+                    default_graphify_mode=agent_config.graphify_mode,
+                    default_graphify_config=agent_config.graphify_config,
                 )
             )
         review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
@@ -2199,6 +2517,16 @@ def run_overall_review_stage(
             reviewer_handoff=effective_reviewer_handoffs,
             reviewer_selections_by_name=reviewer_selections_by_name,
             progress=progress,
+        )
+        refresh_graphify_workers_for_checkpoint(
+            [
+                *([developer.worker] if developer is not None else []),
+                *(reviewer.worker for reviewer in reviewers),
+            ],
+            prompt=(
+                "A08 overall-review checkpoint; refresh the graph from all current "
+                "changed files before initialization and impact analysis"
+            ),
         )
         reviewers = initialize_overall_review_reviewers(
             reviewers,
@@ -2307,13 +2635,6 @@ def run_overall_review_stage(
                 message("整体复核仅剩非阻断歧义，已保留复核记录并继续完成。")
                 _write_overall_review_state(paths["state_path"], passed=True)
                 break
-            if review_round_policy.should_escalate_before_next_review():
-                if review_round_policy.max_rounds is None:
-                    raise RuntimeError("review_round_policy 配置错误：无限轮次不应触发整体复核超限")
-                raise RuntimeError(
-                    f"整体复核超过最大审核轮次 {review_round_policy.max_rounds}，仍未通过:\n"
-                    f"{previous_review_msg}"
-                )
             if developer is None:
                 if developer_plan is None:
                     developer_plan = resolve_developer_plan(args, project_dir=project_dir, progress=progress)
@@ -2334,6 +2655,28 @@ def run_overall_review_stage(
                     active_code_context=active_code_context,
                 )
                 developer_initialized = True
+            if review_round_policy.should_escalate_before_next_review():
+                if review_round_policy.max_rounds is None:
+                    raise RuntimeError("review_round_policy 配置错误：无限轮次不应触发整体复核超限")
+                hitl_result = run_overall_review_limit_hitl_loop(
+                    developer,
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    paths=paths,
+                    review_msg=previous_review_msg,
+                    review_limit=review_round_policy.max_rounds,
+                    review_rounds_used=review_round_policy.quota_count,
+                    progress=progress,
+                    # 审核超限通常涉及真实环境、凭据或风险接受，属于关键决策；
+                    # 即使 --yes 也不得代替人类自动回复。
+                    human_input_provider=None,
+                    audit_context=audit_context,
+                )
+                developer = hitl_result.owner
+                code_change_msg = get_markdown_content(paths["developer_output_path"]).strip()
+                review_round_policy.reset_after_hitl()
+                round_index += 1
+                continue
             developer, code_change_msg = refine_overall_review_code(
                 developer,
                 project_dir=project_dir,

@@ -8,9 +8,9 @@
       "TA03": "edit_vendor_node_modules",
       "TA04": "change_shared_runtime_or_artifact_contract",
       "TA05": "change_bridge_payload_without_both_sides",
-      "TA06": "treat_routing_docs_as_implementation_truth",
+      "TA06": "treat_routing_docs_or_graph_evidence_as_implementation_truth",
       "TA07": "claim_external_runtime_behavior_as_visible_fact",
-      "TA08": "treat_generated_artifact_as_source",
+      "TA08": "treat_generated_artifact_or_code_graph_as_source",
       "TA09": "change_web_port_proxy_assumptions"
     },
     "pre_edit_checks": {
@@ -19,7 +19,7 @@
       "PC03": "reroute_to_owned_source_not_vendor",
       "PC04": "read_linked_workflow_stage_runtime_tests",
       "PC05": "read_protocol_producer_and_consumer",
-      "PC06": "recheck_code_tests_configs_after_routing",
+      "PC06": "recheck_code_tests_configs_after_routing_or_graph_discovery",
       "PC07": "mark_external_behavior_out_of_scope_unless_visible",
       "PC08": "confirm_generator_before_generated_output_edit",
       "PC09": "check_launcher_and_vite_proxy_together"
@@ -30,7 +30,7 @@
       "SO03": "inspect_package_entry_config_outside_node_modules",
       "SO04": "trace_artifact_writer_and_reader",
       "SO05": "compare_python_protocol_helpers_with_frontend_client",
-      "SO06": "use_routing_docs_only_to_narrow_search",
+      "SO06": "use_routing_docs_and_graph_evidence_only_to_narrow_search",
       "SO07": "separate_visible_code_from_external_process_effects",
       "SO08": "inspect_generated_path_and_nearest_generator_test",
       "SO09": "verify_port_constants_and_frontend_proxy_config"
@@ -83,9 +83,10 @@
       "trigger_actions": ["TA03"],
       "why_risky": "vendor_dependencies_are_not_owned_source",
       "related_selectors": [
-        {"type": "subtree", "path": "packages/tui/node_modules"}
+        {"type": "subtree", "path": "packages/tui/node_modules"},
+        {"type": "subtree", "path": "third_party/ponytail"}
       ],
-      "affected_modules": ["M07_frontend_packages"],
+      "affected_modules": ["M05_tmux_runtime_hitl", "M07_frontend_packages"],
       "blast_radius": "unsupported_vendor_patch",
       "check_before_edit": ["PC03"],
       "safe_observation_methods": ["SO03"]
@@ -138,16 +139,18 @@
       "title": "routing_docs_are_navigation_only",
       "severity": "medium",
       "confidence": "high",
-      "symptoms": ["route_code_conflict", "stale_path", "implementation_truth_claim_from_docs"],
+      "symptoms": ["route_code_conflict", "stale_path", "implementation_truth_claim_from_docs", "implementation_truth_claim_from_graphify"],
       "trigger_actions": ["TA06"],
-      "why_risky": "routing_docs_cannot_prove_behavior",
+      "why_risky": "routing_docs_and_static_graph_evidence_cannot_prove_behavior",
       "related_selectors": [
         {"type": "literal", "path": "AGENTS.md"},
         {"type": "literal", "path": "docs/repo_map.json"},
         {"type": "literal", "path": "docs/task_routes.json"},
-        {"type": "literal", "path": "docs/pitfalls.json"}
+        {"type": "literal", "path": "docs/pitfalls.json"},
+        {"type": "literal", "path": "tmux_core/runtime/graphify.py"},
+        {"type": "literal", "path": "scripts/tmux-graphify"}
       ],
-      "affected_modules": ["M09_routing_init_layer", "M11_tests"],
+      "affected_modules": ["M09_routing_init_layer", "M11_tests", "M12_project_graph_service"],
       "blast_radius": "false_assumption",
       "check_before_edit": ["PC06"],
       "safe_observation_methods": ["SO06"]
@@ -165,9 +168,11 @@
         {"type": "literal", "path": "A00_main_web.py"},
         {"type": "literal", "path": "A00_main_tui.py"},
         {"type": "literal", "path": "T11_tui_backend.py"},
-        {"type": "literal", "path": "T11_web_backend.py"}
+        {"type": "literal", "path": "T11_web_backend.py"},
+        {"type": "literal", "path": "tmux_core/runtime/graphify.py"},
+        {"type": "literal", "path": "scripts/tmux-graphify"}
       ],
-      "affected_modules": ["M01_workflow_entry", "M02_web_launcher", "M05_tmux_runtime_hitl", "M06_bridge_protocol_backends"],
+      "affected_modules": ["M01_workflow_entry", "M02_web_launcher", "M05_tmux_runtime_hitl", "M06_bridge_protocol_backends", "M12_project_graph_service"],
       "blast_radius": "incorrect_environment_claim",
       "check_before_edit": ["PC07"],
       "safe_observation_methods": ["SO07"]
@@ -177,14 +182,16 @@
       "title": "generated_artifacts_are_not_source_truth",
       "severity": "medium",
       "confidence": "medium",
-      "symptoms": ["source_inferred_from_generated_output", "fixture_only_fix"],
+      "symptoms": ["source_inferred_from_generated_output", "fixture_only_fix", "graphify_generation_treated_as_source_truth", "inferred_edge_treated_as_extracted_fact"],
       "trigger_actions": ["TA08"],
-      "why_risky": "generated_outputs_are_not_canonical_implementation",
+      "why_risky": "generated_outputs_and_graphify_graphs_are_not_canonical_implementation",
       "related_selectors": [
         {"type": "subtree", "path": "_tui_e2e_projects"},
-        {"type": "subtree", "path": ".tmp"}
+        {"type": "subtree", "path": ".tmp"},
+        {"type": "literal", "path": "tmux_core/runtime/graphify.py"},
+        {"type": "literal", "path": "scripts/tmux-graphify"}
       ],
-      "affected_modules": ["M10_generated_artifacts", "M09_routing_init_layer"],
+      "affected_modules": ["M10_generated_artifacts", "M09_routing_init_layer", "M12_project_graph_service"],
       "blast_radius": "fixture_only_fix",
       "check_before_edit": ["PC08", "PC06"],
       "safe_observation_methods": ["SO08"]

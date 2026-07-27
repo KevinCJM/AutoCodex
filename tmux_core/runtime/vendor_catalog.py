@@ -51,7 +51,10 @@ LEGACY_MODEL_CHOICES_BY_VENDOR: dict[str, tuple[str, ...]] = {
 }
 LEGACY_MODEL_ALIASES_BY_VENDOR: dict[str, dict[str, str]] = {
     "codex": {
-        "gpt-5": "gpt-5.4",
+        # `gpt-5` historically meant "the current Codex default", not one
+        # particular point release.  Keep that compatibility contract tied to
+        # the scanned inventory so a retired model is never synthesized.
+        "gpt-5": "default",
     },
     "gemini": {
         "default": "auto",
@@ -1552,11 +1555,11 @@ def _resolve_model_choice(vendor_id: str, requested_model: str, inventory: Vendo
     model_text = str(requested_model or "").strip()
     if not model_text:
         model_text = inventory.default_model or LEGACY_DEFAULT_MODEL_BY_VENDOR[vendor_id]
-    if model_text == "default":
-        model_text = inventory.default_model or ""
     alias_target = LEGACY_MODEL_ALIASES_BY_VENDOR.get(vendor_id, {}).get(model_text, "")
     if alias_target:
         model_text = alias_target
+    if model_text == "default":
+        model_text = inventory.default_model or ""
     if not inventory.installed:
         raise ValueError(f"{vendor_id} is not installed on this machine")
     model = inventory.find_model(model_text)

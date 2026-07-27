@@ -12,7 +12,7 @@ import argparse
 import contextlib
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -53,6 +53,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     list_registered_tmux_workers,
+    normalize_graphify_config,
 )
 from tmux_core.stage_kernel.detailed_design import (
     DetailedDesignReviewerSpec,
@@ -98,6 +99,8 @@ from tmux_core.stage_kernel.shared_review import (
     ensure_empty_file,
     ensure_review_artifacts,
     ensure_review_artifacts_exist,
+    inherit_legacy_handoff_ponytail_mode,
+    inherit_legacy_handoff_graphify_mode,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
     prompt_required_replacement_review_agent_selection,
@@ -110,6 +113,9 @@ from tmux_core.stage_kernel.shared_review import (
     render_tmux_start_summary,
     resolve_reviewer_artifact_agent_name,
     resolve_agent_run_config_with_recovery,
+    resolve_main_ponytail_mode,
+    resolve_workflow_graphify_config,
+    resolve_workflow_graphify_mode,
     resolve_stage_agent_config,
     collect_review_limit_hitl_response,
     run_review_limit_hitl_cycle,
@@ -176,6 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
+    parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--review-max-rounds", default="", help="任务拆分评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=<key>,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--reviewer-role", action="append", default=[], help="重复传入以覆盖任务拆分评审角色列表")
@@ -461,12 +471,19 @@ def _reviewer_spec_identity(reviewer_spec: TaskSplitReviewerSpec) -> str:
     return str(reviewer_spec.reviewer_key or reviewer_spec.role_name).strip()
 
 
-def _reviewer_default_selection() -> ReviewAgentSelection:
+def _reviewer_default_selection(
+    ponytail_mode: str = "full",
+    graphify_mode: str = "off",
+    graphify_config: dict[str, object] | None = None,
+) -> ReviewAgentSelection:
     return ReviewAgentSelection(
         vendor=DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
         model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
         reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
         proxy_url="",
+        ponytail_mode=str(ponytail_mode or "full").strip() or "full",
+        graphify_mode=str(graphify_mode or "off").strip() or "off",
+        graphify_config=dict(graphify_config or {}),
     )
 
 
@@ -654,6 +671,9 @@ def create_task_split_ba_handoff(
         model=selection.model,
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
+        ponytail_mode=selection.ponytail_mode,
+        graphify_mode=selection.graphify_mode,
+        graphify_config=selection.graphify_config,
     )
 
 
@@ -681,9 +701,39 @@ def prepare_task_split_ba_handoff(
     ba_handoff: RequirementsAnalystHandoff | None,
     allow_back_first_prompt: bool = False,
 ) -> tuple[RequirementsAnalystHandoff, bool]:
-    if _is_live_ba_handoff(ba_handoff):
+    if ba_handoff is not None:
+        inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
+        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
+    expected_ponytail_mode = resolve_main_ponytail_mode(args, stage_key="task_split")
+    expected_graphify_mode = resolve_workflow_graphify_mode(args, stage_key="task_split")
+    expected_graphify_config = resolve_workflow_graphify_config(args)
+    handoff_live = _is_live_ba_handoff(ba_handoff)
+    mode_compatible = (
+        ba_handoff is not None
+        and str(ba_handoff.ponytail_mode or "off").strip() == expected_ponytail_mode
+        and str(
+            getattr(
+                getattr(ba_handoff.worker, "config", None),
+                "graphify_mode",
+                ba_handoff.graphify_mode,
+            )
+            or "off"
+        ).strip()
+        == expected_graphify_mode
+        and normalize_graphify_config(
+            getattr(
+                getattr(ba_handoff.worker, "config", None),
+                "graphify_config",
+                ba_handoff.graphify_config,
+            )
+        )
+        == expected_graphify_config
+    )
+    if handoff_live and mode_compatible:
         message("复用上一阶段的需求分析师继续生成任务单")
         return ba_handoff, False
+    if handoff_live and not mode_compatible:
+        message("需求分析师的 Ponytail 模式与当前阶段不一致，将重建会话")
     role_label = _task_split_ba_display_name(project_dir=project_dir)
     selection = collect_ba_agent_selection(
         args,
@@ -696,7 +746,15 @@ def prepare_task_split_ba_handoff(
     requirement_name = str(getattr(args, "requirement_name", "") or "").strip()
     if requirement_name:
         create_kwargs["requirement_name"] = requirement_name
-    return create_task_split_ba_handoff(**create_kwargs), True
+    new_handoff = create_task_split_ba_handoff(**create_kwargs)
+    if handoff_live and not mode_compatible and ba_handoff is not None:
+        try:
+            ba_handoff.worker.request_kill()
+        except (TmuxControlUnavailable, TmuxMutationOutcomeUnknown):
+            raise
+        except Exception:
+            pass
+    return new_handoff, True
 
 
 def build_task_split_init_prompt(paths: dict[str, Path], *, role_desc: str = TASK_SPLIT_BA_ROLE_DESC) -> str:
@@ -909,6 +967,9 @@ def recreate_task_split_ba_handoff(
         previous_handoff.model,
         previous_handoff.reasoning_effort,
         previous_handoff.proxy_url,
+        previous_handoff.ponytail_mode,
+        previous_handoff.graphify_mode,
+        previous_handoff.graphify_config,
     )
     selection = (
         prompt_required_replacement_review_agent_selection(
@@ -1305,20 +1366,45 @@ def build_reviewer_workers(
 ) -> tuple[list[ReviewerRuntime], list[ReviewerRuntime]]:
     if progress is not None:
         progress.set_phase("任务拆分 / 启动审核器")
+    if reviewer_handoff:
+        inherit_legacy_handoff_graphify_mode(
+            args,
+            getattr(reviewer_handoff[0].selection, "graphify_mode", "off"),
+        )
     reviewers: list[ReviewerRuntime] = []
     newly_created_reviewers: list[ReviewerRuntime] = []
     predicted_session_names: set[str] = set()
     interactive = stdin_is_interactive()
+    agent_config = resolve_stage_agent_config(args, stage_key="task_split")
+
+    def handoff_mode_matches(item: ReviewAgentHandoff) -> bool:
+        reviewer_key = _reviewer_spec_identity(
+            TaskSplitReviewerSpec(
+                role_name=item.role_name,
+                role_prompt=item.role_prompt,
+                reviewer_key=item.reviewer_key,
+            )
+        )
+        desired = (reviewer_selections_by_name or {}).get(reviewer_key) or agent_config.reviewer_selection(reviewer_key)
+        expected_mode = desired.ponytail_mode if desired is not None else agent_config.ponytail_mode
+        expected_graphify = desired.graphify_mode if desired is not None else agent_config.graphify_mode
+        expected_graphify_config = desired.graphify_config if desired is not None else agent_config.graphify_config
+        return (
+            str(getattr(item.selection, "ponytail_mode", "") or "off").strip() == expected_mode
+            and str(getattr(item.selection, "graphify_mode", "") or "off").strip() == expected_graphify
+            and normalize_graphify_config(getattr(item.selection, "graphify_config", {}))
+            == normalize_graphify_config(expected_graphify_config)
+        )
+
     live_handoffs_by_key = {
         item.reviewer_key: item
         for item in reviewer_handoff
-        if _is_live_reviewer_handoff(item)
+        if _is_live_reviewer_handoff(item) and handoff_mode_matches(item)
     }
     if live_handoffs_by_key:
         message("复用仍存活的详细设计审核智能体继续审核任务单")
     if reviewer_handoff and len(live_handoffs_by_key) != len(reviewer_handoff):
         message("部分详细设计审核智能体已失效，仅重建失效的任务拆分审核智能体")
-    agent_config = resolve_stage_agent_config(args)
     for reviewer_spec in reviewer_specs:
         reviewer_key = _reviewer_spec_identity(reviewer_spec)
         live_handoff = live_handoffs_by_key.get(reviewer_key)
@@ -1347,9 +1433,19 @@ def build_reviewer_workers(
                 role_label=reviewer_display_name,
                 progress=progress,
             )
+            selection = replace(selection, ponytail_mode=agent_config.ponytail_mode)
+            selection = replace(
+                selection,
+                graphify_mode=agent_config.graphify_mode,
+                graphify_config=agent_config.graphify_config,
+            )
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
         elif selection is None:
-            selection = _reviewer_default_selection()
+            selection = _reviewer_default_selection(
+                agent_config.ponytail_mode,
+                agent_config.graphify_mode,
+                agent_config.graphify_config,
+            )
         reviewer = create_reviewer_runtime(
             project_dir=project_dir,
             requirement_name=requirement_name,
@@ -2103,6 +2199,18 @@ def run_task_split_stage(
 ) -> TaskSplitStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if ba_handoff is not None:
+        inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
+        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
+    elif reviewer_handoff:
+        inherit_legacy_handoff_ponytail_mode(
+            args,
+            getattr(reviewer_handoff[0].selection, "ponytail_mode", "off"),
+        )
+        inherit_legacy_handoff_graphify_mode(
+            args,
+            getattr(reviewer_handoff[0].selection, "graphify_mode", "off"),
+        )
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     if args.project_dir:
         project_dir = str(Path(args.project_dir).expanduser().resolve())
@@ -2213,7 +2321,7 @@ def run_task_split_stage(
         review_round_policy = ReviewRoundPolicy(review_round_limit)
         reviewer_specs_prompted = stdin_is_interactive() and not reviewer_handoff and not any(
             str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
-        ) and not resolve_stage_agent_config(args).reviewer_order
+        ) and not resolve_stage_agent_config(args, stage_key="task_split").reviewer_order
         reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
             reviewer_specs_prompted,
@@ -2230,7 +2338,7 @@ def run_task_split_stage(
             for item in active_reviewer_handoff
             if _is_live_reviewer_handoff(item)
         )
-        agent_config = resolve_stage_agent_config(args)
+        agent_config = resolve_stage_agent_config(args, stage_key="task_split")
         reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
             stdin_is_interactive() and not bool(agent_config.reviewers) and bool(reviewer_specs),
@@ -2247,6 +2355,9 @@ def run_task_split_stage(
             skip_reviewer_keys=live_reviewer_keys,
             allow_back_first_prompt=reviewer_selection_allow_back,
             stage_key="task_split_reviewer_selection",
+            default_ponytail_mode=agent_config.ponytail_mode,
+            default_graphify_mode=agent_config.graphify_mode,
+            default_graphify_config=agent_config.graphify_config,
         )
         created_new_ba = False
         if existing_task_split_mode == "rerun":

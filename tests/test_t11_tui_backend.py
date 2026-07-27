@@ -36,11 +36,13 @@ from T11_tui_backend import (
     PromptBroker,
     RunnerExecutionState,
     TuiBackendServer,
+    _read_graphify_app_status,
     _write_project_stage_state_record,
     main as backend_main,
 )
 from T10_tui_protocol import build_request
 from T09_terminal_ops import BridgePromptRequest
+from tmux_core.bridge.backend import _flatten_graphify_worker_fields
 from tmux_core.runtime.tmux_runtime import (
     AgentRuntimeInterventionRequired,
     AgentStartupInterventionRequired,
@@ -48,6 +50,7 @@ from tmux_core.runtime.tmux_runtime import (
     get_current_stage_runner_id,
     runtime_shutdown_requested,
 )
+from tmux_core.runtime.hitl import build_prefixed_sha256
 
 
 def _write_valid_routing_layer(project_dir: Path) -> None:
@@ -87,6 +90,62 @@ def _write_valid_routing_layer(project_dir: Path) -> None:
         ),
         encoding="utf-8",
     )
+
+
+def _write_grill_recovery_session(
+    project_dir: Path,
+    requirement_name: str,
+    *,
+    state: str = "awaiting_answer",
+    pending_answer: str = "",
+    active_worker_state_path: str = "",
+    question_hash: str | None = None,
+) -> tuple[Path, Path]:
+    question_path = project_dir / ".requirements_runtime" / "grill-question.md"
+    question_path.parent.mkdir(parents=True, exist_ok=True)
+    question_path.write_text(
+        """## 问题
+数据边界如何定义？
+
+## 为什么需要决定
+影响实现范围。
+
+## 推荐答案
+方案 B
+
+## 回答方式
+select
+
+## 选项
+- 方案 A
+- 方案 B
+
+## 已核实事实
+- 已读取 AGENTS.md 和路由层
+""",
+        encoding="utf-8",
+    )
+    session_path = project_dir / ".tmux_workflow" / requirement_name / "grill" / "session.json"
+    session_path.parent.mkdir(parents=True, exist_ok=True)
+    session_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "1.0",
+                "session_id": "grill-session-a",
+                "requirements_mode": "grill",
+                "state": state,
+                "question_seq": 3,
+                "pending_question_path": str(question_path),
+                "pending_question_hash": question_hash or build_prefixed_sha256(question_path),
+                "pending_answer": pending_answer,
+                "active_worker_state_path": active_worker_state_path,
+                "updated_at": "2026-07-24T12:00:00+00:00",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    return session_path, question_path
 
 
 class _FakeTarget:
@@ -449,6 +508,29 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(hitl["reason_text"], "指定文件连续 2 次修复后仍不符合要求。")
         self.assertEqual(hitl["target_paths"], ["/tmp/review.md", "/tmp/review.json"])
         self.assertEqual(hitl["attach_command"], "tmux attach -t 测试工程师-参水猿")
+
+    def test_pending_hitl_snapshot_exposes_grill_prompt_details(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._pending_prompt = PendingPromptState(  # noqa: SLF001
+            prompt_id="prompt_grill_2",
+            prompt_type="multiline",
+            payload={
+                "title": "需求澄清 · Grill 第 2 题",
+                "is_hitl": True,
+                "interaction_kind": "grill",
+                "question_index": 2,
+                "recommendation": "保持旧接口兼容",
+                "reason_text": "该选择决定迁移风险。",
+                "question_path": "/tmp/grill-question.md",
+            },
+        )
+
+        hitl = server._build_hitl_snapshot()  # noqa: SLF001
+
+        self.assertEqual(hitl["interaction_kind"], "grill")
+        self.assertEqual(hitl["question_index"], 2)
+        self.assertEqual(hitl["recommendation"], "保持旧接口兼容")
+        self.assertEqual(hitl["reason_text"], "该选择决定迁移风险。")
 
     def test_pending_attention_snapshot_can_be_derived_from_plain_prompt(self):
         server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
@@ -939,6 +1021,80 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertTrue(snapshot["pending_attention"])
         self.assertEqual(snapshot["pending_attention_reason"], "select")
         self.assertEqual(snapshot["pending_attention_since"], "2026-04-23T10:00:00+08:00")
+
+    def test_app_snapshot_exposes_only_safe_project_level_graphify_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            report_path = project_dir / ".tmux_workflow" / "evidence.md"
+            report_path.parent.mkdir(parents=True)
+            report_path.write_text("# Graphify evidence\n", encoding="utf-8")
+            fake_graphify = SimpleNamespace(
+                read_graphify_project_status=lambda _project_dir: {
+                    "mode": "auto",
+                    "state": "ready",
+                    "version": "0.9.27",
+                    "freshness": "fresh",
+                    "node_count": 5098,
+                    "edge_count": 22091,
+                    "report_path": str(report_path),
+                    "last_error": "cache /Users/example/.cache/graphify failed",
+                    "executable_path": "/Users/example/.local/bin/graphify",
+                    "cache_dir": "/Users/example/.cache/graphify",
+                }
+            )
+            with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
+                server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+                server._set_context(project_dir=str(project_dir))  # noqa: SLF001
+                snapshot = server._build_app_snapshot()  # noqa: SLF001
+                allowed = server._allowed_file_preview_paths(  # noqa: SLF001
+                    stages={},
+                    control={"workers": []},
+                    hitl={},
+                    artifacts={"items": []},
+                )
+
+        self.assertEqual(snapshot["graphify"]["state"], "ready")
+        self.assertEqual(snapshot["graphify"]["node_count"], 5098)
+        self.assertEqual(snapshot["graphify"]["report_path"], str(report_path))
+        self.assertIn("<redacted-path>", snapshot["graphify"]["last_error"])
+        self.assertNotIn("executable_path", snapshot["graphify"])
+        self.assertNotIn("cache_dir", snapshot["graphify"])
+        self.assertIn(str(report_path), allowed)
+
+    def test_graphify_report_outside_project_is_not_exposed(self):
+        with tempfile.TemporaryDirectory() as tmpdir, tempfile.NamedTemporaryFile() as outside:
+            fake_graphify = SimpleNamespace(
+                read_graphify_project_status=lambda _project_dir: {
+                    "mode": "auto",
+                    "state": "ready",
+                    "report_path": outside.name,
+                }
+            )
+            with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
+                status = _read_graphify_app_status(tmpdir)
+
+        self.assertEqual(status["state"], "ready")
+        self.assertNotIn("report_path", status)
+
+    def test_worker_snapshot_exposes_only_safe_graphify_turn_identity(self):
+        flattened = _flatten_graphify_worker_fields(
+            {
+                "config": {
+                    "graphify_mode": "auto",
+                    "graphify_config": {"include": ["secret/**"]},
+                },
+                "graphify_evidence_id": "evidence-123",
+                "graphify_fingerprint": "a" * 64,
+                "graphify_freshness": "fresh",
+                "graphify_cache_dir": "/Users/example/.cache/private",
+            }
+        )
+        self.assertEqual(flattened["graphify_mode"], "auto")
+        self.assertEqual(flattened["graphify_evidence_id"], "evidence-123")
+        self.assertEqual(flattened["graphify_fingerprint"], "a" * 64)
+        self.assertEqual(flattened["graphify_freshness"], "fresh")
+        self.assertNotIn("graphify_config", flattened)
+        self.assertNotIn("graphify_cache_dir", flattened)
 
     def test_stage_status_does_not_treat_unattached_awaiting_reconfig_worker_as_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4885,6 +5041,414 @@ class T11TuiBackendTests(unittest.TestCase):
             {"accepted": False},
         )
 
+    def test_grill_prompt_exposes_cursor_and_rejects_stale_or_duplicate_responses(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        pending = PendingPromptState(
+            prompt_id="prompt-grill",
+            prompt_type="select",
+            payload={
+                "interaction_kind": "grill",
+                "question_index": 7,
+                "title": "选择边界",
+            },
+            owner_runner_id="runner-a03",
+            question_seq=7,
+        )
+        prompt_queue: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+        server._pending_prompts[pending.prompt_id] = pending  # noqa: SLF001
+        server._pending_prompt = pending  # noqa: SLF001
+        server._prompt_broker._pending[pending.prompt_id] = prompt_queue  # noqa: SLF001
+
+        snapshot = server.build_prompt_snapshot()
+        request_payload = server._build_prompt_request_payload(pending, prompt_revision=3)  # noqa: SLF001
+        self.assertEqual(snapshot["owner_runner_id"], "runner-a03")
+        self.assertEqual(snapshot["question_seq"], 7)
+        self.assertEqual(request_payload["owner_runner_id"], "runner-a03")
+        self.assertEqual(request_payload["question_seq"], 7)
+
+        self.assertEqual(
+            server.resolve_prompt("prompt-grill", {"value": "A"}),
+            {"accepted": False},
+        )
+        self.assertEqual(
+            server.resolve_prompt(
+                "prompt-grill",
+                {"value": "A", "runner_id": "runner-old", "question_seq": 7},
+            ),
+            {"accepted": False},
+        )
+        self.assertEqual(
+            server.resolve_prompt(
+                "prompt-grill",
+                {"value": "A", "runner_id": "runner-a03", "question_seq": 6},
+            ),
+            {"accepted": False},
+        )
+        self.assertTrue(prompt_queue.empty())
+
+        self.assertEqual(
+            server.resolve_prompt(
+                "prompt-grill",
+                {"value": "A", "runner_id": "runner-a03", "question_seq": 7},
+            ),
+            {"accepted": True},
+        )
+        self.assertEqual(prompt_queue.get_nowait()["value"], "A")
+        self.assertEqual(
+            server.resolve_prompt(
+                "prompt-grill",
+                {"value": "A", "runner_id": "runner-a03", "question_seq": 7},
+            ),
+            {"accepted": False},
+        )
+
+    def test_grill_prompt_open_returns_owner_cursor_for_initial_request_event(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._runner_local.runner_id = "runner-a03"  # noqa: SLF001
+        request = BridgePromptRequest(
+            prompt_type="select",
+            payload={"interaction_kind": "grill", "question_index": 4, "title": "选择边界"},
+        )
+        with patch.object(server._attention_manager, "start_prompt"), patch.object(  # noqa: SLF001
+            server,
+            "_emit_hitl_prompt_log",
+        ), patch.object(server, "_emit_display_stage_state"), patch.object(
+            server,
+            "_schedule_flow_snapshot_update",
+        ):
+            metadata = server._handle_prompt_open("prompt-grill-open", request)  # noqa: SLF001
+
+        self.assertEqual(metadata["owner_runner_id"], "runner-a03")
+        self.assertEqual(metadata["question_seq"], 4)
+        self.assertEqual(server._pending_prompts["prompt-grill-open"].question_seq, 4)  # noqa: SLF001
+
+    def test_grill_prompt_open_without_registered_runner_uses_prompt_scoped_cursor(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        request = BridgePromptRequest(
+            prompt_type="select",
+            payload={"interaction_kind": "grill", "question_index": 2, "title": "选择边界"},
+        )
+        with patch.object(server._attention_manager, "start_prompt"), patch.object(  # noqa: SLF001
+            server,
+            "_emit_hitl_prompt_log",
+        ), patch.object(server, "_emit_display_stage_state"), patch.object(
+            server,
+            "_schedule_flow_snapshot_update",
+        ):
+            metadata = server._handle_prompt_open("prompt-grill-unowned", request)  # noqa: SLF001
+
+        self.assertEqual(metadata["owner_runner_id"], "prompt-owner:prompt-grill-unowned")
+        self.assertEqual(metadata["question_seq"], 2)
+        self.assertEqual(
+            server._pending_prompts["prompt-grill-unowned"].owner_runner_id,  # noqa: SLF001
+            "prompt-owner:prompt-grill-unowned",
+        )
+
+    def test_grill_awaiting_answer_recovers_as_submittable_snapshot_without_live_runner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp).resolve()
+            requirement_name = "需求A"
+            session_path, question_path = _write_grill_recovery_session(project_dir, requirement_name)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                action="stage.a03.start",
+            )
+            server._display_action = "stage.a03.start"  # noqa: SLF001
+
+            snapshot = server.build_prompt_snapshot()
+
+            self.assertTrue(snapshot["pending"])
+            self.assertEqual(snapshot["prompt_type"], "multiline")
+            self.assertEqual(snapshot["question_seq"], 3)
+            self.assertEqual(snapshot["owner_runner_id"], "grill-session:grill-session-a")
+            self.assertEqual(snapshot["grill_session_id"], "grill-session-a")
+            self.assertEqual(snapshot["grill_question_hash"], build_prefixed_sha256(question_path))
+            self.assertTrue(snapshot["payload"]["can_submit"])
+            self.assertFalse(snapshot["payload"]["recovery_pending"])
+            self.assertTrue(snapshot["payload"]["synthetic_recovery"])
+            self.assertNotIn(snapshot["prompt_id"], server._pending_prompts)  # noqa: SLF001
+            self.assertEqual(server._prompt_broker.pending_prompt_ids(), ())  # noqa: SLF001
+            self.assertIn("安全写入 Grill 会话", snapshot["payload"]["recovery_message"])
+            self.assertEqual(snapshot["payload"]["recommendation"], "方案 B")
+            self.assertEqual(snapshot["payload"]["reason_text"], "影响实现范围。")
+            self.assertEqual(snapshot["payload"]["answer_options"], ["方案 A", "方案 B"])
+            self.assertEqual(snapshot["payload"]["default_value"], "方案 B")
+            self.assertEqual(server.build_file_preview(question_path)["path"], str(question_path))
+            repeated = server.build_prompt_snapshot()
+            self.assertEqual(repeated["prompt_revision"], snapshot["prompt_revision"])
+            response_payload = {
+                "prompt_id": snapshot["prompt_id"],
+                "value": "采用业务日边界",
+                "runner_id": snapshot["owner_runner_id"],
+                "question_seq": 3,
+                "grill_session_id": snapshot["grill_session_id"],
+                "grill_question_hash": snapshot["grill_question_hash"],
+            }
+            with patch.object(server, "_schedule_flow_snapshot_update") as refresh:
+                response = server.resolve_prompt(snapshot["prompt_id"], response_payload)
+            self.assertEqual(response, {"accepted": True})
+            refresh.assert_called_once()
+            session_payload = json.loads(session_path.read_text(encoding="utf-8"))
+            self.assertEqual(session_payload["state"], "answer_pending")
+            self.assertEqual(session_payload["pending_answer"], "采用业务日边界")
+            self.assertEqual(session_payload["pending_question_path"], "")
+            self.assertEqual(session_payload["pending_question_hash"], "")
+            self.assertEqual(session_payload["accepted_answers"][-1]["answer"], "采用业务日边界")
+            cleared = server.build_prompt_snapshot()
+            self.assertFalse(cleared["pending"])
+            self.assertGreater(cleared["prompt_revision"], snapshot["prompt_revision"])
+            accepted_revision = cleared["prompt_revision"]
+            with patch.object(server, "_schedule_flow_snapshot_update"):
+                duplicate = server.resolve_prompt(snapshot["prompt_id"], response_payload)
+            self.assertEqual(duplicate, {"accepted": False})
+            self.assertEqual(server.build_prompt_snapshot()["prompt_revision"], accepted_revision)
+
+    def test_grill_recovery_does_not_reopen_consumed_or_invalid_question(self):
+        cases = (
+            {"state": "turn_in_progress"},
+            {"pending_answer": "方案 B"},
+            {"question_hash": "sha256:invalid"},
+        )
+        for index, overrides in enumerate(cases, start=1):
+            with self.subTest(case=index), tempfile.TemporaryDirectory() as tmp:
+                project_dir = Path(tmp).resolve()
+                requirement_name = "需求A"
+                _write_grill_recovery_session(project_dir, requirement_name, **overrides)
+                server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+                server._set_context(  # noqa: SLF001
+                    project_dir=str(project_dir),
+                    requirement_name=requirement_name,
+                    action="stage.a03.start",
+                )
+                server._display_action = "stage.a03.start"  # noqa: SLF001
+
+                self.assertFalse(server.build_prompt_snapshot()["pending"])
+
+    def test_synthetic_grill_recovery_rejects_every_stale_cursor_component(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp).resolve()
+            requirement_name = "需求A"
+            session_path, _question_path = _write_grill_recovery_session(project_dir, requirement_name)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                action="stage.a03.start",
+            )
+            server._display_action = "stage.a03.start"  # noqa: SLF001
+            snapshot = server.build_prompt_snapshot()
+            baseline_revision = snapshot["prompt_revision"]
+            base_response = {
+                "prompt_id": snapshot["prompt_id"],
+                "value": "方案 B",
+                "runner_id": snapshot["owner_runner_id"],
+                "question_seq": snapshot["question_seq"],
+                "grill_session_id": snapshot["grill_session_id"],
+                "grill_question_hash": snapshot["grill_question_hash"],
+            }
+            cases = (
+                {"prompt_id": "grill_recovery_stale"},
+                {"runner_id": "grill-session:stale"},
+                {"question_seq": 2},
+                {"grill_session_id": "stale-session"},
+                {"grill_question_hash": "sha256:stale"},
+                {"value": "   "},
+            )
+            for overrides in cases:
+                with self.subTest(overrides=overrides), patch.object(
+                    server,
+                    "_schedule_flow_snapshot_update",
+                ):
+                    response = server.resolve_prompt(
+                        snapshot["prompt_id"],
+                        {**base_response, **overrides},
+                    )
+                self.assertEqual(response, {"accepted": False})
+                persisted = json.loads(session_path.read_text(encoding="utf-8"))
+                self.assertEqual(persisted["state"], "awaiting_answer")
+                self.assertEqual(persisted["pending_answer"], "")
+                self.assertEqual(server.build_prompt_snapshot()["prompt_revision"], baseline_revision)
+
+    def test_synthetic_grill_recovery_rejects_broker_runner_and_lock_races(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp).resolve()
+            requirement_name = "需求A"
+            session_path, _question_path = _write_grill_recovery_session(project_dir, requirement_name)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                action="stage.a03.start",
+            )
+            server._display_action = "stage.a03.start"  # noqa: SLF001
+            snapshot = server.build_prompt_snapshot()
+            response_payload = {
+                "prompt_id": snapshot["prompt_id"],
+                "value": "方案 B",
+                "runner_id": snapshot["owner_runner_id"],
+                "question_seq": snapshot["question_seq"],
+                "grill_session_id": snapshot["grill_session_id"],
+                "grill_question_hash": snapshot["grill_question_hash"],
+            }
+
+            server._prompt_broker._pending["prompt_other"] = queue.Queue(maxsize=1)  # noqa: SLF001
+            with patch.object(server, "_schedule_flow_snapshot_update") as refresh:
+                self.assertEqual(
+                    server.resolve_prompt(snapshot["prompt_id"], response_payload),
+                    {"accepted": False},
+                )
+            refresh.assert_called_once()
+            server._prompt_broker._pending.pop("prompt_other", None)  # noqa: SLF001
+
+            worker_key = "late-a03-runner"
+            server._workers[worker_key] = threading.current_thread()  # noqa: SLF001
+            server._runner_executions[worker_key] = RunnerExecutionState(  # noqa: SLF001
+                runner_id="runner-late",
+                action="stage.a03.start",
+                stage_seq=4,
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                current_action="stage.a03.start",
+                current_stage_seq=4,
+            )
+            with patch.object(server, "_schedule_flow_snapshot_update") as refresh:
+                self.assertEqual(
+                    server.resolve_prompt(snapshot["prompt_id"], response_payload),
+                    {"accepted": False},
+                )
+            refresh.assert_called_once()
+            server._workers.pop(worker_key, None)  # noqa: SLF001
+            server._runner_executions.pop(worker_key, None)  # noqa: SLF001
+
+            with patch(
+                "tmux_core.bridge.backend.requirement_concurrency_lock",
+                side_effect=RuntimeError("并发冲突：同项目同需求已有运行中任务"),
+            ), patch.object(server, "_schedule_flow_snapshot_update") as refresh:
+                self.assertEqual(
+                    server.resolve_prompt(snapshot["prompt_id"], response_payload),
+                    {"accepted": False},
+                )
+            refresh.assert_called_once()
+            persisted = json.loads(session_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["state"], "awaiting_answer")
+            self.assertEqual(persisted["pending_answer"], "")
+
+    def test_synthetic_grill_recovery_maps_legacy_select_token_before_persisting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp).resolve()
+            requirement_name = "需求A"
+            session_path, _question_path = _write_grill_recovery_session(project_dir, requirement_name)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                action="stage.a03.start",
+            )
+            server._display_action = "stage.a03.start"  # noqa: SLF001
+            snapshot = server.build_prompt_snapshot()
+            with patch.object(server, "_schedule_flow_snapshot_update"):
+                response = server.resolve_prompt(
+                    snapshot["prompt_id"],
+                    {
+                        "prompt_id": snapshot["prompt_id"],
+                        "value": "option_2",
+                        "runner_id": snapshot["owner_runner_id"],
+                        "question_seq": snapshot["question_seq"],
+                        "grill_session_id": snapshot["grill_session_id"],
+                        "grill_question_hash": snapshot["grill_question_hash"],
+                    },
+                )
+            self.assertEqual(response, {"accepted": True})
+            persisted = json.loads(session_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["pending_answer"], "方案 B")
+            self.assertEqual(persisted["accepted_answers"][-1]["answer"], "方案 B")
+
+    def test_grill_recovery_rebinds_only_live_runner_broker_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp).resolve()
+            requirement_name = "需求A"
+            worker_state_path = project_dir / ".requirements_runtime" / "worker.state.json"
+            worker_state_path.parent.mkdir(parents=True, exist_ok=True)
+            worker_state_path.write_text(
+                json.dumps(
+                    {
+                        "project_dir": str(project_dir),
+                        "requirement_name": requirement_name,
+                        "workflow_action": "stage.a03.start",
+                        "stage_runner_id": "runner-a03-live",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            _write_grill_recovery_session(
+                project_dir,
+                requirement_name,
+                active_worker_state_path=str(worker_state_path),
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                action="stage.a03.start",
+            )
+            server._display_action = "stage.a03.start"  # noqa: SLF001
+            worker_key = "runner-worker"
+            server._workers[worker_key] = threading.current_thread()  # noqa: SLF001
+            server._runner_executions[worker_key] = RunnerExecutionState(  # noqa: SLF001
+                runner_id="runner-a03-live",
+                action="stage.a03.start",
+                stage_seq=4,
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                current_action="stage.a03.start",
+                current_stage_seq=4,
+            )
+            broker_prompt_id = f"prompt_{threading.current_thread().ident}_1"
+            prompt_queue: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+            server._prompt_broker._pending[broker_prompt_id] = prompt_queue  # noqa: SLF001
+
+            snapshot = server.build_prompt_snapshot()
+
+            self.assertEqual(snapshot["prompt_id"], broker_prompt_id)
+            self.assertEqual(snapshot["owner_runner_id"], "runner-a03-live")
+            self.assertTrue(snapshot["payload"]["can_submit"])
+            self.assertIs(server._pending_prompts[broker_prompt_id], server._pending_prompt)  # noqa: SLF001
+            with patch.object(server, "_schedule_flow_snapshot_update"), patch.object(
+                server,
+                "_restore_active_runner_after_prompt_resolution",
+            ):
+                response = server.resolve_prompt(
+                    broker_prompt_id,
+                    {
+                        "value": "option_2",
+                        "runner_id": "runner-a03-live",
+                        "question_seq": 3,
+                    },
+                )
+            self.assertEqual(response, {"accepted": True})
+            self.assertEqual(prompt_queue.get_nowait()["value"], "option_2")
+
+    def test_non_grill_prompt_response_remains_compatible_with_prompt_id_only(self):
+        server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        pending = PendingPromptState(
+            prompt_id="prompt-standard",
+            prompt_type="text",
+            payload={"title": "标准输入"},
+        )
+        prompt_queue: queue.Queue[dict[str, object]] = queue.Queue(maxsize=1)
+        server._pending_prompts[pending.prompt_id] = pending  # noqa: SLF001
+        server._pending_prompt = pending  # noqa: SLF001
+        server._prompt_broker._pending[pending.prompt_id] = prompt_queue  # noqa: SLF001
+
+        self.assertEqual(
+            server.resolve_prompt("prompt-standard", {"value": "legacy"}),
+            {"accepted": True},
+        )
+        self.assertEqual(prompt_queue.get_nowait()["value"], "legacy")
+
     def test_prompt_resolved_schedules_lightweight_snapshot_after_unblocking(self):
         server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
         server._pending_prompts["prompt_1"] = PendingPromptState(  # noqa: SLF001
@@ -5516,6 +6080,151 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(prompt.payload["title"], "HITL: 智能体运行期权限介入")
         self.assertIn("运行期权限确认", prompt.payload["prompt_text"])
         self.assertEqual(checked_blockers, ["codex_approval"])
+        resume_worker.assert_not_called()
+
+    def test_opencode_question_intervention_prompts_human_to_answer_in_tmux(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str((Path(tmpdir) / "runtime-worker.state.json").resolve())
+            error = AgentRuntimeInterventionRequired(
+                blocker_kind="opencode_question",
+                session_name="开发工程师-地杰星",
+                state_path=state_path,
+                message="Agent runtime requires manual intervention",
+            )
+            recovered_worker = SimpleNamespace(runtime_intervention_is_resolved=lambda _blocker_kind: True)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+
+            with patch.object(
+                server,
+                "_current_stage_workers_without_runtime_io",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_current_stage_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_persist_runner_awaiting_input",
+                return_value=True,
+            ), patch.object(
+                server._prompt_broker,
+                "request",
+                return_value={"value": "recheck_after_manual_intervention"},
+            ) as request_prompt, patch(
+                "T11_tui_backend.load_worker_from_state_path",
+                return_value=recovered_worker,
+            ), patch("T11_tui_backend.try_resume_worker"):
+                server._await_agent_ready_timeout_recovery(  # noqa: SLF001
+                    request_id="",
+                    action="stage.a05.start",
+                    stage_seq=24,
+                    error=error,
+                    respond=False,
+                )
+
+        request_prompt.assert_called_once()
+        prompt = request_prompt.call_args.args[0]
+        self.assertEqual(prompt.payload["recovery_kind"], "agent_runtime_intervention")
+        self.assertEqual(prompt.payload["title"], "HITL: 智能体运行期问题待回答")
+        self.assertIn("进入原 tmux 会话回答智能体的问题", prompt.payload["prompt_text"])
+        self.assertEqual(prompt.payload["attach_command"], "tmux attach -t 开发工程师-地杰星")
+
+    def test_long_running_task_intervention_explains_no_prompt_replay(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str((Path(tmpdir) / "runtime-worker.state.json").resolve())
+            error = AgentRuntimeInterventionRequired(
+                blocker_kind="long_running_task_result",
+                session_name="开发工程师-天满星",
+                state_path=state_path,
+                message="Agent runtime requires manual intervention",
+            )
+            recovered_worker = SimpleNamespace(runtime_intervention_is_resolved=lambda _blocker_kind: True)
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+
+            with patch.object(
+                server,
+                "_current_stage_workers_without_runtime_io",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_current_stage_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_persist_runner_awaiting_input",
+                return_value=True,
+            ), patch.object(
+                server._prompt_broker,
+                "request",
+                return_value={"value": "recheck_after_manual_intervention"},
+            ) as request_prompt, patch(
+                "T11_tui_backend.load_worker_from_state_path",
+                return_value=recovered_worker,
+            ), patch("T11_tui_backend.try_resume_worker"):
+                server._await_agent_ready_timeout_recovery(  # noqa: SLF001
+                    request_id="",
+                    action="stage.a07.start",
+                    stage_seq=48,
+                    error=error,
+                    respond=False,
+                )
+
+        request_prompt.assert_called_once()
+        prompt = request_prompt.call_args.args[0]
+        self.assertEqual(prompt.payload["title"], "HITL: 智能体任务长时间运行")
+        self.assertIn("不会重发提示词", prompt.payload["prompt_text"])
+        self.assertEqual(prompt.payload["attach_command"], "tmux attach -t 开发工程师-天满星")
+
+    def test_codex_hook_trust_intervention_prompts_human_without_auto_trusting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str((Path(tmpdir) / "runtime-worker.state.json").resolve())
+            error = AgentRuntimeInterventionRequired(
+                blocker_kind="codex_hook_trust",
+                session_name="需求分析师-氐土貉",
+                state_path=state_path,
+                message="Agent runtime requires manual intervention",
+            )
+            checked_blockers: list[str] = []
+            recovered_worker = SimpleNamespace(
+                runtime_intervention_is_resolved=lambda blocker_kind: checked_blockers.append(blocker_kind) or True
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+
+            with patch.object(
+                server,
+                "_current_stage_workers_without_runtime_io",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_current_stage_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_persist_runner_awaiting_input",
+                return_value=True,
+            ), patch.object(
+                server._prompt_broker,
+                "request",
+                return_value={"value": "recheck_after_manual_intervention"},
+            ) as request_prompt, patch(
+                "T11_tui_backend.load_worker_from_state_path",
+                return_value=recovered_worker,
+            ), patch("T11_tui_backend.try_resume_worker") as resume_worker:
+                server._await_agent_ready_timeout_recovery(  # noqa: SLF001
+                    request_id="",
+                    action="stage.a05.start",
+                    stage_seq=29,
+                    error=error,
+                    respond=False,
+                )
+
+        request_prompt.assert_called_once()
+        prompt = request_prompt.call_args.args[0]
+        self.assertEqual(prompt.payload["recovery_kind"], "agent_runtime_intervention")
+        self.assertEqual(prompt.payload["title"], "HITL: Codex Hook 待确认")
+        self.assertIn("系统不会自动信任", prompt.payload["prompt_text"])
+        self.assertEqual(prompt.payload["attach_command"], "tmux attach -t 需求分析师-氐土貉")
+        self.assertEqual(checked_blockers, ["codex_hook_trust"])
         resume_worker.assert_not_called()
 
     def test_prompt_shutdown_marks_runner_interrupted_without_generic_error(self):
@@ -8463,6 +9172,69 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["tmux_control_status"], "unavailable")
         self.assertEqual(snapshot["tmux_control_error"], "list-panes timeout")
         self.assertEqual(snapshot["tmux_control_unavailable_since"], "2026-07-14T10:00:00+08:00")
+
+    def test_worker_snapshot_flattens_optional_ponytail_state_without_polluting_legacy_workers(self):
+        from tmux_core.bridge.backend import _read_worker_state_snapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "worker-1",
+                        "config": {"ponytail_mode": "full"},
+                        "ponytail_policy": {
+                            "bundle_version": "4.8.4",
+                            "delivery": "runtime_prompt",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            ponytail_snapshot = _read_worker_state_snapshot(state_path)
+            state_path.write_text(json.dumps({"worker_id": "legacy-worker"}), encoding="utf-8")
+            legacy_snapshot = _read_worker_state_snapshot(state_path)
+
+        self.assertEqual(ponytail_snapshot["ponytail_mode"], "full")
+        self.assertEqual(ponytail_snapshot["ponytail_bundle_version"], "4.8.4")
+        self.assertEqual(ponytail_snapshot["ponytail_delivery"], "runtime_prompt")
+        self.assertNotIn("ponytail_mode", legacy_snapshot)
+        self.assertNotIn("ponytail_bundle_version", legacy_snapshot)
+        self.assertNotIn("ponytail_delivery", legacy_snapshot)
+
+    def test_worker_snapshot_flattens_optional_grill_state_without_polluting_legacy_workers(self):
+        from tmux_core.bridge.backend import _read_worker_state_snapshot
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "worker.state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "worker_id": "requirements-analyst",
+                        "config": {"requirements_mode": "grill-with-docs"},
+                        "grill_policy": {
+                            "bundle_commit": "ed37663cc5fbef691ddfecd080dff42f7e7e350d",
+                            "delivery": "runtime_prompt",
+                            "question_seq": 4,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            grill_snapshot = _read_worker_state_snapshot(state_path)
+            state_path.write_text(json.dumps({"worker_id": "legacy-worker"}), encoding="utf-8")
+            legacy_snapshot = _read_worker_state_snapshot(state_path)
+
+        self.assertEqual(grill_snapshot["requirements_mode"], "grill-with-docs")
+        self.assertEqual(grill_snapshot["grill_bundle_commit"], "ed37663cc5fbef691ddfecd080dff42f7e7e350d")
+        self.assertEqual(grill_snapshot["grill_delivery"], "runtime_prompt")
+        self.assertEqual(grill_snapshot["grill_question_seq"], 4)
+        self.assertNotIn("requirements_mode", legacy_snapshot)
+        self.assertNotIn("grill_bundle_commit", legacy_snapshot)
+        self.assertNotIn("grill_delivery", legacy_snapshot)
+        self.assertNotIn("grill_question_seq", legacy_snapshot)
 
     def test_ready_agent_health_does_not_erase_running_turn_contract(self):
         from tmux_core.bridge.backend import _read_worker_state_snapshot

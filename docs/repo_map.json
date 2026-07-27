@@ -28,14 +28,22 @@
       "name": "workflow_entry",
       "path": "A00_main_tui.py",
       "kind": "python_entry_orchestrator",
-      "purpose": "launch and chain A01-A08 workflow",
+      "purpose": "launch and chain A01-A08 workflow, including shared behavior-profile, requirements-interview, and project Graphify policy propagation",
       "task_keywords": [
         "main",
         "workflow",
         "stage_chain",
         "legacy_cli",
         "tui_launch",
-        "project_dir"
+        "project_dir",
+        "agent_config",
+        "ponytail_mode",
+        "behavior_profile_config",
+        "requirements_mode",
+        "grill",
+        "grill_with_docs",
+        "graphify_mode",
+        "project_graph"
       ],
       "owned_paths": [
         {
@@ -75,7 +83,11 @@
       ],
       "key_symbols": [
         "main",
-        "build_parser"
+        "build_parser",
+        "resolve_workflow_ponytail_mode",
+        "resolve_workflow_requirements_mode",
+        "resolve_workflow_graphify_mode",
+        "configured_workflow_requirements_mode"
       ],
       "first_read_selectors": [
         {
@@ -113,6 +125,10 @@
         {
           "type": "depends_on",
           "target": "M08_shared_support"
+        },
+        {
+          "type": "depends_on",
+          "target": "M12_project_graph_service"
         }
       ],
       "out_of_scope_dependencies": [
@@ -128,6 +144,14 @@
         {
           "type": "literal",
           "path": "tests/test_architecture_boundaries.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_a03_requirements_clarification.py"
         }
       ],
       "related_config_selectors": [],
@@ -135,8 +159,10 @@
       "blast_radius": "whole_python_workflow",
       "pitfall_ids": [
         "P01",
+        "P03",
         "P04",
-        "P07"
+        "P07",
+        "P08"
       ],
       "minimum_regression_selectors": [
         {
@@ -146,6 +172,10 @@
         {
           "type": "literal",
           "path": "tests/test_architecture_boundaries.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_config.py"
         }
       ],
       "read_before_edit_selectors": [
@@ -175,7 +205,11 @@
         "fact_status": "mixed",
         "evidence": [
           "README.md",
-          "README.zh-CN.md"
+          "README.zh-CN.md",
+          "tmux_core/workflow/entry.py",
+        "tests/test_a00_main.py",
+          "tests/test_grill_config.py",
+          "tests/test_a03_requirements_clarification.py"
         ],
         "unsampled_paths": []
       }
@@ -319,7 +353,7 @@
       "name": "stage_family",
       "path": "A02_RequirementIntake.py",
       "kind": "python_stage_family",
-      "purpose": "stage entry family and shared stage implementation surface",
+      "purpose": "stage entry family and shared stage implementation surface, including the persisted A03 Grill interview lifecycle",
       "task_keywords": [
         "requirement",
         "clarification",
@@ -327,7 +361,12 @@
         "design",
         "task_split",
         "development",
-        "overall_review"
+        "overall_review",
+        "requirements_mode",
+        "grill",
+        "grill_with_docs",
+        "domain_context",
+        "adr_draft"
       ],
       "owned_paths": [
         {
@@ -385,6 +424,12 @@
           "role": "stage_entry"
         },
         {
+          "type": "literal",
+          "path": "T12_requirements_common.py",
+          "match": "exact",
+          "role": "shared_requirements_support"
+        },
+        {
           "type": "subtree",
           "path": "tmux_core/stage_kernel",
           "match": "subtree",
@@ -403,6 +448,9 @@
       ],
       "key_symbols": [
         "main",
+        "run_requirements_clarification",
+        "build_requirements_grill_paths",
+        "resolve_workflow_requirements_mode",
         "needs_code_confirmation"
       ],
       "first_read_selectors": [
@@ -423,6 +471,10 @@
         {
           "type": "literal",
           "path": "T05_hitl_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tmux_core/runtime/grill.py"
         },
         {
           "type": "literal",
@@ -495,6 +547,14 @@
         {
           "type": "literal",
           "path": "tests/test_stage_kernel_turn_output_goals.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_hitl_runtime.py"
         }
       ],
       "related_config_selectors": [
@@ -514,6 +574,18 @@
     "minimum_regression_selectors": [
       {
         "type": "literal",
+        "path": "tests/test_a02_requirements_analysis.py"
+      },
+      {
+        "type": "literal",
+        "path": "tests/test_a03_requirements_clarification.py"
+      },
+      {
+        "type": "literal",
+        "path": "tests/test_t05_hitl_runtime.py"
+      },
+      {
+        "type": "literal",
         "path": "tests/test_runtime_scope_cleanup.py"
       },
       {
@@ -527,6 +599,10 @@
         {
           "type": "literal",
           "path": "tests/test_stage_kernel_turn_output_goals.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_hitl_runtime.py"
         }
       ],
       "read_before_edit_selectors": [
@@ -555,7 +631,10 @@
       "grounding": {
         "fact_status": "mixed",
       "evidence": [
+        "A02_RequirementsAnalysis.py",
         "A03_RequirementsClarification.py",
+        "T12_requirements_common.py",
+        "tests/test_a02_requirements_analysis.py",
         "tests/test_a03_requirements_clarification.py",
       "tests/test_a03_requirements_review.py",
       "tests/test_a05_detailed_design.py",
@@ -576,6 +655,8 @@
         "tests/test_runtime_scope_cleanup.py",
         "tests/test_stage_kernel_review_design_shared.py",
         "tests/test_stage_kernel_turn_output_goals.py",
+        "tests/test_t05_hitl_runtime.py",
+        "tests/test_grill_config.py",
           "tmux_core/stage_kernel/overall_review.py",
           "tmux_core/stage_kernel/task_split.py"
         ],
@@ -587,13 +668,16 @@
       "name": "prompt_contracts",
       "path": "Prompt_01_RoutingLayerPlanning.py",
       "kind": "prompt_and_contract_family",
-      "purpose": "business prompt files and output contract helpers",
+      "purpose": "business prompt files and output contract helpers, including controlled CONTEXT/ADR reference consumption in A04/A05",
       "task_keywords": [
         "prompt",
         "contract",
         "schema",
         "agent_wording",
-        "output_format"
+        "output_format",
+        "context_reference",
+        "adr_reference",
+        "grill_with_docs"
       ],
       "owned_paths": [
         {
@@ -766,6 +850,8 @@
         "evidence": [
           "T04_common_prompt.py",
           "Prompt_03_RequirementsClarification.py",
+          "Prompt_04_RequirementsReview.py",
+          "Prompt_05_DetailedDesign.py",
           "tmux_core/prompt_contracts/common.py",
           "tmux_core/prompt_contracts/spec.py",
           "tests/test_prompt_contract_specs.py",
@@ -779,7 +865,7 @@
       "name": "tmux_runtime_hitl",
       "path": "T02_tmux_agents.py",
       "kind": "runtime_and_terminal_protocol",
-      "purpose": "tmux worker control, HITL files, terminal input/output, provider runtime",
+      "purpose": "tmux worker control, HITL files, terminal I/O, provider runtime, behavior profiles, Grill interviews, and vendor-neutral Graphify evidence delivery",
       "task_keywords": [
         "tmux",
         "worker",
@@ -799,7 +885,22 @@
         "deveco",
         "deveco code",
         "agy",
-        "antigravity"
+        "antigravity",
+        "ponytail",
+        "behavior_profile",
+        "runtime_prompt_injection",
+        "vendored_skill_bundle",
+        "grill",
+        "grill_me",
+        "grill_with_docs",
+        "requirements_mode",
+        "grill_session",
+        "domain_modeling",
+        "graphify",
+        "graphify_mode",
+        "graphify_evidence",
+        "code_graph",
+        "tmux_graphify_cmd"
       ],
       "owned_paths": [
         {
@@ -843,6 +944,18 @@
           "path": "tmux_core/runtime",
           "match": "subtree",
           "role": "implementation_tree"
+        },
+        {
+          "type": "subtree",
+          "path": "third_party/ponytail",
+          "match": "subtree",
+          "role": "vendored_behavior_profile_bundle"
+        },
+        {
+          "type": "subtree",
+          "path": "third_party/mattpocock-skills",
+          "match": "subtree",
+          "role": "vendored_requirements_interview_bundle"
         }
       ],
       "entry_selectors": [
@@ -872,7 +985,23 @@
         "refresh_vendor_catalog",
         "ensure_vendor_catalog_current",
         "ensure_vendor_catalogs_current",
-        "resolve_launch"
+        "resolve_launch",
+        "PonytailMode",
+        "render_ponytail_rules",
+        "build_ponytail_bootstrap",
+        "build_ponytail_reminder",
+        "RequirementsMode",
+        "GrillTurnProfile",
+        "render_grill_rules",
+        "build_grill_bootstrap",
+        "build_grill_reminder",
+        "GraphifyMode",
+        "GraphifyTurnProfile",
+        "build_graphify_evidence_block",
+        "resolve_graphify_turn_profile",
+        "GraphifySessionModeMismatch",
+        "run_hitl_agent_loop",
+        "GrillSessionState"
       ],
       "first_read_selectors": [
         {
@@ -926,6 +1055,10 @@
         {
           "type": "used_by",
           "target": "M09_routing_init_layer"
+        },
+        {
+          "type": "depends_on",
+          "target": "M12_project_graph_service"
         }
       ],
       "out_of_scope_dependencies": [
@@ -955,14 +1088,14 @@
           "type": "literal",
           "path": "tests/test_b01_terminal_interaction.py"
         },
-      {
-        "type": "literal",
-        "path": "tests/test_runtime_contract_compat.py"
-      },
-      {
-        "type": "literal",
-        "path": "tests/test_tmux_runtime_resilience.py"
-      },
+        {
+          "type": "literal",
+          "path": "tests/test_runtime_contract_compat.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_tmux_runtime_resilience.py"
+        },
         {
           "type": "literal",
           "path": "tests/test_role_orchestration.py"
@@ -970,6 +1103,38 @@
         {
           "type": "literal",
           "path": "tests/test_vendor_catalog.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ponytail.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ponytail_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ponytail_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_hitl_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_runtime.py"
         }
       ],
       "related_config_selectors": [
@@ -983,7 +1148,8 @@
       "pitfall_ids": [
         "P01",
         "P04",
-        "P07"
+        "P07",
+        "P08"
       ],
       "minimum_regression_selectors": [
         {
@@ -1013,6 +1179,38 @@
         {
           "type": "literal",
           "path": "tests/test_role_orchestration.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ponytail.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ponytail_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ponytail_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_grill_hitl_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_runtime.py"
         }
       ],
       "read_before_edit_selectors": [
@@ -1041,16 +1239,43 @@
           "B01_terminal_interaction.py",
           "T09_terminal_ops.py",
           "tmux_core/runtime/tmux_runtime.py",
+          "tmux_core/runtime/ponytail.py",
+          "tmux_core/runtime/grill.py",
+          "tmux_core/runtime/graphify.py",
           "tmux_core/runtime/vendor_catalog.py",
           "tmux_core/runtime/hitl.py",
-      "tests/test_t02_tmux_agents.py",
-      "tests/test_b01_terminal_interaction.py",
-      "tests/test_t09_terminal_ops.py",
-      "tests/test_runtime_contract_compat.py",
-      "tests/test_tmux_runtime_resilience.py",
+          "third_party/ponytail/LICENSE",
+          "third_party/ponytail/UPSTREAM.json",
+          "third_party/ponytail/skills/ponytail/SKILL.md",
+          "third_party/ponytail/skills/ponytail-audit/SKILL.md",
+          "third_party/ponytail/skills/ponytail-debt/SKILL.md",
+          "third_party/ponytail/skills/ponytail-gain/SKILL.md",
+          "third_party/ponytail/skills/ponytail-help/SKILL.md",
+          "third_party/ponytail/skills/ponytail-review/SKILL.md",
+          "third_party/mattpocock-skills/LICENSE",
+          "third_party/mattpocock-skills/UPSTREAM.json",
+          "third_party/mattpocock-skills/skills/grill-me/SKILL.md",
+          "third_party/mattpocock-skills/skills/grill-with-docs/SKILL.md",
+          "third_party/mattpocock-skills/skills/grilling/SKILL.md",
+          "third_party/mattpocock-skills/skills/domain-modeling/SKILL.md",
+          "third_party/mattpocock-skills/skills/domain-modeling/CONTEXT-FORMAT.md",
+          "third_party/mattpocock-skills/skills/domain-modeling/ADR-FORMAT.md",
+          "tests/test_t02_tmux_agents.py",
+          "tests/test_b01_terminal_interaction.py",
+          "tests/test_t09_terminal_ops.py",
+          "tests/test_runtime_contract_compat.py",
+          "tests/test_tmux_runtime_resilience.py",
           "tests/test_vendor_catalog.py",
           "tests/test_t05_hitl_runtime.py",
-          "tests/test_role_orchestration.py"
+          "tests/test_role_orchestration.py",
+          "tests/test_ponytail.py",
+          "tests/test_ponytail_runtime.py",
+          "tests/test_ponytail_config.py",
+          "tests/test_grill.py",
+          "tests/test_grill_runtime.py",
+          "tests/test_grill_config.py",
+          "tests/test_grill_hitl_runtime.py",
+          "tests/test_graphify_runtime.py"
         ],
         "unsampled_paths": []
       }
@@ -1060,7 +1285,7 @@
       "name": "bridge_protocol_backends",
       "path": "T10_tui_protocol.py",
       "kind": "python_bridge_protocol",
-      "purpose": "NDJSON protocol and Python backends for TUI/Web clients",
+      "purpose": "NDJSON protocol and Python backends for TUI/Web clients, including recoverable Grill prompts and safe project-level Graphify status",
       "task_keywords": [
         "protocol",
         "backend",
@@ -1068,7 +1293,22 @@
         "opentui",
         "web_backend",
         "api",
-        "healthz"
+        "healthz",
+        "worker_snapshot",
+        "ponytail_mode",
+        "ponytail_bundle_version",
+        "ponytail_delivery",
+        "requirements_mode",
+        "grill_bundle_commit",
+        "grill_delivery",
+        "grill_question_seq",
+        "interaction_kind",
+        "recommendation",
+        "reason_text",
+        "prompt_response_cursor",
+        "graphify_status",
+        "snapshot_app_graphify",
+        "graphify_report_preview"
       ],
       "owned_paths": [
         {
@@ -1120,7 +1360,12 @@
         "build_response",
         "build_event",
         "encode_message",
-        "decode_message"
+        "decode_message",
+        "_flatten_ponytail_worker_fields",
+        "_flatten_grill_worker_fields",
+        "_read_graphify_app_status",
+        "PromptBroker",
+        "PendingPromptState"
       ],
       "first_read_selectors": [
         {
@@ -1166,6 +1411,10 @@
         {
           "type": "used_by",
           "target": "M02_web_launcher"
+        },
+        {
+          "type": "depends_on",
+          "target": "M12_project_graph_service"
         }
       ],
       "out_of_scope_dependencies": [
@@ -1188,6 +1437,18 @@
         {
           "type": "literal",
           "path": "tests/test_tui_web_protocol_no_audit.py"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/promptMetadata.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/graphifyStatus.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/web/src/domain/promptMetadata.test.ts"
         }
       ],
       "related_config_selectors": [
@@ -1205,7 +1466,8 @@
       "pitfall_ids": [
         "P01",
         "P05",
-        "P07"
+        "P07",
+        "P08"
       ],
       "minimum_regression_selectors": [
         {
@@ -1223,6 +1485,14 @@
         {
           "type": "literal",
           "path": "tests/test_tui_web_protocol_no_audit.py"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/promptMetadata.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/web/src/domain/promptMetadata.test.ts"
         }
       ],
       "read_before_edit_selectors": [
@@ -1250,9 +1520,12 @@
         "evidence": [
           "tmux_core/bridge/backend.py",
           "tmux_core/bridge/web_backend.py",
+          "tmux_core/runtime/graphify.py",
           "tests/test_t11_tui_backend.py",
           "tests/test_t11_web_backend.py",
-          "tests/test_tui_web_protocol_no_audit.py"
+          "tests/test_tui_web_protocol_no_audit.py",
+          "packages/tui/src/promptMetadata.test.ts",
+          "packages/web/src/domain/promptMetadata.test.ts"
         ],
         "unsampled_paths": []
       }
@@ -1262,7 +1535,7 @@
       "name": "frontend_packages",
       "path": "packages",
       "kind": "bun_solid_frontend_family",
-      "purpose": "OpenTUI terminal UI and Solid Web console",
+      "purpose": "OpenTUI terminal UI and Solid Web console, including Grill prompts, recovery metadata, worker labels, and project Graphify status",
       "task_keywords": [
         "frontend",
         "opentui",
@@ -1275,7 +1548,19 @@
         "vendor_label",
         "mimo",
         "deveco",
-        "deveco code"
+        "deveco code",
+        "ponytail",
+        "behavior_profile_label",
+        "agent_config_label",
+        "requirements_mode",
+        "grill",
+        "grill_prompt",
+        "recommendation",
+        "reason_text",
+        "prompt_cursor",
+        "graphify_status",
+        "code_graph_status",
+        "graphify_report"
       ],
       "owned_paths": [
         {
@@ -1365,7 +1650,12 @@
       ],
       "key_symbols": [
         "promptSyncUpdateFromSnapshot",
-        "reconcilePromptSyncState"
+        "reconcilePromptSyncState",
+        "buildAgentConfigLabel",
+        "resolvePromptMetadata",
+        "grillPromptKicker",
+        "normalizeGraphifyStatus",
+        "graphifyStatusLabel"
       ],
       "first_read_selectors": [
         {
@@ -1461,8 +1751,16 @@
         },
         {
           "type": "literal",
+          "path": "packages/tui/src/promptMetadata.test.ts"
+        },
+        {
+          "type": "literal",
           "path": "packages/tui/src/routes_smoke.test.ts"
-      },
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/ui_smoke.test.ts"
+        },
       {
         "type": "literal",
         "path": "packages/tui/src/backend/client.test.ts"
@@ -1478,6 +1776,18 @@
       {
         "type": "literal",
         "path": "packages/web/src/domain/normalize.test.ts"
+      },
+      {
+        "type": "literal",
+        "path": "packages/web/src/domain/agents.test.ts"
+      },
+      {
+        "type": "literal",
+        "path": "packages/web/src/domain/promptMetadata.test.ts"
+      },
+      {
+        "type": "literal",
+        "path": "packages/web/src/domain/graphifyStatus.test.ts"
       },
     {
       "type": "literal",
@@ -1511,6 +1821,7 @@
       "pitfall_ids": [
         "P03",
         "P05",
+        "P08",
         "P09"
       ],
       "minimum_regression_selectors": [
@@ -1544,8 +1855,20 @@
         },
         {
           "type": "literal",
+          "path": "packages/tui/src/promptMetadata.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/graphifyStatus.test.ts"
+        },
+        {
+          "type": "literal",
           "path": "packages/tui/src/routes_smoke.test.ts"
-      },
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/ui_smoke.test.ts"
+        },
       {
         "type": "literal",
         "path": "packages/tui/src/backend/client.test.ts"
@@ -1561,6 +1884,18 @@
     {
       "type": "literal",
       "path": "packages/web/src/domain/stageState.test.ts"
+    },
+    {
+      "type": "literal",
+      "path": "packages/web/src/domain/agents.test.ts"
+    },
+    {
+      "type": "literal",
+      "path": "packages/web/src/domain/promptMetadata.test.ts"
+    },
+    {
+      "type": "literal",
+      "path": "packages/web/src/domain/graphifyStatus.test.ts"
     },
     {
       "type": "literal",
@@ -1590,6 +1925,8 @@
         "fact_status": "mixed",
         "evidence": [
       "packages/tui/src/app.tsx",
+      "packages/tui/src/ui/DialogConfirm.tsx",
+      "packages/tui/src/ui_smoke.test.ts",
       "packages/tui/src/backend/client.test.ts",
       "packages/tui/src/backend/client.ts",
       "packages/tui/src/footerProgress.test.ts",
@@ -1598,6 +1935,10 @@
           "packages/tui/src/promptTransition.ts",
           "packages/tui/src/promptSnapshot.test.ts",
           "packages/tui/src/promptSnapshot.ts",
+          "packages/tui/src/promptMetadata.ts",
+          "packages/tui/src/promptMetadata.test.ts",
+          "packages/tui/src/graphifyStatus.ts",
+          "packages/tui/src/graphifyStatus.test.ts",
           "packages/tui/src/homeAgents.ts",
           "packages/tui/src/homeAgents.test.ts",
           "packages/tui/src/routes/HomeRoute.tsx",
@@ -1613,7 +1954,13 @@
       "packages/web/src/domain/normalize.ts",
       "packages/web/src/domain/stageState.test.ts",
       "packages/web/src/domain/stageState.ts",
-      "packages/web/src/domain/types.ts",
+          "packages/web/src/domain/types.ts",
+          "packages/web/src/domain/agents.ts",
+          "packages/web/src/domain/agents.test.ts",
+          "packages/web/src/domain/promptMetadata.ts",
+          "packages/web/src/domain/promptMetadata.test.ts",
+          "packages/web/src/domain/graphifyStatus.ts",
+          "packages/web/src/domain/graphifyStatus.test.ts",
       "packages/web/src",
       "packages/web/src/styles/app.css",
       "packages/web/tests",
@@ -1634,6 +1981,8 @@
         "tools",
         "pre_development",
         "requirements_common",
+        "requirements_mode",
+        "grill_config",
         "path",
         "json",
         "helper"
@@ -1683,6 +2032,8 @@
         }
       ],
       "key_symbols": [
+        "resolve_workflow_requirements_mode",
+        "configured_workflow_requirements_mode",
         "needs_code_confirmation"
       ],
       "first_read_selectors": [
@@ -1776,8 +2127,11 @@
       ],
       "scope_notes": [],
       "grounding": {
-        "fact_status": "needs_code_confirmation",
-        "evidence": [],
+        "fact_status": "mixed",
+        "evidence": [
+          "tmux_core/stage_kernel/shared_review.py",
+          "tests/test_grill_config.py"
+        ],
         "unsampled_paths": []
       }
     },
@@ -1786,7 +2140,7 @@
       "name": "routing_init_layer",
       "path": "docs/repo_map.json",
       "kind": "machine_routing_layer_and_initializer",
-      "purpose": "create, validate, audit, and store routing artifacts",
+      "purpose": "create, validate, audit, and store routing artifacts while treating Graphify only as optional static input for route creation",
       "task_keywords": [
         "agents_md",
         "repo_map",
@@ -1794,7 +2148,10 @@
         "pitfalls",
         "routing_layer",
         "audit",
-        "machine_first"
+        "machine_first",
+        "graphify",
+        "graphify_evidence",
+        "code_graph_candidate"
       ],
       "owned_paths": [
         {
@@ -1945,6 +2302,10 @@
         {
           "type": "literal",
           "path": "tests/test_t03_agent_init_workflow.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ai_hermes_route_task.py"
         }
       ],
       "relations": [
@@ -1959,6 +2320,10 @@
         {
           "type": "writes",
           "target": "M10_generated_artifacts"
+        },
+        {
+          "type": "depends_on",
+          "target": "M12_project_graph_service"
         }
       ],
       "out_of_scope_dependencies": [
@@ -1972,6 +2337,10 @@
         {
           "type": "literal",
           "path": "tests/test_t03_agent_init_workflow.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_ai_hermes_route_task.py"
         }
       ],
       "related_config_selectors": [],
@@ -2035,8 +2404,10 @@
           "skills/ai-hermes-routing-init/scripts/route_task.py",
           "A01_Routing_LayerPlanning.py",
           "T03_agent_init_workflow.py",
+          "tmux_core/runtime/graphify.py",
           "tests/test_a01_routing_layer_planning.py",
-          "tests/test_t03_agent_init_workflow.py"
+          "tests/test_t03_agent_init_workflow.py",
+          "tests/test_ai_hermes_route_task.py"
         ],
         "unsampled_paths": []
       }
@@ -2127,18 +2498,249 @@
       }
     },
     {
+      "id": "M12_project_graph_service",
+      "name": "project_graph_service",
+      "path": "tmux_core/runtime/graphify.py",
+      "kind": "isolated_external_tool_adapter",
+      "purpose": "resolve pinned Graphify tooling, build safe code-only project snapshots and immutable graph generations, and provide bounded read-only evidence",
+      "task_keywords": [
+        "graphify",
+        "graphifyy",
+        "graphify_mode",
+        "project_graph",
+        "code_graph",
+        "code_only",
+        "source_snapshot",
+        "graph_cache",
+        "affected",
+        "god_nodes",
+        "tmux_graphify"
+      ],
+      "owned_paths": [
+        {
+          "type": "literal",
+          "path": "tmux_core/runtime/graphify.py",
+          "match": "exact",
+          "role": "project_graph_adapter"
+        },
+        {
+          "type": "literal",
+          "path": "scripts/tmux-graphify",
+          "match": "exact",
+          "role": "managed_tool_cli"
+        },
+        {
+          "type": "subtree",
+          "path": "tools/graphify",
+          "match": "subtree",
+          "role": "isolated_tool_manifest"
+        }
+      ],
+      "entry_selectors": [
+        {
+          "type": "literal",
+          "path": "tmux_core/runtime/graphify.py"
+        },
+        {
+          "type": "literal",
+          "path": "scripts/tmux-graphify"
+        }
+      ],
+      "key_symbols": [
+        "GraphifyMode",
+        "GraphifyStatus",
+        "GraphifyTurnProfile",
+        "GraphifyToolResolution",
+        "GraphifyProjectSnapshot",
+        "GraphifyEvidence",
+        "TurnContextBlock",
+        "resolve_graphify_turn_profile",
+        "build_graphify_evidence_block",
+        "read_graphify_project_status"
+      ],
+      "first_read_selectors": [
+        {
+          "type": "literal",
+          "path": "tmux_core/runtime/graphify.py"
+        },
+        {
+          "type": "literal",
+          "path": "scripts/tmux-graphify"
+        }
+      ],
+      "then_check_selectors": [
+        {
+          "type": "literal",
+          "path": "tools/graphify/pyproject.toml"
+        },
+        {
+          "type": "literal",
+          "path": "tools/graphify/uv.lock"
+        },
+        {
+          "type": "literal",
+          "path": "tools/graphify/UPSTREAM.json"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_runtime.py"
+        }
+      ],
+      "relations": [
+        {
+          "type": "used_by",
+          "target": "M01_workflow_entry"
+        },
+        {
+          "type": "used_by",
+          "target": "M05_tmux_runtime_hitl"
+        },
+        {
+          "type": "used_by",
+          "target": "M06_bridge_protocol_backends"
+        },
+        {
+          "type": "used_by",
+          "target": "M09_routing_init_layer"
+        },
+        {
+          "type": "verified_by",
+          "target": "M11_tests"
+        }
+      ],
+      "out_of_scope_dependencies": [
+        "graphify_external_binary",
+        "uv_registry_and_network",
+        "target_project_dynamic_runtime_behavior"
+      ],
+      "related_test_selectors": [
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_t11_tui_backend.py"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/graphifyStatus.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/web/src/domain/graphifyStatus.test.ts"
+        }
+      ],
+      "related_config_selectors": [
+        {
+          "type": "literal",
+          "path": "tools/graphify/pyproject.toml"
+        },
+        {
+          "type": "literal",
+          "path": "tools/graphify/uv.lock"
+        },
+        {
+          "type": "literal",
+          "path": "tools/graphify/UPSTREAM.json"
+        }
+      ],
+      "edit_risk": "high",
+      "blast_radius": "project_source_scanning_and_all_agent_turn_context",
+      "pitfall_ids": [
+        "P06",
+        "P07",
+        "P08"
+      ],
+      "minimum_regression_selectors": [
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_config.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_t11_tui_backend.py"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/graphifyStatus.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/web/src/domain/graphifyStatus.test.ts"
+        }
+      ],
+      "read_before_edit_selectors": [
+        {
+          "type": "field_ref",
+          "field": "first_read_selectors"
+        },
+        {
+          "type": "field_ref",
+          "field": "then_check_selectors"
+        },
+        {
+          "type": "field_ref",
+          "field": "related_test_selectors"
+        },
+        {
+          "type": "field_ref",
+          "field": "related_config_selectors"
+        }
+      ],
+      "routing_confidence": "medium",
+      "expand_search_codes": [
+        "TX03",
+        "TX04",
+        "TX05",
+        "TX07"
+      ],
+      "scope_notes": [],
+      "grounding": {
+        "fact_status": "grounded",
+        "evidence": [
+          "tmux_core/runtime/graphify.py",
+          "scripts/tmux-graphify",
+          "tools/graphify/pyproject.toml",
+          "tools/graphify/uv.lock",
+          "tools/graphify/UPSTREAM.json",
+          "tmux_core/runtime/tmux_runtime.py",
+          "tmux_core/bridge/backend.py",
+          "tests/test_graphify_runtime.py",
+          "tests/test_graphify_config.py",
+          "tests/test_t11_tui_backend.py",
+          "packages/tui/src/graphifyStatus.ts",
+          "packages/tui/src/graphifyStatus.test.ts",
+          "packages/web/src/domain/graphifyStatus.ts",
+          "packages/web/src/domain/graphifyStatus.test.ts"
+        ],
+        "unsampled_paths": []
+      }
+    },
+    {
       "id": "M11_tests",
       "name": "tests",
       "path": "tests",
       "kind": "pytest_regression_suite",
-      "purpose": "visible Python regression and boundary tests",
+      "purpose": "visible Python regression and boundary tests, including the isolated Graphify service and frontend status contract",
       "task_keywords": [
         "test",
         "pytest",
         "regression",
         "boundary",
         "failing_test",
-        "coverage"
+        "coverage",
+        "graphify",
+        "code_graph",
+        "graph_cache"
       ],
       "owned_paths": [
         {
@@ -2201,6 +2803,10 @@
         {
           "type": "verifies",
           "target": "M06_bridge_protocol_backends"
+        },
+        {
+          "type": "verifies",
+          "target": "M12_project_graph_service"
         }
       ],
       "out_of_scope_dependencies": [],
@@ -2219,7 +2825,8 @@
       "blast_radius": "regression_confidence",
       "pitfall_ids": [
         "P01",
-        "P06"
+        "P06",
+        "P08"
       ],
       "minimum_regression_selectors": [
         {
@@ -2245,8 +2852,13 @@
       ],
       "scope_notes": [],
       "grounding": {
-        "fact_status": "needs_code_confirmation",
-        "evidence": [],
+        "fact_status": "mixed",
+        "evidence": [
+          "tests/test_graphify_runtime.py",
+          "tests/test_t11_tui_backend.py",
+          "packages/tui/src/graphifyStatus.test.ts",
+          "packages/web/src/domain/graphifyStatus.test.ts"
+        ],
         "unsampled_paths": []
       }
     }

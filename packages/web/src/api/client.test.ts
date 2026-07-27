@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { connectBridgeEvents, getRequirements, parseBridgeEvent } from './client'
+import { connectBridgeEvents, getRequirements, parseBridgeEvent, submitPromptResponse } from './client'
 
 class FakeEventSource {
   listeners = new Map<string, Array<(event: MessageEvent<string>) => void>>()
@@ -41,9 +41,10 @@ test('connectBridgeEvents registers named bridge events', () => {
   fake.emit('log.append', { text: 'hello' })
   fake.emit('snapshot.stage', { route: 'development' })
   fake.emit('prompt.request', { id: 'prompt_1' })
+  fake.emit('snapshot.prompt', { pending: true, prompt_id: 'prompt_1' })
   disconnect()
 
-  expect(received).toEqual(['log.append', 'snapshot.stage', 'prompt.request'])
+  expect(received).toEqual(['log.append', 'snapshot.stage', 'prompt.request', 'snapshot.prompt'])
   expect(fake.closed).toBe(true)
 })
 
@@ -65,4 +66,36 @@ test('getRequirements reports non-json backend response clearly', async () => {
   } finally {
     globalThis.fetch = originalFetch
   }
+})
+
+test('submitPromptResponse carries the Grill cursor and keeps legacy calls unchanged', async () => {
+  const originalFetch = globalThis.fetch
+  const bodies: Array<Record<string, unknown>> = []
+  globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    bodies.push(JSON.parse(String(init?.body ?? '{}')) as Record<string, unknown>)
+    return new Response(JSON.stringify({ ok: true, payload: { accepted: true } }), { status: 200 })
+  }) as typeof fetch
+  try {
+    await submitPromptResponse('prompt-grill', 'A', {
+      runnerId: 'runner-a03',
+      questionSeq: 3,
+      grillSessionId: 'session-a',
+      grillQuestionHash: 'sha256:abc',
+    })
+    await submitPromptResponse('prompt-standard', 'legacy')
+  } finally {
+    globalThis.fetch = originalFetch
+  }
+
+  expect(bodies).toEqual([
+    {
+      prompt_id: 'prompt-grill',
+      value: 'A',
+      runner_id: 'runner-a03',
+      question_seq: 3,
+      grill_session_id: 'session-a',
+      grill_question_hash: 'sha256:abc',
+    },
+    { prompt_id: 'prompt-standard', value: 'legacy' },
+  ])
 })

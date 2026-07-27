@@ -1009,6 +1009,49 @@ mimo/mimo-v2.5-pro
         gemini_resolution = resolve_launch("gemini", "auto", "medium", catalog=catalog)
         self.assertEqual(gemini_resolution.resolved_model, "flash")
 
+    def test_codex_gpt5_alias_tracks_scanned_default_without_reviving_retired_model(self):
+        current_model = ModelInventory(
+            vendor_id="codex",
+            model_id="gpt-5.5",
+            display_name="GPT-5.5",
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            reasoning=ReasoningInventory(
+                vendor_id="codex",
+                model_id="gpt-5.5",
+                source_kind=SOURCE_DYNAMIC_CLI,
+                confidence=CONFIDENCE_HIGH,
+                reasoning_control_mode=REASONING_NATIVE,
+                supports_reasoning=True,
+                native_reasoning_levels=("low", "medium", "high", "xhigh"),
+                normalized_reasoning_levels=("low", "medium", "high", "xhigh", "max"),
+                default_normalized_effort="high",
+                default_native_level="medium",
+            ),
+        )
+        catalog = CatalogSnapshot(
+            schema_version=SCHEMA_VERSION,
+            generated_at="2026-07-26T00:00:00+00:00",
+            cache_path="/tmp/catalog.json",
+            vendors=(
+                VendorInventory(
+                    vendor_id="codex",
+                    installed=True,
+                    scan_status=OK_SCAN_STATUS,
+                    source_kind=SOURCE_DYNAMIC_CLI,
+                    confidence=CONFIDENCE_HIGH,
+                    binary_path="/usr/bin/codex",
+                    models=(current_model,),
+                    default_model=current_model.model_id,
+                ),
+            ),
+        )
+
+        alias_resolution = resolve_launch("codex", "gpt-5", "high", catalog=catalog)
+        self.assertEqual(alias_resolution.resolved_model, "gpt-5.5")
+        with self.assertRaisesRegex(ValueError, "model unavailable"):
+            resolve_launch("codex", "gpt-5.4", "high", catalog=catalog)
+
     def test_removed_qwen_and_kimi_vendors_are_rejected(self):
         for vendor_id in ("qwen", "kimi"):
             with self.subTest(vendor=vendor_id):

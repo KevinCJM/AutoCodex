@@ -12,6 +12,7 @@ import {
 } from './api/client'
 import { appendLog, classifyLog } from './domain/logs'
 import { buildAgentConfigLabel, buildHomeAgents, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState } from './domain/agents'
+import { graphifyStatusLabel, graphifyStatusTone } from './domain/graphifyStatus'
 import {
   EMPTY_APP,
   EMPTY_CONTROL,
@@ -26,6 +27,7 @@ import {
   normalizeStageSnapshot,
 } from './domain/normalize'
 import { resolvePromptAwareStatus, resolvePromptResponseTransition } from './domain/promptTransition'
+import { grillPromptKicker, promptAnswerOptions, promptCanSubmit, promptRecoveryMessage, resolvePromptMetadata } from './domain/promptMetadata'
 import { STAGE_LABELS, STAGE_ROUTES, routeLabel, stageLabelForAction, stageRouteForAction } from './domain/stages'
 import {
   applyStageGeneration,
@@ -176,6 +178,15 @@ function PromptCard(props: { prompt: PromptSnapshot; hitl: HitlSnapshot; onSubmi
   const [error, setError] = createSignal('')
   const [submitting, setSubmitting] = createSignal(false)
   const promptType = createMemo(() => String(props.prompt.promptType || 'text'))
+  const promptMetadata = createMemo(() => resolvePromptMetadata({
+    interactionKind: props.prompt.interactionKind,
+    questionIndex: props.prompt.questionIndex,
+    recommendation: props.prompt.recommendation,
+    reasonText: props.prompt.reasonText,
+  }, props.prompt.payload))
+  const canSubmit = createMemo(() => promptCanSubmit(props.prompt.payload))
+  const recoveryMessage = createMemo(() => promptRecoveryMessage(props.prompt.payload))
+  const answerOptions = createMemo(() => promptAnswerOptions(props.prompt.payload))
   const isSelectPrompt = createMemo(() => promptType() === 'select' || promptType() === 'confirm')
   const selectOptions = createMemo<ChoiceOption[]>(() => {
     const rawOptions = Array.isArray(props.prompt.payload.options) ? props.prompt.payload.options : []
@@ -218,11 +229,11 @@ function PromptCard(props: { prompt: PromptSnapshot; hitl: HitlSnapshot; onSubmi
   })
   let previousPromptKey = ''
   const changeChoice = (value: string) => {
-    if (submitting()) return
+    if (submitting() || !canSubmit()) return
     setDraft(value)
   }
   const sendValue = async (value: unknown) => {
-    if (submitting()) return
+    if (submitting() || !canSubmit()) return
     setError('')
     setSubmitting(true)
     try {
@@ -269,22 +280,48 @@ function PromptCard(props: { prompt: PromptSnapshot; hitl: HitlSnapshot; onSubmi
 
   return (
     <section class={`hero-card prompt-card ${submitting() ? 'is-processing' : ''}`}>
-      <div class="card-kicker">需要你输入</div>
+      <div class="card-kicker">{grillPromptKicker(promptMetadata())}</div>
       <h2>{title()}</h2>
-      <Show when={!isSelectPrompt()}>
+      <Show when={promptMetadata().reasonText}>
+        <div class="prompt-guidance">
+          <span>{promptMetadata().isGrill ? '为什么需要决定' : '原因'}</span>
+          <p>{promptMetadata().reasonText}</p>
+        </div>
+      </Show>
+      <Show when={promptMetadata().recommendation}>
+        <div class="prompt-guidance prompt-recommendation">
+          <span>推荐答案</span>
+          <p>{promptMetadata().recommendation}</p>
+        </div>
+      </Show>
+      <Show when={answerOptions().length > 0}>
+        <div class="prompt-guidance">
+          <span>可选答案</span>
+          <p>{answerOptions().join(' / ')}</p>
+        </div>
+      </Show>
+      <Show when={!canSubmit()}>
+        <div class="prompt-guidance" role="status" aria-live="polite">
+          <span>等待需求澄清 runner 恢复</span>
+          <p>{recoveryMessage() || '问题已恢复为只读状态；runner 恢复后系统会自动开放输入。'}</p>
+        </div>
+      </Show>
+      <Show when={!isSelectPrompt() && canSubmit()}>
         <label class="sr-only" for={fieldId()}>{title()}</label>
       </Show>
-      <Switch>
-        <Match when={isSelectPrompt()}>
-          <ChoiceButtons options={visibleSelectOptions()} value={draft()} onChange={changeChoice} ariaLabel={title()} disabled={submitting()} />
-        </Match>
-        <Match when={promptType() === 'multiline'}>
-          <textarea id={fieldId()} rows={7} value={draft()} disabled={submitting()} onInput={(event) => setDraft(event.currentTarget.value)} />
-        </Match>
-        <Match when={true}>
-          <input id={fieldId()} value={draft()} disabled={submitting()} onInput={(event) => setDraft(event.currentTarget.value)} />
-        </Match>
-      </Switch>
+      <Show when={canSubmit()}>
+        <Switch>
+          <Match when={isSelectPrompt()}>
+            <ChoiceButtons options={visibleSelectOptions()} value={draft()} onChange={changeChoice} ariaLabel={title()} disabled={submitting()} />
+          </Match>
+          <Match when={promptType() === 'multiline'}>
+            <textarea id={fieldId()} rows={7} value={draft()} disabled={submitting()} onInput={(event) => setDraft(event.currentTarget.value)} />
+          </Match>
+          <Match when={true}>
+            <input id={fieldId()} value={draft()} disabled={submitting()} onInput={(event) => setDraft(event.currentTarget.value)} />
+          </Match>
+        </Switch>
+      </Show>
       <Show when={submitting()}>
         <div class="prompt-processing" role="status" aria-live="polite">
           <span class="mini-spinner" />
@@ -293,10 +330,12 @@ function PromptCard(props: { prompt: PromptSnapshot; hitl: HitlSnapshot; onSubmi
       </Show>
       <Show when={error() || backendError()}><p class="form-error">{error() || backendError()}</p></Show>
       <div class="primary-actions">
-        <Show when={canGoBack()}>
+        <Show when={canSubmit() && canGoBack()}>
           <button class="ghost-button" disabled={submitting()} onClick={goBack}>上一步</button>
         </Show>
-        <button class="primary-button" disabled={submitting()} onClick={submit}><Send size={16} />提交</button>
+        <Show when={canSubmit()}>
+          <button class="primary-button" disabled={submitting()} onClick={submit}><Send size={16} />提交</button>
+        </Show>
         <Show when={previewPath()}><button class="ghost-button" disabled={submitting()} onClick={() => props.onPreview(previewPath())}><FileText size={16} />预览</button></Show>
       </div>
     </section>
@@ -308,6 +347,7 @@ function CurrentCard(props: {
   stage: StageSnapshot
   artifacts: ArtifactsSnapshot
   agentCount: number
+  onPreview: (path: string) => void
 }) {
   const requirement = () => props.stage.requirementName || props.app.requirementName
   return (
@@ -320,7 +360,25 @@ function CurrentCard(props: {
       <div class="summary-strip">
         <StatLine label="智能体" value={props.agentCount} tone={props.agentCount > 0 ? 'active' : 'muted'} />
         <StatLine label="文件" value={props.artifacts.items.length} />
+        <Show when={props.app.graphify} keyed>
+          {(graphify) => (
+            <StatLine
+              label="代码图谱"
+              value={`${graphifyStatusLabel(graphify)}${graphify.version ? ` · v${graphify.version}` : ''}`}
+              tone={graphifyStatusTone(graphify)}
+            />
+          )}
+        </Show>
       </div>
+      <Show when={props.app.graphify?.nodeCount || props.app.graphify?.edgeCount}>
+        <p class="hero-copy">{`${props.app.graphify?.nodeCount ?? 0} nodes / ${props.app.graphify?.edgeCount ?? 0} edges`}</p>
+      </Show>
+      <Show when={props.app.graphify?.lastError}>
+        <p class="form-error">{props.app.graphify?.lastError}</p>
+      </Show>
+      <Show when={props.app.graphify?.reportPath}>
+        <PathButton path={props.app.graphify?.reportPath ?? ''} label="Graphify evidence report" onPreview={props.onPreview} />
+      </Show>
     </section>
   )
 }
@@ -469,7 +527,13 @@ function HomeView(props: {
         <PromptCard prompt={props.snapshots.prompt} hitl={props.snapshots.hitl} onSubmit={props.onPromptSubmit} onPreview={props.onPreview} />
       </Show>
       <AttentionCard app={app()} hitl={props.snapshots.hitl} onPreview={props.onPreview} />
-      <CurrentCard app={app()} stage={stage()} artifacts={props.snapshots.artifacts} agentCount={props.agents.length} />
+      <CurrentCard
+        app={app()}
+        stage={stage()}
+        artifacts={props.snapshots.artifacts}
+        agentCount={props.agents.length}
+        onPreview={props.onPreview}
+      />
       <AgentOverview agents={props.agents} />
       <StartWorkflowCard
         busy={busy()}
@@ -1016,6 +1080,22 @@ export function App() {
       })
       return
     }
+    if (event.type === 'snapshot.prompt') {
+      promptRevision += 1
+      const prompt = normalizePromptSnapshot(event.payload)
+      setSnapshots((prev) => ({
+        ...prev,
+        prompt,
+        app: {
+          ...prev.app,
+          activeStageStatus: prompt.pending
+            ? resolvePromptAwareStatus(prev.app.activeStageStatus, true)
+            : prev.app.activeStageStatus,
+        },
+      }))
+      if (prompt.pending) setActiveTab('home')
+      return
+    }
     if (event.type === 'snapshot.artifacts') {
       setSnapshots((prev) => ({ ...prev, artifacts: normalizeArtifactsSnapshot(event.payload) as ArtifactsSnapshot }))
       return
@@ -1075,7 +1155,23 @@ export function App() {
   const submitPrompt = async (value: unknown) => {
     const submitted = snapshots().prompt
     if (!submitted.pending || !submitted.promptId) return
-    const response = await submitPromptResponse(submitted.promptId, value)
+    if (!promptCanSubmit(submitted.payload)) return
+    const response = await submitPromptResponse(
+      submitted.promptId,
+      value,
+      submitted.ownerRunnerId !== undefined && submitted.questionSeq !== undefined
+        ? {
+          runnerId: submitted.ownerRunnerId,
+          questionSeq: submitted.questionSeq,
+          grillSessionId: String(
+            submitted.payload.grill_session_id ?? submitted.payload.grillSessionId ?? '',
+          ).trim() || undefined,
+          grillQuestionHash: String(
+            submitted.payload.grill_question_hash ?? submitted.payload.grillQuestionHash ?? '',
+          ).trim() || undefined,
+        }
+        : undefined,
+    )
     const accepted = response.accepted === true
     const transition = resolvePromptResponseTransition(submitted.promptId, snapshots().prompt, accepted)
     if (!transition.accepted) {

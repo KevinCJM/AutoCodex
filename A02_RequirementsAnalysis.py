@@ -67,12 +67,16 @@ from A03_RequirementsClarification import (
     RequirementsAnalystHandoff,
     REQUIREMENTS_CLARIFICATION_STAGE_NAME,
     REQUIREMENTS_CLARIFICATION_TURN_PHASE,
+    REQUIREMENTS_RUNTIME_ROOT_NAME,
     RequirementsClarificationAgentSelection,
     RequirementsClarificationStageResult,
     RequirementsStageResult,
     collect_requirements_clarification_agent_selection,
     collect_request as collect_clarification_request,
+    archive_terminal_requirements_grill_session,
+    build_requirements_grill_paths,
     has_existing_requirements_clarification,
+    load_persisted_requirements_grill_selection,
     load_json_object as load_clarification_json_object,
     normalize_effort_choice,
     normalize_model_choice,
@@ -103,7 +107,15 @@ from T08_pre_development import (
 from T09_terminal_ops import SingleLineSpinnerMonitor, clear_pending_tty_input, maybe_launch_tui, message
 from T02_tmux_agents import TmuxBatchWorker
 from T05_hitl_runtime import build_prefixed_sha256
-from tmux_core.stage_kernel.shared_review import is_agent_config_error
+from tmux_core.runtime.hitl import read_grill_session_header
+from tmux_core.stage_kernel.shared_review import (
+    configured_workflow_requirements_mode,
+    is_agent_config_error,
+    resolve_main_ponytail_mode,
+    resolve_workflow_ponytail_mode,
+    resolve_workflow_graphify_mode,
+    resolve_workflow_requirements_mode,
+)
 from T12_requirements_common import (
     DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT,
     DEFAULT_REQUIREMENTS_ANALYSIS_MODEL,
@@ -144,6 +156,11 @@ _INTAKE_VALUE_FLAGS = {
     "--requirement-name",
     "--input-type",
     "--input-value",
+    "--ponytail-mode",
+    "--main-ponytail-mode",
+    "--requirements-mode",
+    "--graphify-mode",
+    "--agent-config",
 }
 
 
@@ -175,6 +192,55 @@ def _build_intake_argv(argv: Sequence[str]) -> list[str]:
             continue
         index += 1
     return filtered
+
+
+def _materialize_workflow_ponytail_args(argv: Sequence[str]) -> tuple[list[str], str]:
+    raw_args = list(argv)
+    workflow_args = SimpleNamespace(
+        ponytail_mode=_extract_passthrough_option(raw_args, "--ponytail-mode"),
+        agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
+        yes="--yes" in raw_args,
+    )
+    mode = resolve_workflow_ponytail_mode(workflow_args)
+    if "--ponytail-mode" not in raw_args:
+        raw_args.extend(["--ponytail-mode", mode])
+    return raw_args, mode
+
+
+def _materialize_workflow_requirements_args(argv: Sequence[str]) -> tuple[list[str], str]:
+    raw_args = list(argv)
+    workflow_args = SimpleNamespace(
+        requirements_mode=_extract_passthrough_option(raw_args, "--requirements-mode"),
+        agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
+        yes="--yes" in raw_args,
+    )
+    # Keep this pre-intake pass non-interactive.  A03 must know the selected
+    # requirement before it can resume an unfinished Grill session without
+    # accidentally prompting for (and then passing) a conflicting default.
+    mode = configured_workflow_requirements_mode(workflow_args)
+    if mode:
+        # An explicit CLI/config value still has to pass the public execution
+        # gate.  In particular, ``--yes`` and headless invocations must never
+        # create a Grill worker merely because the mode was already resolved.
+        mode = resolve_workflow_requirements_mode(workflow_args)
+    if mode and "--requirements-mode" not in raw_args:
+        raw_args.extend(["--requirements-mode", mode])
+    return raw_args, mode
+
+
+def _materialize_workflow_graphify_args(argv: Sequence[str]) -> tuple[list[str], str]:
+    raw_args = list(argv)
+    workflow_args = SimpleNamespace(
+        graphify_mode=_extract_passthrough_option(raw_args, "--graphify-mode"),
+        agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
+    )
+    mode = resolve_workflow_graphify_mode(
+        workflow_args,
+        stage_key="requirements_clarification",
+    )
+    if "--graphify-mode" not in raw_args:
+        raw_args.extend(["--graphify-mode", mode])
+    return raw_args, mode
 
 
 @contextmanager
@@ -220,6 +286,9 @@ def run_requirements_analysis(
         model: str = DEFAULT_REQUIREMENTS_ANALYSIS_MODEL,
         reasoning_effort: str = DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT,
         proxy_url: str = "",
+        ponytail_mode: str = "off",
+        requirements_mode: str = "standard",
+        graphify_mode: str = "off",
         resume_existing: bool = False,
         preserve_ba_worker: bool = False,
 ) -> RequirementsClarificationStageResult:
@@ -231,6 +300,9 @@ def run_requirements_analysis(
             model=model,
             reasoning_effort=reasoning_effort,
             proxy_url=proxy_url,
+            ponytail_mode=ponytail_mode,
+            requirements_mode=requirements_mode,
+            graphify_mode=graphify_mode,
             resume_existing=resume_existing,
             preserve_ba_worker=preserve_ba_worker,
         )
@@ -240,6 +312,8 @@ def collect_requirements_analysis_agent_selection(args) -> RequirementsClarifica
     interactive = stdin_is_interactive()
     vendor_value = str(getattr(args, "vendor", "") or "").strip()
     proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
+    ponytail_mode = resolve_main_ponytail_mode(args, stage_key="requirements_clarification")
+    graphify_mode = resolve_workflow_graphify_mode(args, stage_key="requirements_clarification")
     try:
         if vendor_value:
             vendor = normalize_vendor_choice(vendor_value)
@@ -280,6 +354,9 @@ def collect_requirements_analysis_agent_selection(args) -> RequirementsClarifica
         model=model,
         reasoning_effort=reasoning_effort,
         proxy_url=proxy_url,
+        ponytail_mode=ponytail_mode,
+        requirements_mode=str(getattr(args, "requirements_mode", "") or "standard").strip(),
+        graphify_mode=graphify_mode,
     )
 
 
@@ -288,7 +365,10 @@ def run_requirements_stage(
         *,
         preserve_ba_worker: bool = False,
 ) -> RequirementsClarificationStageResult:
-    intake_result = run_requirement_intake_stage(argv)
+    materialized_argv, _ = _materialize_workflow_ponytail_args(argv or ())
+    materialized_argv, _ = _materialize_workflow_requirements_args(materialized_argv)
+    materialized_argv, _ = _materialize_workflow_graphify_args(materialized_argv)
+    intake_result = run_requirement_intake_stage(materialized_argv)
     clear_pending_tty_input()
     message("进入需求澄清阶段")
     clarification_args = [
@@ -297,9 +377,21 @@ def run_requirements_stage(
         "--requirement-name",
         intake_result.requirement_name,
     ]
-    if argv:
-        passthrough = list(argv)
-        for flag in ("--vendor", "--model", "--effort", "--proxy-url", "--yes", "--overwrite"):
+    if materialized_argv:
+        passthrough = materialized_argv
+        for flag in (
+            "--vendor",
+            "--model",
+            "--effort",
+            "--proxy-url",
+            "--ponytail-mode",
+            "--main-ponytail-mode",
+            "--requirements-mode",
+            "--graphify-mode",
+            "--agent-config",
+            "--yes",
+            "--overwrite",
+        ):
             if flag in passthrough:
                 index = passthrough.index(flag)
                 clarification_args.append(flag)
@@ -316,21 +408,75 @@ def main(argv: Sequence[str] | None = None) -> int:
     if redirected:
         return int(launch)
     try:
-        raw_args = list(launch)
+        raw_args, workflow_ponytail_mode = _materialize_workflow_ponytail_args(launch)
+        raw_args, workflow_requirements_mode = _materialize_workflow_requirements_args(raw_args)
+        raw_args, workflow_graphify_mode = _materialize_workflow_graphify_args(raw_args)
         intake_result = run_requirement_intake_stage(_build_intake_argv(raw_args))
         clear_pending_tty_input()
         message("进入需求澄清阶段")
         project_dir = intake_result.project_dir
         requirement_name = intake_result.requirement_name
+        _, grill_session_path, _ = build_requirements_grill_paths(project_dir, requirement_name)
+        grill_session_header = read_grill_session_header(grill_session_path)
+        active_grill_session = (
+            grill_session_header
+            if grill_session_header is not None
+            and grill_session_header.state not in {"confirmed", "aborted"}
+            else None
+        )
+        persisted_active_selection = None
+        if active_grill_session is not None:
+            if "--yes" in raw_args or not stdin_is_interactive():
+                raise RuntimeError(
+                    "活跃 Grill 会话需要人类继续逐题确认；--yes 或非交互模式不能恢复该会话。"
+                )
+            if (
+                workflow_requirements_mode
+                and workflow_requirements_mode != active_grill_session.requirements_mode
+            ):
+                raise RuntimeError(
+                    "活跃 Grill 会话禁止中途切换模式: "
+                    f"persisted={active_grill_session.requirements_mode}, "
+                    f"requested={workflow_requirements_mode}"
+                )
+            workflow_requirements_mode = active_grill_session.requirements_mode
+            persisted_active_selection = load_persisted_requirements_grill_selection(
+                project_dir=project_dir,
+                runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_RUNTIME_ROOT_NAME,
+                state_path=active_grill_session.active_worker_state_path,
+                requirements_mode=workflow_requirements_mode,
+            )
+        elif not workflow_requirements_mode:
+            scoped_mode_args = SimpleNamespace(
+                requirements_mode="",
+                agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
+                yes="--yes" in raw_args,
+            )
+            workflow_requirements_mode = resolve_workflow_requirements_mode(scoped_mode_args)
         selection_args = SimpleNamespace(
             vendor=_extract_passthrough_option(raw_args, "--vendor"),
             model=_extract_passthrough_option(raw_args, "--model"),
             effort=_extract_passthrough_option(raw_args, "--effort"),
             proxy_url=_extract_passthrough_option(raw_args, "--proxy-url"),
+            ponytail_mode=workflow_ponytail_mode,
+            requirements_mode=workflow_requirements_mode,
+            graphify_mode=workflow_graphify_mode,
+            main_ponytail_mode="",
+            agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
+            yes="--yes" in raw_args,
+            reviewer_agent=[],
             overwrite="--overwrite" in raw_args,
         )
         if has_existing_requirements_clarification(project_dir, requirement_name):
-            if should_reuse_existing_requirements_clarification(
+            grill_reuse_confirmed = (
+                workflow_requirements_mode == "standard"
+                or (
+                    grill_session_header is not None
+                    and grill_session_header.requirements_mode == workflow_requirements_mode
+                    and grill_session_header.state == "confirmed"
+                )
+            )
+            if grill_reuse_confirmed and should_reuse_existing_requirements_clarification(
                     project_dir,
                     requirement_name,
                     overwrite=bool(selection_args.overwrite),
@@ -339,8 +485,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 message("复用已有的需求澄清，直接进入需求评审阶段")
                 result = reuse_existing_requirements_clarification(project_dir, requirement_name)
             else:
+                if (
+                    grill_session_header is not None
+                    and grill_session_header.state in {"confirmed", "aborted"}
+                ):
+                    archive_terminal_requirements_grill_session(project_dir, requirement_name)
                 message("不直接复用已有需求澄清，将启动需求分析师基于现有澄清继续核验")
-                selection = collect_requirements_analysis_agent_selection(selection_args)
+                selection = (
+                    persisted_active_selection
+                    or collect_requirements_analysis_agent_selection(selection_args)
+                )
                 message(render_requirements_clarification_stage_start(selection))
                 result = run_requirements_analysis(
                     project_dir,
@@ -349,13 +503,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                     model=selection.model,
                     reasoning_effort=selection.reasoning_effort,
                     proxy_url=selection.proxy_url,
+                    ponytail_mode=selection.ponytail_mode,
+                    requirements_mode=workflow_requirements_mode,
+                    graphify_mode=selection.graphify_mode,
                     resume_existing=True,
                     preserve_ba_worker=False,
                 )
         else:
+            if (
+                grill_session_header is not None
+                and grill_session_header.state in {"confirmed", "aborted"}
+            ):
+                archive_terminal_requirements_grill_session(project_dir, requirement_name)
             message(
                 "执行摘要: 未检测到可复用的需求澄清，需要启动需求分析师智能体执行需求澄清；请为需求分析师选择厂商、模型、推理强度、代理端口。")
-            selection = collect_requirements_analysis_agent_selection(selection_args)
+            selection = (
+                persisted_active_selection
+                or collect_requirements_analysis_agent_selection(selection_args)
+            )
             message(render_requirements_clarification_stage_start(selection))
             result = run_requirements_analysis(
                 project_dir,
@@ -364,6 +529,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 model=selection.model,
                 reasoning_effort=selection.reasoning_effort,
                 proxy_url=selection.proxy_url,
+                ponytail_mode=selection.ponytail_mode,
+                requirements_mode=workflow_requirements_mode,
+                graphify_mode=selection.graphify_mode,
                 resume_existing=False,
                 preserve_ba_worker=False,
             )
@@ -376,6 +544,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 requirements_clear_path=result.requirements_clear_path,
                 cleanup_paths=(),
                 ba_handoff=result.ba_handoff,
+                requirements_mode=result.requirements_mode,
             )
     except Exception as error:  # noqa: BLE001
         message(error)

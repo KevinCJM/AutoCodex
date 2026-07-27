@@ -8,6 +8,41 @@ test('BackendClient can be constructed', () => {
   expect(client).toBeInstanceOf(BackendClient)
 })
 
+test('BackendClient submits Grill cursor while keeping legacy prompt responses compatible', async () => {
+  const client = new BackendClient() as any
+  const requests: Array<{ action: string; payload: Record<string, unknown> }> = []
+  client.request = async (action: string, payload: Record<string, unknown>) => {
+    requests.push({ action, payload })
+    return { accepted: true }
+  }
+
+  await client.submitPrompt('prompt-grill', 'A', {
+    runnerId: 'runner-a03',
+    questionSeq: 5,
+    grillSessionId: 'session-a',
+    grillQuestionHash: 'sha256:abc',
+  })
+  await client.submitPrompt('prompt-standard', 'legacy')
+
+  expect(requests).toEqual([
+    {
+      action: 'prompt.response',
+      payload: {
+        prompt_id: 'prompt-grill',
+        value: 'A',
+        runner_id: 'runner-a03',
+        question_seq: 5,
+        grill_session_id: 'session-a',
+        grill_question_hash: 'sha256:abc',
+      },
+    },
+    {
+      action: 'prompt.response',
+      payload: { prompt_id: 'prompt-standard', value: 'legacy' },
+    },
+  ])
+})
+
 test('backend client resolves repo root and python config from repository root', () => {
   const root = repoRoot()
   expect(existsSync(join(root, 'U01_common_config.py'))).toBe(true)

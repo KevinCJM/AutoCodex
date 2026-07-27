@@ -341,10 +341,25 @@ export class BackendClient {
     return this.request('app.bootstrap', {})
   }
 
-  async submitPrompt(promptId: string, value: unknown) {
+  async submitPrompt(
+    promptId: string,
+    value: unknown,
+    cursor?: {
+      runnerId: string
+      questionSeq: number
+      grillSessionId?: string
+      grillQuestionHash?: string
+    },
+  ) {
     return this.request('prompt.response', {
       prompt_id: promptId,
       value,
+      ...(cursor ? {
+        runner_id: cursor.runnerId,
+        question_seq: cursor.questionSeq,
+        ...(cursor.grillSessionId ? { grill_session_id: cursor.grillSessionId } : {}),
+        ...(cursor.grillQuestionHash ? { grill_question_hash: cursor.grillQuestionHash } : {}),
+      } : {}),
     })
   }
 

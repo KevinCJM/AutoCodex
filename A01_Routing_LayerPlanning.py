@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -25,6 +25,8 @@ from tmux_core.runtime.vendor_catalog import (
     get_normalized_effort_choices,
     get_vendor_inventory,
 )
+from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
+from tmux_core.runtime.graphify import GraphifyMode, normalize_graphify_mode
 from T02_tmux_agents import (
     AgentRunConfig,
     Vendor,
@@ -59,6 +61,7 @@ from T09_terminal_ops import (
     prompt_metadata,
     prompt_select_option,
     prompt_with_default,
+    terminal_ui_is_interactive,
 )
 
 
@@ -88,6 +91,8 @@ VENDOR_ALIASES = {
 DEFAULT_MODEL_BY_VENDOR = dict(LEGACY_DEFAULT_MODEL_BY_VENDOR)
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 PROXY_PRESET_CHOICES = ("", "10900", "7890")
+PONYTAIL_MODE_CHOICES = tuple(mode.value for mode in PonytailMode)
+GRAPHIFY_MODE_CHOICES = tuple(mode.value for mode in GraphifyMode)
 RUN_INIT_CHOICES = ("yes", "no")
 EMPTY_PROJECT_ROUTING_SKIP_MESSAGE = "当前项目未检测到业务文件，跳过路由层初始化。"
 
@@ -103,6 +108,9 @@ class CliRequest:
     run_init: bool
     max_refine_rounds: int
     auto_confirm: bool
+    ponytail_mode: str = PonytailMode.OFF.value
+    graphify_mode: str = GraphifyMode.OFF.value
+    graphify_config: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -128,6 +136,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="模型名称")
     parser.add_argument("--effort", help="推理强度")
     parser.add_argument("--proxy-port", default="", help="代理端口或完整代理 URL")
+    parser.add_argument("--ponytail-mode", choices=PONYTAIL_MODE_CHOICES, default="", help="Ponytail 模式: off|lite|full|ultra")
+    parser.add_argument("--graphify-mode", choices=GRAPHIFY_MODE_CHOICES, default="", help="Graphify 模式: off|auto|required")
+    parser.add_argument("--main-ponytail-mode", choices=PONYTAIL_MODE_CHOICES, default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--run-init", choices=RUN_INIT_CHOICES, help="是否执行 AGENT初始化: yes|no")
     parser.add_argument("--max-refine-rounds", type=int, default=3, help="最大 refine 轮数")
     parser.add_argument("--resume-run", default="", help="恢复已有 run_id，仅供 B01 控制台使用")
@@ -162,7 +174,7 @@ def normalize_model_choice(
         index = int(text)
         if 1 <= index <= len(models):
             return models[index - 1]
-    if normalized_vendor in {"opencode", "mimo", "agy", "deveco"} and text == "default":
+    if text == "default":
         resolved_default = get_default_model_for_vendor(normalized_vendor, catalog=snapshot)
         if resolved_default in models:
             return resolved_default
@@ -404,6 +416,88 @@ def prompt_run_init(default: bool = True) -> bool:
     return normalize_run_init_choice(candidate)
 
 
+def prompt_ponytail_mode(default: str = PonytailMode.FULL.value) -> str:
+    normalized_default = normalize_ponytail_mode(default, default=PonytailMode.FULL).value
+    candidate = prompt_select_option(
+        title="选择 Ponytail 模式",
+        options=(
+            (PonytailMode.FULL.value, "Full（默认）— 强制最小正确实现"),
+            (PonytailMode.LITE.value, "Lite — 完成需求并提示更简单方案"),
+            (PonytailMode.ULTRA.value, "Ultra — 极致 YAGNI"),
+            (PonytailMode.OFF.value, "Off — 不注入 Ponytail"),
+        ),
+        default_value=normalized_default,
+        prompt_text="选择 Ponytail 模式",
+    )
+    return normalize_ponytail_mode(candidate).value
+
+
+def resolve_cli_ponytail_mode(
+        args: argparse.Namespace,
+        *,
+        initial_mode: str = "",
+        interactive: bool,
+) -> str:
+    if str(getattr(args, "agent_config", "") or "").strip():
+        # 延迟导入避免 shared_review 在加载 A01 选择器时形成循环依赖。
+        from tmux_core.stage_kernel.shared_review import resolve_stage_agent_config
+
+        agent_config = resolve_stage_agent_config(args, stage_key="routing")
+        if agent_config.main is not None:
+            return normalize_ponytail_mode(agent_config.main.ponytail_mode).value
+        return normalize_ponytail_mode(agent_config.ponytail_mode, default=PonytailMode.FULL).value
+    explicit = str(
+        getattr(args, "main_ponytail_mode", "")
+        or getattr(args, "ponytail_mode", "")
+        or initial_mode
+        or ""
+    ).strip()
+    if explicit:
+        return normalize_ponytail_mode(explicit).value
+    if bool(getattr(args, "yes", False)) or not interactive:
+        return PonytailMode.FULL.value
+    with _routing_prompt_step(7, allow_back=False):
+        return prompt_ponytail_mode(PonytailMode.FULL.value)
+
+
+def resolve_cli_graphify_mode(
+        args: argparse.Namespace,
+        *,
+        initial_mode: str = "",
+        project_dir: str = "",
+) -> str:
+    explicit = str(getattr(args, "graphify_mode", "") or "").strip()
+    if explicit or str(getattr(args, "agent_config", "") or "").strip():
+        # 延迟导入避免 shared_review 在加载 A01 选择器时形成循环依赖。
+        from tmux_core.stage_kernel.shared_review import resolve_workflow_graphify_mode
+
+        mode = resolve_workflow_graphify_mode(args, stage_key="routing")
+    elif str(initial_mode or "").strip():
+        mode = normalize_graphify_mode(initial_mode).value
+    else:
+        mode = GraphifyMode.AUTO.value
+    if not bool(getattr(args, "yes", False)) and terminal_ui_is_interactive():
+        from tmux_core.runtime.graphify import enable_graphify_interactive_recovery
+
+        if str(project_dir or getattr(args, "project_dir", "") or "").strip():
+            enable_graphify_interactive_recovery(
+                str(project_dir or getattr(args, "project_dir", "") or "").strip()
+            )
+    return mode
+
+
+def resolve_cli_graphify_config(
+    args: argparse.Namespace,
+    *,
+    initial_config: dict[str, object] | None = None,
+) -> dict[str, object]:
+    if str(getattr(args, "agent_config", "") or "").strip():
+        from tmux_core.stage_kernel.shared_review import resolve_workflow_graphify_config
+
+        return resolve_workflow_graphify_config(args)
+    return dict(initial_config or {})
+
+
 def prompt_confirmation(summary_text: str, *, force_yes: bool = False) -> bool:
     message("\n执行摘要:")
     message(summary_text)
@@ -550,6 +644,20 @@ def _collect_interactive_cli_request(
         run_init=run_init,
         max_refine_rounds=max_refine_rounds,
         auto_confirm=bool(args.yes),
+        ponytail_mode=resolve_cli_ponytail_mode(
+            args,
+            initial_mode=initial_request.ponytail_mode if initial_request else "",
+            interactive=run_init and terminal_ui_is_interactive(),
+        ),
+        graphify_mode=resolve_cli_graphify_mode(
+            args,
+            initial_mode=initial_request.graphify_mode if initial_request else "",
+            project_dir=project_dir,
+        ),
+        graphify_config=resolve_cli_graphify_config(
+            args,
+            initial_config=initial_request.graphify_config if initial_request else None,
+        ),
     )
 
 
@@ -648,6 +756,20 @@ def collect_cli_request(
         run_init=run_init,
         max_refine_rounds=max_refine_rounds,
         auto_confirm=bool(args.yes),
+        ponytail_mode=resolve_cli_ponytail_mode(
+            args,
+            initial_mode=initial_request.ponytail_mode if initial_request else "",
+            interactive=run_init and terminal_ui_is_interactive(),
+        ),
+        graphify_mode=resolve_cli_graphify_mode(
+            args,
+            initial_mode=initial_request.graphify_mode if initial_request else "",
+            project_dir=project_dir,
+        ),
+        graphify_config=resolve_cli_graphify_config(
+            args,
+            initial_config=initial_request.graphify_config if initial_request else None,
+        ),
     )
 
 
@@ -665,6 +787,9 @@ def prepare_agent_run_config(request: CliRequest) -> AgentRunConfig:
         model=request.model,
         reasoning_effort=request.reasoning_effort,
         proxy_url=request.proxy_port,
+        ponytail_mode=request.ponytail_mode,
+        graphify_mode=request.graphify_mode,
+        graphify_config=request.graphify_config,
     )
 
 

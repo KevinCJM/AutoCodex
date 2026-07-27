@@ -74,6 +74,41 @@ class WebBackendTests(unittest.TestCase):
         self.assertFalse(bootstrap['payload']['capabilities']['bridge_only_terminal_ui'])
         self.assertTrue(bootstrap['payload']['capabilities']['web_file_preview'])
 
+    def test_web_snapshot_preserves_optional_ponytail_worker_fields(self):
+        server, thread = self._start_server()
+        snapshots = {
+            'app': {},
+            'stages': {
+                'development': {
+                    'workers': [{
+                        'session_name': 'dev-1',
+                        'ponytail_mode': 'full',
+                    'ponytail_bundle_version': '4.8.4',
+                    'ponytail_delivery': 'runtime_prompt',
+                    'requirements_mode': 'grill-with-docs',
+                    'grill_bundle_commit': 'ed37663cc5fbef691ddfecd080dff42f7e7e350d',
+                    'grill_delivery': 'runtime_prompt',
+                    'grill_question_seq': 3,
+                    }],
+                },
+            },
+            'control': {'workers': []},
+        }
+        try:
+            with patch.object(server, 'build_snapshots', return_value=snapshots):
+                payload = self._get_json(server, '/api/snapshots')
+        finally:
+            self._stop_server(server, thread)
+
+        worker = payload['payload']['stages']['development']['workers'][0]
+        self.assertEqual(worker['ponytail_mode'], 'full')
+        self.assertEqual(worker['ponytail_bundle_version'], '4.8.4')
+        self.assertEqual(worker['ponytail_delivery'], 'runtime_prompt')
+        self.assertEqual(worker['requirements_mode'], 'grill-with-docs')
+        self.assertEqual(worker['grill_bundle_commit'], 'ed37663cc5fbef691ddfecd080dff42f7e7e350d')
+        self.assertEqual(worker['grill_delivery'], 'runtime_prompt')
+        self.assertEqual(worker['grill_question_seq'], 3)
+
     def test_web_backend_prompt_response_roundtrip(self):
         server, thread = self._start_server()
         try:

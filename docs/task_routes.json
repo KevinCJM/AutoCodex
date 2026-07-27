@@ -259,7 +259,9 @@
         "task_routes",
         "pitfalls",
         "machine_first",
-        "audit"
+        "audit",
+        "graphify_evidence",
+        "code_graph_candidate"
       ],
       "negative_keywords": [
         "human_docs",
@@ -268,6 +270,7 @@
       "route_priority": 100,
       "first_read_modules": [
         "M09_routing_init_layer",
+        "M12_project_graph_service",
         "M04_prompt_contracts",
         "M11_tests"
       ],
@@ -340,7 +343,13 @@
         "task_split",
         "development",
         "overall_review",
-        "artifact"
+        "artifact",
+        "requirements_mode",
+        "grill",
+        "grill_me",
+        "grill_with_docs",
+        "context.md",
+        "adr"
       ],
       "negative_keywords": [],
       "route_priority": 85,
@@ -381,12 +390,21 @@
         "agent_config",
         "provider",
         "model",
-        "proxy"
+        "proxy",
+        "grill_session",
+        "grill_question",
+        "grill_confirmation",
+        "grill_recovery",
+        "domain_document_publish",
+        "graphify_mode",
+        "graphify_evidence",
+        "tmux_graphify_cmd"
       ],
       "negative_keywords": [],
       "route_priority": 80,
       "first_read_modules": [
         "M05_tmux_runtime_hitl",
+        "M12_project_graph_service",
         "M08_shared_support",
         "M03_stage_family"
       ],
@@ -395,7 +413,8 @@
       "pitfall_ids": [
         "P01",
         "P04",
-        "P07"
+        "P07",
+        "P08"
       ],
       "expand_search_codes": [
         "TX02",
@@ -417,7 +436,15 @@
         "ndjson",
         "t11_tui_backend",
         "stage_registry",
-        "client_ts"
+        "client_ts",
+        "interaction_kind",
+        "recommendation",
+        "reason_text",
+        "prompt_response_cursor",
+        "grill_prompt",
+        "graphify_status",
+        "snapshot_app_graphify",
+        "code_graph_status"
       ],
       "negative_keywords": [
         "web_only"
@@ -426,7 +453,8 @@
       "first_read_modules": [
         "M06_bridge_protocol_backends",
         "M07_frontend_packages",
-        "M05_tmux_runtime_hitl"
+        "M05_tmux_runtime_hitl",
+        "M12_project_graph_service"
       ],
       "selector_deltas": {
         "then_check_selectors": [
@@ -440,7 +468,8 @@
       "pitfall_ids": [
         "P03",
         "P05",
-        "P07"
+        "P07",
+        "P08"
       ],
       "expand_search_codes": [
         "TX02",
@@ -460,7 +489,9 @@
         "vite",
         "webbackend",
         "healthz",
-        "backend_port"
+        "backend_port",
+        "graphify_status",
+        "code_graph_status"
       ],
       "negative_keywords": [
         "opentui_only"
@@ -469,13 +500,15 @@
       "first_read_modules": [
         "M02_web_launcher",
         "M06_bridge_protocol_backends",
-        "M07_frontend_packages"
+        "M07_frontend_packages",
+        "M12_project_graph_service"
       ],
       "selector_deltas": {},
       "selector_overrides": {},
       "pitfall_ids": [
         "P05",
         "P07",
+        "P08",
         "P09"
       ],
       "expand_search_codes": [
@@ -494,15 +527,84 @@
         "contract",
         "output_schema",
         "reviewer_instruction",
-        "agent_instruction"
+        "agent_instruction",
+        "ponytail",
+        "ponytail_rules",
+        "behavior_profile",
+        "runtime_prompt_injection",
+        "grill",
+        "grill_rules",
+        "grill_me",
+        "grill_with_docs",
+        "requirements_interview"
       ],
       "negative_keywords": [],
       "route_priority": 75,
       "first_read_modules": [
+        "M05_tmux_runtime_hitl",
         "M04_prompt_contracts",
         "M03_stage_family"
       ],
-      "selector_deltas": {},
+      "selector_deltas": {
+        "first_read_selectors": [
+          {
+            "type": "literal",
+            "path": "tmux_core/runtime/ponytail.py"
+          },
+          {
+            "type": "literal",
+            "path": "tmux_core/runtime/grill.py"
+          },
+          {
+            "type": "literal",
+            "path": "tmux_core/runtime/tmux_runtime.py"
+          }
+        ],
+        "then_check_selectors": [
+          {
+            "type": "literal",
+            "path": "third_party/ponytail/UPSTREAM.json"
+          },
+          {
+            "type": "literal",
+            "path": "third_party/mattpocock-skills/UPSTREAM.json"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_ponytail.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_ponytail_runtime.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_grill.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_grill_runtime.py"
+          }
+        ],
+        "minimum_regression_selectors": [
+          {
+            "type": "literal",
+            "path": "tests/test_ponytail.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_ponytail_runtime.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_grill.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_grill_runtime.py"
+          }
+        ]
+      },
       "selector_overrides": {},
       "pitfall_ids": [
         "P02",
@@ -528,16 +630,53 @@
         "config",
         "helper",
         "pre_development",
-        "requirements_common"
+        "requirements_common",
+        "agent_config",
+        "ponytail_mode",
+        "behavior_profile_config",
+        "role_override",
+        "requirements_mode",
+        "grill_config",
+        "requirements_clarification_mode"
       ],
       "negative_keywords": [],
       "route_priority": 60,
       "first_read_modules": [
         "M08_shared_support",
         "M01_workflow_entry",
-        "M03_stage_family"
+        "M03_stage_family",
+        "M05_tmux_runtime_hitl"
       ],
-      "selector_deltas": {},
+      "selector_deltas": {
+        "first_read_selectors": [
+          {
+            "type": "literal",
+            "path": "tmux_core/workflow/entry.py"
+          },
+          {
+            "type": "literal",
+            "path": "tmux_core/stage_kernel/shared_review.py"
+          },
+          {
+            "type": "literal",
+            "path": "tmux_core/runtime/ponytail.py"
+          },
+          {
+            "type": "literal",
+            "path": "tmux_core/runtime/grill.py"
+          }
+        ],
+        "minimum_regression_selectors": [
+          {
+            "type": "literal",
+            "path": "tests/test_ponytail_runtime.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_grill_config.py"
+          }
+        ]
+      },
       "selector_overrides": {},
       "pitfall_ids": [
         "P04",
@@ -633,7 +772,20 @@
         "antigravity",
         "antigravity cli"
       ],
-      "negative_keywords": [],
+      "negative_keywords": [
+        "ponytail",
+        "ponytail_mode",
+        "behavior_profile",
+        "behavior profile",
+        "grill",
+        "grill-me",
+        "grill-with-docs",
+        "requirements_mode",
+        "requirements interview",
+        "graphify",
+        "graphify_mode",
+        "code_graph"
+      ],
       "route_priority": 90,
       "first_read_modules": [
         "M05_tmux_runtime_hitl",
@@ -703,6 +855,14 @@
           {
             "type": "literal",
             "path": "packages/tui/src/homeAgents.test.ts"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_ponytail_runtime.py"
+          },
+          {
+            "type": "literal",
+            "path": "tests/test_grill_runtime.py"
           }
         ]
       },
@@ -720,6 +880,57 @@
       ],
       "stop_codes": [
         "SV01",
+        "SV03"
+      ]
+    },
+    {
+      "id": "R12_graphify_code_graph",
+      "task_type": "project_graphify_code_graph_or_evidence",
+      "match_keywords": [
+        "graphify",
+        "graphifyy",
+        "graphify_mode",
+        "project_graph",
+        "code_graph",
+        "code-only",
+        "code_only",
+        "source_snapshot",
+        "graph_cache",
+        "graphify_evidence",
+        "tmux-graphify",
+        "affected",
+        "god-nodes"
+      ],
+      "negative_keywords": [
+        "vendor_catalog",
+        "model_catalog",
+        "eighth_vendor"
+      ],
+      "route_priority": 95,
+      "first_read_modules": [
+        "M12_project_graph_service",
+        "M05_tmux_runtime_hitl",
+        "M06_bridge_protocol_backends",
+        "M07_frontend_packages",
+        "M09_routing_init_layer",
+        "M11_tests"
+      ],
+      "selector_deltas": {},
+      "selector_overrides": {},
+      "pitfall_ids": [
+        "P06",
+        "P07",
+        "P08"
+      ],
+      "expand_search_codes": [
+        "TX03",
+        "TX04",
+        "TX05",
+        "TX07"
+      ],
+      "stop_codes": [
+        "SV01",
+        "SV02",
         "SV03"
       ]
     }

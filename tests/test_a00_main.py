@@ -32,6 +32,7 @@ class _RequirementsStageResult:
     reviewer_handoff: object | None = None
     developer_handoff: object | None = None
     reuse_existing_original_requirement: bool = False
+    requirements_mode: str = ""
 
 
 def _hold_requirement_lock(
@@ -62,6 +63,24 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(
             build_stage_args("/tmp/project", auto_confirm=False, review_max_rounds="infinite"),
             ["--project-dir", "/tmp/project", "--review-max-rounds", "infinite"],
+        )
+
+    def test_build_stage_args_can_pass_requirements_mode_only_to_requested_stage(self):
+        self.assertEqual(
+            build_stage_args(
+                "/tmp/project",
+                auto_confirm=False,
+                requirement_name="需求A",
+                requirements_mode="grill-with-docs",
+            ),
+            [
+                "--project-dir",
+                "/tmp/project",
+                "--requirement-name",
+                "需求A",
+                "--requirements-mode",
+                "grill-with-docs",
+            ],
         )
 
     def test_build_stage_args_can_include_existing_requirement_reuse_flag(self):
@@ -147,6 +166,8 @@ class A00MainTests(unittest.TestCase):
                 calls.append(("a03", list(argv)))
                 lifecycle.append("a03")
                 self.assertTrue(preserve_ba_worker)
+                self.assertIn("--requirements-mode", argv)
+                self.assertEqual(argv[argv.index("--requirements-mode") + 1], "standard")
                 return _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")
 
             def fake_a04(argv, ba_handoff=None, preserve_ba_worker=False):  # noqa: ANN001
@@ -218,14 +239,14 @@ class A00MainTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ("a01", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--yes"]),
-                    ("a02", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--yes"]),
-                    ("a03", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
-                    ("a04", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
-                    ("a05", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
-                    ("a06", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
-                    ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
-                    ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
+                    ("a01", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a02", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a03", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--requirements-mode", "standard", "--graphify-mode", "auto", "--yes"]),
+                    ("a04", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a05", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a06", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
                 ],
             )
             self.assertEqual(lifecycle, ["a01", "flush", "a02", "flush", "a03", "flush", "a04", "flush", "a05", "flush", "a06", "flush", "a07", "flush", "a08"])
@@ -449,7 +470,11 @@ class A00MainTests(unittest.TestCase):
 
             def clarification(argv, preserve_ba_worker=False):  # noqa: ANN001, ARG001
                 clarification_calls.append(list(argv))
-                return _RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba")
+                return _RequirementsStageResult(
+                    requirement_name="需求A",
+                    ba_handoff="live-ba",
+                    requirements_mode="standard",
+                )
 
             def review(argv, ba_handoff=None, preserve_ba_worker=False):  # noqa: ANN001, ARG001
                 review_calls.append(list(argv))
@@ -489,6 +514,8 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(len(review_calls), 2)
         self.assertIn("--allow-previous-stage-back", review_calls[0])
         self.assertIn("--allow-previous-stage-back", clarification_calls[1])
+        self.assertIn("--requirements-mode", clarification_calls[1])
+        self.assertIn("standard", clarification_calls[1])
 
     def test_main_allows_back_across_later_stage_boundaries(self):
         stage_results = {
@@ -560,7 +587,7 @@ class A00MainTests(unittest.TestCase):
             development_calls: list[list[str]] = []
             overall_review_calls: list[list[str]] = []
             prompts: list[object] = []
-            prompt_values = [PROMPT_BACK_VALUE, "yes"]
+            prompt_values = ["full", PROMPT_BACK_VALUE, "yes"]
 
             def request_prompt(request):  # noqa: ANN001
                 prompts.append(request)
@@ -609,12 +636,12 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(len(development_calls), 2)
         self.assertEqual(len(overall_review_calls), 1)
-        self.assertEqual(len(prompts), 2)
-        self.assertEqual(prompts[0].prompt_type, "select")
-        self.assertEqual(prompts[0].payload["prompt_text"], "是否执行全面复核")
-        self.assertEqual(prompts[0].payload["options"], [{"value": "yes", "label": "是"}, {"value": "skip", "label": "跳过"}])
-        self.assertTrue(prompts[0].payload["allow_back"])
-        self.assertEqual(prompts[0].payload["back_value"], PROMPT_BACK_VALUE)
+        self.assertEqual(len(prompts), 3)
+        self.assertEqual(prompts[1].prompt_type, "select")
+        self.assertEqual(prompts[1].payload["prompt_text"], "是否执行全面复核")
+        self.assertEqual(prompts[1].payload["options"], [{"value": "yes", "label": "是"}, {"value": "skip", "label": "跳过"}])
+        self.assertTrue(prompts[1].payload["allow_back"])
+        self.assertEqual(prompts[1].payload["back_value"], PROMPT_BACK_VALUE)
 
     def test_main_overall_review_entry_prompt_can_skip_under_bridge_ui(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -622,6 +649,8 @@ class A00MainTests(unittest.TestCase):
 
             def request_prompt(request):  # noqa: ANN001
                 prompts.append(request)
+                if request.payload.get("prompt_text") == "选择 Ponytail 模式":
+                    return {"value": "full"}
                 return {"value": "skip"}
 
             ui = BridgeTerminalUI(
@@ -657,8 +686,8 @@ class A00MainTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         a08_mock.assert_not_called()
-        self.assertEqual(len(prompts), 1)
-        self.assertTrue(prompts[0].payload["allow_back"])
+        self.assertEqual(len(prompts), 2)
+        self.assertTrue(prompts[1].payload["allow_back"])
 
     def test_main_forwards_agent_config_and_can_skip_overall_review(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -668,10 +697,10 @@ class A00MainTests(unittest.TestCase):
             config_path.write_text(
                 json.dumps(
                     {
-                        "main": {"vendor": "codex", "model": "gpt-5.4", "effort": "high", "proxy": "10900"},
+                        "main": {"vendor": "codex", "model": "default", "effort": "high", "proxy": "10900"},
                         "reviewers": [
-                            {"name": "R1", "vendor": "codex", "model": "gpt-5.4-mini", "effort": "medium", "proxy": "10900"},
-                            {"name": "R2", "vendor": "codex", "model": "gpt-5.4", "effort": "high"},
+                            {"name": "R1", "vendor": "codex", "model": "default", "effort": "medium", "proxy": "10900"},
+                            {"name": "R2", "vendor": "codex", "model": "default", "effort": "high"},
                         ],
                     },
                     ensure_ascii=False,
@@ -710,6 +739,15 @@ class A00MainTests(unittest.TestCase):
             ) as a08_mock, patch(
                 "A00_main_tui.notify_stage_action_changed",
                 side_effect=stage_notifications.append,
+            ), patch(
+                "tmux_core.stage_kernel.shared_review.get_default_model_for_vendor",
+                return_value="gpt-5.4",
+            ), patch(
+                "tmux_core.stage_kernel.shared_review.normalize_model_choice",
+                side_effect=lambda _vendor, model: "gpt-5.4" if model == "default" else model,
+            ), patch(
+                "tmux_core.stage_kernel.shared_review.normalize_effort_choice",
+                side_effect=lambda _vendor, _model, effort: effort,
             ):
                 exit_code = main(
                     [
@@ -724,13 +762,17 @@ class A00MainTests(unittest.TestCase):
                 )
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(calls["a01"][-8:], ["--vendor", "codex", "--model", "gpt-5.4", "--effort", "high", "--proxy-port", "10900"])
+        self.assertIn("--vendor", calls["a01"])
+        self.assertIn("--model", calls["a01"])
+        codex_model = calls["a01"][calls["a01"].index("--model") + 1]
+        self.assertTrue(codex_model)
+        self.assertEqual(calls["a01"][-2:], ["--proxy-port", "10900"])
         self.assertIn("--proxy-url", calls["a03"])
         self.assertNotIn("--proxy-port", calls["a03"])
         for stage in ("a04", "a05", "a06", "a07"):
             self.assertEqual(calls[stage].count("--reviewer-agent"), 2)
-        self.assertIn("name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium,proxy=10900", calls["a04"])
-        self.assertIn("name=R2,vendor=codex,model=gpt-5.4,effort=high", calls["a07"])
+        self.assertIn(f"name=R1,vendor=codex,model={codex_model},effort=medium,proxy=10900", calls["a04"])
+        self.assertIn(f"name=R2,vendor=codex,model={codex_model},effort=high", calls["a07"])
         a08_mock.assert_not_called()
         self.assertNotIn("stage.a08.start", stage_notifications)
 
@@ -741,16 +783,23 @@ class A00MainTests(unittest.TestCase):
             config_path.write_text(
                 json.dumps(
                     {
-                        "main": {"vendor": "codex", "model": "gpt-5.4", "effort": "high"},
-                        "reviewers": [{"name": "R1", "vendor": "codex", "model": "gpt-5.4-mini", "effort": "medium"}],
+                        "ponytail_mode": "full",
+                        "main": {"vendor": "codex", "model": "default", "effort": "high"},
+                        "reviewers": [{"name": "R1", "vendor": "codex", "model": "default", "effort": "medium"}],
                         "stages": {
-                            "routing": {"main": {"vendor": "gemini", "model": "flash", "effort": "medium", "proxy": "10809"}},
+                            "requirement_intake": {
+                                "main": {"vendor": "codex", "model": "default", "effort": "high", "ponytail": "lite"}
+                            },
+                            "routing": {"main": {"vendor": "codex", "model": "default", "effort": "medium", "proxy": "10809", "ponytail_mode": "ultra"}},
+                            "requirements_review": {
+                                "main": {"vendor": "codex", "model": "default", "effort": "high", "ponytail": "ultra"}
+                            },
                             "development": {
-                                "main": {"vendor": "claude", "model": "sonnet", "effort": "high"},
-                                "reviewers": [{"name": "R1", "vendor": "opencode", "model": "opencode/big-pickle", "effort": "xhigh"}],
+                                "main": {"vendor": "claude", "model": "sonnet", "effort": "high", "ponytail": "off"},
+                                "reviewers": [{"name": "R1", "vendor": "codex", "model": "default", "effort": "xhigh", "ponytail": "lite"}],
                             },
                             "overall_review": {
-                                "reviewers": [{"name": "R1", "vendor": "gemini", "model": "flash", "effort": "medium", "proxy": "10900"}]
+                                "reviewers": [{"name": "R1", "vendor": "codex", "model": "default", "effort": "medium", "proxy": "10900", "ponytail_mode": "ultra"}]
                             },
                         },
                     },
@@ -788,16 +837,31 @@ class A00MainTests(unittest.TestCase):
             ), patch(
                 "A00_main_tui.run_overall_review_stage",
                 side_effect=remember("a08", _RequirementsStageResult(requirement_name="需求A")),
-            ), patch("A00_main_tui.notify_stage_action_changed"):
+            ), patch("A00_main_tui.notify_stage_action_changed"), patch(
+                "tmux_core.stage_kernel.shared_review.get_default_model_for_vendor",
+                return_value="gpt-5.4",
+            ), patch(
+                "tmux_core.stage_kernel.shared_review.normalize_model_choice",
+                side_effect=lambda _vendor, model: "gpt-5.4" if model == "default" else model,
+            ), patch(
+                "tmux_core.stage_kernel.shared_review.normalize_effort_choice",
+                side_effect=lambda _vendor, _model, effort: effort,
+            ):
                 exit_code = main(["--project-dir", tmpdir, "--requirement-name", "需求A", "--agent-config", str(config_path)])
 
         self.assertEqual(exit_code, 0)
-        self.assertEqual(calls["a01"][-8:], ["--vendor", "gemini", "--model", "flash", "--effort", "medium", "--proxy-port", "10809"])
-        self.assertIn("name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium", calls["a05"])
+        self.assertIn("--vendor", calls["a01"])
+        codex_model = calls["a01"][calls["a01"].index("--model") + 1]
+        self.assertTrue(codex_model)
+        self.assertEqual(calls["a01"][calls["a01"].index("--main-ponytail-mode") + 1], "ultra")
+        self.assertEqual(calls["a02"][calls["a02"].index("--main-ponytail-mode") + 1], "lite")
+        self.assertEqual(calls["a04"][calls["a04"].index("--main-ponytail-mode") + 1], "ultra")
+        self.assertIn(f"name=R1,vendor=codex,model={codex_model},effort=medium", calls["a05"])
         self.assertIn("--vendor", calls["a07"])
         self.assertIn("claude", calls["a07"])
-        self.assertIn("name=R1,vendor=opencode,model=opencode/big-pickle,effort=xhigh", calls["a07"])
-        self.assertIn("name=R1,vendor=gemini,model=flash,effort=medium,proxy=10900", calls["a08"])
+        self.assertEqual(calls["a07"][calls["a07"].index("--main-ponytail-mode") + 1], "off")
+        self.assertIn(f"name=R1,vendor=codex,model={codex_model},effort=xhigh,ponytail=lite", calls["a07"])
+        self.assertIn(f"name=R1,vendor=codex,model={codex_model},effort=medium,proxy=10900,ponytail=ultra", calls["a08"])
 
     def test_main_reraises_stage_exception_in_bridge_mode(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -887,7 +951,7 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             observed["argv"],
-            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"],
+            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"],
         )
         self.assertIsNone(observed["ba_handoff"])
         self.assertTrue(observed["preserve_workers"])
@@ -931,7 +995,7 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             observed["argv"],
-            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"],
+            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"],
         )
         self.assertIsNone(observed["ba_handoff"])
         self.assertEqual(observed["reviewer_handoff"], ())
@@ -991,8 +1055,8 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
-                ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--yes"]),
+                ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
             ],
         )
         self.assertLess(
@@ -1138,7 +1202,7 @@ class A00MainTests(unittest.TestCase):
         ):
             exit_code = main([])
         self.assertEqual(exit_code, 0)
-        routing_stage.assert_called_once_with([])
+        routing_stage.assert_called_once_with(["--ponytail-mode", "full", "--graphify-mode", "auto"])
         self.assertIn("--project-dir", intake_stage.call_args.args[0])
         self.assertIn("/tmp/project", intake_stage.call_args.args[0])
 
@@ -1273,10 +1337,10 @@ class A00MainTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertNotIn("--review-max-rounds", calls["a03"])
-        self.assertEqual(calls["a04"][-2:], ["--review-max-rounds", "2"])
-        self.assertEqual(calls["a05"][-2:], ["--review-max-rounds", "3"])
-        self.assertEqual(calls["a06"][-2:], ["--review-max-rounds", "4"])
-        self.assertEqual(calls["a07"][-2:], ["--review-max-rounds", "infinite"])
+        self.assertEqual(calls["a04"][calls["a04"].index("--review-max-rounds"):][:2], ["--review-max-rounds", "2"])
+        self.assertEqual(calls["a05"][calls["a05"].index("--review-max-rounds"):][:2], ["--review-max-rounds", "3"])
+        self.assertEqual(calls["a06"][calls["a06"].index("--review-max-rounds"):][:2], ["--review-max-rounds", "4"])
+        self.assertEqual(calls["a07"][calls["a07"].index("--review-max-rounds"):][:2], ["--review-max-rounds", "infinite"])
         self.assertNotIn("--review-max-rounds", calls["a08"])
 
     def test_ensure_pre_development_task_record_keeps_existing_file(self):

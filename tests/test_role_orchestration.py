@@ -154,6 +154,10 @@ class _IdleVisibleCodexWorker(_FakeWorker):
         self._mark_agent_ready_from_observation(observation)
         return True
 
+    def refresh_turn_start_agent_state(self, *, label: str = "stage_ready_check"):
+        self._try_mark_turn_start_ready_from_current_observation(label=label, delayed=False)
+        return self.state
+
     def ensure_agent_ready(self, timeout_sec: float = 0.0) -> None:
         _ = timeout_sec
         self.ensure_calls += 1
@@ -178,6 +182,19 @@ class _CompletedBusyWorker(_FakeWorker):
         _ = timeout_sec
         self.ensure_calls += 1
         self.state = "READY"
+
+
+class _StaleCompletedButUnresolvedWorker(_CompletedBusyWorker):
+    def read_state(self):
+        state = super().read_state()
+        state.update(
+            {
+                "turn_state": "waiting_result",
+                "dispatch_state": "submitted",
+                "current_task_runtime_status": "done",
+            }
+        )
+        return state
 
 
 class _PrelaunchMissingSessionWorker(_FakeWorker):
@@ -384,7 +401,7 @@ class RoleOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(main.worker.ensure_calls, 0)
 
-    def test_ensure_main_ready_normalizes_idle_codex_surface_over_lagging_health(self):
+    def test_ensure_main_ready_uses_runtime_turn_start_probe_over_lagging_health(self):
         for health_state in ("BUSY", "STARTING"):
             with self.subTest(health_state=health_state):
                 worker = _IdleVisibleCodexWorker(health_state)
@@ -561,6 +578,73 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertEqual([item.reviewer_name for item in updated], ["R1"])
         self.assertEqual(reviewer_worker.ensure_calls, 0)
         self.assertEqual(reviewer_worker.state, "BUSY")
+
+    def test_run_reviewer_phase_dispatches_with_completed_busy_main_but_strictly_readies_reviewers(self):
+        main_worker = _CompletedBusyWorker()
+        main_worker.completed = True
+        main_worker.state = "BUSY"
+        main = SimpleNamespace(worker=main_worker)
+        reviewer_worker = _CompletedBusyWorker()
+        reviewer_worker.completed = True
+        reviewer_worker.state = "BUSY"
+        reviewers = [SimpleNamespace(worker=reviewer_worker, reviewer_name="R1")]
+        observed: list[tuple[str, str]] = []
+
+        def _run_phase(active_reviewers):  # noqa: ANN001
+            observed.append((main_worker.state, active_reviewers[0].worker.state))
+            return list(active_reviewers)
+
+        updated = run_reviewer_phase(
+            main,
+            reviewers,
+            run_phase=_run_phase,
+            reviewer_label_getter=lambda item, _index: item.reviewer_name,
+        )
+
+        self.assertEqual(observed, [("BUSY", "READY")])
+        self.assertEqual(updated, reviewers)
+        self.assertEqual(main_worker.ensure_calls, 0)
+        self.assertEqual(reviewer_worker.ensure_calls, 1)
+
+    def test_run_reviewer_phase_still_strictly_readies_incomplete_busy_main(self):
+        main_worker = _FakeWorker("BUSY")
+        main = SimpleNamespace(worker=main_worker)
+        reviewer_worker = _FakeWorker("BUSY")
+        reviewers = [SimpleNamespace(worker=reviewer_worker, reviewer_name="R1")]
+        observed: list[tuple[str, str]] = []
+
+        def _run_phase(active_reviewers):  # noqa: ANN001
+            observed.append((main_worker.state, active_reviewers[0].worker.state))
+            return list(active_reviewers)
+
+        updated = run_reviewer_phase(
+            main,
+            reviewers,
+            run_phase=_run_phase,
+            reviewer_label_getter=lambda item, _index: item.reviewer_name,
+        )
+
+        self.assertEqual(observed, [("READY", "READY")])
+        self.assertEqual(updated, reviewers)
+        self.assertEqual(main_worker.ensure_calls, 1)
+        self.assertEqual(reviewer_worker.ensure_calls, 1)
+
+    def test_run_reviewer_phase_does_not_trust_stale_success_fields_for_unresolved_main(self):
+        main_worker = _StaleCompletedButUnresolvedWorker()
+        main_worker.completed = True
+        main_worker.state = "BUSY"
+        main = SimpleNamespace(worker=main_worker)
+        observed: list[str] = []
+
+        updated = run_reviewer_phase(
+            main,
+            [],
+            run_phase=lambda reviewers: observed.append(main_worker.state) or list(reviewers),
+        )
+
+        self.assertEqual(updated, [])
+        self.assertEqual(observed, ["READY"])
+        self.assertEqual(main_worker.ensure_calls, 1)
 
     def test_drop_dead_reviewers_keeps_fresh_dead_workers_until_launch(self):
         fresh = SimpleNamespace(worker=_DeathAwareFakeWorker("DEAD", launched=False), reviewer_name="fresh")
@@ -810,6 +894,62 @@ class RoleOrchestrationTests(unittest.TestCase):
         self.assertIs(current_main, main)
         self.assertEqual(updated, [reviewer])
 
+    def test_death_handling_reviewer_phase_dispatches_with_completed_busy_main(self):
+        main_worker = _CompletedBusyWorker()
+        main_worker.completed = True
+        main_worker.state = "BUSY"
+        main = SimpleNamespace(worker=main_worker)
+        reviewer_worker = _CompletedBusyWorker()
+        reviewer_worker.completed = True
+        reviewer_worker.state = "BUSY"
+        reviewer = SimpleNamespace(worker=reviewer_worker, reviewer_name="审核员")
+        replace_main = mock.Mock(side_effect=AssertionError("已完成的 BUSY 主智能体不应重建"))
+        observed: list[tuple[str, str]] = []
+
+        def _run_phase(active_reviewers):  # noqa: ANN001
+            observed.append((main_worker.state, active_reviewers[0].worker.state))
+            return list(active_reviewers)
+
+        updated, current_main = run_reviewer_phase_with_death_handling(
+            main,
+            [reviewer],
+            run_phase=_run_phase,
+            replace_dead_main_owner=replace_main,
+            reviewer_label_getter=lambda item, _index: item.reviewer_name,
+        )
+
+        self.assertIs(current_main, main)
+        self.assertEqual(updated, [reviewer])
+        self.assertEqual(observed, [("BUSY", "BUSY")])
+        self.assertEqual(main_worker.ensure_calls, 0)
+        self.assertEqual(reviewer_worker.ensure_calls, 0)
+        replace_main.assert_not_called()
+
+    def test_death_handling_reviewer_phase_still_strictly_readies_incomplete_busy_main(self):
+        main_worker = _DeathAwareFakeWorker("BUSY", launched=True)
+        main = SimpleNamespace(worker=main_worker)
+        reviewer_worker = _DeathAwareFakeWorker("BUSY", launched=True)
+        reviewer = SimpleNamespace(worker=reviewer_worker, reviewer_name="审核员")
+        observed: list[tuple[str, str]] = []
+
+        def _run_phase(active_reviewers):  # noqa: ANN001
+            observed.append((main_worker.state, active_reviewers[0].worker.state))
+            return list(active_reviewers)
+
+        updated, current_main = run_reviewer_phase_with_death_handling(
+            main,
+            [reviewer],
+            run_phase=_run_phase,
+            replace_dead_main_owner=lambda owner: owner,
+            reviewer_label_getter=lambda item, _index: item.reviewer_name,
+        )
+
+        self.assertIs(current_main, main)
+        self.assertEqual(updated, [reviewer])
+        self.assertEqual(observed, [("READY", "BUSY")])
+        self.assertEqual(main_worker.ensure_calls, 1)
+        self.assertEqual(reviewer_worker.ensure_calls, 1)
+
     def test_run_reviewer_phase_with_death_handling_drops_reviewer_after_manual_dead_choice(self):
         main = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True))
         reviewer = SimpleNamespace(worker=_LaggingRefreshWorker(["BUSY", "BUSY", "BUSY"]), reviewer_name="测试工程师")
@@ -869,6 +1009,12 @@ class RoleOrchestrationTests(unittest.TestCase):
         reviewer = SimpleNamespace(worker=_ReadyDeathWorker(session_name="审核员-地巧星"), reviewer_name="审核员-地巧星")
         replacement = SimpleNamespace(worker=_DeathAwareFakeWorker("READY", launched=True), reviewer_name="审核员-新")
         replace_calls: list[object] = []
+        phase_calls: list[list[str]] = []
+        notices: list[str] = []
+
+        def run_phase(reviewers):  # noqa: ANN001
+            phase_calls.append([item.reviewer_name for item in reviewers])
+            return list(reviewers)
 
         with mock.patch(
             "tmux_core.stage_kernel.death_orchestration.request_worker_manual_intervention",
@@ -877,15 +1023,18 @@ class RoleOrchestrationTests(unittest.TestCase):
             updated, current_main = run_reviewer_phase_with_death_handling(
                 main,
                 [reviewer],
-                run_phase=lambda reviewers: list(reviewers),
+                run_phase=run_phase,
                 replace_dead_main_owner=lambda owner: owner,
                 replace_dead_reviewer=lambda item, _index: replace_calls.append(item) or replacement,
                 reviewer_label_getter=lambda item, _index: item.reviewer_name,
+                notify=notices.append,
             )
 
         self.assertIs(current_main, main)
         self.assertEqual(updated, [replacement])
         self.assertEqual(replace_calls, [reviewer])
+        self.assertEqual(phase_calls, [["审核员-地巧星"], ["审核员-新"]])
+        self.assertEqual(notices, ["审核员-地巧星 已重建，重新执行当前审核步骤。"])
         prompt.assert_called_once()
 
 

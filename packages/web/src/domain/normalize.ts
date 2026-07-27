@@ -22,6 +22,8 @@ import type {
   WorkerSnapshot,
 } from './types'
 import { STAGE_ROUTES } from './stages'
+import { normalizeGraphifyStatus } from './graphifyStatus'
+import { resolvePromptMetadata } from './promptMetadata'
 
 export const EMPTY_STAGE: StageSnapshot = {
   projectDir: '',
@@ -215,6 +217,30 @@ export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
     model: str(item.model),
     resolvedModel: str(item.resolved_model ?? item.resolvedModel),
     reasoningEffort: str(item.reasoning_effort ?? item.reasoningEffort),
+    ponytailMode: item.ponytail_mode === undefined && item.ponytailMode === undefined
+      ? undefined
+      : str(item.ponytail_mode ?? item.ponytailMode),
+    ponytailBundleVersion: item.ponytail_bundle_version === undefined && item.ponytailBundleVersion === undefined
+      ? undefined
+      : str(item.ponytail_bundle_version ?? item.ponytailBundleVersion),
+    ponytailDelivery: item.ponytail_delivery === undefined && item.ponytailDelivery === undefined
+      ? undefined
+      : str(item.ponytail_delivery ?? item.ponytailDelivery),
+    requirementsMode: item.requirements_mode === undefined && item.requirementsMode === undefined
+      ? undefined
+      : str(item.requirements_mode ?? item.requirementsMode),
+    grillBundleCommit: item.grill_bundle_commit === undefined && item.grillBundleCommit === undefined
+      ? undefined
+      : str(item.grill_bundle_commit ?? item.grillBundleCommit),
+    grillDelivery: item.grill_delivery === undefined && item.grillDelivery === undefined
+      ? undefined
+      : str(item.grill_delivery ?? item.grillDelivery),
+    grillQuestionSeq: (() => {
+      const raw = item.grill_question_seq ?? item.grillQuestionSeq
+      if (raw === undefined || raw === null || raw === '') return undefined
+      const parsed = Number(raw)
+      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+    })(),
     retryCount: num(item.retry_count ?? item.retryCount),
     note: str(item.note),
     transcriptPath: str(item.transcript_path ?? item.transcriptPath),
@@ -295,11 +321,25 @@ export function normalizeHitlSnapshot(value: unknown): HitlSnapshot {
 
 export function normalizePromptSnapshot(value: unknown): PromptSnapshot {
   const item = objectOf(value)
+  const payload = objectOf(item.payload)
+  const metadata = resolvePromptMetadata(item, payload)
+  const rawQuestionSeq = item.question_seq ?? item.questionSeq ?? payload.question_seq ?? payload.questionSeq
+  const parsedQuestionSeq = Number(rawQuestionSeq)
   return {
     pending: bool(item.pending),
     promptId: str(item.prompt_id ?? item.promptId),
     promptType: str(item.prompt_type ?? item.promptType),
-    payload: objectOf(item.payload),
+    payload,
+    interactionKind: metadata.interactionKind || undefined,
+    questionIndex: metadata.questionIndex,
+    recommendation: metadata.recommendation || undefined,
+    reasonText: metadata.reasonText || undefined,
+    ownerRunnerId: str(
+      item.owner_runner_id ?? item.ownerRunnerId ?? payload.owner_runner_id ?? payload.ownerRunnerId,
+    ) || undefined,
+    questionSeq: Number.isSafeInteger(parsedQuestionSeq) && parsedQuestionSeq >= 0
+      ? parsedQuestionSeq
+      : undefined,
   }
 }
 
@@ -347,6 +387,7 @@ export function normalizeAppSnapshot(value: unknown): AppSnapshot {
     pendingAttention: bool(item.pending_attention ?? item.pendingAttention),
     pendingAttentionReason: str(item.pending_attention_reason ?? item.pendingAttentionReason),
     pendingAttentionSince: str(item.pending_attention_since ?? item.pendingAttentionSince),
+    graphify: normalizeGraphifyStatus(item.graphify),
     recentArtifacts: Array.isArray(item.recent_artifacts) ? item.recent_artifacts.map(artifact) : [],
     availableRuns: runs.map((run): RunOption => {
       const raw = objectOf(run)

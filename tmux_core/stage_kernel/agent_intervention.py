@@ -264,7 +264,8 @@ def wait_for_worker_runtime_intervention(
         if callable(resolved) and bool(resolved(error.blocker_kind)):
             return
         current_reason = (
-            "人工处理后权限确认页面仍然可见；请继续在原 tmux 会话完成授权或拒绝。"
+            "人工处理后智能体的交互页面仍然可见；"
+            "请继续在原 tmux 会话完成回答、授权或拒绝。"
         )
 
 

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import shutil
@@ -41,6 +42,7 @@ from T02_tmux_agents import (
     worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.agent_intervention import run_worker_turn_with_startup_recovery
+from tmux_core.runtime.graphify import GraphifyMode, GraphifyTurnProfile
 
 
 ROUTING_LAYER_REQUIRED_FILES = (
@@ -1085,7 +1087,7 @@ class RunManifest:
     runtime_dir: str
     project_dir: str
     selection: dict[str, object]
-    config: dict[str, str]
+    config: dict[str, object]
     status: str
     created_at: str
     updated_at: str
@@ -1102,7 +1104,7 @@ class BatchInitResult:
     run_id: str
     runtime_dir: str
     selection: TargetSelection
-    config: dict[str, str]
+    config: dict[str, object]
     results: list[DirectoryInitResult]
 
     def to_dict(self) -> dict[str, object]:
@@ -1266,6 +1268,13 @@ class RunStore:
             model=self.manifest.config["model"],
             reasoning_effort=self.manifest.config["reasoning_effort"],
             proxy_url=self.manifest.config.get("proxy_url", ""),
+            ponytail_mode=self.manifest.config.get("ponytail_mode", "off"),
+            graphify_mode=self.manifest.config.get("graphify_mode", "off"),
+            graphify_config=(
+                dict(self.manifest.config.get("graphify_config", {}))
+                if isinstance(self.manifest.config.get("graphify_config", {}), dict)
+                else {}
+            ),
         )
 
     def write_manifest(self) -> Path:
@@ -1773,6 +1782,19 @@ def run_directory_initialization_with_worker(
             workflow_stage: str,
             run_turn_kwargs: dict[str, object],
     ) -> CommandResult:
+        effective_kwargs = dict(run_turn_kwargs)
+        if "graphify_profile" in effective_kwargs:
+            try:
+                declared_parameters = inspect.signature(worker.run_turn).parameters
+            except (TypeError, ValueError):
+                declared_parameters = {}
+            # Audit/refine explicitly disable Graphify on the real runtime.
+            # Legacy/custom A01 worker factories may expose only the former
+            # run_turn contract (or a forwarding **kwargs wrapper), so keep
+            # those factories compatible instead of leaking a new keyword.
+            if "graphify_profile" not in declared_parameters:
+                effective_kwargs.pop("graphify_profile", None)
+
         def on_intervention(error: Exception) -> None:
             sync_state(
                 workflow_stage,
@@ -1791,7 +1813,7 @@ def run_directory_initialization_with_worker(
 
         return run_worker_turn_with_startup_recovery(
             worker,
-            run_turn_kwargs=run_turn_kwargs,
+            run_turn_kwargs=effective_kwargs,
             stage_label="AGENT初始化",
             role_label=str(worker.session_name or target_dir.name or "路由智能体"),
             on_intervention=on_intervention,
@@ -1939,6 +1961,7 @@ def run_directory_initialization_with_worker(
                 "label": f"audit_routing_layer_{round_index}",
                 "prompt": build_audit_prompt(audit_round=round_index),
                 "completion_contract": contract,
+                "graphify_profile": GraphifyTurnProfile(mode=GraphifyMode.OFF.value),
             },
         )
         if run_store is not None:
@@ -1987,6 +2010,7 @@ def run_directory_initialization_with_worker(
                 "label": f"refine_routing_layer_{current_round}",
                 "prompt": build_refine_prompt(audit_record),
                 "completion_contract": contract,
+                "graphify_profile": GraphifyTurnProfile(mode=GraphifyMode.OFF.value),
             },
         )
         if run_store is not None:

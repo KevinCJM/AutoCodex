@@ -13,6 +13,7 @@ from pathlib import Path
 
 import T02_tmux_agents as runtime_module
 from T02_tmux_agents import (
+    AgentRuntimeInterventionRequired,
     AgentRuntimeState,
     AgentStartupInterventionRequired,
     AgentRunConfig,
@@ -44,6 +45,8 @@ from T02_tmux_agents import (
     TASK_RESULT_CONTRACT_ERROR_PREFIX,
     TURN_ARTIFACT_CONTRACT_ERROR_PREFIX,
     RuntimeShutdownRequested,
+    LONG_RUNNING_TASK_RESULT_BLOCKER,
+    LONG_RUNNING_TASK_RESULT_REASON_PREFIX,
     cleanup_registered_tmux_workers,
     clear_runtime_shutdown_request,
     build_prompt_header,
@@ -77,6 +80,38 @@ from tmux_core.stage_kernel.role_orchestration import ensure_reviewers_ready
 
 
 class TmuxAgentsTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+            vendor_id: str,
+            requested_model: str,
+            requested_effort: str,
+    ) -> SimpleNamespace:
+        """Keep runtime unit tests independent from the host's live model catalog."""
+        return SimpleNamespace(
+            resolved_model=str(requested_model or "test/default"),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            normalized_effort=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path="",
+        )
+
+    def setUp(self) -> None:
+        # Model discovery/fail-closed validation has its own vendor-catalog
+        # suite.  These tests exercise runtime state and tmux behavior, so a
+        # controlled resolution boundary avoids depending on which CLIs and
+        # models happen to be installed on the test host.
+        resolver = mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            side_effect=self._runtime_test_resolution,
+        )
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
     @staticmethod
     def _resolved_test_config(
             *,
@@ -525,6 +560,94 @@ a07.developer.refine_code
             """
             self.assertFalse(worker._visible_indicates_agent_ready(queued_visible))
 
+    def test_codex_hook_review_overlay_has_priority_over_spinner_and_ready_composer(self):
+        hook_review_visible = """
+Hooks
+3 hooks need review before they can run.
+Press t to trust all; enter to review hooks; esc to close
+› Write tests for @filename
+  gpt-5.6-sol xhigh · ~/project
+"""
+        ready_visible = """
+› Write tests for @filename
+  gpt-5.6-sol xhigh · ~/project
+"""
+        detector = CodexOutputDetector()
+        active_hook = WorkerObservation(
+            visible_text=hook_review_visible,
+            raw_log_delta="",
+            raw_log_tail=ready_visible,
+            current_command="node",
+            current_path="/tmp/project",
+            pane_dead=False,
+            session_exists=True,
+            log_mtime=0.0,
+            observed_at="2026-07-22T17:08:30",
+            pane_title="⠋ project",
+        )
+        stale_hook = WorkerObservation(
+            visible_text=ready_visible,
+            raw_log_delta="",
+            raw_log_tail=hook_review_visible,
+            current_command="node",
+            current_path="/tmp/project",
+            pane_dead=False,
+            session_exists=True,
+            log_mtime=0.0,
+            observed_at="2026-07-22T17:08:31",
+            pane_title="project",
+        )
+
+        self.assertEqual(detector.classify_agent_state(active_hook), AgentRuntimeState.STARTING)
+        self.assertEqual(detector.classify_agent_state(stale_hook), AgentRuntimeState.READY)
+
+    def test_codex_ready_detection_uses_latest_viewport_interaction_block(self):
+        detector = CodexOutputDetector()
+        stale_busy_before_latest_prompt = "\n".join(
+            (
+                "• Working (9m 12s • esc to interrupt)",
+                "• 完成",
+                "Worked for 11m 38s",
+                "› Write tests for @filename",
+                "  gpt-5.6-sol max · ~/project",
+            )
+        )
+        active_busy_after_prompt = "\n".join(
+            (
+                "› Write tests for @filename",
+                "  gpt-5.6-sol max · ~/project",
+                "• Working (2s • esc to interrupt)",
+            )
+        )
+        active_busy_before_prompt = "\n".join(
+            (
+                "• Working (2s • esc to interrupt)",
+                "› Write tests for @filename",
+                "  gpt-5.6-sol max · ~/project",
+            )
+        )
+
+        ready_observation = self._observation(
+            visible_text=stale_busy_before_latest_prompt,
+            raw_log_tail="older task output • esc to interrupt",
+            current_command="node",
+            pane_title="project",
+        )
+        busy_observation = self._observation(
+            visible_text=active_busy_after_prompt,
+            current_command="node",
+            pane_title="project",
+        )
+        busy_before_prompt_observation = self._observation(
+            visible_text=active_busy_before_prompt,
+            current_command="node",
+            pane_title="project",
+        )
+
+        self.assertEqual(detector.classify_agent_state(ready_observation), AgentRuntimeState.READY)
+        self.assertEqual(detector.classify_agent_state(busy_observation), AgentRuntimeState.STARTING)
+        self.assertEqual(detector.classify_agent_state(busy_before_prompt_observation), AgentRuntimeState.STARTING)
+
     def test_launched_codex_without_ready_footer_is_busy(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             work_dir = Path(tmp_dir) / "project"
@@ -794,9 +917,15 @@ QUEUED
         self.assertEqual(config.vendor, Vendor.DEVECO)
         self.assertEqual(config.resolved_executable, "/opt/DevEco Code/bin/DevEco")
         self.assertEqual(config.expected_current_commands(), ("deveco", "DevEco", "node"))
-        self.assertEqual(
-            command,
-            "env DEVECO_DISABLE_AUTOUPDATE=1 '/opt/DevEco Code/bin/DevEco' '/tmp/project with spaces' --pure --model deveco/GLM-current",
+        self.assertIn("PONYTAIL_DEFAULT_MODE=off", command)
+        self.assertIn("TMUX_GRAPHIFY_MODE=off", command)
+        self.assertIn("TMUX_GRAPHIFY_READ_ONLY=1", command)
+        self.assertIn("DEVECO_DISABLE_AUTOUPDATE=1", command)
+        self.assertTrue(
+            command.endswith(
+                "'/opt/DevEco Code/bin/DevEco' '/tmp/project with spaces' "
+                "--pure --model deveco/GLM-current"
+            )
         )
 
     def test_deveco_run_config_freezes_scan_resolution_for_summary_prompt_and_launch(self):
@@ -2037,6 +2166,8 @@ workspace (/directory)                                                     branc
             reasoning_effort="xhigh",
         ).build_launch_command(work_dir)
         self.assertIn("codex --model", codex_cmd)
+        self.assertIn("--disable hooks", codex_cmd)
+        self.assertNotIn("--dangerously-bypass-hook-trust", codex_cmd)
         self.assertIn("--cd /tmp/project", codex_cmd)
 
         claude_cmd = self._resolved_test_config(
@@ -2119,7 +2250,8 @@ workspace (/directory)                                                     branc
             header = build_prompt_header(Vendor.AGY, "Gemini 3.5 Flash (Low)", "low")
 
         self.assertIn("agy --model 'Gemini 3.5 Flash (Low)' --dangerously-skip-permissions", command)
-        self.assertNotIn("/tmp/project", command)
+        self.assertNotIn("agy /tmp/project", command)
+        self.assertIn("TMUX_GRAPHIFY_PROJECT_DIR=/tmp/project", command)
         self.assertEqual(config.expected_current_commands(), ("agy", "node"))
         self.assertIn("vendor: agy", header)
         self.assertIn("agy_model=Gemini 3.5 Flash (Low)", header)
@@ -5591,6 +5723,9 @@ workspace (/directory)                                                     branc
             def target_exists(self, target=None):  # noqa: ANN001, ARG002
                 return True
 
+            def session_exists(self):
+                return True
+
             def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
                 return WorkerObservation(
                     visible_text="Working on files...\nesc interrupt",
@@ -5617,7 +5752,7 @@ workspace (/directory)                                                     branc
             worker = EndlessBusyWorker(
                 worker_id="endless-busy-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             worker.pane_id = "%1"
@@ -5638,8 +5773,8 @@ workspace (/directory)                                                     branc
             with mock.patch("T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 2), mock.patch(
                 "T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC",
                 0.01,
-            ):
-                result = worker._wait_for_task_result_while_agent_busy_after_timeout(  # noqa: SLF001
+            ), self.assertRaises(AgentRuntimeInterventionRequired) as caught:
+                worker._wait_for_task_result_while_agent_busy_after_timeout(  # noqa: SLF001
                     label="development_start_M1-T1",
                     attempt=1,
                     timeout_sec=1200.0,
@@ -5651,9 +5786,208 @@ workspace (/directory)                                                     branc
                     prompt_submission_observed=True,
                 )
 
-            self.assertIsNone(result)
             self.assertEqual(worker.wait_calls, 4)
-            self.assertTrue(worker.dispatch_reason.startswith("stale_busy_without_contract:"))
+            self.assertEqual(caught.exception.blocker_kind, LONG_RUNNING_TASK_RESULT_BLOCKER)
+            self.assertTrue(worker.dispatch_reason.startswith(f"{LONG_RUNNING_TASK_RESULT_REASON_PREFIX}:"))
+            self.assertIn("不会自动重发", str(caught.exception))
+            self.assertEqual(worker.read_state()["agent_state"], AgentRuntimeState.BUSY.value)
+            self.assertEqual(worker.read_state()["startup_blocker_kind"], LONG_RUNNING_TASK_RESULT_BLOCKER)
+
+    def test_task_result_long_running_intervention_resumes_same_wait_without_prompt_replay(self):
+        completed_result = TaskResultFile(
+            result_path="/tmp/result.json",
+            payload={"status": "completed"},
+            artifact_paths={},
+            artifact_hashes={},
+            validated_at="2026-07-22T22:00:00",
+        )
+
+        class LongRunningWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.wait_calls = 0
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def session_exists(self):
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="Waiting for background terminal\nesc to interrupt",
+                    raw_log_delta="",
+                    raw_log_tail="Waiting for background terminal\nesc to interrupt",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-22T21:59:00",
+                    pane_title="⠋ codex",
+                )
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.BUSY
+
+            def wait_for_task_result(self, **kwargs):  # noqa: ANN003
+                self.wait_calls += 1
+                if self.wait_calls <= 4:
+                    raise TimeoutError("still waiting for background terminal")
+                return completed_result
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            worker = LongRunningWorker(
+                worker_id="long-running-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            worker.agent_state = AgentRuntimeState.BUSY
+            worker.turn_state = runtime_module.TurnState.WAITING_RESULT
+            worker.current_task_runtime_status = "running"
+            task_status_path = root / "task_status.json"
+            task_status_path.write_text('{"status": "running"}', encoding="utf-8")
+            result_path = root / "result.json"
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+            )
+            interventions: list[AgentRuntimeInterventionRequired] = []
+
+            def acknowledge_same_turn(current_worker, error):  # noqa: ANN001
+                self.assertIs(current_worker, worker)
+                interventions.append(error)
+                self.assertTrue(current_worker.runtime_intervention_is_resolved(error.blocker_kind))
+
+            worker._runtime_intervention_handler = acknowledge_same_turn  # noqa: SLF001
+            with mock.patch("T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 2), mock.patch(
+                "T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC",
+                0.01,
+            ):
+                result = worker._wait_for_task_result_while_agent_busy_after_timeout(  # noqa: SLF001
+                    label="development_start_M1-T2",
+                    attempt=1,
+                    timeout_sec=1200.0,
+                    contract=contract,
+                    task_status_path=task_status_path,
+                    result_path=result_path,
+                    baseline_visible="",
+                    baseline_raw_log_tail="",
+                    prompt_submission_observed=True,
+                )
+
+            self.assertIs(result, completed_result)
+            self.assertEqual(len(interventions), 1)
+            self.assertEqual(interventions[0].blocker_kind, LONG_RUNNING_TASK_RESULT_BLOCKER)
+            self.assertEqual(worker.dispatch_state, "submitted")
+            self.assertEqual(worker.dispatch_reason, "")
+
+    def test_run_turn_long_running_intervention_sends_business_prompt_once(self):
+        completed_result = TaskResultFile(
+            result_path="/tmp/result.json",
+            payload={"status": "completed"},
+            artifact_paths={},
+            artifact_hashes={},
+            validated_at="2026-07-22T22:10:00",
+        )
+
+        class LongRunningTurnWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                self.sent_prompts: list[str] = []
+                self.wait_calls = 0
+                super().__init__(**kwargs)
+
+            def read_state(self):
+                return {"status": "ready", "agent_alive": True}
+
+            def _write_state(self, status, *, note, extra=None):  # noqa: ANN001, ARG002
+                return None
+
+            def _log_event(self, event, **payload):  # noqa: ANN001, ARG002
+                return None
+
+            def _append_transcript(self, title, body):  # noqa: ANN001, ARG002
+                return None
+
+            def _record_result(self, result, *, status, note, extra=None):  # noqa: ANN001, ARG002
+                return None
+
+            def _ensure_agent_ready_for_turn_start(self, **kwargs):  # noqa: ANN003
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, **kwargs):  # noqa: ANN003
+                return None
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="Waiting for background terminal\nesc to interrupt",
+                    raw_log_delta="background job active",
+                    raw_log_tail="Waiting for background terminal\nesc to interrupt",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-22T22:09:00",
+                    pane_title="⠋ codex",
+                )
+
+            def get_agent_state(self, observation=None, *, task_running_override=None):  # noqa: ANN001, ARG002
+                return AgentRuntimeState.BUSY
+
+            def wait_for_task_result(self, **kwargs):  # noqa: ANN003
+                self.wait_calls += 1
+                if self.wait_calls <= 4:
+                    raise TimeoutError("still waiting for background terminal")
+                return completed_result
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            worker = LongRunningTurnWorker(
+                worker_id="long-running-turn-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+            )
+            interventions: list[AgentRuntimeInterventionRequired] = []
+
+            with mock.patch("T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 1), mock.patch(
+                "T02_tmux_agents.TASK_RESULT_BUSY_TIMEOUT_EXTENSION_SEC",
+                0.01,
+            ):
+                result = worker.run_turn(
+                    label="development_start_M1-T2",
+                    prompt="只执行一次的开发任务",
+                    result_contract=contract,
+                    timeout_sec=0.01,
+                    runtime_intervention_handler=lambda _worker, error: interventions.append(error),
+                )
+
+            self.assertTrue(result.ok)
+            self.assertEqual(len(worker.sent_prompts), 1)
+            self.assertEqual(len(interventions), 1)
+            self.assertEqual(interventions[0].blocker_kind, LONG_RUNNING_TASK_RESULT_BLOCKER)
+            self.assertIsNone(worker._runtime_intervention_handler)  # noqa: SLF001
 
     def test_task_result_busy_after_timeout_finalizes_when_ready_surface_has_no_delta(self):
         class ReadySurfaceWorker(TmuxBatchWorker):
@@ -5772,7 +6106,7 @@ workspace (/directory)                                                     branc
             worker = ReadyMissingResultWorker(
                 worker_id="ready-missing-result-worker",
                 work_dir=tmp_dir,
-                config=AgentRunConfig(vendor="codex", model="gpt-5.4-mini"),
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
                 runtime_root=root / "runtime",
             )
             contract = TaskResultContract(
@@ -5795,6 +6129,183 @@ workspace (/directory)                                                     branc
         self.assertFalse(result.ok)
         self.assertIn(TASK_RESULT_CONTRACT_ERROR_PREFIX, result.clean_output)
         self.assertIn("task_result_missing_after_timeout", result.clean_output)
+
+    def test_run_turn_records_contract_error_raised_during_busy_timeout_recovery(self):
+        class BusyThenReadyWithoutResultWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts: list[str] = []
+                self.wait_calls = 0
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                return None
+
+            def wait_for_task_result(self, **kwargs):  # noqa: ANN003
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise TimeoutError("initial task-result timeout")
+                raise RuntimeError(
+                    f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: "
+                    "phase=a07_developer_task_complete agent_state=READY error=缺少 result.json"
+                )
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="Working on files...\nesc to interrupt",
+                    raw_log_delta="",
+                    raw_log_tail="Working on files...\nesc to interrupt",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-23T07:42:49",
+                    pane_title="⠋ TmuxCodingTeam",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "Working on files...\nesc to interrupt"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            worker = BusyThenReadyWithoutResultWorker(
+                worker_id="busy-then-ready-missing-result-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            contract = TaskResultContract(
+                turn_id="a07_developer_task_complete",
+                phase="a07_developer_task_complete",
+                task_kind="a07_developer_task_complete",
+                mode="a07_developer_task_complete",
+                expected_statuses=("completed",),
+                required_artifacts={"developer_output": root / "工程师开发内容.md"},
+            )
+
+            result = worker.run_turn(
+                label="development_start_M5-T2",
+                prompt="write developer output",
+                result_contract=contract,
+                timeout_sec=0.01,
+                prompt_submit_timeout_sec=0.01,
+            )
+            final_state = worker.read_state()
+
+        self.assertFalse(result.ok)
+        self.assertGreaterEqual(worker.wait_calls, 2)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertIn(TASK_RESULT_CONTRACT_ERROR_PREFIX, result.clean_output)
+        self.assertIn("agent_state=READY", result.clean_output)
+        self.assertNotIn("stale_busy_without_contract", result.clean_output)
+        self.assertEqual(final_state["result_status"], "failed")
+
+    def test_run_turn_records_artifact_contract_error_raised_during_busy_timeout_recovery(self):
+        class BusyThenReadyWithoutArtifactsWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.sent_prompts: list[str] = []
+                self.wait_calls = 0
+
+            def session_exists(self):
+                return True
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ARG002
+                self.pane_id = "%1"
+                self.agent_started = True
+                self.agent_ready = True
+                self.agent_state = AgentRuntimeState.READY
+                self.current_command = "codex"
+                self.current_path = str(self.work_dir)
+                self.last_pane_title = "TmuxCodingTeam"
+
+            def _send_text(self, text, enter_count=None):  # noqa: ANN001, ARG002
+                self.sent_prompts.append(text)
+
+            def _wait_for_prompt_submission(self, *, prompt, timeout_sec):  # noqa: ANN001, ARG002
+                return None
+
+            def wait_for_turn_artifacts(self, **kwargs):  # noqa: ANN003
+                self.wait_calls += 1
+                if self.wait_calls == 1:
+                    raise TimeoutError("initial artifact timeout")
+                raise RuntimeError(
+                    f"{TURN_ARTIFACT_CONTRACT_ERROR_PREFIX}: "
+                    "phase=任务开发 runtime_stalled idle_sec=45.0"
+                )
+
+            def _try_finalize_turn_artifacts_after_timeout(self, **kwargs):  # noqa: ANN003
+                return None
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                return WorkerObservation(
+                    visible_text="Working on review...\nesc to interrupt",
+                    raw_log_delta="",
+                    raw_log_tail="Working on review...\nesc to interrupt",
+                    current_command="codex",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at="2026-07-23T07:42:49",
+                    pane_title="⠋ TmuxCodingTeam",
+                )
+
+            def capture_visible(self, tail_lines=500):  # noqa: ARG002
+                return "Working on review...\nesc to interrupt"
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            status_path = root / "review.json"
+            worker = BusyThenReadyWithoutArtifactsWorker(
+                worker_id="busy-then-ready-missing-artifacts-worker",
+                work_dir=tmp_dir,
+                config=self._resolved_test_config(vendor="codex", model="gpt-5.4-mini"),
+                runtime_root=root / "runtime",
+            )
+            contract = TurnFileContract(
+                turn_id="development_review_M5-T2",
+                phase="任务开发",
+                status_path=status_path,
+                validator=lambda path: (_ for _ in ()).throw(FileNotFoundError(path)),
+                quiet_window_sec=0.0,
+            )
+
+            result = worker.run_turn(
+                label="development_review_M5-T2",
+                prompt="review developer output",
+                completion_contract=contract,
+                timeout_sec=0.01,
+                prompt_submit_timeout_sec=0.01,
+            )
+            final_state = worker.read_state()
+
+        self.assertFalse(result.ok)
+        self.assertEqual(worker.wait_calls, 2)
+        self.assertEqual(len(worker.sent_prompts), 1)
+        self.assertIn(TURN_ARTIFACT_CONTRACT_ERROR_PREFIX, result.clean_output)
+        self.assertEqual(final_state["result_status"], "failed")
 
     def test_wait_for_task_result_marks_task_done_when_result_stable_and_agent_ready(self):
         class ResultReadyWorker(TmuxBatchWorker):
@@ -7519,7 +8030,9 @@ workspace (/directory)                                                     branc
                 return WorkerObservation(
                     visible_text="\n".join(
                         [
+                            "• Working (9m 12s • esc to interrupt)",
                             "• 完成",
+                            "Worked for 11m 38s",
                             "",
                             "",
                             "› Run /review on my current changes",
@@ -7528,7 +8041,7 @@ workspace (/directory)                                                     branc
                         ]
                     ),
                     raw_log_delta="",
-                    raw_log_tail="• 完成",
+                    raw_log_tail="older task output • esc to interrupt\n• 完成",
                     current_command="codex",
                     current_path=str(self.work_dir),
                     pane_dead=False,
@@ -8458,7 +8971,7 @@ workspace (/directory)                                                     branc
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
-            worker.agent_started = True
+            worker.agent_started = False
             with self.assertRaises(TimeoutError):
                 worker._wait_for_prompt_submission(prompt="analyze", timeout_sec=0.01)
 
@@ -10654,6 +11167,25 @@ Do you trust the files in this folder?
                 pane_title="OpenCode",
             )
         )
+        question_phase = detector.classify_agent_state(
+            WorkerObservation(
+                visible_text=(
+                    "→ Asked 1 question\n"
+                    "详细设计 的评审结论是审核通过还是不通过？\n"
+                    "3. Type your own answer\n"
+                    "↑↓ select  enter submit  esc dismiss"
+                ),
+                raw_log_delta="",
+                raw_log_tail="Ask anything...\nctrl+p commands",
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-07-22T00:00:02",
+                pane_title="OpenCode",
+            )
+        )
         footer_ready_state = detector.classify_agent_state(
             WorkerObservation(
                 visible_text="OK\n\n10.9K  ctrl+p commands",
@@ -10699,6 +11231,7 @@ Do you trust the files in this folder?
         self.assertEqual(booting_phase, AgentRuntimeState.STARTING)
         self.assertEqual(waiting_phase, AgentRuntimeState.READY)
         self.assertEqual(processing_phase, AgentRuntimeState.BUSY)
+        self.assertEqual(question_phase, AgentRuntimeState.STARTING)
         self.assertEqual(footer_ready_state, AgentRuntimeState.READY)
         self.assertEqual(wrapped_footer_ready_state, AgentRuntimeState.READY)
         self.assertEqual(opaque_tui_processing_phase, AgentRuntimeState.BUSY)
@@ -12566,7 +13099,13 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
         self.assertEqual(calls[1][1]["timeout_sec"], 30.0)
         self.assertEqual(calls[2][0][0], "send-keys")
         self.assertEqual(calls[2][1]["timeout_sec"], 15.0)
-        delete_buffer.assert_called_once()
+        delete_buffer_calls = [
+            call
+            for call in delete_buffer.call_args_list
+            if call.args
+            and list(call.args[0])[:3] == ["tmux", "delete-buffer", "-b"]
+        ]
+        self.assertEqual(len(delete_buffer_calls), 1)
 
     def test_run_turn_never_retries_after_prompt_submission_outcome_unknown(self):
         class DispatchTimeoutWorker(TmuxBatchWorker):

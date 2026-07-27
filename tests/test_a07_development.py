@@ -245,6 +245,35 @@ def _write_required_inputs(paths: dict[str, Path]) -> None:
 
 
 class A07DevelopmentTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+        vendor_id: str,
+        requested_model: str,
+        requested_effort: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            resolved_model=str(requested_model or f"{vendor_id}/test-default"),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor_id}",
+        )
+
+    def setUp(self) -> None:
+        # Development-stage tests exercise orchestration, recovery and file
+        # contracts. Model discovery is covered by test_vendor_catalog.py, so
+        # keep this suite hermetic instead of paying for installed CLI probes.
+        resolver = patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            side_effect=self._runtime_test_resolution,
+        )
+        resolver.start()
+        self.addCleanup(resolver.stop)
+
     def test_recovery_helpers_propagate_tmux_liveness_uncertainty(self):
         errors = (
             TmuxControlUnavailable(
@@ -704,7 +733,9 @@ class A07DevelopmentTests(unittest.TestCase):
             ), patch(
                 "A07_Development._run_single_reviewer_initialization",
                 return_value=new_reviewer,
-            ):
+            ), patch(
+                "A07_Development._wait_for_reviewer_materialized_outputs",
+            ) as late_output_wait:
                 result = run_reviewer_turn_with_recreation(
                     old_reviewer,
                     project_dir=project_dir,
@@ -729,6 +760,7 @@ class A07DevelopmentTests(unittest.TestCase):
 
         self.assertIs(result, new_reviewer)
         self.assertEqual(prompts, ["write 需求A_评审记录_测试工程师-旧星.json", "write 需求A_评审记录_测试工程师-新星.json"])
+        late_output_wait.assert_not_called()
 
     def test_live_reviewer_non_death_failure_does_not_prompt_recreation(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -755,7 +787,11 @@ class A07DevelopmentTests(unittest.TestCase):
             ), patch(
                 "A07_Development.request_worker_manual_intervention",
                 return_value=AGENT_INTERVENTION_WORKER_DEAD,
-            ) as prompt_recovery, patch("A07_Development.recreate_development_reviewer_runtime") as recreate_runtime:
+            ) as prompt_recovery, patch(
+                "A07_Development.recreate_development_reviewer_runtime",
+            ) as recreate_runtime, patch(
+                "A07_Development._wait_for_reviewer_materialized_outputs",
+            ) as late_output_wait:
                 result = run_reviewer_turn_with_recreation(
                     reviewer,
                     project_dir=project_dir,
@@ -769,6 +805,7 @@ class A07DevelopmentTests(unittest.TestCase):
 
         recreate_runtime.assert_not_called()
         prompt_recovery.assert_called_once()
+        late_output_wait.assert_not_called()
         self.assertIsNone(result)
 
     def test_reviewer_file_intervention_dead_is_consumed_without_second_prompt(self):
@@ -3241,7 +3278,9 @@ class A07DevelopmentTests(unittest.TestCase):
             ), patch(
                 "A07_Development.recreate_development_reviewer_runtime",
                 side_effect=[replacement1, replacement2],
-            ) as recreate_runtime:
+            ) as recreate_runtime, patch(
+                "A07_Development.try_resume_worker",
+            ) as try_resume:
                 result = _run_single_reviewer_initialization(
                     reviewer,
                     project_dir=project_dir,
@@ -3264,6 +3303,7 @@ class A07DevelopmentTests(unittest.TestCase):
         self.assertTrue(recreate_runtime.call_args_list[1].kwargs["required_reconfiguration"])
         self.assertIn("连续 2 次死亡/失败", recreate_runtime.call_args_list[1].kwargs["reason_text"])
         self.assertIn("智能体进程已死亡或退出", recreate_runtime.call_args_list[1].kwargs["reason_text"])
+        try_resume.assert_not_called()
 
     def test_developer_ready_timeout_requires_manual_retry_and_continues_after_success(self):
         developer = DeveloperRuntime(

@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import atexit
+import copy
 import fcntl
 import errno
 import hashlib
@@ -33,6 +34,48 @@ from typing import Any, Mapping, Sequence
 from contextlib import contextmanager
 from urllib.parse import urlparse
 from tmux_core.runtime.vendor_catalog import LaunchResolution, resolve_launch
+from tmux_core.runtime.ponytail import (
+    BUNDLE_COMMIT as PONYTAIL_BUNDLE_COMMIT,
+    BUNDLE_DELIVERY as PONYTAIL_BUNDLE_DELIVERY,
+    BUNDLE_VERSION as PONYTAIL_BUNDLE_VERSION,
+    PonytailBundleError,
+    PonytailMode,
+    build_ponytail_bootstrap,
+    build_ponytail_reminder,
+    END_MARKER as PONYTAIL_END_MARKER,
+    normalize_ponytail_mode,
+    validate_ponytail_bundle,
+)
+from tmux_core.runtime.grill import (
+    BUNDLE_COMMIT as GRILL_BUNDLE_COMMIT,
+    BUNDLE_DELIVERY as GRILL_BUNDLE_DELIVERY,
+    BEGIN_MARKER as GRILL_BEGIN_MARKER,
+    GrillBundleError,
+    GrillTurnProfile,
+    RequirementsMode,
+    build_grill_bootstrap,
+    build_grill_reminder,
+    normalize_grill_turn_profile,
+    normalize_requirements_mode,
+    validate_grill_bundle,
+)
+from tmux_core.runtime.graphify import (
+    GraphifyBuildConfig,
+    GraphifyError,
+    GraphifyMode,
+    GraphifyTurnProfile,
+    build_graphify_evidence_block,
+    graphify_interactive_recovery_enabled,
+    graphify_required_recovery_decision,
+    graphify_required_recovery_guard,
+    normalize_graphify_mode,
+    publish_graphify_off_status,
+    publish_graphify_pending_status,
+    resolve_graphify_tool,
+    resolve_graphify_turn_profile,
+    set_graphify_required_recovery_decision,
+    setup_managed_graphify,
+)
 from tmux_core.runtime.contracts import (
     TASK_RESULT_COMPLETED,
     TASK_RESULT_HITL,
@@ -70,6 +113,10 @@ TMUX_MISSING_ERROR_MARKERS = (
     "unknown target",
     "no server running",
     "no sessions",
+    # tmux reports an absent server socket this way when TMUX_TMPDIR points at
+    # a clean runtime.  This is an explicit no-server result, not a control
+    # timeout/unavailability condition.
+    "no such file or directory",
 )
 
 
@@ -98,6 +145,8 @@ TURN_ARTIFACT_POST_DONE_GRACE_SEC = 10.0
 TASK_RESULT_POST_DONE_GRACE_SEC = 10.0
 TASK_RESULT_READY_MISSING_GRACE_SEC = 2.0
 STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX = "stale_busy_without_contract"
+LONG_RUNNING_TASK_RESULT_REASON_PREFIX = "long_running_task_result"
+LONG_RUNNING_TASK_RESULT_BLOCKER = "long_running_task_result"
 TASK_CONTRACT_STALL_IDLE_SEC = 45.0
 CODEX_TRANSIENT_SHELL_START_GRACE_SEC = 15.0
 TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS = _positive_int_env("TMUX_TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 30)
@@ -375,6 +424,19 @@ CODEX_UPDATE_NOTICE_PATTERNS = (
     r"Skip until next version",
     r"Press enter to continue",
 )
+CODEX_HOOK_REVIEW_NEEDS_PATTERN = (
+    r"\b\d+\s+hooks?\s+need(?:s)?\s+review\s+before\s+(?:they|it)\s+can\s+run\b"
+)
+CODEX_HOOK_REVIEW_OVERVIEW_PATTERNS = (
+    r"\bPress\s+t\s+to\s+trust\s+all\b",
+    r"\benter\s+to\s+review\s+hooks\b",
+    r"\besc\s+to\s+close\b",
+)
+CODEX_HOOK_REVIEW_DETAIL_PATTERNS = (
+    r"\bNew\s+hook\s*-\s*review\s+required\b",
+    r"\bPress\s+t\s+to\s+trust\b",
+    r"\besc\s+to\s+go\s+back\b",
+)
 CODEX_STARTING_PATTERNS = (
     r"\bmodel:\s*loading\b",
     r"Starting MCP servers",
@@ -384,6 +446,9 @@ CODEX_VISIBLE_BUSY_PATTERNS = (
     r"\besc(?: again)? to interrupt\b",
     r"^\s*[•●]\s+(?:Working|Thinking|Running)\b",
     r"Messages to be submitted after next tool call",
+)
+CODEX_TURN_COMPLETED_PATTERNS = (
+    r"^\s*(?:[•●]\s+)?Worked for\s+\d+(?:\.\d+)?(?:s|m|h)\b",
 )
 CODEX_PROMPT_REJECTION_PATTERNS = (
     r"No active thread is available",
@@ -450,6 +515,18 @@ OPENCODE_PERMISSION_PROMPT_COMPACT_PATTERNS = (
     r"permissionrequired",
     r"allowonce",
     r"reject",
+)
+OPENCODE_QUESTION_PROMPT_PATTERNS = (
+    r"\bAsked\s+\d+\s+questions?\b",
+    r"\bType your own answer\b",
+    r"\benter\s+submit\b",
+    r"\besc\s+dismiss\b",
+)
+OPENCODE_QUESTION_PROMPT_COMPACT_PATTERNS = (
+    r"asked\d+questions?",
+    r"typeyourownanswer",
+    r"entersubmit",
+    r"escdismiss",
 )
 OPENCODE_FOOTER_PATTERNS = (
     r"ctrl\+p commands$",
@@ -527,7 +604,9 @@ MIMO_FOOTER_PATTERNS = (
     r"\$ ?子智能体",
     r"/ ?唤起命令",
 )
+CODEX_HOOK_TRUST_BLOCKER = "codex_hook_trust"
 OPENCODE_PERMISSION_BLOCKER = "opencode_permission"
+OPENCODE_QUESTION_BLOCKER = "opencode_question"
 DEVECO_UPDATE_BLOCKER = "deveco_update"
 DEVECO_STUDIO_V011_BLOCKER = "deveco_studio_v011"
 DEVECO_STUDIO_V012_BLOCKER = "deveco_studio_v012"
@@ -581,13 +660,52 @@ def _codex_effective_recent_surface(text: str, *, max_lines: int = 120) -> str:
     return "\n".join(lines[start_index:])
 
 
+def _codex_surface_has_hook_review(text: str) -> bool:
+    """Detect a Codex hook-trust gate in the current viewport only."""
+
+    visible_surface = "\n".join(str(text or "").splitlines()[-120:])
+    if not visible_surface.strip():
+        return False
+    if not re.search(CODEX_HOOK_REVIEW_NEEDS_PATTERN, visible_surface, re.IGNORECASE):
+        return False
+    overview = all(
+        re.search(pattern, visible_surface, re.IGNORECASE)
+        for pattern in CODEX_HOOK_REVIEW_OVERVIEW_PATTERNS
+    )
+    detail = all(
+        re.search(pattern, visible_surface, re.IGNORECASE)
+        for pattern in CODEX_HOOK_REVIEW_DETAIL_PATTERNS
+    )
+    return bool(overview or detail)
+
+
 def _codex_surface_has_ready_blocker(text: str) -> bool:
     surface = str(text or "")
     if not surface.strip():
         return False
-    return any(
+    if _codex_surface_has_hook_review(surface):
+        return True
+    # Startup markers describe the whole current viewport and must keep their
+    # priority even when Codex already rendered its input box.  A real BUSY row
+    # can also sit above the input/footer, so only an explicit completed-turn
+    # boundary may retire an earlier BUSY marker.
+    if any(
         re.search(pattern, surface, re.IGNORECASE | re.MULTILINE)
-        for pattern in (*CODEX_STARTING_PATTERNS, *CODEX_VISIBLE_BUSY_PATTERNS)
+        for pattern in CODEX_STARTING_PATTERNS
+    ):
+        return True
+    lines = surface.splitlines()[-120:]
+    last_completed_index = -1
+    for index, line in enumerate(lines):
+        if any(
+            re.search(pattern, line, re.IGNORECASE | re.MULTILINE)
+            for pattern in CODEX_TURN_COMPLETED_PATTERNS
+        ):
+            last_completed_index = index
+    busy_surface = "\n".join(lines[last_completed_index + 1:]) if last_completed_index >= 0 else surface
+    return any(
+        re.search(pattern, busy_surface, re.IGNORECASE | re.MULTILINE)
+        for pattern in CODEX_VISIBLE_BUSY_PATTERNS
     )
 
 
@@ -1511,6 +1629,10 @@ class TmuxBackend:
         return str(probe.value or "").strip()
 
     def capture_visible(self, target: str, *, tail_lines: int = DEFAULT_CAPTURE_TAIL_LINES) -> str:
+        # `visible_text` is a control-plane signal: startup blockers and
+        # READY/BUSY markers must describe the pane's current viewport only.
+        # Passing `-S -N` includes scrollback, so an old "esc to interrupt"
+        # marker can keep a completed agent BUSY indefinitely.
         probe = self._probe_readonly(
             "capture-pane",
             "capture-pane",
@@ -1518,13 +1640,14 @@ class TmuxBackend:
             "-p",
             "-t",
             target,
-            "-S",
-            f"-{tail_lines}",
             timeout_sec=TMUX_CAPTURE_COMMAND_TIMEOUT_SEC,
             recovery_timeout_sec=TMUX_CAPTURE_RECOVERY_TIMEOUT_SEC,
         )
         if not probe.present:
             raise subprocess.CalledProcessError(1, ["tmux", "capture-pane", "-t", target])
+        # Keep the compatibility argument, but never trim the control-plane
+        # viewport: a blocker at the top of a tall pane is still current.
+        _ = tail_lines
         return str(probe.value or "")
 
     def pipe_log(self, target: str, raw_log_path: Path) -> None:
@@ -1869,6 +1992,84 @@ class AgentStartupInterventionRequired(AgentInterventionRequired):
 
 class AgentRuntimeInterventionRequired(AgentInterventionRequired):
     """A live, already-started agent is blocked on an explicit human decision."""
+
+
+class PonytailSessionModeMismatch(RuntimeError):
+    """A live session cannot be reused under a different behavior policy."""
+
+
+class GrillSessionModeMismatch(RuntimeError):
+    """A live session cannot be reused under a different requirements policy."""
+
+
+def normalize_graphify_config(value: Mapping[str, object] | None) -> dict[str, object]:
+    """Validate and canonicalize the stage-wide Graphify build policy."""
+
+    if not value:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("graphify 配置必须是 JSON 对象")
+    allowed = {
+        "include",
+        "exclude",
+        "max_workers",
+        "initial_timeout_sec",
+        "incremental_timeout_sec",
+    }
+    unknown = sorted(str(key) for key in value if str(key) not in allowed)
+    if unknown:
+        raise ValueError(f"graphify 配置包含未知字段: {', '.join(unknown)}")
+
+    def patterns(key: str) -> tuple[str, ...]:
+        raw = value.get(key, ())
+        if raw in (None, ""):
+            return ()
+        if not isinstance(raw, (list, tuple)):
+            raise ValueError(f"graphify.{key} 必须是字符串数组")
+        normalized = tuple(str(item or "").strip() for item in raw)
+        if any(not item for item in normalized):
+            raise ValueError(f"graphify.{key} 不能包含空值")
+        return normalized
+
+    def positive_int(key: str, default: int) -> int:
+        try:
+            result = int(value.get(key, default))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"graphify.{key} 必须是正整数") from error
+        if result <= 0:
+            raise ValueError(f"graphify.{key} 必须是正整数")
+        return result
+
+    def positive_float(key: str, default: float) -> float:
+        try:
+            result = float(value.get(key, default))
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"graphify.{key} 必须是正数") from error
+        if result <= 0:
+            raise ValueError(f"graphify.{key} 必须是正数")
+        return result
+
+    defaults = GraphifyBuildConfig()
+    normalized = {
+        "include": patterns("include"),
+        "exclude": patterns("exclude"),
+        "max_workers": positive_int("max_workers", defaults.max_workers),
+        "initial_timeout_sec": positive_float(
+            "initial_timeout_sec",
+            defaults.initial_timeout_sec,
+        ),
+        "incremental_timeout_sec": positive_float(
+            "incremental_timeout_sec",
+            defaults.incremental_timeout_sec,
+        ),
+    }
+    if normalized["max_workers"] != 1:
+        raise ValueError("graphify.max_workers 第一版固定为 1")
+    return normalized
+
+
+class GraphifySessionModeMismatch(RuntimeError):
+    """A live session cannot be reused under a different project graph policy."""
 
 
 def is_worker_death_error(error: BaseException | str) -> bool:
@@ -2323,6 +2524,21 @@ def load_worker_from_state_path(
                 model=model,
                 reasoning_effort=str(config_payload.get("reasoning_effort", "high")).strip() or "high",
                 proxy_url=str(config_payload.get("proxy_url", "")).strip(),
+                ponytail_mode=str(config_payload.get("ponytail_mode", PonytailMode.OFF.value)).strip()
+                or PonytailMode.OFF.value,
+                requirements_mode=str(
+                    config_payload.get("requirements_mode", RequirementsMode.STANDARD.value)
+                ).strip()
+                or RequirementsMode.STANDARD.value,
+                graphify_mode=str(
+                    config_payload.get("graphify_mode", GraphifyMode.OFF.value)
+                ).strip()
+                or GraphifyMode.OFF.value,
+                graphify_config=(
+                    config_payload.get("graphify_config", {})
+                    if isinstance(config_payload.get("graphify_config", {}), Mapping)
+                    else {}
+                ),
             ),
             runtime_root=path.parent.parent,
             existing_runtime_dir=path.parent,
@@ -2339,6 +2555,8 @@ def load_worker_from_state_path(
                 PASSIVE_REFRESH_RAW_LOG_DELTA_LIMIT_BYTES
             )
         return worker
+    except (PonytailBundleError, GrillBundleError):
+        raise
     except Exception:
         return None
 
@@ -2840,6 +3058,23 @@ def _opencode_visible_permission_blocker(visible_text: str) -> bool:
     return bool(regular_match or compact_match)
 
 
+def _opencode_visible_question_blocker(visible_text: str) -> bool:
+    """Detect OpenCode's active Ask UI from the current viewport only."""
+    normalized_visible = _normalize_opencode_surface(visible_text)
+    compact_visible = _compact_opencode_surface(visible_text)
+    if not normalized_visible and not compact_visible:
+        return False
+    regular_match = all(
+        re.search(pattern, normalized_visible, re.IGNORECASE | re.MULTILINE)
+        for pattern in OPENCODE_QUESTION_PROMPT_PATTERNS
+    )
+    compact_match = all(
+        re.search(pattern, compact_visible, re.IGNORECASE | re.MULTILINE)
+        for pattern in OPENCODE_QUESTION_PROMPT_COMPACT_PATTERNS
+    )
+    return bool(regular_match or compact_match)
+
+
 def _classify_opencode_surface_state(
         *,
         visible_text: str,
@@ -2850,7 +3085,7 @@ def _classify_opencode_surface_state(
     normalized_recent = _normalize_opencode_surface(recent_log)
     compact_visible = _compact_opencode_surface(visible_text)
     compact_recent = _compact_opencode_surface(recent_log)
-    if _opencode_visible_permission_blocker(visible_text):
+    if _opencode_visible_permission_blocker(visible_text) or _opencode_visible_question_blocker(visible_text):
         return AgentRuntimeState.STARTING
     if _matches_opencode_surface(
             normalized_visible,
@@ -2911,6 +3146,8 @@ def _classify_mimo_surface_state(
     normalized_recent = _normalize_opencode_surface(recent_log)
     compact_visible = _compact_opencode_surface(visible_text)
     compact_recent = _compact_opencode_surface(recent_log)
+    if _opencode_visible_question_blocker(visible_text):
+        return AgentRuntimeState.STARTING
     if all(re.search(pattern, normalized_visible or normalized_recent, re.IGNORECASE) for pattern in MIMO_TRUST_PROMPT_PATTERNS) or all(
         re.search(pattern, compact_visible or compact_recent, re.IGNORECASE) for pattern in MIMO_TRUST_PROMPT_COMPACT_PATTERNS
     ):
@@ -3364,6 +3601,8 @@ class CodexOutputDetector(BaseOutputDetector):
         title = str(observation.pane_title or "").strip()
         if not title:
             return AgentRuntimeState.STARTING
+        if _codex_surface_has_hook_review(surface):
+            return AgentRuntimeState.STARTING
         if BRAILLE_SPINNER_PREFIX_RE.match(title):
             return AgentRuntimeState.BUSY
         if _codex_surface_has_ready_blocker(surface):
@@ -3734,11 +3973,37 @@ class AgentRunConfig:
     supports_reasoning: bool = False
     resolution_notes: tuple[str, ...] = ()
     resolved_executable: str = ""
+    ponytail_mode: str = PonytailMode.OFF.value
+    requirements_mode: str = RequirementsMode.STANDARD.value
+    graphify_mode: str = GraphifyMode.OFF.value
+    graphify_config: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vendor", normalize_vendor(self.vendor))
         object.__setattr__(self, "reasoning_effort", normalize_effort(self.reasoning_effort))
         object.__setattr__(self, "proxy_url", normalize_proxy_url(self.proxy_url))
+        object.__setattr__(
+            self,
+            "ponytail_mode",
+            normalize_ponytail_mode(self.ponytail_mode, default=PonytailMode.OFF).value,
+        )
+        object.__setattr__(
+            self,
+            "requirements_mode",
+            normalize_requirements_mode(
+                self.requirements_mode,
+                default=RequirementsMode.STANDARD,
+            ).value,
+        )
+        object.__setattr__(
+            self,
+            "graphify_mode",
+            normalize_graphify_mode(
+                self.graphify_mode,
+                default=GraphifyMode.OFF,
+            ).value,
+        )
+        object.__setattr__(self, "graphify_config", normalize_graphify_config(self.graphify_config))
         object.__setattr__(self, "model", str(self.model or "").strip())
         if not self.model:
             raise ValueError("model 不能为空")
@@ -3787,7 +4052,7 @@ class AgentRunConfig:
         )
         return f"{header}\n\n{str(prompt or '').strip()}".strip()
 
-    def to_summary(self) -> dict[str, str]:
+    def to_summary(self) -> dict[str, object]:
         resolution = self._frozen_resolution()
         return {
             "vendor": self.vendor.value,
@@ -3798,6 +4063,10 @@ class AgentRunConfig:
             "reasoning_control_mode": self.reasoning_control_mode,
             "catalog_source_kind": self.catalog_source_kind,
             "proxy_url": self.proxy_url,
+            "ponytail_mode": self.ponytail_mode,
+            "requirements_mode": self.requirements_mode,
+            "graphify_mode": self.graphify_mode,
+            "graphify_config": dict(self.graphify_config),
             "reasoning_note": build_reasoning_note(self.vendor, self.reasoning_effort, model=self.model, resolution=resolution),
         }
 
@@ -3829,6 +4098,8 @@ class AgentRunConfig:
                 "danger-full-access",
                 "--ask-for-approval",
                 "never",
+                "--disable",
+                "hooks",
                 "--cd",
                 str(work_dir),
                 "--no-alt-screen",
@@ -3853,8 +4124,6 @@ class AgentRunConfig:
             ]
         elif self.vendor == Vendor.DEVECO:
             args = [
-                "env",
-                "DEVECO_DISABLE_AUTOUPDATE=1",
                 self.resolved_executable or "deveco",
                 str(work_dir),
                 "--pure",
@@ -3880,7 +4149,19 @@ class AgentRunConfig:
             raise ValueError(f"不支持的厂商: {self.vendor}")
 
         args.extend(self.extra_args)
-        return " ".join(shlex.quote(item) for item in args)
+        graphify_wrapper = PROJECT_ROOT / "scripts" / "tmux-graphify"
+        environment = [
+            "env",
+            "PONYTAIL_DEFAULT_MODE=off",
+            f"TMUX_GRAPHIFY_CMD={graphify_wrapper}",
+            f"TMUX_GRAPHIFY_PROJECT_DIR={work_dir}",
+            f"TMUX_GRAPHIFY_MODE={self.graphify_mode}",
+            "TMUX_GRAPHIFY_READ_ONLY=1",
+            "GRAPHIFY_QUERY_LOG_DISABLE=1",
+        ]
+        if self.vendor == Vendor.DEVECO:
+            environment.append("DEVECO_DISABLE_AUTOUPDATE=1")
+        return " ".join(shlex.quote(item) for item in [*environment, *args])
 
 
 @dataclass
@@ -3939,6 +4220,30 @@ class TmuxBatchWorker:
         if not self.work_dir.is_dir():
             raise FileNotFoundError(f"工作目录不存在: {self.work_dir}")
         self.config = config
+        self.ponytail_mode = normalize_ponytail_mode(
+            getattr(self.config, "ponytail_mode", PonytailMode.OFF.value),
+            default=PonytailMode.OFF,
+        ).value
+        if self.ponytail_mode != PonytailMode.OFF.value:
+            validate_ponytail_bundle()
+        self.requirements_mode = normalize_requirements_mode(
+            getattr(self.config, "requirements_mode", RequirementsMode.STANDARD.value),
+            default=RequirementsMode.STANDARD,
+        ).value
+        if self.requirements_mode != RequirementsMode.STANDARD.value:
+            validate_grill_bundle()
+        self.graphify_mode = normalize_graphify_mode(
+            getattr(self.config, "graphify_mode", GraphifyMode.OFF.value),
+            default=GraphifyMode.OFF,
+        ).value
+        self.graphify_generation_refreshed = False
+        if self.graphify_mode == GraphifyMode.OFF.value:
+            # OFF must remain a hard runtime no-op while still replacing a
+            # previous runner's Ready/Failed project badge with the truthful
+            # current mode.
+            publish_graphify_off_status(self.work_dir)
+        else:
+            publish_graphify_pending_status(self.work_dir, self.graphify_mode)
         self.backend = backend or TmuxBackend()
         self.detector = build_output_detector(self.config.vendor)
         self.runtime_root = Path(runtime_root or DEFAULT_RUNTIME_ROOT).expanduser().resolve()
@@ -3993,6 +4298,13 @@ class TmuxBatchWorker:
         self.stage_runner_id = ""
         self.orphaned_at = ""
         self.orphaned_reason = ""
+        self.ponytail_session_generation = uuid.uuid4().hex
+        self.ponytail_full_delivered = False
+        self.ponytail_delivered_mode = ""
+        self.grill_session_generation = uuid.uuid4().hex
+        self.grill_full_delivered = False
+        self.grill_delivered_mode = ""
+        self.grill_question_seq = 0
         self._runtime_metadata: dict[str, object] = {
             key: value
             for key, value in dict(runtime_metadata or {}).items()
@@ -4025,6 +4337,52 @@ class TmuxBatchWorker:
         self.launch_command = self.config.build_launch_command(self.work_dir)
         if self.state_path.exists():
             existing_state = self.read_state()
+            self.graphify_generation_refreshed = bool(
+                existing_state.get("graphify_generation_refreshed", False)
+            )
+            existing_config = existing_state.get("config", {})
+            if not isinstance(existing_config, Mapping):
+                existing_config = {}
+            existing_ponytail_mode = normalize_ponytail_mode(
+                existing_config.get("ponytail_mode", PonytailMode.OFF.value),
+                default=PonytailMode.OFF,
+            ).value
+            if existing_session_name and existing_ponytail_mode != self.ponytail_mode:
+                raise PonytailSessionModeMismatch(
+                    "cannot reuse tmux session with a different Ponytail mode: "
+                    f"session={existing_session_name}, existing={existing_ponytail_mode}, "
+                    f"requested={self.ponytail_mode}"
+                )
+            existing_requirements_mode = normalize_requirements_mode(
+                existing_config.get("requirements_mode", RequirementsMode.STANDARD.value),
+                default=RequirementsMode.STANDARD,
+            ).value
+            if existing_session_name and existing_requirements_mode != self.requirements_mode:
+                raise GrillSessionModeMismatch(
+                    "cannot reuse tmux session with a different requirements mode: "
+                    f"session={existing_session_name}, existing={existing_requirements_mode}, "
+                    f"requested={self.requirements_mode}"
+                )
+            existing_graphify_mode = normalize_graphify_mode(
+                existing_config.get("graphify_mode", GraphifyMode.OFF.value),
+                default=GraphifyMode.OFF,
+            ).value
+            if existing_session_name and existing_graphify_mode != self.graphify_mode:
+                raise GraphifySessionModeMismatch(
+                    "cannot reuse tmux session with a different Graphify mode: "
+                    f"session={existing_session_name}, existing={existing_graphify_mode}, "
+                    f"requested={self.graphify_mode}"
+                )
+            existing_graphify_config = normalize_graphify_config(
+                existing_config.get("graphify_config", {})
+                if isinstance(existing_config.get("graphify_config", {}), Mapping)
+                else {}
+            )
+            if existing_session_name and existing_graphify_config != dict(self.config.graphify_config):
+                raise GraphifySessionModeMismatch(
+                    "cannot reuse tmux session with a different Graphify scan policy: "
+                    f"session={existing_session_name}"
+                )
             self.pane_id = existing_pane_id or str(existing_state.get("pane_id", self.pane_id))
             self.session_name = existing_session_name or str(existing_state.get("session_name", self.session_name))
             if reserved_session_name and self.session_name != reserved_session_name:
@@ -4049,6 +4407,39 @@ class TmuxBatchWorker:
                 self.stage_runner_id = str(existing_state.get("stage_runner_id", "") or "").strip()
             self.orphaned_at = str(existing_state.get("orphaned_at", "") or "").strip()
             self.orphaned_reason = str(existing_state.get("orphaned_reason", "") or "").strip()
+            ponytail_policy = existing_state.get("ponytail_policy", {})
+            if isinstance(ponytail_policy, Mapping):
+                existing_generation = str(ponytail_policy.get("session_generation", "") or "").strip()
+                if existing_generation:
+                    self.ponytail_session_generation = existing_generation
+                delivered_mode = str(ponytail_policy.get("delivered_mode", "") or "").strip().lower()
+                bundle_matches = (
+                    str(ponytail_policy.get("bundle_version", "") or "") == PONYTAIL_BUNDLE_VERSION
+                    and str(ponytail_policy.get("bundle_commit", "") or "") == PONYTAIL_BUNDLE_COMMIT
+                )
+                self.ponytail_full_delivered = bool(
+                    ponytail_policy.get("full_delivered", False)
+                    and delivered_mode == self.ponytail_mode
+                    and bundle_matches
+                )
+                self.ponytail_delivered_mode = delivered_mode if self.ponytail_full_delivered else ""
+            grill_policy = existing_state.get("grill_policy", {})
+            if isinstance(grill_policy, Mapping):
+                existing_generation = str(grill_policy.get("session_generation", "") or "").strip()
+                if existing_generation:
+                    self.grill_session_generation = existing_generation
+                delivered_mode = str(grill_policy.get("delivered_mode", "") or "").strip().lower()
+                bundle_matches = (
+                    str(grill_policy.get("bundle_commit", "") or "") == GRILL_BUNDLE_COMMIT
+                )
+                self.grill_full_delivered = bool(
+                    grill_policy.get("full_delivered", False)
+                    and delivered_mode == self.requirements_mode
+                    and bundle_matches
+                )
+                self.grill_delivered_mode = delivered_mode if self.grill_full_delivered else ""
+                with contextlib.suppress(TypeError, ValueError):
+                    self.grill_question_seq = max(int(grill_policy.get("question_seq", 0) or 0), 0)
             existing_runner_id = str(existing_state.get("stage_runner_id", "") or "").strip()
             if (
                     metadata_owns_runner_id
@@ -4195,6 +4586,360 @@ class TmuxBatchWorker:
 
     def show_transcript_tail(self, *, max_lines: int = 60) -> str:
         return read_text_tail(self.transcript_path, max_lines=max_lines)
+
+    def _configured_ponytail_mode(self) -> str:
+        config = getattr(self, "config", None)
+        return normalize_ponytail_mode(
+            getattr(
+                self,
+                "ponytail_mode",
+                getattr(config, "ponytail_mode", PonytailMode.OFF.value),
+            ),
+            default=PonytailMode.OFF,
+        ).value
+
+    def _ponytail_policy_payload(self) -> dict[str, object]:
+        return {
+            "session_generation": self.ponytail_session_generation,
+            "full_delivered": self.ponytail_full_delivered,
+            "delivered_mode": self.ponytail_delivered_mode,
+            "bundle_version": PONYTAIL_BUNDLE_VERSION,
+            "bundle_commit": PONYTAIL_BUNDLE_COMMIT,
+            "delivery": PONYTAIL_BUNDLE_DELIVERY,
+        }
+
+    def _reset_ponytail_delivery_generation(self) -> None:
+        self.ponytail_session_generation = uuid.uuid4().hex
+        self.ponytail_full_delivered = False
+        self.ponytail_delivered_mode = ""
+        if not self.state_path.exists():
+            return
+        with self.state_lock:
+            payload = self.read_state()
+            payload["ponytail_policy"] = self._ponytail_policy_payload()
+            payload["updated_at"] = _now_iso()
+            payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+            payload["last_writer"] = "TmuxBatchWorker.ponytail_generation"
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def _mark_ponytail_bootstrap_delivered(self, submitted_prompt: str) -> None:
+        ponytail_mode = self._configured_ponytail_mode()
+        if ponytail_mode == PonytailMode.OFF.value:
+            return
+        authoritative_block = build_ponytail_bootstrap(ponytail_mode)
+        stripped_prompt = str(submitted_prompt or "").lstrip()
+        if not (
+            stripped_prompt == authoritative_block
+            or stripped_prompt.startswith(f"{authoritative_block}\n\n")
+        ):
+            return
+        self.ponytail_full_delivered = True
+        self.ponytail_delivered_mode = ponytail_mode
+
+    def _clear_ponytail_bootstrap_delivery_for_prompt(self, submitted_prompt: str) -> None:
+        ponytail_mode = self._configured_ponytail_mode()
+        if ponytail_mode == PonytailMode.OFF.value:
+            return
+        authoritative_block = build_ponytail_bootstrap(ponytail_mode)
+        stripped_prompt = str(submitted_prompt or "").lstrip()
+        if stripped_prompt == authoritative_block or stripped_prompt.startswith(f"{authoritative_block}\n\n"):
+            self.ponytail_full_delivered = False
+            self.ponytail_delivered_mode = ""
+
+    def _persist_ponytail_policy_fast(self) -> None:
+        with self.state_lock:
+            payload = self.read_state()
+            payload["ponytail_policy"] = self._ponytail_policy_payload()
+            payload["updated_at"] = _now_iso()
+            payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+            payload["last_writer"] = "TmuxBatchWorker.ponytail_delivery"
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def _confirm_ponytail_bootstrap_delivery(self, submitted_prompt: str) -> None:
+        previous_full_delivered = self.ponytail_full_delivered
+        previous_delivered_mode = self.ponytail_delivered_mode
+        self._mark_ponytail_bootstrap_delivered(submitted_prompt)
+        if (
+            self.ponytail_full_delivered == previous_full_delivered
+            and self.ponytail_delivered_mode == previous_delivered_mode
+        ):
+            return
+        try:
+            self._persist_ponytail_policy_fast()
+        except Exception:
+            self.ponytail_full_delivered = previous_full_delivered
+            self.ponytail_delivered_mode = previous_delivered_mode
+            raise
+
+    def _configured_requirements_mode(self) -> str:
+        config = getattr(self, "config", None)
+        return normalize_requirements_mode(
+            getattr(
+                self,
+                "requirements_mode",
+                getattr(config, "requirements_mode", RequirementsMode.STANDARD.value),
+            ),
+            default=RequirementsMode.STANDARD,
+        ).value
+
+    def _configured_graphify_mode(self) -> str:
+        config = getattr(self, "config", None)
+        return normalize_graphify_mode(
+            getattr(
+                self,
+                "graphify_mode",
+                getattr(config, "graphify_mode", GraphifyMode.OFF.value),
+            ),
+            default=GraphifyMode.OFF,
+        ).value
+
+    def _normalize_graphify_profile_for_turn(
+            self,
+            profile: GraphifyTurnProfile | GraphifyMode | str,
+    ) -> GraphifyTurnProfile:
+        if isinstance(profile, GraphifyTurnProfile):
+            normalized = profile
+        else:
+            normalized = GraphifyTurnProfile(mode=normalize_graphify_mode(profile).value)
+        configured_mode = self._configured_graphify_mode()
+        if normalized.mode != GraphifyMode.OFF.value and normalized.mode != configured_mode:
+            raise GraphifySessionModeMismatch(
+                "Graphify turn mode does not match the worker project graph mode: "
+                f"session={getattr(self, 'session_name', '')}, configured={configured_mode}, "
+                f"turn={normalized.mode}"
+            )
+        return normalized
+
+    def _resolve_graphify_profile_for_turn(
+            self,
+            prompt: str,
+            profile: GraphifyTurnProfile | GraphifyMode | str | None,
+    ) -> GraphifyTurnProfile:
+        if profile is not None:
+            return self._normalize_graphify_profile_for_turn(profile)
+        if self._configured_graphify_mode() == GraphifyMode.OFF.value:
+            # OFF is a hard no-op: do not touch the cache, probe tools, or
+            # publish project status merely because a turn wrapper prepared
+            # an immutable profile for its repair cycle.
+            return GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
+        refresh = not bool(getattr(self, "graphify_generation_refreshed", False))
+        resolved = resolve_graphify_turn_profile(
+            project_dir=self.work_dir,
+            mode=self._configured_graphify_mode(),
+            prompt=str(prompt or ""),
+            runtime_dir=self.runtime_dir,
+            config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
+            refresh=refresh,
+        )
+        if self._configured_graphify_mode() != GraphifyMode.OFF.value:
+            self.graphify_generation_refreshed = True
+        return resolved
+
+    def prepare_graphify_turn_profile(self, prompt: str) -> GraphifyTurnProfile:
+        """Resolve one immutable evidence profile for a logical turn/repairs."""
+
+        return self._resolve_graphify_profile_for_turn(str(prompt or ""), None)
+
+    def refresh_graphify_generation(self, prompt: str) -> GraphifyTurnProfile:
+        """Refresh the shared project graph at an explicit stage checkpoint."""
+
+        if self._configured_graphify_mode() == GraphifyMode.OFF.value:
+            return GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
+        profile = resolve_graphify_turn_profile(
+            project_dir=self.work_dir,
+            mode=self._configured_graphify_mode(),
+            prompt=str(prompt or "Graphify stage checkpoint"),
+            runtime_dir=self.runtime_dir,
+            config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
+            refresh=True,
+        )
+        self.graphify_generation_refreshed = True
+        return profile
+
+    def mark_graphify_generation_current(self) -> None:
+        """Tell a peer worker that another worker refreshed their shared graph."""
+
+        if self._configured_graphify_mode() != GraphifyMode.OFF.value:
+            self.graphify_generation_refreshed = True
+
+    def _grill_policy_payload(self) -> dict[str, object]:
+        return {
+            "session_generation": self.grill_session_generation,
+            "full_delivered": self.grill_full_delivered,
+            "delivered_mode": self.grill_delivered_mode,
+            "question_seq": self.grill_question_seq,
+            "bundle_commit": GRILL_BUNDLE_COMMIT,
+            "delivery": GRILL_BUNDLE_DELIVERY,
+        }
+
+    def _reset_grill_delivery_generation(self) -> None:
+        self.grill_session_generation = uuid.uuid4().hex
+        self.grill_full_delivered = False
+        self.grill_delivered_mode = ""
+        self.grill_question_seq = 0
+        if not self.state_path.exists():
+            return
+        with self.state_lock:
+            payload = self.read_state()
+            payload["grill_policy"] = self._grill_policy_payload()
+            payload["updated_at"] = _now_iso()
+            payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+            payload["last_writer"] = "TmuxBatchWorker.grill_generation"
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def _normalize_grill_profile_for_turn(
+            self,
+            profile: GrillTurnProfile | RequirementsMode | str | None,
+    ) -> GrillTurnProfile | None:
+        if profile is None:
+            return None
+        normalized = normalize_grill_turn_profile(profile)
+        configured_mode = self._configured_requirements_mode()
+        if normalized.mode != configured_mode:
+            raise GrillSessionModeMismatch(
+                "Grill turn mode does not match the worker requirements mode: "
+                f"session={getattr(self, 'session_name', '')}, configured={configured_mode}, "
+                f"turn={normalized.mode}"
+            )
+        return normalized
+
+    @staticmethod
+    def _managed_grill_profile_from_prompt(
+            submitted_prompt: str,
+    ) -> tuple[GrillTurnProfile, bool] | None:
+        source = str(submitted_prompt or "").lstrip()
+        header_pattern = re.compile(
+            rf"{re.escape(GRILL_BEGIN_MARKER)}\n"
+            r"GRILL PROFILE( REMINDER)? — mode: ([a-z-]+); question_seq: ([0-9]+)(?:\.|\n)",
+        )
+        for match in header_pattern.finditer(source):
+            try:
+                profile = GrillTurnProfile(mode=match.group(2), question_seq=int(match.group(3)))
+            except ValueError:
+                continue
+            is_bootstrap = not bool(match.group(1))
+            authoritative_block = (
+                build_grill_bootstrap(profile)
+                if is_bootstrap
+                else build_grill_reminder(profile)
+            )
+            if not source.startswith(authoritative_block, match.start()):
+                continue
+            prefix = source[:match.start()].rstrip()
+            if prefix and not prefix.endswith(PONYTAIL_END_MARKER):
+                continue
+            return profile, is_bootstrap
+        return None
+
+    def _mark_grill_prompt_delivered(self, submitted_prompt: str) -> None:
+        configured_mode = self._configured_requirements_mode()
+        if configured_mode == RequirementsMode.STANDARD.value:
+            return
+        managed = self._managed_grill_profile_from_prompt(submitted_prompt)
+        if managed is None:
+            return
+        profile, is_bootstrap = managed
+        if profile.mode != configured_mode:
+            return
+        self.grill_question_seq = profile.question_seq
+        if is_bootstrap:
+            self.grill_full_delivered = True
+            self.grill_delivered_mode = profile.mode
+
+    def _clear_grill_bootstrap_delivery_for_prompt(self, submitted_prompt: str) -> None:
+        configured_mode = self._configured_requirements_mode()
+        if configured_mode == RequirementsMode.STANDARD.value:
+            return
+        managed = self._managed_grill_profile_from_prompt(submitted_prompt)
+        if managed is None:
+            return
+        profile, is_bootstrap = managed
+        if is_bootstrap and profile.mode == configured_mode:
+            self.grill_full_delivered = False
+            self.grill_delivered_mode = ""
+
+    def _persist_grill_policy_fast(self) -> None:
+        with self.state_lock:
+            payload = self.read_state()
+            payload["grill_policy"] = self._grill_policy_payload()
+            payload["updated_at"] = _now_iso()
+            payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+            payload["last_writer"] = "TmuxBatchWorker.grill_delivery"
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def _confirm_grill_prompt_delivery(self, submitted_prompt: str) -> None:
+        previous = (
+            self.grill_full_delivered,
+            self.grill_delivered_mode,
+            self.grill_question_seq,
+        )
+        self._mark_grill_prompt_delivered(submitted_prompt)
+        current = (
+            self.grill_full_delivered,
+            self.grill_delivered_mode,
+            self.grill_question_seq,
+        )
+        if current == previous:
+            return
+        try:
+            self._persist_grill_policy_fast()
+        except Exception:
+            (
+                self.grill_full_delivered,
+                self.grill_delivered_mode,
+                self.grill_question_seq,
+            ) = previous
+            raise
+
+    def _confirm_grill_profile_delivery(
+            self,
+            profile: GrillTurnProfile | RequirementsMode | str | None,
+            *,
+            delivery_bundle_commit: str = "",
+    ) -> None:
+        """Latch a managed Grill profile after a persisted contract proves submission."""
+        if profile is None:
+            return
+        normalized = self._normalize_grill_profile_for_turn(profile)
+        if normalized is None or not normalized.enabled:
+            return
+        previous = (
+            self.grill_full_delivered,
+            self.grill_delivered_mode,
+            self.grill_question_seq,
+        )
+        self.grill_question_seq = normalized.question_seq
+        # A reminder can only be generated after the full bootstrap was
+        # latched. Therefore an unlatched recovered submission necessarily
+        # carried the full block for this launch generation.  The persisted
+        # turn must also prove which audited bundle produced that block; an
+        # older live session must receive the current full bootstrap again.
+        if (
+            not self.grill_full_delivered
+            and str(delivery_bundle_commit or "").strip() == GRILL_BUNDLE_COMMIT
+        ):
+            self.grill_full_delivered = True
+            self.grill_delivered_mode = normalized.mode
+        current = (
+            self.grill_full_delivered,
+            self.grill_delivered_mode,
+            self.grill_question_seq,
+        )
+        if current == previous:
+            return
+        try:
+            self._persist_grill_policy_fast()
+        except Exception:
+            (
+                self.grill_full_delivered,
+                self.grill_delivered_mode,
+                self.grill_question_seq,
+            ) = previous
+            raise
 
     def read_state(self) -> dict[str, object]:
         with self.state_lock:
@@ -4717,6 +5462,50 @@ class TmuxBatchWorker:
             ),
         )
 
+    def _runtime_codex_hook_trust_intervention(
+            self,
+            observation: WorkerObservation,
+            *,
+            context: str,
+    ) -> AgentRuntimeInterventionRequired | None:
+        if self.config.vendor != Vendor.CODEX:
+            return None
+        if not _codex_surface_has_hook_review(observation.visible_text):
+            return None
+        context_text = str(context or "运行智能体任务").strip() or "运行智能体任务"
+        return AgentRuntimeInterventionRequired(
+            blocker_kind=CODEX_HOOK_TRUST_BLOCKER,
+            session_name=self.session_name,
+            state_path=str(self.state_path),
+            message=(
+                "Agent runtime requires manual intervention.\n"
+                f"{context_text}时检测到 Codex Hook 信任审核；系统不会自动信任或执行用户 Hook。\n"
+                f"请进入会话处理: tmux attach -t {self.session_name}"
+            ),
+        )
+
+    def _runtime_question_intervention(
+            self,
+            observation: WorkerObservation,
+            *,
+            context: str,
+    ) -> AgentRuntimeInterventionRequired | None:
+        if not _is_opencode_like_vendor(self.config.vendor):
+            return None
+        if not _opencode_visible_question_blocker(observation.visible_text):
+            return None
+        context_text = str(context or "运行智能体任务").strip() or "运行智能体任务"
+        return AgentRuntimeInterventionRequired(
+            blocker_kind=OPENCODE_QUESTION_BLOCKER,
+            session_name=self.session_name,
+            state_path=str(self.state_path),
+            message=(
+                "Agent runtime requires manual intervention.\n"
+                f"{context_text}时检测到智能体发起了交互式问题；系统不会代替人类选择答案。\n"
+                f"请进入会话回答: tmux attach -t {self.session_name}"
+            ),
+        )
+
     @contextmanager
     def _pause_business_timeout_for_runtime_intervention(self):
         with self._runtime_intervention_pause_lock:
@@ -4742,28 +5531,55 @@ class TmuxBatchWorker:
             raise RuntimeError("agent exited during runtime intervention")
         if blocker == OPENCODE_PERMISSION_BLOCKER:
             return not _opencode_visible_permission_blocker(observation.visible_text)
+        if blocker == OPENCODE_QUESTION_BLOCKER:
+            return not _opencode_visible_question_blocker(observation.visible_text)
+        if blocker == CODEX_HOOK_TRUST_BLOCKER:
+            return not _codex_surface_has_hook_review(observation.visible_text)
+        if blocker == LONG_RUNNING_TASK_RESULT_BLOCKER:
+            # This blocker is an acknowledgement gate, not a terminal overlay.
+            # A human recheck grants another wait budget while the same already
+            # submitted turn remains live; it must never cause prompt replay.
+            return True
         return True
 
-    def _handle_runtime_intervention_if_needed(
+    def _request_runtime_intervention(
             self,
-            observation: WorkerObservation,
+            error: AgentRuntimeInterventionRequired,
             *,
             context: str,
+            preserve_agent_state: AgentRuntimeState | None = None,
     ) -> None:
-        error = self._runtime_permission_intervention(observation, context=context)
-        if error is None:
-            return
         self._log_event(
             "runtime_intervention_required",
             blocker_kind=error.blocker_kind,
             context=str(context or "").strip(),
             session_name=self.session_name,
         )
-        self.mark_awaiting_reconfiguration(
-            reason_text=str(error),
-            startup_blocker_kind=error.blocker_kind,
-            startup_blocker_requires_manual=True,
-        )
+        if preserve_agent_state is None:
+            self.mark_awaiting_reconfiguration(
+                reason_text=str(error),
+                startup_blocker_kind=error.blocker_kind,
+                startup_blocker_requires_manual=True,
+            )
+        else:
+            self.agent_state = preserve_agent_state
+            self.agent_ready = preserve_agent_state == AgentRuntimeState.READY
+            self.startup_blocker_kind = error.blocker_kind
+            self.startup_blocker_requires_manual = True
+            self._write_state(
+                WorkerStatus.RUNNING,
+                note="awaiting_runtime_intervention",
+                extra={
+                    "result_status": "running",
+                    "health_status": "awaiting_reconfig",
+                    "health_note": str(error),
+                    "agent_state": preserve_agent_state.value,
+                    "agent_ready": self.agent_ready,
+                    "current_task_runtime_status": self.current_task_runtime_status,
+                    "startup_blocker_kind": error.blocker_kind,
+                    "startup_blocker_requires_manual": True,
+                },
+            )
         handler = self._runtime_intervention_handler
         if handler is None:
             raise error
@@ -4771,18 +5587,45 @@ class TmuxBatchWorker:
             handler(self, error)
         self.startup_blocker_kind = ""
         self.startup_blocker_requires_manual = False
+        if preserve_agent_state is not None:
+            self.agent_state = preserve_agent_state
+            self.agent_ready = preserve_agent_state == AgentRuntimeState.READY
+        resolved_extra: dict[str, object] = {
+            "result_status": "running",
+            "health_status": "alive",
+            "health_note": "runtime_intervention_resolved",
+            "current_task_runtime_status": self.current_task_runtime_status,
+            "startup_blocker_kind": "",
+            "startup_blocker_requires_manual": False,
+        }
+        if preserve_agent_state is not None:
+            resolved_extra.update(
+                {
+                    "agent_state": preserve_agent_state.value,
+                    "agent_ready": self.agent_ready,
+                }
+            )
         self._write_state(
             WorkerStatus.RUNNING,
             note="runtime_intervention_resolved",
-            extra={
-                "result_status": "running",
-                "health_status": "alive",
-                "health_note": "runtime_intervention_resolved",
-                "current_task_runtime_status": self.current_task_runtime_status,
-                "startup_blocker_kind": "",
-                "startup_blocker_requires_manual": False,
-            },
+            extra=resolved_extra,
         )
+
+    def _handle_runtime_intervention_if_needed(
+            self,
+            observation: WorkerObservation,
+            *,
+            context: str,
+    ) -> bool:
+        error = self._runtime_codex_hook_trust_intervention(observation, context=context)
+        if error is None:
+            error = self._runtime_permission_intervention(observation, context=context)
+        if error is None:
+            error = self._runtime_question_intervention(observation, context=context)
+        if error is None:
+            return False
+        self._request_runtime_intervention(error, context=context)
+        return True
 
     def mark_provider_runtime_error(self, *, reason_text: str) -> None:
         reason = str(reason_text or "").strip()
@@ -4853,6 +5696,8 @@ class TmuxBatchWorker:
 
     def create_session(self) -> str:
         raise_if_runtime_shutdown_requested("creating tmux session")
+        self._reset_ponytail_delivery_generation()
+        self._reset_grill_delivery_generation()
         self._reset_terminal_activity()
         self.agent_started = False
         self.agent_ready = False
@@ -5097,6 +5942,8 @@ class TmuxBatchWorker:
             "last_terminal_signature": "",
             "last_terminal_changed_at": "",
             "terminal_recently_changed": False,
+            "ponytail_policy": self._ponytail_policy_payload(),
+            "grill_policy": self._grill_policy_payload(),
         }
         payload.update(self._runtime_metadata)
         payload.update(self._tmux_control_state_payload())
@@ -5162,6 +6009,8 @@ class TmuxBatchWorker:
                 "last_terminal_signature": self.last_terminal_signature,
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
+                "ponytail_policy": self._ponytail_policy_payload(),
+                "grill_policy": self._grill_policy_payload(),
             }
             payload.update(self._runtime_metadata)
             previous_runner_id = str(previous.get("stage_runner_id", "") or "").strip()
@@ -5321,6 +6170,8 @@ class TmuxBatchWorker:
                 "last_terminal_signature": self.last_terminal_signature,
                 "last_terminal_changed_at": self.last_terminal_changed_at,
                 "terminal_recently_changed": self.terminal_recently_changed,
+                "ponytail_policy": self._ponytail_policy_payload(),
+                "grill_policy": self._grill_policy_payload(),
             }
             for key in (
                 "project_dir",
@@ -5719,6 +6570,12 @@ class TmuxBatchWorker:
                        extra: dict[str, object] | None = None) -> None:
         extra_payload = dict(extra or {})
         if status == WorkerStatus.SUCCEEDED:
+            self._mark_ponytail_bootstrap_delivered(result.command)
+            # A successful turn/result contract is authoritative submission
+            # evidence.  Persist the Grill delivery latch here as the final
+            # fallback for paths that do not observe BUSY/prompt echo before
+            # the contract completes.
+            self._confirm_grill_prompt_delivery(result.command)
             self.turn_state = TurnState.SUCCEEDED
             self.dispatch_state = ""
             self.dispatch_reason = ""
@@ -5877,7 +6734,10 @@ class TmuxBatchWorker:
             label: str,
             error: PromptSubmissionRejectedError,
             timeout_sec: float,
+            submitted_prompt: str = "",
     ) -> None:
+        self._clear_ponytail_bootstrap_delivery_for_prompt(submitted_prompt)
+        self._clear_grill_bootstrap_delivery_for_prompt(submitted_prompt)
         self.dispatch_state = "delayed"
         self.dispatch_reason = error.reason
         self._write_state(
@@ -5902,7 +6762,10 @@ class TmuxBatchWorker:
             label: str,
             error: BaseException,
             timeout_sec: float,
+            submitted_prompt: str = "",
     ) -> None:
+        self._clear_ponytail_bootstrap_delivery_for_prompt(submitted_prompt)
+        self._clear_grill_bootstrap_delivery_for_prompt(submitted_prompt)
         self.turn_state = TurnState.SUBMISSION_UNKNOWN
         self.dispatch_state = "submission_unknown"
         self.dispatch_reason = f"prompt_submission_unconfirmed:{error}"
@@ -5940,10 +6803,11 @@ class TmuxBatchWorker:
         while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for prompt submission")
             observation = self.observe(tail_lines=320)
-            self._handle_runtime_intervention_if_needed(
+            if self._handle_runtime_intervention_if_needed(
                 observation,
                 context="等待智能体确认收到 prompt",
-            )
+            ):
+                continue
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for prompt submission")
             if observation.pane_dead:
@@ -6789,9 +7653,9 @@ class TmuxBatchWorker:
         while True:
             raise_if_runtime_shutdown_requested("waiting for busy agent task result")
             if extension_count >= max(int(TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS), 0):
-                self.dispatch_state = "delayed"
+                self.dispatch_state = "awaiting_input"
                 self.dispatch_reason = (
-                    f"{STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX}:"
+                    f"{LONG_RUNNING_TASK_RESULT_REASON_PREFIX}:"
                     f"phase={contract.phase} result_path={result_path} "
                     f"busy_extensions_exhausted={extension_count}"
                 )
@@ -6803,7 +7667,42 @@ class TmuxBatchWorker:
                     result_path=str(result_path),
                     dispatch_reason=self.dispatch_reason,
                 )
-                return None
+                intervention = AgentRuntimeInterventionRequired(
+                    blocker_kind=LONG_RUNNING_TASK_RESULT_BLOCKER,
+                    session_name=self.session_name,
+                    state_path=str(self.state_path),
+                    message=(
+                        "Agent runtime requires manual intervention.\n"
+                        f"{contract.phase} 的任务结果等待预算已用尽，但智能体仍处于 BUSY，"
+                        "原任务已提交且系统不会自动重发。\n"
+                        f"请进入会话确认任务是否仍应继续: tmux attach -t {self.session_name}"
+                    ),
+                )
+                self._request_runtime_intervention(
+                    intervention,
+                    context=f"等待任务结果 phase={contract.phase}",
+                    preserve_agent_state=AgentRuntimeState.BUSY,
+                )
+                extension_count = 0
+                self.turn_state = TurnState.WAITING_RESULT
+                self.dispatch_state = "submitted"
+                self.dispatch_reason = ""
+                self._write_state(
+                    WorkerStatus.RUNNING,
+                    note="long_running_task_wait_resumed",
+                    extra={
+                        "result_status": "running",
+                        "health_status": "alive",
+                        "health_note": "long_running_task_wait_resumed",
+                        "agent_state": AgentRuntimeState.BUSY.value,
+                        "agent_ready": False,
+                        "turn_state": TurnState.WAITING_RESULT.value,
+                        "dispatch_state": "submitted",
+                        "dispatch_reason": "",
+                        "current_task_runtime_status": self.current_task_runtime_status,
+                    },
+                )
+                continue
             observation = self._busy_agent_observation_after_turn_timeout()
             if observation is None:
                 return self._try_finalize_task_result_from_ready_agent_after_busy_timeout(
@@ -7024,10 +7923,11 @@ class TmuxBatchWorker:
                 observation = self._probe_agent_liveness_for_file_wait()
             else:
                 observation = self.observe(tail_lines=160, tail_bytes=12000)
-                self._handle_runtime_intervention_if_needed(
+                if self._handle_runtime_intervention_if_needed(
                     observation,
                     context=f"等待智能体写入任务结果 phase={contract.phase}",
-                )
+                ):
+                    continue
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for ready task result")
             if observation.pane_dead:
@@ -7048,6 +7948,10 @@ class TmuxBatchWorker:
                 ready_or_idle_surface = self._observation_indicates_ready_or_idle_surface(observation)
             if agent_state == AgentRuntimeState.BUSY and not ready_or_idle_surface:
                 saw_busy_after_submit = True
+                # This READY-only contract path intentionally skips the
+                # generic prompt-confirmation helper.  A real BUSY surface is
+                # therefore its first authoritative submission evidence.
+                self._confirm_grill_prompt_delivery(prompt)
                 ready_hits = 0
                 result_file = self._try_finalize_task_result_from_ready_agent_after_busy_timeout(
                     contract=contract,
@@ -7761,19 +8665,20 @@ class TmuxBatchWorker:
             return False
 
     def _probe_agent_liveness_for_file_wait(self) -> WorkerObservation:
-        if type(self).observe is not TmuxBatchWorker.observe:
-            observation = self.observe(tail_lines=80, tail_bytes=0)
-        elif self.current_task_runtime_status == TASK_STATUS_RUNNING:
-            observation = self.observe(tail_lines=80, tail_bytes=12000)
-        elif _is_opencode_like_vendor(self.config.vendor) and self.agent_state == AgentRuntimeState.BUSY:
-            observation = self.observe(tail_lines=80, tail_bytes=12000)
-        else:
-            observation = self._capture_lightweight_observation()
-        self._handle_runtime_intervention_if_needed(
-            observation,
-            context="等待智能体写入任务结果",
-        )
-        return observation
+        while True:
+            if type(self).observe is not TmuxBatchWorker.observe:
+                observation = self.observe(tail_lines=80, tail_bytes=0)
+            elif self.current_task_runtime_status == TASK_STATUS_RUNNING:
+                observation = self.observe(tail_lines=80, tail_bytes=12000)
+            elif _is_opencode_like_vendor(self.config.vendor) and self.agent_state == AgentRuntimeState.BUSY:
+                observation = self.observe(tail_lines=80, tail_bytes=12000)
+            else:
+                observation = self._capture_lightweight_observation()
+            if not self._handle_runtime_intervention_if_needed(
+                observation,
+                context="等待智能体写入任务结果",
+            ):
+                return observation
 
     def _maybe_probe_agent_liveness_for_file_wait(
             self,
@@ -8026,6 +8931,30 @@ class TmuxBatchWorker:
             task_running_override: bool | None = None,
     ) -> AgentRuntimeState:
         return self._classify_agent_state(observation, task_running_override=task_running_override)
+
+    def refresh_turn_start_agent_state(self, *, label: str = "stage_ready_check") -> AgentRuntimeState:
+        """Return the runtime-owned state to use before dispatching another turn.
+
+        A completed turn can leave a provider title or cached health snapshot in
+        BUSY briefly after its input surface is already available.  Keep that
+        provider-specific reconciliation inside the runtime classifier instead
+        of duplicating terminal heuristics in stage orchestration.
+        """
+
+        previous = self.read_state()
+        unresolved_turn = worker_state_has_unresolved_turn(previous) or worker_state_has_unresolved_turn(
+            {
+                "turn_state": self.turn_state.value,
+                "current_task_runtime_status": self.current_task_runtime_status,
+                "dispatch_state": self.dispatch_state,
+            }
+        )
+        if not unresolved_turn:
+            self._try_mark_turn_start_ready_from_current_observation(
+                label=label,
+                delayed=False,
+            )
+        return self.get_agent_state()
 
     @staticmethod
     def _can_finalize_task_result_from_contract_without_helper(contract: TaskResultContract) -> bool:
@@ -8396,10 +9325,13 @@ class TmuxBatchWorker:
         while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for agent ready")
             observation = self.observe(tail_lines=220)
-            self._handle_runtime_intervention_if_needed(
+            if self._handle_runtime_intervention_if_needed(
                 observation,
                 context="等待智能体进入可输入状态",
-            )
+            ):
+                previous_ready_signature = ""
+                stable_count = 0
+                continue
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while agent was starting")
             if observation.pane_dead:
@@ -8481,7 +9413,188 @@ class TmuxBatchWorker:
             raise self._deveco_startup_intervention(last_deveco_blocker)
         raise RuntimeError(f"Timed out waiting for agent ready.\n{self.capture_visible(240)}")
 
+    def _replace_graphify_mode_before_launch(self, mode: GraphifyMode | str) -> None:
+        normalized = normalize_graphify_mode(mode, default=GraphifyMode.AUTO).value
+        self.graphify_mode = normalized
+        # AgentRunConfig is frozen and reconstructing it would repeat dynamic
+        # vendor/model discovery.  Clone the already-resolved launch config and
+        # change only this pre-launch, stage-wide policy selected by the human.
+        next_config = copy.copy(self.config)
+        object.__setattr__(next_config, "graphify_mode", normalized)
+        self.config = next_config
+        self.launch_command = self.config.build_launch_command(self.work_dir)
+        self.graphify_generation_refreshed = False
+        if normalized == GraphifyMode.OFF.value:
+            publish_graphify_off_status(self.work_dir)
+
+    def _graphify_recovery_interaction_scope(self) -> str:
+        runner_id = str(getattr(self, "stage_runner_id", "") or "").strip()
+        if runner_id:
+            return runner_id
+        metadata = getattr(self, "_runtime_metadata", {})
+        if isinstance(metadata, Mapping):
+            run_id = str(metadata.get("run_id", "") or "").strip()
+            if run_id:
+                return f"run:{run_id}"
+            workflow_action = str(metadata.get("workflow_action", "") or "").strip()
+            stage_seq = str(metadata.get("stage_seq", "") or "").strip()
+            requirement_name = str(metadata.get("requirement_name", "") or "").strip()
+            if workflow_action and stage_seq:
+                return f"stage:{requirement_name}:{workflow_action}:{stage_seq}"
+        runtime_dir = getattr(self, "runtime_dir", None)
+        if runtime_dir:
+            return f"runtime:{Path(runtime_dir).expanduser().resolve()}"
+        # Tests and legacy embedders can construct a worker without runner
+        # metadata. Keep their decision local to this worker object.
+        return f"legacy-worker:{id(self)}"
+
+    def _run_required_graphify_preflight(self) -> None:
+        prompt = "Graphify required preflight for this project"
+        interaction_scope = self._graphify_recovery_interaction_scope()
+        original_error: GraphifyError | None = None
+        try:
+            self._resolve_graphify_profile_for_turn(prompt, None)
+            self.graphify_generation_refreshed = True
+            return
+        except GraphifyError as error:
+            original_error = error
+            if not graphify_interactive_recovery_enabled(self.work_dir):
+                raise
+
+        # All project workers share one graph. Serialize this recovery prompt
+        # so parallel workers owned by the same runner cannot duplicate it.
+        with graphify_required_recovery_guard():
+            remembered = graphify_required_recovery_decision(
+                self.work_dir,
+                interaction_scope=interaction_scope,
+            )
+            if remembered in {GraphifyMode.AUTO.value, GraphifyMode.OFF.value}:
+                self._replace_graphify_mode_before_launch(remembered)
+                if remembered == GraphifyMode.AUTO.value:
+                    self._resolve_graphify_profile_for_turn(prompt, None)
+                    self.graphify_generation_refreshed = True
+                return
+
+            from T09_terminal_ops import message, prompt_metadata, prompt_select_option
+
+            if original_error is None:  # pragma: no cover - guarded by the except path above.
+                return
+            current_error: BaseException = original_error
+            while True:
+                with prompt_metadata(
+                    stage_key="graphify_required_recovery",
+                    interaction_kind="graphify_setup",
+                ):
+                    decision = prompt_select_option(
+                        title="Graphify Required 预检失败",
+                        options=(
+                            ("install_retry", "安装或重试 Graphify 0.9.27"),
+                            (GraphifyMode.AUTO.value, "切换 Auto — 允许无图降级"),
+                            (GraphifyMode.OFF.value, "切换 Off — 关闭本阶段图谱"),
+                            ("terminate", "终止当前阶段"),
+                        ),
+                        default_value="install_retry",
+                        prompt_text="选择 Graphify 恢复方式",
+                        extra_payload={
+                            "interaction_kind": "graphify_setup",
+                            "reason_text": str(current_error),
+                            "recovery_kind": "graphify_required_intervention",
+                        },
+                    )
+                if decision == "install_retry":
+                    try:
+                        setup_managed_graphify()
+                        self.graphify_generation_refreshed = False
+                        self._resolve_graphify_profile_for_turn(prompt, None)
+                    except GraphifyError as error:
+                        current_error = error
+                        message(f"Graphify 预检仍未通过: {error}")
+                        continue
+                    self.graphify_generation_refreshed = True
+                    return
+                if decision in {GraphifyMode.AUTO.value, GraphifyMode.OFF.value}:
+                    set_graphify_required_recovery_decision(
+                        self.work_dir,
+                        decision,
+                        interaction_scope=interaction_scope,
+                    )
+                    self._replace_graphify_mode_before_launch(decision)
+                    if decision == GraphifyMode.AUTO.value:
+                        self._resolve_graphify_profile_for_turn(prompt, None)
+                        self.graphify_generation_refreshed = True
+                    return
+                raise original_error
+
+    def _run_auto_graphify_availability_decision(self) -> None:
+        if not graphify_interactive_recovery_enabled(self.work_dir):
+            return
+        resolution = resolve_graphify_tool()
+        if resolution.compatible:
+            return
+        interaction_scope = self._graphify_recovery_interaction_scope()
+        with graphify_required_recovery_guard():
+            remembered = graphify_required_recovery_decision(
+                self.work_dir,
+                interaction_scope=interaction_scope,
+            )
+            if remembered == "continue_auto":
+                return
+            if remembered == GraphifyMode.OFF.value:
+                self._replace_graphify_mode_before_launch(GraphifyMode.OFF)
+                return
+
+            from T09_terminal_ops import message, prompt_metadata, prompt_select_option
+
+            current_error = resolution.error
+            while True:
+                with prompt_metadata(
+                    stage_key="graphify_auto_setup",
+                    interaction_kind="graphify_setup",
+                ):
+                    decision = prompt_select_option(
+                        title="Graphify 0.9.27 尚不可用",
+                        options=(
+                            ("install", "安装项目托管 Graphify 0.9.27"),
+                            ("continue_auto", "本次不安装 — Auto 降级继续"),
+                            (GraphifyMode.OFF.value, "关闭本次 Graphify"),
+                        ),
+                        default_value="install",
+                        prompt_text="选择 Graphify 处理方式",
+                        extra_payload={
+                            "interaction_kind": "graphify_setup",
+                            "reason_text": current_error,
+                        },
+                    )
+                if decision == "install":
+                    try:
+                        setup_managed_graphify()
+                    except GraphifyError as error:
+                        current_error = str(error)
+                        message(f"Graphify 安装未完成: {error}")
+                        continue
+                    return
+                if decision == "continue_auto":
+                    set_graphify_required_recovery_decision(
+                        self.work_dir,
+                        "continue_auto",
+                        interaction_scope=interaction_scope,
+                    )
+                    return
+                set_graphify_required_recovery_decision(
+                    self.work_dir,
+                    GraphifyMode.OFF.value,
+                    interaction_scope=interaction_scope,
+                )
+                self._replace_graphify_mode_before_launch(GraphifyMode.OFF)
+                return
+
     def launch_agent(self, timeout_sec: float = 60.0) -> None:
+        if self._configured_graphify_mode() == GraphifyMode.AUTO.value:
+            self._run_auto_graphify_availability_decision()
+        if self._configured_graphify_mode() == GraphifyMode.REQUIRED.value:
+            # Required mode is a launch gate: tool/build/schema failures must
+            # happen before tmux is mutated so no empty worker session leaks.
+            self._run_required_graphify_preflight()
         last_error: Exception | None = None
         max_attempts = 1
         for attempt in range(1, max_attempts + 1):
@@ -8593,7 +9706,10 @@ class TmuxBatchWorker:
         raise RuntimeError(intervention_text)
 
     def ensure_agent_ready(self, timeout_sec: float = 60.0) -> None:
-        if self.session_exists() and self.pane_id:
+        # A metadata-only worker has no pane yet.  Avoid touching tmux in that
+        # case: control-plane recovery can otherwise delay the initial launch
+        # by a full probe budget before we discover the already-known fact.
+        if self.pane_id and self.session_exists():
             self._ensure_health_supervisor_started()
         if not self.pane_id or not self.target_exists():
             if self.has_ever_launched():
@@ -8604,10 +9720,12 @@ class TmuxBatchWorker:
             return
 
         observation = self.observe(tail_lines=160)
-        self._handle_runtime_intervention_if_needed(
+        if self._handle_runtime_intervention_if_needed(
             observation,
             context="检查智能体是否可输入",
-        )
+        ):
+            self._wait_for_agent_ready(timeout_sec=timeout_sec)
+            return
         current_command = observation.current_command
         if self.get_agent_state(observation) == AgentRuntimeState.READY:
             self._mark_agent_ready_from_observation(observation)
@@ -8635,10 +9753,11 @@ class TmuxBatchWorker:
     ) -> bool:
         if not observation.session_exists or observation.pane_dead:
             return False
-        self._handle_runtime_intervention_if_needed(
+        if self._handle_runtime_intervention_if_needed(
             observation,
             context="准备提交下一轮 prompt",
-        )
+        ):
+            return False
         current_command = observation.current_command or self.current_command
         if current_command in SHELL_COMMANDS or not self._agent_running(current_command):
             return False
@@ -8854,10 +9973,43 @@ class TmuxBatchWorker:
             task_status_path: Path,
             complete_task_command: str | None = None,
             include_turn_protocol: bool,
+            grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
+            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
     ) -> str:
         del task_status_path
         del complete_task_command
-        sections = [str(prompt or "").strip()]
+        business_prompt = str(prompt or "").strip()
+        normalized_graphify_profile = (
+            self._normalize_graphify_profile_for_turn(graphify_profile)
+            if graphify_profile is not None
+            else GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
+        )
+        graphify_prompt = (
+            build_graphify_evidence_block(normalized_graphify_profile, business_prompt)
+            if normalized_graphify_profile.enabled
+            else business_prompt
+        )
+        normalized_grill_profile = self._normalize_grill_profile_for_turn(grill_profile)
+        if normalized_grill_profile is None or not normalized_grill_profile.enabled:
+            grill_prompt = graphify_prompt
+        elif (
+                not self.grill_full_delivered
+                or self.grill_delivered_mode != normalized_grill_profile.mode
+        ):
+            grill_prompt = build_grill_bootstrap(normalized_grill_profile, graphify_prompt)
+        else:
+            grill_prompt = build_grill_reminder(normalized_grill_profile, graphify_prompt)
+        ponytail_mode = self._configured_ponytail_mode()
+        if ponytail_mode == PonytailMode.OFF.value:
+            ponytail_prompt = grill_prompt
+        elif (
+                not self.ponytail_full_delivered
+                or self.ponytail_delivered_mode != ponytail_mode
+        ):
+            ponytail_prompt = build_ponytail_bootstrap(ponytail_mode, grill_prompt)
+        else:
+            ponytail_prompt = build_ponytail_reminder(ponytail_mode, grill_prompt)
+        sections = [ponytail_prompt]
         if include_turn_protocol:
             if required_tokens:
                 turn_protocol_prompt = f"""Turn completion protocol:
@@ -9097,10 +10249,11 @@ class TmuxBatchWorker:
         while self._business_monotonic() < deadline:
             raise_if_runtime_shutdown_requested("waiting for turn reply")
             observation = self.observe(tail_lines=DEFAULT_CAPTURE_TAIL_LINES)
-            self._handle_runtime_intervention_if_needed(
+            if self._handle_runtime_intervention_if_needed(
                 observation,
                 context="等待智能体回复",
-            )
+            ):
+                continue
             if not observation.session_exists:
                 raise RuntimeError("tmux pane exited while waiting for reply")
             if observation.pane_dead:
@@ -9155,6 +10308,197 @@ class TmuxBatchWorker:
         self.agent_ready = False
         raise TimeoutError(f"等待智能体回复超时:\n{clean_ansi(self.capture_visible(200))[-4000:]}")
 
+    def _record_resumed_completion_turn(
+            self,
+            *,
+            label: str,
+            contract: TurnFileContract,
+            file_result: TurnFileResult,
+            task_status_path: Path | None,
+            grill_profile: GrillTurnProfile | RequirementsMode | str | None,
+    ) -> CommandResult:
+        persisted_state = self.read_state()
+        if task_status_path is not None:
+            write_task_status(task_status_path, status=TASK_STATUS_DONE)
+        self.current_task_runtime_status = TASK_STATUS_DONE
+        self.current_task_status_path = str(task_status_path or "")
+        self._confirm_grill_profile_delivery(
+            grill_profile,
+            delivery_bundle_commit=str(
+                persisted_state.get("current_grill_bundle_commit", "") or ""
+            ),
+        )
+        reply = json.dumps(
+            {
+                "status_path": file_result.status_path,
+                "artifact_paths": file_result.artifact_paths,
+                "artifact_hashes": file_result.artifact_hashes,
+                "resumed_existing_submission": True,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        finished_at = _now_iso()
+        result = CommandResult(
+            label=label,
+            command="",
+            exit_code=0,
+            raw_output=reply,
+            clean_output=reply,
+            started_at=str(self.read_state().get("started_at", "") or finished_at),
+            finished_at=finished_at,
+        )
+        self._record_result(
+            result,
+            status=WorkerStatus.SUCCEEDED,
+            note=f"done:{label}:resumed",
+            extra={
+                "label": label,
+                "result_status": "succeeded",
+                "current_turn_id": contract.turn_id,
+                "current_turn_phase": contract.phase,
+                "current_turn_status_path": str(contract.status_path),
+                "current_task_status_path": str(task_status_path or ""),
+                "current_task_runtime_status": TASK_STATUS_DONE,
+                "dispatch_state": "",
+                "dispatch_reason": "",
+                "turn_state": TurnState.SUCCEEDED.value,
+                "resumed_existing_submission": True,
+            },
+        )
+        self._log_event(
+            "turn_resume_contract_completed",
+            label=label,
+            turn_id=contract.turn_id,
+            status_path=str(contract.status_path),
+        )
+        return result
+
+    def resume_completion_turn(
+            self,
+            *,
+            label: str,
+            completion_contract: TurnFileContract,
+            timeout_sec: float,
+            submission_cursor: str = "",
+            stage_status_path: str | Path | None = None,
+            grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
+            runtime_intervention_handler: Callable[[object, AgentRuntimeInterventionRequired], None] | None = None,
+    ) -> CommandResult | None:
+        """Resume an interrupted file-contract turn without submitting its prompt again.
+
+        ``None`` is returned only when persisted state proves the matching turn
+        had not reached the mutation boundary. Every ambiguous mutation state
+        is observed in place and becomes terminal if submission cannot be
+        proven; this method never sends text or Enter.
+        """
+
+        state = self.read_state()
+        task_status_text = str(state.get("current_task_status_path", "") or "").strip()
+        task_status_path = Path(task_status_text).expanduser().resolve() if task_status_text else None
+
+        # A valid contract is authoritative even if the process crashed before
+        # the worker could persist SUCCEEDED or the Grill delivery latch.
+        file_result = None
+        persisted_stage_status = (
+            Path(stage_status_path).expanduser().resolve()
+            if stage_status_path
+            else None
+        )
+        if completion_contract.status_path.exists() or (
+                persisted_stage_status is not None and persisted_stage_status.exists()
+        ):
+            try:
+                file_result = completion_contract.validator(completion_contract.status_path)
+                validate_turn_file_artifact_rules(completion_contract, file_result)
+            except Exception:
+                file_result = None
+        if file_result is not None:
+            return self._record_resumed_completion_turn(
+                label=label,
+                contract=completion_contract,
+                file_result=file_result,
+                task_status_path=task_status_path,
+                grill_profile=grill_profile,
+            )
+
+        expected_status_path = str(completion_contract.status_path.expanduser().resolve())
+        persisted_turn_id = str(state.get("current_turn_id", "") or "").strip()
+        persisted_status_path = str(state.get("current_turn_status_path", "") or "").strip()
+        cursor = str(submission_cursor or "").strip().lower()
+        if persisted_turn_id != completion_contract.turn_id or (
+                persisted_status_path
+                and str(Path(persisted_status_path).expanduser().resolve()) != expected_status_path
+        ):
+            if cursor in {"not_started", "repair_not_started"}:
+                return None
+            raise TmuxMutationOutcomeUnknown(
+                operation="resume persisted Grill turn",
+                error=RuntimeError(
+                    "persisted worker cursor does not match the active Grill turn; "
+                    f"expected_turn={completion_contract.turn_id}, worker_turn={persisted_turn_id or '(empty)'}"
+                ),
+            )
+
+        turn_state = str(state.get("turn_state", "") or "").strip().lower()
+        dispatch_state = str(state.get("dispatch_state", "") or "").strip().lower()
+        if turn_state == TurnState.PREPARING.value and dispatch_state in {"", "preparing"}:
+            return None
+        if (
+            cursor == "repair_not_started"
+            and turn_state in {TurnState.SUCCEEDED.value, TurnState.FAILED.value}
+        ):
+            return None
+
+        submission_unknown = (
+            turn_state == TurnState.SUBMISSION_UNKNOWN.value
+            or dispatch_state in {"submitting", "submission_unknown"}
+        )
+        submitted = (
+            turn_state in {
+                TurnState.SUBMITTED.value,
+                TurnState.WAITING_RESULT.value,
+                TurnState.SUCCEEDED.value,
+                TurnState.FAILED.value,
+                TurnState.ORPHANED.value,
+            }
+            or dispatch_state in {"submitted", "delayed", "running"}
+        )
+        if not submission_unknown and not submitted:
+            raise TmuxMutationOutcomeUnknown(
+                operation="resume persisted Grill turn",
+                error=RuntimeError(
+                    "persisted Grill submission cursor is not safe to replay: "
+                    f"turn_state={turn_state or '(empty)'}, dispatch_state={dispatch_state or '(empty)'}"
+                ),
+            )
+
+        previous_handler = self._runtime_intervention_handler
+        self._runtime_intervention_handler = runtime_intervention_handler
+        try:
+            try:
+                file_result = self.wait_for_turn_artifacts(
+                    contract=completion_contract,
+                    task_status_path=task_status_path,
+                    timeout_sec=timeout_sec,
+                )
+            except Exception as error:
+                if submission_unknown:
+                    raise TmuxMutationOutcomeUnknown(
+                        operation="resume uncertain Grill prompt submission",
+                        error=error,
+                    ) from error
+                raise
+        finally:
+            self._runtime_intervention_handler = previous_handler
+        return self._record_resumed_completion_turn(
+            label=label,
+            contract=completion_contract,
+            file_result=file_result,
+            task_status_path=task_status_path,
+            grill_profile=grill_profile,
+        )
+
     def run_turn(
             self,
             *,
@@ -9169,10 +10513,16 @@ class TmuxBatchWorker:
             pre_submit_observation_tail_lines: int | None = None,
             pre_submit_observation_tail_bytes: int | None = None,
             runtime_intervention_handler: Callable[[object, AgentRuntimeInterventionRequired], None] | None = None,
+            grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
+            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
     ) -> CommandResult:
         previous_handler = self._runtime_intervention_handler
         self._runtime_intervention_handler = runtime_intervention_handler
         try:
+            resolved_graphify_profile = self._resolve_graphify_profile_for_turn(
+                prompt,
+                graphify_profile,
+            )
             return self._run_turn_impl(
                 label=label,
                 prompt=prompt,
@@ -9184,6 +10534,8 @@ class TmuxBatchWorker:
                 prompt_submit_timeout_sec=prompt_submit_timeout_sec,
                 pre_submit_observation_tail_lines=pre_submit_observation_tail_lines,
                 pre_submit_observation_tail_bytes=pre_submit_observation_tail_bytes,
+                grill_profile=grill_profile,
+                graphify_profile=resolved_graphify_profile,
             )
         finally:
             self._runtime_intervention_handler = previous_handler
@@ -9201,6 +10553,8 @@ class TmuxBatchWorker:
             prompt_submit_timeout_sec: float | None = None,
             pre_submit_observation_tail_lines: int | None = None,
             pre_submit_observation_tail_bytes: int | None = None,
+            grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
+            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
     ) -> CommandResult:
         raise_if_runtime_shutdown_requested(f"starting turn {label}")
         started_at = _now_iso()
@@ -9228,7 +10582,10 @@ class TmuxBatchWorker:
                 required_tokens,
                 task_status_path=task_status_path,
                 include_turn_protocol=completion_contract is None and result_contract is None,
+                grill_profile=grill_profile,
+                graphify_profile=graphify_profile,
             )
+            managed_grill_prompt = self._managed_grill_profile_from_prompt(submitted_prompt)
             prompt_hash = hashlib.sha1(submitted_prompt.encode("utf-8")).hexdigest()[:12]
             self._append_transcript(f"{label} / prompt", f"```text\n{submitted_prompt}\n```")
             self._write_state(
@@ -9239,6 +10596,28 @@ class TmuxBatchWorker:
                     "started_at": started_at,
                     "last_turn_token": turn_token,
                     "last_prompt_hash": prompt_hash,
+                    "current_grill_bundle_commit": (
+                        GRILL_BUNDLE_COMMIT if managed_grill_prompt is not None else ""
+                    ),
+                    "current_grill_prompt_kind": (
+                        "bootstrap"
+                        if managed_grill_prompt is not None and managed_grill_prompt[1]
+                        else "reminder"
+                        if managed_grill_prompt is not None
+                        else ""
+                    ),
+                    "graphify_evidence_id": str(
+                        getattr(getattr(graphify_profile, "evidence", None), "evidence_id", "") or ""
+                    ),
+                    "graphify_fingerprint": str(
+                        getattr(getattr(graphify_profile, "evidence", None), "graph_fingerprint", "") or ""
+                    ),
+                    "graphify_freshness": str(
+                        getattr(getattr(graphify_profile, "evidence", None), "freshness", "") or ""
+                    ),
+                    "graphify_generation_refreshed": bool(
+                        getattr(self, "graphify_generation_refreshed", False)
+                    ),
                     "current_turn_id": completion_contract.turn_id if completion_contract else "",
                     "current_turn_phase": completion_contract.phase if completion_contract else "",
                     "current_turn_status_path": str(completion_contract.status_path) if completion_contract else "",
@@ -9304,10 +10683,14 @@ class TmuxBatchWorker:
                         tail_lines=observe_tail_lines,
                         tail_bytes=observe_tail_bytes,
                     )
-                    self._handle_runtime_intervention_if_needed(
-                        baseline_observation,
-                        context="提交 prompt 前复检智能体界面",
-                    )
+                    while self._handle_runtime_intervention_if_needed(
+                            baseline_observation,
+                            context="提交 prompt 前复检智能体界面",
+                    ):
+                        baseline_observation = self.observe(
+                            tail_lines=observe_tail_lines,
+                            tail_bytes=observe_tail_bytes,
+                        )
                     self._log_event(
                         "pre_submit_observe_done",
                         label=label,
@@ -9410,6 +10793,13 @@ class TmuxBatchWorker:
                     attempt=attempt,
                     completion_contract=completion_contract,
                 )
+                self._confirm_ponytail_bootstrap_delivery(submitted_prompt)
+                # `_send_text()` returning only proves that the tmux mutation
+                # call returned; it does not prove Enter submitted the prompt.
+                # An uncertain mutation may, however, have been confirmed by
+                # BUSY/prompt observation or by a completed contract above.
+                if prompt_submission_observed:
+                    self._confirm_grill_prompt_delivery(submitted_prompt)
                 self._mark_turn_waiting_result(label=label)
                 prompt_confirmation_timeout = min(
                     timeout_sec,
@@ -9421,11 +10811,13 @@ class TmuxBatchWorker:
                             self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
                             self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                             prompt_submission_observed = True
+                            self._confirm_grill_prompt_delivery(submitted_prompt)
                         except PromptSubmissionRejectedError as error:
                             self._record_prompt_submission_rejected(
                                 label=label,
                                 error=error,
                                 timeout_sec=prompt_confirmation_timeout,
+                                submitted_prompt=submitted_prompt,
                             )
                             raise
                         except PromptSubmissionUnconfirmedError as error:
@@ -9433,6 +10825,7 @@ class TmuxBatchWorker:
                                 label=label,
                                 error=error,
                                 timeout_sec=prompt_confirmation_timeout,
+                                submitted_prompt=submitted_prompt,
                             )
                         except TimeoutError as error:
                             self.dispatch_state = "delayed"
@@ -9481,11 +10874,13 @@ class TmuxBatchWorker:
                                 self._wait_for_prompt_submission(prompt=submitted_prompt, timeout_sec=prompt_confirmation_timeout)
                                 self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                                 prompt_submission_observed = True
+                                self._confirm_grill_prompt_delivery(submitted_prompt)
                             except PromptSubmissionRejectedError as error:
                                 self._record_prompt_submission_rejected(
                                     label=label,
                                     error=error,
                                     timeout_sec=prompt_confirmation_timeout,
+                                    submitted_prompt=submitted_prompt,
                                 )
                                 raise
                             except PromptSubmissionUnconfirmedError as error:
@@ -9493,6 +10888,7 @@ class TmuxBatchWorker:
                                     label=label,
                                     error=error,
                                     timeout_sec=prompt_confirmation_timeout,
+                                    submitted_prompt=submitted_prompt,
                                 )
                             except TimeoutError as error:
                                 self.dispatch_state = "delayed"
@@ -9577,6 +10973,7 @@ class TmuxBatchWorker:
                                 prompt_submit_timeout_sec if prompt_submit_timeout_sec is not None else 20.0,
                             )
                         ),
+                        submitted_prompt=submitted_prompt,
                     )
                 if (
                         not prompt_submission_rejected
@@ -9589,6 +10986,8 @@ class TmuxBatchWorker:
                         self.turn_state = TurnState.WAITING_RESULT
                         self.dispatch_state = "submitted"
                         self.dispatch_reason = "prompt_submission_confirmed_by_busy_probe"
+                        self._confirm_ponytail_bootstrap_delivery(submitted_prompt)
+                        self._confirm_grill_prompt_delivery(submitted_prompt)
                 if completion_contract is not None:
                     file_result = self._try_finalize_turn_artifacts_after_timeout(
                         contract=completion_contract,
@@ -9668,14 +11067,25 @@ class TmuxBatchWorker:
                         )
                         return result
                 if completion_contract is not None:
-                    file_result = self._wait_for_turn_artifacts_while_agent_busy_after_timeout(
-                        label=label,
-                        attempt=attempt,
-                        timeout_sec=timeout_sec,
-                        contract=completion_contract,
-                        task_status_path=task_status_path,
-                        prompt_submission_observed=prompt_submission_observed,
-                    )
+                    try:
+                        file_result = self._wait_for_turn_artifacts_while_agent_busy_after_timeout(
+                            label=label,
+                            attempt=attempt,
+                            timeout_sec=timeout_sec,
+                            contract=completion_contract,
+                            task_status_path=task_status_path,
+                            prompt_submission_observed=prompt_submission_observed,
+                        )
+                    except RuntimeError as recovery_error:
+                        if not is_turn_artifact_contract_error(recovery_error):
+                            raise
+                        # This call runs from inside the TimeoutError handler.  A
+                        # contract error raised here would otherwise bypass every
+                        # sibling exception handler and skip _record_result().
+                        # Normalize it into this turn's failed CommandResult so
+                        # the stage-level repair/HITL policy can handle it.
+                        error = recovery_error
+                        file_result = None
                     if file_result is not None:
                         reply = json.dumps(
                             {
@@ -9714,17 +11124,27 @@ class TmuxBatchWorker:
                         )
                         return result
                 if result_contract is not None:
-                    task_result = self._wait_for_task_result_while_agent_busy_after_timeout(
-                        label=label,
-                        attempt=attempt,
-                        timeout_sec=timeout_sec,
-                        contract=result_contract,
-                        task_status_path=task_status_path,
-                        result_path=result_path,
-                        baseline_visible=locals().get("baseline_visible", ""),
-                        baseline_raw_log_tail=locals().get("baseline_raw_log_tail", ""),
-                        prompt_submission_observed=prompt_submission_observed,
-                    )
+                    try:
+                        task_result = self._wait_for_task_result_while_agent_busy_after_timeout(
+                            label=label,
+                            attempt=attempt,
+                            timeout_sec=timeout_sec,
+                            contract=result_contract,
+                            task_status_path=task_status_path,
+                            result_path=result_path,
+                            baseline_visible=locals().get("baseline_visible", ""),
+                            baseline_raw_log_tail=locals().get("baseline_raw_log_tail", ""),
+                            prompt_submission_observed=prompt_submission_observed,
+                        )
+                    except RuntimeError as recovery_error:
+                        if not is_task_result_contract_error(recovery_error):
+                            raise
+                        # See the completion-contract branch above.  In
+                        # particular, BUSY -> READY without result.json is a
+                        # repairable contract failure, not an unrecorded stage
+                        # exception.
+                        error = recovery_error
+                        task_result = None
                     if task_result is not None:
                         reply = json.dumps(task_result.payload, ensure_ascii=False, indent=2)
                         finished_at = _now_iso()
@@ -9751,7 +11171,7 @@ class TmuxBatchWorker:
                             },
                         )
                         return result
-                    if prompt_submission_observed:
+                    if prompt_submission_observed and not is_task_result_contract_error(error):
                         if not str(self.dispatch_reason or "").startswith(STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX):
                             self.dispatch_state = "delayed"
                             self.dispatch_reason = (
@@ -9768,7 +11188,11 @@ class TmuxBatchWorker:
                     self.turn_state == TurnState.SUBMISSION_UNKNOWN
                     or self.dispatch_state == "submission_unknown"
                 )
-                if attempt < 2 and not is_task_result_contract_error(error) and not unresolved_submission:
+                output_contract_failed = (
+                    is_task_result_contract_error(error)
+                    or is_turn_artifact_contract_error(error)
+                )
+                if attempt < 2 and not output_contract_failed and not unresolved_submission:
                     self._log_event("turn_timeout_retry", label=label, attempt=attempt)
                     self._write_state(
                         WorkerStatus.RUNNING,
@@ -9831,6 +11255,13 @@ class TmuxBatchWorker:
             except AgentRuntimeInterventionRequired as error:
                 self.current_task_runtime_status = read_task_status(task_status_path)
                 previous = self.read_state()
+                runtime_agent_state = (
+                    AgentRuntimeState.BUSY
+                    if error.blocker_kind == LONG_RUNNING_TASK_RESULT_BLOCKER
+                    else AgentRuntimeState.STARTING
+                )
+                self.agent_state = runtime_agent_state
+                self.agent_ready = False
                 self._log_event(
                     "turn_runtime_intervention_required",
                     label=label,
@@ -9852,7 +11283,7 @@ class TmuxBatchWorker:
                         "turn_state": self.turn_state.value,
                         "agent_alive": bool(previous.get("agent_alive", True)),
                         "agent_ready": False,
-                        "agent_state": AgentRuntimeState.STARTING.value,
+                        "agent_state": runtime_agent_state.value,
                         "startup_blocker_kind": error.blocker_kind,
                         "startup_blocker_requires_manual": True,
                     },

@@ -183,6 +183,34 @@ def _read_turn_artifact_bundle(turn_status_path: str) -> dict[str, object]:
     }
 
 
+def _read_ponytail_snapshot_fields(state_path: str) -> dict[str, str]:
+    path_text = str(state_path or "").strip()
+    if not path_text:
+        return {}
+    try:
+        payload = json.loads(Path(path_text).expanduser().resolve().read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    config = payload.get("config", {})
+    policy = payload.get("ponytail_policy", {})
+    if not isinstance(config, dict):
+        config = {}
+    if not isinstance(policy, dict):
+        policy = {}
+    candidates = {
+        "ponytail_mode": config.get("ponytail_mode") or config.get("ponytail"),
+        "ponytail_bundle_version": policy.get("bundle_version"),
+        "ponytail_delivery": policy.get("delivery"),
+    }
+    return {
+        key: str(value).strip()
+        for key, value in candidates.items()
+        if str(value or "").strip()
+    }
+
+
 def prompt_yes_no(prompt_text: str, default: bool = False) -> bool:
     return normalize_run_init_choice("yes" if terminal_prompt_yes_no(prompt_text, default) else "no")
 
@@ -627,11 +655,11 @@ class AgentInitControlCenter:
         for row in self.build_status_rows():
             entry = self._entry_by_dir(row.work_dir)
             artifact_bundle = _read_turn_artifact_bundle(entry.current_turn_status_path)
+            ponytail_fields = _read_ponytail_snapshot_fields(str(getattr(entry, "state_path", "") or ""))
             artifact_paths = list(artifact_bundle["artifact_paths"]) if artifact_bundle["artifact_paths"] else []
             if not artifact_paths and entry.result_status == "passed":
                 artifact_paths = [str(path.resolve()) for path in required_routing_layer_paths(row.work_dir) if path.exists()]
-            snapshots.append(
-                {
+            snapshot = {
                     "index": row.index,
                     "work_dir": row.work_dir,
                     "session_name": row.session_name,
@@ -655,7 +683,8 @@ class AgentInitControlCenter:
                     "resolved_model": self.config.resolved_model,
                     "reasoning_effort": self.config.reasoning_effort,
                 }
-            )
+            snapshot.update(ponytail_fields)
+            snapshots.append(snapshot)
         return snapshots
 
     def render_status(self) -> str:

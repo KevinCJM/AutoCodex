@@ -27,6 +27,9 @@ from Prompt_02_RequirementIntake import (
     get_notion_requirement,
 )
 from A01_Routing_LayerPlanning import DEFAULT_MODEL_BY_VENDOR, prompt_effort, prompt_model, prompt_vendor
+from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
+from tmux_core.runtime.graphify import GraphifyMode
+from tmux_core.stage_kernel.shared_review import resolve_main_ponytail_mode, resolve_workflow_graphify_mode
 from T01_tools import get_markdown_content
 from T02_tmux_agents import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -35,7 +38,12 @@ from T02_tmux_agents import (
     cleanup_registered_tmux_workers,
     worker_state_is_prelaunch_active,
 )
-from T05_hitl_runtime import HitlPromptContext, run_hitl_agent_loop, validate_hitl_status_file
+from T05_hitl_runtime import (
+    HitlPromptContext,
+    read_grill_session_header,
+    run_hitl_agent_loop,
+    validate_hitl_status_file,
+)
 from tmux_core.stage_kernel.agent_intervention import wait_for_worker_startup_intervention
 from T08_pre_development import ensure_pre_development_task_record, mark_requirement_intake_completed
 from T09_terminal_ops import (
@@ -67,7 +75,9 @@ from T12_requirements_common import (
 
 
 INPUT_TYPE_CHOICES = ("text", "file", "notion")
-DEFAULT_NOTION_MODEL = "gpt-5.4-mini"
+# The Notion helper is still a normal Codex worker; keep its default aligned
+# with the dynamically scanned vendor catalog instead of pinning a retired ID.
+DEFAULT_NOTION_MODEL = "default"
 DEFAULT_NOTION_EFFORT = "high"
 NOTION_TURN_PHASE = "requirements_intake_notion"
 NOTION_RUNTIME_ROOT_NAME = ".requirements_intake_runtime"
@@ -84,6 +94,8 @@ class RequirementIntakeRequest:
     overwrite: bool
     auto_confirm: bool
     reuse_existing_original_requirement: bool = False
+    ponytail_mode: str = PonytailMode.OFF.value
+    graphify_mode: str = GraphifyMode.OFF.value
 
 
 @dataclass(frozen=True)
@@ -99,6 +111,8 @@ class RequirementIntakeStageResult:
     original_requirement_path: str
     cleanup_paths: tuple[str, ...] = ()
     reuse_existing_original_requirement: bool = False
+    ponytail_mode: str = PonytailMode.OFF.value
+    graphify_mode: str = GraphifyMode.OFF.value
 
 
 class NotionInputRetryRequired(RuntimeError):
@@ -122,6 +136,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖已存在的原始需求文件")
     parser.add_argument("--reuse-existing-original-requirement", action="store_true", help="复用已存在的原始需求文件")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--requirements-mode",
+        choices=("standard", "grill", "grill-with-docs"),
+        default="",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--yes", action="store_true", help="跳过非覆盖类确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
     parser.add_argument("--legacy-cli", action="store_true", help="使用旧版 Python CLI，不跳转 OpenTUI")
@@ -360,6 +384,9 @@ def reprompt_request_for_input_source(request: RequirementIntakeRequest) -> Requ
         input_value=input_value,
         overwrite=request.overwrite,
         auto_confirm=request.auto_confirm,
+        reuse_existing_original_requirement=request.reuse_existing_original_requirement,
+        ponytail_mode=request.ponytail_mode,
+        graphify_mode=request.graphify_mode,
     )
 
 
@@ -440,7 +467,14 @@ def prompt_recreate_notion_reader_selection(
         message("新的智能体必须切换 vendor 或 model。")
 
 
-def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name: str) -> InputReadResult:
+def run_notion_reader(
+    project_dir: str | Path,
+    notion_url: str,
+    requirement_name: str,
+    *,
+    ponytail_mode: str = PonytailMode.OFF.value,
+    graphify_mode: str = GraphifyMode.OFF.value,
+) -> InputReadResult:
     project_root = resolve_existing_directory(project_dir)
     runtime_root = project_root / NOTION_RUNTIME_ROOT_NAME
     output_path, question_path, record_path = build_notion_hitl_paths(project_root, requirement_name)
@@ -456,6 +490,10 @@ def run_notion_reader(project_dir: str | Path, notion_url: str, requirement_name
                 vendor=current_vendor,
                 model=current_model,
                 reasoning_effort=current_reasoning_effort,
+                ponytail_mode=ponytail_mode,
+                # A02 only propagates the workflow policy.  The temporary
+                # Notion reader must not build/query or inject a project graph.
+                graphify_mode=GraphifyMode.OFF.value,
             ),
             runtime_root=runtime_root,
         )
@@ -658,7 +696,13 @@ def read_input_content(request: RequirementIntakeRequest) -> InputReadResult:
                 raise RequirementInputRetryRequired(str(error)) from error
             raise
     if request.input_type == "notion":
-        result = run_notion_reader(request.project_dir, request.input_value, request.requirement_name)
+        result = run_notion_reader(
+            request.project_dir,
+            request.input_value,
+            request.requirement_name,
+            ponytail_mode=request.ponytail_mode,
+            graphify_mode=request.graphify_mode,
+        )
         return InputReadResult(content=ensure_non_empty_content(result.content), cleanup_paths=result.cleanup_paths)
     raise ValueError(f"不支持的输入方式: {request.input_type}")
 
@@ -777,7 +821,29 @@ def collect_request(args: argparse.Namespace) -> RequirementIntakeRequest:
                 step = max(first_prompt_step, step - 1)
 
     project_dir = str(resolve_existing_directory(project_dir))
-    clear_requirements_human_exchange_file(project_dir, requirement_name)
+    if input_type == "notion":
+        ponytail_mode = resolve_main_ponytail_mode(args, stage_key="requirement_intake")
+    else:
+        explicit_ponytail_mode = str(getattr(args, "ponytail_mode", "") or "").strip()
+        ponytail_mode = (
+            normalize_ponytail_mode(explicit_ponytail_mode).value
+            if explicit_ponytail_mode
+            else PonytailMode.FULL.value
+        )
+    graphify_mode = resolve_workflow_graphify_mode(args, stage_key="requirement_intake")
+    grill_session_path = (
+        Path(project_dir).expanduser().resolve()
+        / ".tmux_workflow"
+        / sanitize_requirement_name(requirement_name)
+        / "grill"
+        / "session.json"
+    )
+    grill_session_header = read_grill_session_header(grill_session_path)
+    if (
+        grill_session_header is None
+        or grill_session_header.state in {"confirmed", "aborted"}
+    ):
+        clear_requirements_human_exchange_file(project_dir, requirement_name)
     return RequirementIntakeRequest(
         project_dir=project_dir,
         requirement_name=requirement_name,
@@ -786,6 +852,8 @@ def collect_request(args: argparse.Namespace) -> RequirementIntakeRequest:
         overwrite=bool(args.overwrite),
         auto_confirm=bool(args.yes),
         reuse_existing_original_requirement=reuse_existing_original_requirement,
+        ponytail_mode=ponytail_mode,
+        graphify_mode=graphify_mode,
     )
 
 
@@ -867,6 +935,8 @@ def run_requirement_intake_stage(argv: Sequence[str] | None = None) -> Requireme
         requirement_name=request.requirement_name,
         original_requirement_path=str(output_path.resolve()),
         reuse_existing_original_requirement=request.reuse_existing_original_requirement,
+        ponytail_mode=request.ponytail_mode,
+        graphify_mode=request.graphify_mode,
     )
 
 

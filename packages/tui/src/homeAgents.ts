@@ -53,6 +53,16 @@ const EFFORT_LABELS: Record<string, string> = {
   minimal: 'Minimal',
   xhigh: 'XHigh',
 }
+const PONYTAIL_MODE_LABELS: Record<string, string> = {
+  off: 'Off',
+  lite: 'Lite',
+  full: 'Full',
+  ultra: 'Ultra',
+}
+const REQUIREMENTS_MODE_LABELS: Record<string, string> = {
+  grill: 'Grill Me',
+  'grill-with-docs': 'Grill with Docs',
+}
 
 type HomeAgentSortEntry = {
   item: HomeAgentItem
@@ -209,9 +219,17 @@ export function buildAgentConfigLabel(worker: WorkerSnapshot): string {
   const vendor = formatVendor(worker.vendor || '')
   const model = formatModel(worker.model || worker.resolvedModel || '')
   const effort = formatEffort(worker.reasoningEffort || '')
-  if (!vendor && !model && !effort) return ''
+  const ponytailMode = String(worker.ponytailMode || '').trim().toLowerCase()
+  const ponytail = ponytailMode
+    ? `Ponytail ${PONYTAIL_MODE_LABELS[ponytailMode] || titleCase(ponytailMode)}`
+    : ''
+  const requirementsMode = String(worker.requirementsMode || '').trim().toLowerCase().replaceAll('_', '-')
+  const requirements = requirementsMode && requirementsMode !== 'standard'
+    ? REQUIREMENTS_MODE_LABELS[requirementsMode] || `Requirements ${titleCase(requirementsMode)}`
+    : ''
+  if (!vendor && !model && !effort && !ponytail && !requirements) return ''
   const modelAndEffort = [model, effort].filter(Boolean).join(', ')
-  return [vendor, modelAndEffort].filter(Boolean).join(' | ')
+  return [vendor, modelAndEffort, ponytail, requirements].filter(Boolean).join(' | ')
 }
 
 function workerRoleFromSessionName(sessionName: string): string {

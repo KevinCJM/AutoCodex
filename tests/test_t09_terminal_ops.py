@@ -169,6 +169,31 @@ class T09TerminalOpsTests(unittest.TestCase):
         )
         self.assertTrue(captured[0].payload["is_hitl"])
 
+    def test_bridge_terminal_ui_multiline_prompt_passes_grill_metadata(self):
+        captured: list[BridgePromptRequest] = []
+
+        def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
+            captured.append(request)
+            return {"value": "采用推荐方案"}
+
+        ui = BridgeTerminalUI(emit_event=lambda *_args, **_kwargs: None, request_prompt=request_prompt)
+        ui.prompt_multiline(
+            title="Grill 第 2 题",
+            question_path="/tmp/question.md",
+            is_hitl=True,
+            extra_payload={
+                "interaction_kind": "grill",
+                "question_index": 2,
+                "recommendation": "采用推荐方案",
+                "reason_text": "该选择决定兼容边界。",
+            },
+        )
+
+        self.assertEqual(captured[0].payload["interaction_kind"], "grill")
+        self.assertEqual(captured[0].payload["question_index"], 2)
+        self.assertEqual(captured[0].payload["recommendation"], "采用推荐方案")
+        self.assertEqual(captured[0].payload["reason_text"], "该选择决定兼容边界。")
+
     def test_bridge_terminal_ui_select_prompt_preserves_preview_metadata(self):
         captured: list[BridgePromptRequest] = []
 

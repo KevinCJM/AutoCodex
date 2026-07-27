@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "package": "mattpocock-skills-grill-bundle",
+  "upstream": {
+    "repository": "https://github.com/mattpocock/skills",
+    "commit": "ed37663cc5fbef691ddfecd080dff42f7e7e350d"
+  },
+  "license": "MIT",
+  "files": {
+    "LICENSE": {
+      "bytes": 1068,
+      "sha256": "0e7ac423bf2c6e223b7c5b156f8cf72da49d748e56a1641402c31f22ad07dbb5"
+    },
+    "skills/domain-modeling/ADR-FORMAT.md": {
+      "bytes": 2766,
+      "sha256": "f1f36cd3f8d3b6474ddd5855da4e233bfc4ae1a1c5024909ccf11871819a41b2"
+    },
+    "skills/domain-modeling/CONTEXT-FORMAT.md": {
+      "bytes": 2299,
+      "sha256": "b8cc318f2a4285b530e908b6bc43901c3c5cd11100362636bbc4216639bef597"
+    },
+    "skills/domain-modeling/SKILL.md": {
+      "bytes": 3427,
+      "sha256": "152e2c97239affb12a60c5f4a7e74ab546a49ae169688c81f4e2ccc42dafa579"
+    },
+    "skills/grill-me/SKILL.md": {
+      "bytes": 147,
+      "sha256": "6189dfceb7304a6e5558f75d87e68fa3bc7fcf7ba120e44f21f8a61fe01eba54"
+    },
+    "skills/grill-with-docs/SKILL.md": {
+      "bytes": 245,
+      "sha256": "610d091047bcfb9db0f75c057d15538481a721111579fc5ec7f83ad9131a2165"
+    },
+    "skills/grilling/SKILL.md": {
+      "bytes": 843,
+      "sha256": "44331dda57f461db4fec3f2efb6ddabe7aaaa0a57ae0f88a883bc61aed8a0587"
+    }
+  }
+}

@@ -30,6 +30,7 @@ export const BRIDGE_EVENT_TYPES = [
   'snapshot.stage',
   'snapshot.control',
   'snapshot.hitl',
+  'snapshot.prompt',
   'snapshot.artifacts',
 ] as const
 
@@ -85,11 +86,29 @@ export async function postBridgeRequest(action: string, payload: Record<string, 
   }))
 }
 
-export async function submitPromptResponse(promptId: string, value: unknown): Promise<Record<string, unknown>> {
+export async function submitPromptResponse(
+  promptId: string,
+  value: unknown,
+  cursor?: {
+    runnerId: string
+    questionSeq: number
+    grillSessionId?: string
+    grillQuestionHash?: string
+  },
+): Promise<Record<string, unknown>> {
   return await readEnvelope<Record<string, unknown>>(await fetch('/api/prompt-response', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt_id: promptId, value }),
+    body: JSON.stringify({
+      prompt_id: promptId,
+      value,
+      ...(cursor ? {
+        runner_id: cursor.runnerId,
+        question_seq: cursor.questionSeq,
+        ...(cursor.grillSessionId ? { grill_session_id: cursor.grillSessionId } : {}),
+        ...(cursor.grillQuestionHash ? { grill_question_hash: cursor.grillQuestionHash } : {}),
+      } : {}),
+    }),
   }))
 }
 

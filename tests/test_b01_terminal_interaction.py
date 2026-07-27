@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from tmux_core.runtime.vendor_catalog import CatalogSnapshot
 from B01_terminal_interaction import (
     AgentInitControlCenter,
     collect_b01_request,
@@ -21,7 +22,71 @@ from T03_agent_init_workflow import determine_batch_worker_count
 from A01_Routing_LayerPlanning import build_parser
 
 
+_B01_TEST_CATALOG = CatalogSnapshot.from_dict(
+    {
+        "schema_version": "1.0",
+        "generated_at": "2026-07-26T00:00:00+00:00",
+        "cache_path": "/test/cache/vendor_catalog.json",
+        "vendors": [
+            {
+                "vendor_id": "codex",
+                "installed": True,
+                "scan_status": "ok",
+                "source_kind": "test_fixture",
+                "confidence": "high",
+                "binary_path": "/test/bin/codex",
+                "default_model": "gpt-5.4",
+                "models": [
+                    {
+                        "vendor_id": "codex",
+                        "model_id": "gpt-5.4",
+                        "display_name": "gpt-5.4",
+                        "source_kind": "test_fixture",
+                        "confidence": "high",
+                        "reasoning": {
+                            "vendor_id": "codex",
+                            "model_id": "gpt-5.4",
+                            "source_kind": "test_fixture",
+                            "confidence": "high",
+                            "reasoning_control_mode": "native",
+                            "supports_reasoning": True,
+                            "native_reasoning_levels": ["low", "medium", "high", "xhigh"],
+                            "normalized_reasoning_levels": ["low", "medium", "high", "xhigh"],
+                            "default_normalized_effort": "high",
+                            "default_native_level": "high",
+                        },
+                    }
+                ],
+            }
+        ],
+    }
+)
+
+
 class B01TerminalInteractionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # B01 tests verify interaction ordering and control flow, while the
+        # catalog itself has dedicated tests. Keep the real selection and
+        # model/effort validation paths, but bind them to a deterministic
+        # snapshot so a cold host cannot trigger external vendor CLI probes.
+        catalog_patches = (
+            patch(
+                "A01_Routing_LayerPlanning.get_catalog_snapshot",
+                return_value=_B01_TEST_CATALOG,
+            ),
+            patch(
+                "A01_Routing_LayerPlanning.ensure_vendor_catalog_current",
+                return_value=_B01_TEST_CATALOG,
+            ),
+            patch(
+                "B01_terminal_interaction.get_default_model_for_vendor",
+                side_effect=lambda vendor: _B01_TEST_CATALOG.vendor(vendor).default_model,
+            ),
+        )
+        for catalog_patch in catalog_patches:
+            catalog_patch.start()
+            self.addCleanup(catalog_patch.stop)
+
     def test_parse_control_command_supports_aliases(self):
         self.assertEqual(parse_control_command("").action, "status")
         self.assertEqual(parse_control_command("list").action, "status")
@@ -598,6 +663,11 @@ class B01TerminalInteractionTests(unittest.TestCase):
                         "last_heartbeat_at": "2026-05-03T13:00:00",
                         "state_path": str(state_path),
                         "transcript_path": str(state_path.parent / "transcript.md"),
+                        "config": {"ponytail_mode": "full"},
+                        "ponytail_policy": {
+                            "bundle_version": "4.8.4",
+                            "delivery": "runtime_prompt",
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -655,6 +725,9 @@ class B01TerminalInteractionTests(unittest.TestCase):
         self.assertEqual(snapshots[0]["model"], "gpt-5.4")
         self.assertEqual(snapshots[0]["resolved_model"], "gpt-5.4")
         self.assertEqual(snapshots[0]["reasoning_effort"], "high")
+        self.assertEqual(snapshots[0]["ponytail_mode"], "full")
+        self.assertEqual(snapshots[0]["ponytail_bundle_version"], "4.8.4")
+        self.assertEqual(snapshots[0]["ponytail_delivery"], "runtime_prompt")
 
     def test_refresh_worker_health_keeps_prelaunch_active_worker_starting(self):
         with tempfile.TemporaryDirectory() as tmpdir:

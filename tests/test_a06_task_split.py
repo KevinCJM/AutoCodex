@@ -102,6 +102,51 @@ def _dummy_contract() -> TurnFileContract:
 
 
 class A06TaskSplitTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+        vendor_id: str,
+        requested_model: str,
+        requested_effort: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            resolved_model=str(
+                requested_model
+                if requested_model and requested_model != "default"
+                else f"{vendor_id}/test-default"
+            ),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor_id}",
+        )
+
+    def setUp(self) -> None:
+        # A06 tests exercise orchestration and handoff reuse, not host CLI
+        # discovery. Keep runtime resolution hermetic so a cold OpenCode-like
+        # catalog cannot add an 11-second external probe to unrelated tests.
+        catalog_patches = (
+            patch(
+                "tmux_core.runtime.tmux_runtime.resolve_launch",
+                side_effect=self._runtime_test_resolution,
+            ),
+            patch("A06_TaskSplit.get_default_model_for_vendor", return_value="gpt-5.4"),
+            patch(
+                "A06_TaskSplit.normalize_model_choice",
+                side_effect=lambda vendor, model: str(model or f"{vendor}/test-default"),
+            ),
+            patch(
+                "A06_TaskSplit.normalize_effort_choice",
+                side_effect=lambda _vendor, _model, effort: str(effort or "high"),
+            ),
+        )
+        for catalog_patch in catalog_patches:
+            catalog_patch.start()
+            self.addCleanup(catalog_patch.stop)
+
     def test_shutdown_workers_cleans_reused_detailed_design_runtime_workers_on_success(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -1014,14 +1059,14 @@ class A06TaskSplitTests(unittest.TestCase):
                     reviewer_key="开发工程师",
                     role_name="开发工程师",
                     role_prompt="实现视角",
-                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", "", "full"),
                     worker=_FakeWorker(session_name="开发工程师-天魁星", runtime_root=Path(tmp_dir) / "runtime-1", runtime_dir=Path(tmp_dir) / "runtime-1" / "worker-1"),
                 ),
                 ReviewAgentHandoff(
                     reviewer_key="测试工程师",
                     role_name="测试工程师",
                     role_prompt="测试视角",
-                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", "", "full"),
                     worker=_FakeWorker(session_name="测试工程师-天英星", runtime_root=Path(tmp_dir) / "runtime-2", runtime_dir=Path(tmp_dir) / "runtime-2" / "worker-1"),
                 ),
             )
@@ -1115,14 +1160,14 @@ class A06TaskSplitTests(unittest.TestCase):
                     reviewer_key="开发工程师",
                     role_name="开发工程师",
                     role_prompt="实现视角",
-                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", "", "full"),
                     worker=_FakeWorker(session_name="开发工程师-天魁星", runtime_root=Path(tmp_dir) / "runtime-1", runtime_dir=Path(tmp_dir) / "runtime-1" / "worker-1"),
                 ),
                 ReviewAgentHandoff(
                     reviewer_key="测试工程师",
                     role_name="测试工程师",
                     role_prompt="测试视角",
-                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                    selection=ReviewAgentSelection("codex", "gpt-5.4", "high", "", "full"),
                     worker=_FakeWorker(
                         session_name="测试工程师-天英星",
                         runtime_root=Path(tmp_dir) / "runtime-2",
@@ -1138,7 +1183,10 @@ class A06TaskSplitTests(unittest.TestCase):
             ]
             args = build_parser().parse_args(["--project-dir", tmp_dir, "--requirement-name", "需求A"])
 
-            with patch("A06_TaskSplit.prompt_review_agent_selection", return_value=ReviewAgentSelection("claude", "sonnet", "medium", "")):
+            with patch(
+                "A06_TaskSplit.prompt_review_agent_selection",
+                return_value=ReviewAgentSelection("claude", "sonnet", "medium", "", "full"),
+            ):
                 reviewers, created_new = build_reviewer_workers(
                     args,
                     project_dir=tmp_dir,

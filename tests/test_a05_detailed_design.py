@@ -96,6 +96,54 @@ class _FreshReviewerWorker:
 
 
 class A05DetailedDesignTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+        vendor_id: str,
+        requested_model: str,
+        requested_effort: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            resolved_model=str(
+                requested_model
+                if requested_model and requested_model != "default"
+                else f"{vendor_id}/test-default"
+            ),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor_id}",
+        )
+
+    def setUp(self) -> None:
+        # A05 unit tests exercise stage orchestration, not external CLI model
+        # discovery. Keep AgentRunConfig deterministic and hermetic so an
+        # unavailable OpenCode-like executable cannot add an 11-second probe.
+        catalog_patches = (
+            patch(
+                "tmux_core.runtime.tmux_runtime.resolve_launch",
+                side_effect=self._runtime_test_resolution,
+            ),
+            patch(
+                "A05_DetailedDesign.get_default_model_for_vendor",
+                return_value="gpt-5.4",
+            ),
+            patch(
+                "A05_DetailedDesign.normalize_model_choice",
+                side_effect=lambda vendor, model: str(model or f"{vendor}/test-default"),
+            ),
+            patch(
+                "A05_DetailedDesign.normalize_effort_choice",
+                side_effect=lambda _vendor, _model, effort: str(effort or "high"),
+            ),
+        )
+        for catalog_patch in catalog_patches:
+            catalog_patch.start()
+            self.addCleanup(catalog_patch.stop)
+
     def test_detailed_design_reviewer_count_prompt_allows_previous_step_back(self):
         from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, PromptBackRequested, use_terminal_ui
 

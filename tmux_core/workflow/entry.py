@@ -13,7 +13,15 @@ from pathlib import Path
 from typing import Sequence
 
 from tmux_core.runtime.tmux_runtime import cleanup_registered_tmux_workers
-from tmux_core.stage_kernel.shared_review import ReviewAgentSelection, StageAgentConfig, resolve_stage_agent_config
+from tmux_core.runtime.graphify import GraphifyMode, cancel_graphify_processes, normalize_graphify_mode
+from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
+from tmux_core.stage_kernel.shared_review import (
+    ReviewAgentSelection,
+    StageAgentConfig,
+    configured_workflow_requirements_mode,
+    resolve_stage_agent_config,
+    resolve_workflow_ponytail_mode,
+)
 from tmux_core.stage_kernel.requirement_intake import run_requirement_intake_stage
 from tmux_core.stage_kernel.requirements_clarification import run_requirements_clarification_stage
 from tmux_core.stage_kernel.detailed_design import run_detailed_design_stage
@@ -71,6 +79,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--main-agent", default="", help="主工作智能体配置: vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体配置，可重复: name=<key>,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--agent-config", default="", help="模型配置 JSON；命令行 --main-agent/--reviewer-agent 优先")
+    parser.add_argument("--ponytail-mode", choices=tuple(mode.value for mode in PonytailMode), default="", help="Ponytail 模式: off|lite|full|ultra")
+    parser.add_argument(
+        "--graphify-mode",
+        choices=tuple(mode.value for mode in GraphifyMode),
+        default="",
+        help="Graphify 模式: off|auto|required",
+    )
+    parser.add_argument(
+        "--requirements-mode",
+        choices=("standard", "grill", "grill-with-docs"),
+        default="",
+        help="需求澄清模式: standard|grill|grill-with-docs",
+    )
     parser.add_argument("--skip-overall-review", action="store_true", help="A07 后直接结束当前已实现流程，不启动 A08")
     parser.add_argument("--yes", action="store_true", help="传递给当前已实现阶段，跳过非关键确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
@@ -85,6 +106,7 @@ def build_stage_args(
         requirement_name: str = "",
         review_max_rounds: str = "",
         main_agent: ReviewAgentSelection | None = None,
+        main_ponytail_mode: str = "",
         reviewer_agents: Sequence[str] = (),
         main_proxy_arg: str = "--proxy-url",
         reuse_existing_original_requirement: bool = False,
@@ -92,6 +114,10 @@ def build_stage_args(
         include_ui_flags: bool = False,
         no_tui: bool = False,
         legacy_cli: bool = False,
+        ponytail_mode: str = "",
+        requirements_mode: str = "",
+        graphify_mode: str = "",
+        agent_config: str = "",
 ) -> list[str]:
     args: list[str] = []
     if str(project_dir).strip():
@@ -104,10 +130,27 @@ def build_stage_args(
         args.append("--allow-previous-stage-back")
     if str(review_max_rounds).strip():
         args.extend(["--review-max-rounds", str(review_max_rounds).strip()])
+    inherited_ponytail_mode = ""
+    if str(ponytail_mode or "").strip():
+        inherited_ponytail_mode = normalize_ponytail_mode(ponytail_mode).value
+        args.extend(["--ponytail-mode", inherited_ponytail_mode])
+    if str(requirements_mode or "").strip():
+        args.extend(["--requirements-mode", str(requirements_mode).strip()])
+    if str(graphify_mode or "").strip():
+        args.extend([
+            "--graphify-mode",
+            normalize_graphify_mode(graphify_mode, default=GraphifyMode.AUTO).value,
+        ])
+    if str(agent_config or "").strip():
+        args.extend(["--agent-config", str(agent_config).strip()])
+    role_ponytail_mode = str(main_ponytail_mode or "").strip()
     if main_agent is not None:
         args.extend(["--vendor", main_agent.vendor, "--model", main_agent.model, "--effort", main_agent.reasoning_effort])
         if str(main_agent.proxy_url or "").strip():
             args.extend([main_proxy_arg, str(main_agent.proxy_url).strip()])
+        role_ponytail_mode = main_agent.ponytail_mode
+    if inherited_ponytail_mode and role_ponytail_mode and role_ponytail_mode != inherited_ponytail_mode:
+        args.extend(["--main-ponytail-mode", normalize_ponytail_mode(role_ponytail_mode).value])
     for reviewer_agent in reviewer_agents:
         reviewer_text = str(reviewer_agent or "").strip()
         if reviewer_text:
@@ -121,7 +164,7 @@ def build_stage_args(
     return args
 
 
-def _format_reviewer_agent_arg(name: str, selection: ReviewAgentSelection) -> str:
+def _format_reviewer_agent_arg(name: str, selection: ReviewAgentSelection, *, inherited_ponytail_mode: str = "") -> str:
     parts = [
         f"name={name}",
         f"vendor={selection.vendor}",
@@ -130,6 +173,8 @@ def _format_reviewer_agent_arg(name: str, selection: ReviewAgentSelection) -> st
     ]
     if str(selection.proxy_url or "").strip():
         parts.append(f"proxy={str(selection.proxy_url).strip()}")
+    if str(inherited_ponytail_mode or "").strip() and selection.ponytail_mode != inherited_ponytail_mode:
+        parts.append(f"ponytail={selection.ponytail_mode}")
     return ",".join(parts)
 
 
@@ -139,7 +184,7 @@ def _workflow_reviewer_agent_args(agent_config: StageAgentConfig) -> tuple[str, 
         selection = agent_config.reviewer_selection(reviewer_name)
         if selection is None:
             continue
-        args.append(_format_reviewer_agent_arg(reviewer_name, selection))
+        args.append(_format_reviewer_agent_arg(reviewer_name, selection, inherited_ponytail_mode=agent_config.ponytail_mode))
     return tuple(args)
 
 
@@ -195,9 +240,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     argv = list(launch)
     parser = build_parser()
     args = parser.parse_args(argv)
+    ponytail_mode = resolve_workflow_ponytail_mode(args)
+    # Do not prompt before the requirement scope exists.  A03 must first check
+    # whether that scope already owns an unfinished Grill session; only a fresh
+    # scope may ask for a new mode.  Explicit CLI/config values are still passed
+    # through so A03 can reject an attempted mid-session mode switch.
+    requirements_mode = configured_workflow_requirements_mode(args)
+    if not requirements_mode and bool(args.yes):
+        # `--yes` has a deterministic public default.  Materialize it now so
+        # A00 passes the selected policy to A03 exactly once.  An unfinished
+        # Grill session will still reject headless continuation inside A03.
+        requirements_mode = "standard"
     project_dir = str(args.project_dir or "").strip()
     requirement_name = str(getattr(args, "requirement_name", "") or "").strip()
     routing_agent_config = _workflow_stage_agent_config(args, "routing")
+    intake_agent_config = _workflow_stage_agent_config(args, "requirement_intake")
     clarification_agent_config = _workflow_stage_agent_config(args, "requirements_clarification")
     requirements_review_agent_config = _workflow_stage_agent_config(args, "requirements_review")
     detailed_design_agent_config = _workflow_stage_agent_config(args, "detailed_design")
@@ -228,6 +285,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=routing_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
                 )
                 if routing_allow_project_dir_back:
                     routing_stage_args.append("--allow-project-dir-back")
@@ -265,6 +325,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=intake_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
+                    main_ponytail_mode=(
+                        intake_agent_config.main.ponytail_mode
+                        if intake_agent_config.main is not None
+                        else ""
+                    ),
                 )
                 revisit_intake_requirement_selection = False
                 clear_pending_tty_input()
@@ -314,12 +382,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    requirements_mode=requirements_mode,
+                    graphify_mode=clarification_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
                 )
                 message("\n===== 需求澄清阶段 =====")
                 notify_stage_action_changed("stage.a03.start")
                 try:
                     requirements_result = run_requirements_clarification_stage(
                         clarification_stage_args,
+                        # Grill mode suppresses handoff inside A03 itself.  Keep
+                        # this true so a mode chosen interactively in A03 can
+                        # still preserve a Standard analyst without A00 asking
+                        # the mode a second time.
                         preserve_ba_worker=True,
                     )
                 except PromptBackRequested:
@@ -336,6 +412,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         raise
                     message(error)
                     return 1
+                requirements_mode = str(
+                    getattr(requirements_result, "requirements_mode", "")
+                    or requirements_mode
+                    or "standard"
+                ).strip()
                 stage = "review"
                 continue
 
@@ -347,10 +428,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                     requirement_name=requirements_result.requirement_name,
                     review_max_rounds=str(args.requirements_review_max_rounds or "").strip(),
                     reviewer_agents=_workflow_reviewer_agent_args(requirements_review_agent_config),
+                    main_ponytail_mode=(
+                        requirements_review_agent_config.main.ponytail_mode
+                        if requirements_review_agent_config.main is not None
+                        else ""
+                    ),
                     allow_previous_stage_back=True,
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=requirements_review_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
                 )
                 message("\n===== 需求评审阶段 =====")
                 notify_stage_action_changed("stage.a04.start")
@@ -384,6 +473,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=detailed_design_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
                 )
                 message("\n===== 详细设计阶段 =====")
                 notify_stage_action_changed("stage.a05.start")
@@ -417,6 +509,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=task_split_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
                 )
                 message("\n===== 任务拆分阶段 =====")
                 notify_stage_action_changed("stage.a06.start")
@@ -450,6 +545,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=development_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
                 )
                 message("\n===== 任务开发阶段 =====")
                 cleanup_stale_task_split_runtime_state(project_dir, task_split_result.requirement_name)
@@ -493,6 +591,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     include_ui_flags=True,
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=overall_review_agent_config.graphify_mode,
+                    agent_config=args.agent_config,
                 )
                 message("\n===== 复核阶段 =====")
                 notify_stage_action_changed("stage.a08.start")
@@ -521,6 +622,7 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
+        cancel_graphify_processes()
         cleaned_sessions = cleanup_registered_tmux_workers(reason="keyboard_interrupt")
         if cleaned_sessions:
             message(f"\n已清理 tmux 会话: {', '.join(cleaned_sessions)}")

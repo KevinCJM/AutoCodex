@@ -249,9 +249,37 @@ class FakeWorker:
 
 
 class AgentInitWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+        vendor_id: str,
+        requested_model: str,
+        requested_effort: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            resolved_model=str(
+                requested_model
+                if requested_model and requested_model != "default"
+                else f"{vendor_id}/test-default"
+            ),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor_id}",
+        )
+
     def setUp(self):
         FakeWorker.scripts = {}
         FakeWorker.alive_sessions = {}
+        runtime_resolution_patch = patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            side_effect=self._runtime_test_resolution,
+        )
+        runtime_resolution_patch.start()
+        self.addCleanup(runtime_resolution_patch.stop)
 
     @staticmethod
     def _strong_pass_audit_output() -> str:

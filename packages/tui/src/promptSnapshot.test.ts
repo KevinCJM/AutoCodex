@@ -52,6 +52,90 @@ describe('promptStateFromSnapshot', () => {
     expect(restored).toBeNull()
   })
 
+  it('promotes optional Grill metadata from a prompt snapshot without changing legacy payloads', () => {
+    const restored = promptStateFromSnapshot(
+      {
+        pending: true,
+        prompt_id: 'grill_1',
+        prompt_type: 'select',
+        interaction_kind: 'grill',
+        question_index: 2,
+        owner_runner_id: 'runner-a03',
+        question_seq: 2,
+        recommendation: '选择 A',
+        reason_text: '影响数据边界',
+        payload: { title: '数据边界如何定义？' },
+      },
+      buildDraftKey,
+    )
+
+    expect(restored?.payload).toMatchObject({
+      title: '数据边界如何定义？',
+      interaction_kind: 'grill',
+      question_index: 2,
+      owner_runner_id: 'runner-a03',
+      question_seq: 2,
+      recommendation: '选择 A',
+      reason_text: '影响数据边界',
+    })
+  })
+
+  it('treats the outer Grill cursor as authoritative over stale nested metadata', () => {
+    const restored = promptStateFromSnapshot(
+      {
+        pending: true,
+        prompt_id: 'grill_cursor',
+        prompt_type: 'select',
+        owner_runner_id: 'runner-current',
+        question_seq: 8,
+        payload: {
+          interaction_kind: 'grill',
+          owner_runner_id: 'runner-stale',
+          ownerRunnerId: 'runner-camel-stale',
+          question_seq: 7,
+          questionSeq: 6,
+        },
+      },
+      buildDraftKey,
+    )
+
+    expect(restored?.payload.owner_runner_id).toBe('runner-current')
+    expect(restored?.payload.question_seq).toBe(8)
+    expect(restored?.payload.ownerRunnerId).toBeUndefined()
+    expect(restored?.payload.questionSeq).toBeUndefined()
+  })
+
+  it('restores a submittable synthetic Grill multiline prompt with its persistence cursor', () => {
+    const restored = promptStateFromSnapshot(
+      {
+        pending: true,
+        prompt_id: 'grill_recovery_session-a_3_abc',
+        prompt_type: 'multiline',
+        owner_runner_id: 'grill-session:session-a',
+        question_seq: 3,
+        payload: {
+          interaction_kind: 'grill',
+          synthetic_recovery: true,
+          can_submit: true,
+          default_value: '方案 B',
+          answer_options: ['方案 A', '方案 B'],
+          grill_session_id: 'session-a',
+          grill_question_hash: 'sha256:abc',
+        },
+      },
+      buildDraftKey,
+    )
+
+    expect(restored?.promptType).toBe('multiline')
+    expect(restored?.payload).toMatchObject({
+      can_submit: true,
+      owner_runner_id: 'grill-session:session-a',
+      question_seq: 3,
+      grill_session_id: 'session-a',
+      grill_question_hash: 'sha256:abc',
+    })
+  })
+
   it('parses optional snake-case and camel-case prompt revisions', () => {
     expect(promptRevisionFromPayload({ prompt_revision: 7 })).toBe(7)
     expect(promptRevisionFromPayload({ promptRevision: '8' })).toBe(8)

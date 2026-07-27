@@ -341,6 +341,10 @@ def check_reviewer_job(agent_name_list, directory, task_name="M1-T1",
     for agent_name in agent_name_list:
         print(agent_name)
         json_file_name = json_pattern.replace('*', agent_name)
+        md_file_name = md_pattern.replace('*', agent_name)
+        review_md_empty = is_file_empty(Path(f'{directory}/{md_file_name}'))
+        required_review_pass = "true" if review_md_empty else "false"
+        review_md_state = "空" if review_md_empty else "非空"
         res = check_task_exists(Path(f'{directory}/{json_file_name}'), task_name)
         if not res:
             print(f"{json_file_name} 中不存在 {task_name}")
@@ -352,14 +356,15 @@ def check_reviewer_job(agent_name_list, directory, task_name="M1-T1",
 
 **强制补全指令**：
 立即对《{json_file_name}》中的 **JSON List** 执行以下原子操作：
-- 若 `{task_name}` 存在，按照评审结论更新其 `review_pass` 为 `false`或`true`；
-- 若不存在，追加对象：`{{"task_name": "{task_name}", "review_pass": false 或 true}}`。
+- 对应评审文档《{md_file_name}》当前为**{review_md_state}**；物理一致性要求的唯一值为 `review_pass: {required_review_pass}`。
+- 若 `{task_name}` 存在，将其 `review_pass` 更新为 `{required_review_pass}`；
+- 若不存在，追加对象：`{{"task_name": "{task_name}", "review_pass": {required_review_pass}}}`。
+- 这是文件合同的确定性修复，禁止反问人类选择 `true` 或 `false`。
 
 **禁止输出任何解释，执行后仅返回 `审核通过`或`未通过`。**"""
         else:
-            md_file_name = md_pattern.replace('*', agent_name)
             # 判断 md_file_name 是否为空 (文件不存在视为空)
-            md_bool = is_file_empty(Path(f'{directory}/{md_file_name}'))
+            md_bool = review_md_empty
             json_bool = get_task_review_status(Path(f'{directory}/{json_file_name}'), task_name)
             if md_bool != json_bool:
                 state_machine_output_prompt = state_machine_output(

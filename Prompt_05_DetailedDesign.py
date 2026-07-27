@@ -27,6 +27,13 @@ from Prompt_03_RequirementsClarification import fintech_ba
 from T04_common_prompt import task_start_prompt, state_machine_output, main_agent_workflow_after_review
 
 
+def _project_context_reading_guard(requirements_clear_md: str = "需求澄清") -> str:
+    return f"""## 项目读取顺序与证据边界
+1. 读取项目文件前，必须先定位并遵循当前项目根目录的 `AGENTS.md`；若其中定义了路由层，必须按其规定的读取顺序与选择器定位代码、测试和配置。
+2. 对 CONTEXT/ADR 文档，仅可读取《{requirements_clear_md}》明确引用且位于当前项目内的具体文件；禁止扫描、枚举、搜索或批量读取项目中的其他 CONTEXT/ADR 文档。
+3. CONTEXT/ADR 仅提供领域语义、约束和决策背景，不能作为当前代码实现事实；任何实现结论都必须由当前代码、测试或配置核验。"""
+
+
 # 创建 [需求分析师] 智能体
 @agent_prompt(
     prompt_id="a05.detailed_design.ba_init",
@@ -47,6 +54,8 @@ def create_detailed_design_ba(ba_desc=fintech_ba, init_prompt=task_start_prompt,
                               hitl_record_md='name_人机交互澄清记录.md'):
     detailed_design_prompt = f"""## 角色定位
 {ba_desc}
+
+{_project_context_reading_guard(requirements_clear_md)}
 
 ## 任务
 * 基于《{requirements_clear_md}》+《{original_requirement_md}》+《{hitl_record_md}》理解当前需求。
@@ -91,6 +100,8 @@ def detailed_design(ba_desc=fintech_ba, original_requirement_md='name_原始需�
                     detail_design_md='name_详细设计.md'):
     detailed_design_prompt = f"""## 角色定位
 {ba_desc}
+
+{_project_context_reading_guard(requirements_clear_md)}
 
 ## 任务
 * 参考《{requirements_clear_md}》+《{original_requirement_md}》+《{hitl_record_md}》，输出一份深度足以指导开发的《{detail_design_md}》文件。
@@ -205,6 +216,8 @@ def review_detailed_design(agent_desc, init_prompt=task_start_prompt, task_name=
     review_detailed_design_prompt = f"""## 角色定位
 {agent_desc}
 
+{_project_context_reading_guard(requirements_clear_md)}
+
 ---
 
 ## 任务指令
@@ -287,7 +300,9 @@ def modify_detailed_design(review_msg, *, original_requirement_md='name_原始�
     main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(hitl_record_md=hitl_record_md,
                                                                                ask_human_md=ask_human_md,
                                                                                what_just_change=what_just_change)
-    modify_detailed_design_prompt = f"""## 任务背景
+    modify_detailed_design_prompt = f"""{_project_context_reading_guard(requirements_clear_md)}
+
+## 任务背景
 审核员已基于《{original_requirement_md}》+《{hitl_record_md}》+《{requirements_clear_md}》对比了你的《{detail_design_md}》。
 你需要对这些审计员提出的评审意见进行鉴定、并修复《{detail_design_md}》; 并在信息不足时向人类发起求助。
 
@@ -351,7 +366,9 @@ def hitl_relpy(human_msg, review_msg, *,
     main_agent_workflow_after_review_prompt = main_agent_workflow_after_review(hitl_record_md=hitl_record_md,
                                                                                ask_human_md=ask_human_md,
                                                                                what_just_change=what_just_change)
-    hitl_relpy_prompt = f"""## 背景信息
+    hitl_relpy_prompt = f"""{_project_context_reading_guard()}
+
+## 背景信息
 你上一轮基于审核员的反馈原始记录发起了HITL, 人类对你的提问返回了信息, 基于人类反馈信息重新优化和提出反馈
 
 ## 输入上下文
@@ -416,7 +433,9 @@ def again_review_detailed_design(modify_summary, task_name="name_详细设计", 
                                                        review_json=detail_design_review_json,
                                                        pass_condition="详细设计审核通过, 符合审计准则与四问逻辑。",
                                                        blocked_condition="详细设计文档中发现逻辑错误、需求遗漏、超出边界、或其他潜在隐患。")
-    again_review_detailed_design_prompt = f"""## Input Context Isolation
+    again_review_detailed_design_prompt = f"""{_project_context_reading_guard(requirements_clear_md)}
+
+## Input Context Isolation
 以下为需求分析师针对上一轮评审记录的修复说明，作为本次审计的判定基准之一：
 
 [ANALYST_FEEDBACK_START]

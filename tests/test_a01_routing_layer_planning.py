@@ -81,7 +81,111 @@ def _first_catalog_model(vendor_id: str) -> str:
     return models[0].model_id
 
 
+def _test_catalog_model(
+    vendor_id: str,
+    model_id: str,
+    *,
+    normalized_levels: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max"),
+    native_levels: tuple[str, ...] = (),
+) -> ModelInventory:
+    return ModelInventory(
+        vendor_id=vendor_id,
+        model_id=model_id,
+        display_name=model_id,
+        source_kind=SOURCE_DYNAMIC_CLI,
+        confidence=CONFIDENCE_HIGH,
+        reasoning=ReasoningInventory(
+            vendor_id=vendor_id,
+            model_id=model_id,
+            source_kind=SOURCE_DYNAMIC_CLI,
+            confidence=CONFIDENCE_HIGH,
+            reasoning_control_mode="native" if native_levels else "implicit_default",
+            supports_reasoning=True,
+            native_reasoning_levels=native_levels,
+            normalized_reasoning_levels=normalized_levels,
+            default_normalized_effort="high",
+            default_native_level="medium" if native_levels else "",
+        ),
+    )
+
+
+def _test_vendor_inventory(
+    vendor_id: str,
+    model_ids: tuple[str, ...],
+    *,
+    default_model: str | None = None,
+    normalized_levels: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max"),
+    native_levels: tuple[str, ...] = (),
+) -> VendorInventory:
+    models = tuple(
+        _test_catalog_model(
+            vendor_id,
+            model_id,
+            normalized_levels=normalized_levels,
+            native_levels=native_levels,
+        )
+        for model_id in model_ids
+    )
+    return VendorInventory(
+        vendor_id=vendor_id,
+        installed=True,
+        scan_status=OK_SCAN_STATUS,
+        source_kind=SOURCE_DYNAMIC_CLI,
+        confidence=CONFIDENCE_HIGH,
+        binary_path=f"/test/bin/{vendor_id}",
+        models=models,
+        default_model=default_model or model_ids[0],
+    )
+
+
+TEST_CATALOG = CatalogSnapshot(
+    schema_version=SCHEMA_VERSION,
+    generated_at="2026-07-26T00:00:00+00:00",
+    cache_path="/test/cache/vendor_catalog.json",
+    vendors=(
+        _test_vendor_inventory(
+            "codex",
+            ("gpt-5.4", "gpt-5.4-mini"),
+            native_levels=("low", "medium", "high", "xhigh"),
+        ),
+        _test_vendor_inventory(
+            "claude",
+            ("sonnet", "opus", "haiku"),
+            native_levels=("low", "medium", "high", "max"),
+        ),
+        _test_vendor_inventory("gemini", ("auto", "flash", "pro")),
+        _test_vendor_inventory(
+            "opencode",
+            ("ark-agent-plan/doubao-seed-2.0-code", "opencode/gpt-5-nano"),
+        ),
+        _test_vendor_inventory("mimo", ("mimo/mimo-v2.5-pro",)),
+        _test_vendor_inventory(
+            "agy",
+            ("Gemini 3.5 Flash (High)",),
+            normalized_levels=("high",),
+        ),
+        _test_vendor_inventory("deveco", ("deveco/GLM-5.1",)),
+    ),
+)
+
+
 class RoutingLayerCliTests(unittest.TestCase):
+    def setUp(self):
+        # These are unit tests for A01 selection/normalization, not external CLI
+        # discovery.  Pin one deterministic catalog so a transient OpenCode
+        # probe cannot seed the process-wide refresh latch with an empty model
+        # set and make later tests order-dependent.
+        for catalog_patch in (
+            patch.object(routing_module, "get_catalog_snapshot", return_value=TEST_CATALOG),
+            patch.object(routing_module, "ensure_vendor_catalog_current", return_value=TEST_CATALOG),
+            patch(
+                "tmux_core.runtime.vendor_catalog.ensure_vendor_catalog_current",
+                return_value=TEST_CATALOG,
+            ),
+        ):
+            catalog_patch.start()
+            self.addCleanup(catalog_patch.stop)
+
     def test_cli_keyboard_interrupt_preserves_live_tmux_sessions(self):
         with patch.object(routing_module, "main", side_effect=KeyboardInterrupt), patch.object(
             routing_module,
@@ -234,6 +338,25 @@ class RoutingLayerCliTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "已扫描模型: none"):
             normalize_model_choice("opencode", "default", catalog=snapshot)
+
+    def test_codex_default_alias_resolves_the_scanned_catalog_default(self):
+        snapshot = SimpleNamespace()
+        model = SimpleNamespace(model_id="codex/current-default")
+        inventory = SimpleNamespace(installed=True)
+        with patch(
+            "A01_Routing_LayerPlanning.get_vendor_inventory",
+            return_value=inventory,
+        ), patch(
+            "A01_Routing_LayerPlanning.get_model_choices",
+            return_value=(model,),
+        ), patch(
+            "A01_Routing_LayerPlanning.get_default_model_for_vendor",
+            return_value=model.model_id,
+        ):
+            self.assertEqual(
+                normalize_model_choice("codex", "default", catalog=snapshot),
+                model.model_id,
+            )
 
     def test_mimo_model_and_effort_normalization_use_catalog(self):
         mimo_model = SimpleNamespace(model_id="mimo/mimo-v2.5-pro")

@@ -69,6 +69,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_provider_runtime_error,
     load_worker_from_state_path,
     list_registered_tmux_workers,
+    normalize_graphify_config,
     try_resume_worker,
 )
 from tmux_core.stage_kernel.detailed_design import collect_ba_agent_selection
@@ -126,6 +127,7 @@ from tmux_core.stage_kernel.shared_review import (
     prompt_review_max_rounds,
     prompt_replacement_review_agent_selection,
     prompt_review_agent_selection,
+    refresh_graphify_workers_for_checkpoint,
     render_review_limit_force_hitl_prompt,
     render_review_limit_human_reply_prompt,
     render_review_agent_selection,
@@ -295,6 +297,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="开发工程师模型名称")
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")
+    parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--developer-role-prompt", default="", help="开发工程师自定义角色定义提示词")
     parser.add_argument("--developer-max-turns", default=None, help="开发工程师最大对话轮数；传 infinite 表示不重建，默认 15")
     parser.add_argument("--review-max-rounds", default="", help="代码评审最多重试几轮；传 infinite 表示不设上限")
@@ -479,6 +485,13 @@ def _worker_selection_from_state(state: dict[str, object]) -> ReviewAgentSelecti
         model=model,
         reasoning_effort=str(config.get("reasoning_effort", "") or "high").strip() or "high",
         proxy_url=str(config.get("proxy_url", "") or "").strip(),
+        ponytail_mode=str(config.get("ponytail_mode", "") or "off").strip() or "off",
+        graphify_mode=str(config.get("graphify_mode", "") or "off").strip() or "off",
+        graphify_config=(
+            dict(config.get("graphify_config", {}))
+            if isinstance(config.get("graphify_config", {}), dict)
+            else {}
+        ),
     )
 
 
@@ -650,6 +663,8 @@ def _recover_development_runtime_resume(
     requirement_name: str,
     paths: dict[str, Path],
     reviewer_specs_by_name: dict[str, DevelopmentReviewerSpec],
+    developer_selection: ReviewAgentSelection | None = None,
+    reviewer_selections_by_name: dict[str, ReviewAgentSelection] | None = None,
 ) -> DevelopmentRuntimeResume | None:
     developer_runtime: DeveloperRuntime | None = None
     reviewers_by_key: dict[str, ReviewerRuntime] = {}
@@ -659,14 +674,32 @@ def _recover_development_runtime_resume(
             continue
         agent_role = str(state.get("agent_role", "") or "").strip()
         worker_id = str(state.get("worker_id", "") or "").strip()
-        allow_stale_busy = agent_role == "developer" or worker_id == build_developer_worker_id()
+        is_developer = agent_role == "developer" or worker_id == build_developer_worker_id()
+        reviewer_key = str(state.get("reviewer_key", "") or state.get("role_name", "") or "").strip()
+        expected_selection = (
+            developer_selection
+            if is_developer
+            else (reviewer_selections_by_name or {}).get(reviewer_key)
+        )
+        has_expected_policy = developer_selection is not None if is_developer else reviewer_selections_by_name is not None
+        if has_expected_policy and (
+            expected_selection is None
+            or str(selection.ponytail_mode or "off").strip()
+            != str(expected_selection.ponytail_mode or "off").strip()
+            or str(selection.graphify_mode or "off").strip()
+            != str(expected_selection.graphify_mode or "off").strip()
+            or normalize_graphify_config(selection.graphify_config)
+            != normalize_graphify_config(expected_selection.graphify_config)
+        ):
+            continue
+        allow_stale_busy = is_developer
         worker = _recover_worker_from_state(
             state_path,
             allow_stale_busy_without_contract=allow_stale_busy,
         )
         if worker is None:
             continue
-        if agent_role == "developer" or worker_id == build_developer_worker_id():
+        if is_developer:
             if developer_runtime is None and _developer_init_contract_is_ready(worker, paths=paths):
                 developer_runtime = DeveloperRuntime(
                     selection=selection,
@@ -676,7 +709,6 @@ def _recover_development_runtime_resume(
             continue
         if agent_role != "reviewer":
             continue
-        reviewer_key = str(state.get("reviewer_key", "") or state.get("role_name", "") or "").strip()
         reviewer_spec = reviewer_specs_by_name.get(reviewer_key)
         if reviewer_spec is None or reviewer_key in reviewers_by_key:
             continue
@@ -1012,7 +1044,7 @@ def resolve_reviewer_specs(
     progress: ReviewStageProgress | None = None,
     allow_back_first_prompt: bool = False,
 ) -> list[DevelopmentReviewerSpec]:
-    agent_config = resolve_stage_agent_config(args)
+    agent_config = resolve_stage_agent_config(args, stage_key="development")
     role_names = [str(item).strip() for item in getattr(args, "reviewer_role", []) if str(item).strip()]
     prompt_values = [str(item).strip() for item in getattr(args, "reviewer_role_prompt", []) if str(item).strip()]
     if agent_config.reviewer_order and not role_names and not prompt_values:
@@ -1083,12 +1115,19 @@ def resolve_developer_role_prompt(
     )
 
 
-def _reviewer_default_selection() -> ReviewAgentSelection:
+def _reviewer_default_selection(
+    ponytail_mode: str = "full",
+    graphify_mode: str = "off",
+    graphify_config: dict[str, object] | None = None,
+) -> ReviewAgentSelection:
     return ReviewAgentSelection(
         vendor=DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
         model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
         reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
         proxy_url="",
+        ponytail_mode=str(ponytail_mode or "full").strip() or "full",
+        graphify_mode=str(graphify_mode or "off").strip() or "off",
+        graphify_config=dict(graphify_config or {}),
     )
 
 
@@ -1200,6 +1239,7 @@ def resolve_developer_plan(
     project_dir: str | Path,
     progress: ReviewStageProgress | None = None,
     allow_back_first_prompt: bool = False,
+    ponytail_stage_key: str = "development",
 ) -> DeveloperPlan:
     role_prompt_prompted = stdin_is_interactive() and not str(getattr(args, "developer_role_prompt", "") or "").strip()
     role_prompt = resolve_developer_role_prompt(
@@ -1211,7 +1251,7 @@ def resolve_developer_plan(
         args,
         role_label=_developer_display_name(project_dir=project_dir),
         allow_back_first_step=allow_back_first_prompt and not role_prompt_prompted,
-        stage_key="development_main",
+        stage_key=f"{ponytail_stage_key}_main",
     )
     message(render_review_agent_selection("开发工程师 配置", selection))
     return DeveloperPlan(selection=selection, role_prompt=role_prompt)
@@ -1768,6 +1808,10 @@ def _run_developer_result_turn(
                 raise
             if (
                 not is_agent_ready_timeout_error(error)
+                and (
+                    not is_worker_death_error(error)
+                    or _worker_appears_live_for_reviewer_recovery(current_developer.worker)
+                )
                 and not _worker_has_stale_busy_without_contract(current_developer.worker)
                 and try_resume_worker(current_developer.worker, timeout_sec=60.0)
             ):
@@ -2085,7 +2129,7 @@ def build_reviewer_workers(
     interactive = stdin_is_interactive()
     if progress is not None:
         progress.set_phase("任务开发 / 启动审核器")
-    agent_config = resolve_stage_agent_config(args)
+    agent_config = resolve_stage_agent_config(args, stage_key="development")
     for reviewer_spec in reviewer_specs:
         reviewer_display_name = _predict_worker_display_name(
             project_dir=project_dir,
@@ -2104,9 +2148,19 @@ def build_reviewer_workers(
                 role_label=reviewer_display_name,
                 progress=progress,
             )
+            selection = replace(selection, ponytail_mode=agent_config.ponytail_mode)
+            selection = replace(
+                selection,
+                graphify_mode=agent_config.graphify_mode,
+                graphify_config=agent_config.graphify_config,
+            )
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
         elif selection is None:
-            selection = _reviewer_default_selection()
+            selection = _reviewer_default_selection(
+                agent_config.ponytail_mode,
+                agent_config.graphify_mode,
+                agent_config.graphify_config,
+            )
         reviewers.append(
             create_reviewer_runtime(
                 project_dir=project_dir,
@@ -2127,6 +2181,9 @@ def collect_reviewer_agent_selections(
     progress: ReviewStageProgress | None = None,
     allow_back_first_prompt: bool = False,
     stage_key: str = "development_reviewer_selection",
+    default_ponytail_mode: str = "full",
+    default_graphify_mode: str = "off",
+    default_graphify_config: dict[str, object] | None = None,
 ) -> dict[str, ReviewAgentSelection]:
     selections: dict[str, ReviewAgentSelection] = {}
     predicted_session_names: set[str] = {str(name).strip() for name in reserved_session_names if str(name).strip()}
@@ -2153,10 +2210,20 @@ def collect_reviewer_agent_selections(
                 allow_back_first_step=next_allow_back,
                 stage_key=stage_key,
             )
+            selection = replace(selection, ponytail_mode=default_ponytail_mode)
+            selection = replace(
+                selection,
+                graphify_mode=default_graphify_mode,
+                graphify_config=dict(default_graphify_config or {}),
+            )
             next_allow_back = False
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
         else:
-            selection = _reviewer_default_selection()
+            selection = _reviewer_default_selection(
+                default_ponytail_mode,
+                default_graphify_mode,
+                default_graphify_config,
+            )
         selections[reviewer_key] = selection
     return selections
 
@@ -2494,6 +2561,10 @@ def _run_single_reviewer_initialization(
                 raise
             if (
                 not is_agent_ready_timeout_error(error)
+                and (
+                    not is_worker_death_error(error)
+                    or _worker_appears_live_for_reviewer_recovery(current_reviewer.worker)
+                )
                 and not _worker_has_stale_busy_without_contract(current_reviewer.worker)
                 and try_resume_worker(current_reviewer.worker, timeout_sec=60.0)
             ):
@@ -3422,7 +3493,15 @@ def run_reviewer_turn_with_recreation(
             current_reviewer = initialized
             continue
         except Exception as error:  # noqa: BLE001
-            outputs_materialized = _wait_for_reviewer_materialized_outputs(current_reviewer, task_name)
+            # Check already-written outputs immediately for every failure, but
+            # spend the late-write grace window only on an artifact-contract
+            # race.  A confirmed dead pane, provider/config failure, or generic
+            # runtime error cannot become healthier by sleeping here; delaying
+            # those recovery choices made each failure look like an 8-second
+            # TUI freeze.
+            outputs_materialized = _reviewer_has_materialized_outputs(current_reviewer, task_name)
+            if not outputs_materialized and is_turn_artifact_contract_error(error):
+                outputs_materialized = _wait_for_reviewer_materialized_outputs(current_reviewer, task_name)
             if (
                 outputs_materialized
                 and _reviewer_artifact_signature(current_reviewer) != baseline_signature
@@ -3704,6 +3783,13 @@ def _run_parallel_reviewers(
     if progress is not None:
         progress.set_phase(f"任务开发 / {task_name} 评审第 {round_index} 轮")
     reviewer_list = list(reviewers)
+    refresh_graphify_workers_for_checkpoint(
+        [reviewer.worker for reviewer in reviewer_list],
+        prompt=(
+            f"A07 developer-to-reviewer checkpoint for task {task_name}; "
+            "refresh changed source files and affected test candidates"
+        ),
+    )
     skip_budget = _ReadyTimeoutSkipBudget(len(reviewer_list))
 
     def run_review_turn(reviewer: ReviewerRuntime) -> ReviewerRuntime | None:
@@ -4635,7 +4721,7 @@ def run_development_stage(
         )
         reviewer_specs_prompted = stdin_is_interactive() and not any(
             str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
-        ) and not resolve_stage_agent_config(args).reviewer_order
+        ) and not resolve_stage_agent_config(args, stage_key="development").reviewer_order
         reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
             reviewer_specs_prompted,
@@ -4658,7 +4744,7 @@ def run_development_stage(
                 if not developer_plan_prompted:
                     raise
                 continue
-        agent_config = resolve_stage_agent_config(args)
+        agent_config = resolve_stage_agent_config(args, stage_key="development")
         reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
             stdin_is_interactive() and not bool(agent_config.reviewers) and bool(reviewer_specs),
@@ -4669,6 +4755,9 @@ def run_development_stage(
             reserved_session_names=(_developer_display_name(project_dir=project_dir),),
             progress=progress,
             allow_back_first_prompt=reviewer_selection_allow_back,
+            default_ponytail_mode=agent_config.ponytail_mode,
+            default_graphify_mode=agent_config.graphify_mode,
+            default_graphify_config=agent_config.graphify_config,
         )
         developer_max_turns_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
@@ -4698,6 +4787,8 @@ def run_development_stage(
                 requirement_name=requirement_name,
                 paths=paths,
                 reviewer_specs_by_name=reviewer_specs_by_name,
+                developer_selection=developer_plan.selection,
+                reviewer_selections_by_name=reviewer_selections_by_name,
             )
             if preserve_workers
             else None

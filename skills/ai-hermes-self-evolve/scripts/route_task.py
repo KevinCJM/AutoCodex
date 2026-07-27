@@ -15,6 +15,15 @@ ROUTING_DATA_FILES = [
 ]
 ROUTING_INIT_NEXT_ACTION = "Run $ai-hermes-routing-init before resolving AI Hermes routes."
 
+_SELECTOR_FIELD_TO_OUTPUT = {
+    "first_read_selectors": "first_read_files",
+    "then_check_selectors": "then_check_files",
+    "related_test_selectors": "related_tests",
+    "related_config_selectors": "related_configs",
+    "minimum_regression_selectors": "minimum_regression",
+}
+_DEFAULT_SELECTOR_FIELDS = tuple(_SELECTOR_FIELD_TO_OUTPUT)
+
 
 def _load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -74,22 +83,34 @@ def _actions(
     rule_catalog = task_routes.get("rule_catalog", {})
     if not isinstance(rule_catalog, Mapping):
         rule_catalog = {}
-    field_to_catalog = {
-        "expand_search_codes": "expand_search",
-        "stop_and_verify_codes": "stop_and_verify",
-        "fact_check_codes": "fact_check",
-    }
+    condition_registry = task_routes.get("condition_code_registry", {})
+    if not isinstance(condition_registry, Mapping):
+        condition_registry = {}
+    field_to_catalog = (
+        ("expand_search_codes", "expand_search", "expand_search_codes"),
+        ("stop_and_verify_codes", "stop_and_verify", "stop_codes"),
+        ("stop_codes", "stop_and_verify", "stop_codes"),
+        ("fact_check_codes", "fact_check", "fact_check_codes"),
+    )
     resolved: dict[str, list[dict[str, str]]] = {}
-    for field, catalog_name in field_to_catalog.items():
+    for field, catalog_name, condition_name in field_to_catalog:
         catalog = rule_catalog.get(catalog_name, {})
         if not isinstance(catalog, Mapping):
             catalog = {}
-        entries: list[dict[str, str]] = []
+        condition_catalog = condition_registry.get(condition_name, {})
+        if not isinstance(condition_catalog, Mapping):
+            condition_catalog = {}
+        entries = resolved.setdefault(catalog_name, [])
+        existing_codes = {item["code"] for item in entries}
         for code in _string_list(route.get(field)):
+            if code in existing_codes:
+                continue
             rule = catalog.get(code, {})
             action = rule.get("action") if isinstance(rule, Mapping) else None
+            if not action:
+                action = condition_catalog.get(code)
             entries.append({"code": code, "action": str(action or "unknown")})
-        resolved[catalog_name] = entries
+            existing_codes.add(code)
     return resolved
 
 
@@ -105,6 +126,164 @@ def _collect_operational_lists(
             merged = _stable_union(merged, _string_list(module_by_id.get(module_id, {}).get(field)))
         operational_lists[field] = merged
     return operational_lists
+
+
+def _selector_fields(task_routes: Mapping[str, Any]) -> list[str]:
+    """Read module selector fields from the current resolution_model contract."""
+    resolution_model = task_routes.get("resolution_model")
+    if not isinstance(resolution_model, Mapping):
+        return []
+    operations = resolution_model.get("operations", [])
+    if not isinstance(operations, list):
+        operations = []
+    for operation in operations:
+        if not isinstance(operation, Mapping) or operation.get("op") != "collect_module_defaults":
+            continue
+        fields = _string_list(operation.get("module_fields"))
+        return fields or list(_DEFAULT_SELECTOR_FIELDS)
+    # A resolution_model marks the selector schema even when an older producer
+    # omitted the descriptive operations list.
+    return list(_DEFAULT_SELECTOR_FIELDS)
+
+
+def _selector_fallback(task_routes: Mapping[str, Any], token: str = "") -> str:
+    contract = task_routes.get("selector_contract", {})
+    if not isinstance(contract, Mapping):
+        contract = {}
+    registry = contract.get("token_registry", {})
+    if not isinstance(registry, Mapping):
+        registry = {}
+    token_contract = registry.get(token, {})
+    fallback = token_contract.get("fallback") if isinstance(token_contract, Mapping) else None
+    allowed = _string_list(task_routes.get("allowed_unresolved_sentinels"))
+    if isinstance(fallback, str) and fallback in allowed:
+        return fallback
+    if "needs_code_confirmation" in allowed:
+        return "needs_code_confirmation"
+    if "unknown" in allowed:
+        return "unknown"
+    return ""
+
+
+def _materialize_selector_lists(
+    *,
+    selected_modules: Sequence[str],
+    module_by_id: Mapping[str, Mapping[str, Any]],
+    route: Mapping[str, Any],
+    task_routes: Mapping[str, Any],
+    fields: Sequence[str],
+) -> dict[str, list[str]]:
+    """Resolve the selector schema into the legacy public operational lists.
+
+    ``field_ref`` is scoped to the module that owns the selector, matching the
+    selector contract. Route-level selectors can name ``module_id`` explicitly
+    for selectors such as ``owned_paths_role``; unresolved tokens emit only an
+    allowed sentinel.
+    """
+    cache: dict[tuple[str, str], list[str]] = {}
+
+    def materialize_module_field(module_id: str, field: str, stack: set[tuple[str, str]]) -> list[str]:
+        cache_key = (module_id, field)
+        if cache_key in cache:
+            return list(cache[cache_key])
+        if cache_key in stack:
+            fallback = _selector_fallback(task_routes)
+            return [fallback] if fallback else []
+        module = module_by_id.get(module_id, {})
+        values = module.get(field, [])
+        if not isinstance(values, list):
+            values = []
+        next_stack = set(stack)
+        next_stack.add(cache_key)
+        resolved: list[str] = []
+        for selector in values:
+            resolved = _stable_union(
+                resolved,
+                materialize_selector(selector, origin_module_id=module_id, stack=next_stack),
+            )
+        cache[cache_key] = resolved
+        return list(resolved)
+
+    def materialize_selector(
+        selector: Any,
+        *,
+        origin_module_id: str | None,
+        stack: set[tuple[str, str]],
+    ) -> list[str]:
+        if isinstance(selector, str):
+            return [selector] if selector else []
+        if not isinstance(selector, Mapping):
+            return []
+        selector_type = str(selector.get("type", "") or "").strip()
+        if selector_type in {"literal", "subtree"}:
+            path = selector.get("path")
+            return [path] if isinstance(path, str) and path else []
+        if selector_type == "field_ref":
+            field = selector.get("field")
+            if not isinstance(field, str) or not field or not origin_module_id:
+                fallback = _selector_fallback(task_routes)
+                return [fallback] if fallback else []
+            return materialize_module_field(origin_module_id, field, stack)
+        if selector_type == "token":
+            token = str(selector.get("token", "") or "")
+            fallback = _selector_fallback(task_routes, token)
+            return [fallback] if fallback else []
+        if selector_type == "owned_paths_role":
+            module_id = str(selector.get("module_id", "") or origin_module_id or "")
+            role = str(selector.get("role", "") or "")
+            module = module_by_id.get(module_id, {})
+            owned_paths = module.get("owned_paths", [])
+            if not isinstance(owned_paths, list):
+                owned_paths = []
+            paths = [
+                str(item.get("path"))
+                for item in owned_paths
+                if isinstance(item, Mapping)
+                and item.get("role") == role
+                and isinstance(item.get("path"), str)
+                and item.get("path")
+            ]
+            if paths:
+                return _stable_union(paths)
+            fallback = _selector_fallback(task_routes)
+            return [fallback] if fallback else []
+        fallback = _selector_fallback(task_routes)
+        return [fallback] if fallback else []
+
+    selector_lists: dict[str, list[str]] = {}
+    deltas = route.get("selector_deltas", {})
+    overrides = route.get("selector_overrides", {})
+    if not isinstance(deltas, Mapping):
+        deltas = {}
+    if not isinstance(overrides, Mapping):
+        overrides = {}
+
+    for field in fields:
+        merged: list[str] = []
+        for module_id in selected_modules:
+            merged = _stable_union(merged, materialize_module_field(module_id, field, set()))
+        output_field = _SELECTOR_FIELD_TO_OUTPUT.get(field, field)
+        delta_key = field if field in deltas else output_field
+        delta_values = deltas.get(delta_key, [])
+        if isinstance(delta_values, list):
+            for selector in delta_values:
+                merged = _stable_union(
+                    merged,
+                    materialize_selector(selector, origin_module_id=None, stack=set()),
+                )
+        override_key = field if field in overrides else output_field
+        if override_key in overrides:
+            merged = []
+            override_values = overrides.get(override_key, [])
+            if isinstance(override_values, list):
+                for selector in override_values:
+                    merged = _stable_union(
+                        merged,
+                        materialize_selector(selector, origin_module_id=None, stack=set()),
+                    )
+        selector_lists[field] = merged
+        selector_lists[output_field] = merged
+    return selector_lists
 
 
 def _collect_pitfalls(
@@ -224,14 +403,40 @@ def resolve_route(
 
     selected_modules = _stable_union(primary_with_children, selected_expand_modules)
 
+    selector_fields = _selector_fields(task_routes)
+    if selector_fields:
+        operational_fields = selector_fields
+        operational_lists = _materialize_selector_lists(
+            selected_modules=selected_modules,
+            module_by_id=module_by_id,
+            route=selected_route,
+            task_routes=task_routes,
+            fields=selector_fields,
+        )
+        operations = task_routes.get("resolution_model", {}).get("operations", [])
+        if not isinstance(operations, list):
+            operations = []
+        operation_by_name = {
+            str(operation.get("op", "")): operation
+            for operation in operations
+            if isinstance(operation, Mapping)
+        }
+        merge_strategy = operation_by_name.get("apply_route_deltas", {}).get("merge")
+        route_level_override = operation_by_name.get("apply_route_overrides", {}).get("merge")
+    else:
+        routing_policy = task_routes.get("routing_policy", {})
+        if not isinstance(routing_policy, Mapping):
+            routing_policy = {}
+        resolution = routing_policy.get("operational_list_resolution", {})
+        if not isinstance(resolution, Mapping):
+            resolution = {}
+        operational_fields = _string_list(resolution.get("apply_to_fields"))
+        operational_lists = _collect_operational_lists(selected_modules, module_by_id, operational_fields)
+        merge_strategy = resolution.get("merge_strategy")
+        route_level_override = resolution.get("route_level_override")
     routing_policy = task_routes.get("routing_policy", {})
     if not isinstance(routing_policy, Mapping):
         routing_policy = {}
-    resolution = routing_policy.get("operational_list_resolution", {})
-    if not isinstance(resolution, Mapping):
-        resolution = {}
-    operational_fields = _string_list(resolution.get("apply_to_fields"))
-    operational_lists = _collect_operational_lists(selected_modules, module_by_id, operational_fields)
     blocking_statuses = _string_list(
         routing_policy.get("grounding_gate", {}).get("blocking_fact_status")
         if isinstance(routing_policy.get("grounding_gate"), Mapping)
@@ -253,8 +458,8 @@ def resolve_route(
         },
         "routing_policy": {
             "operational_fields": operational_fields,
-            "merge_strategy": resolution.get("merge_strategy"),
-            "route_level_override": resolution.get("route_level_override"),
+            "merge_strategy": merge_strategy,
+            "route_level_override": route_level_override,
         },
         "modules": {
             "primary": primary_modules,

@@ -24,6 +24,15 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
         orphaned_workers: [{ session_name: 'dev-1' }],
       },
       pending_hitl: true,
+      graphify: {
+        mode: 'auto',
+        state: 'ready',
+        version: '0.9.27',
+        freshness: 'fresh',
+        node_count: 5098,
+        edge_count: 22091,
+        report_path: '/tmp/project/.tmux_workflow/evidence.md',
+      },
       available_runs: [{ run_id: 'run_1', worker_count: 2, failed_count: 1 }],
     },
     stages: {
@@ -45,6 +54,13 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
           vendor: 'deveco',
           model: 'deveco/GLM-5.1',
           reasoning_effort: 'max',
+          ponytail_mode: 'full',
+          ponytail_bundle_version: '4.8.4',
+          ponytail_delivery: 'runtime_prompt',
+          requirements_mode: 'grill-with-docs',
+          grill_bundle_commit: 'ed37663c',
+          grill_delivery: 'full',
+          grill_question_seq: 3,
           tmux_control_unavailable_since: '2026-07-14T10:00:00+08:00',
           artifact_paths: ['/tmp/out.md'],
         }],
@@ -74,6 +90,14 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
   expect(snapshots.app.activeStageMessage).toBe('M1-T1 评审第 1 轮')
   expect(snapshots.app.activeStageFailure?.message).toBe('failed safely')
   expect(snapshots.app.activeStageFailure?.orphanedWorkers[0]?.attachCommand).toBe('tmux attach -t dev-1')
+  expect(snapshots.app.graphify).toMatchObject({
+    mode: 'auto',
+    state: 'ready',
+    version: '0.9.27',
+    nodeCount: 5098,
+    edgeCount: 22091,
+    reportPath: '/tmp/project/.tmux_workflow/evidence.md',
+  })
   expect(snapshots.stages.development.workers[0]?.sessionName).toBe('dev-1')
   expect(snapshots.stages.development.workers[0]?.turnState).toBe('orphaned')
   expect(snapshots.stages.development.workers[0]).toMatchObject({
@@ -87,6 +111,13 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
     vendor: 'deveco',
     model: 'deveco/GLM-5.1',
     reasoningEffort: 'max',
+    ponytailMode: 'full',
+    ponytailBundleVersion: '4.8.4',
+    ponytailDelivery: 'runtime_prompt',
+    requirementsMode: 'grill-with-docs',
+    grillBundleCommit: 'ed37663c',
+    grillDelivery: 'full',
+    grillQuestionSeq: 3,
   })
   expect(snapshots.stages.development.workers[0]?.tmuxUnavailableSince).toBe('2026-07-14T10:00:00+08:00')
   expect(snapshots.stages.development.milestones[0]?.tasks[0]?.completed).toBe(true)
@@ -111,6 +142,63 @@ test('normalizePromptSnapshot preserves prompt payload for refresh recovery', ()
   expect(prompt.pending).toBe(true)
   expect(prompt.promptId).toBe('prompt_1')
   expect(prompt.payload.default_value).toBe('gemini')
+})
+
+test('normalizePromptSnapshot preserves optional Grill metadata from outer snapshot and nested payload', () => {
+  const prompt = normalizePromptSnapshot({
+    pending: true,
+    prompt_id: 'grill_1',
+    prompt_type: 'select',
+    interaction_kind: 'grill',
+    question_index: 4,
+    owner_runner_id: 'runner-a03',
+    question_seq: 4,
+    payload: {
+      title: '如何定义业务边界？',
+      recommendation: '保留现有边界',
+      reason_text: '会影响后续设计',
+    },
+  })
+
+  expect(prompt).toMatchObject({
+    interactionKind: 'grill',
+    questionIndex: 4,
+    recommendation: '保留现有边界',
+    reasonText: '会影响后续设计',
+    ownerRunnerId: 'runner-a03',
+    questionSeq: 4,
+  })
+})
+
+test('normalizePromptSnapshot restores a submittable synthetic Grill multiline prompt', () => {
+  const prompt = normalizePromptSnapshot({
+    pending: true,
+    prompt_id: 'grill_recovery_session-a_3_abc',
+    prompt_type: 'multiline',
+    owner_runner_id: 'grill-session:session-a',
+    question_seq: 3,
+    payload: {
+      interaction_kind: 'grill',
+      synthetic_recovery: true,
+      can_submit: true,
+      default_value: '方案 B',
+      answer_options: ['方案 A', '方案 B'],
+      grill_session_id: 'session-a',
+      grill_question_hash: 'sha256:abc',
+    },
+  })
+
+  expect(prompt).toMatchObject({
+    pending: true,
+    promptType: 'multiline',
+    ownerRunnerId: 'grill-session:session-a',
+    questionSeq: 3,
+  })
+  expect(prompt.payload).toMatchObject({
+    can_submit: true,
+    grill_session_id: 'session-a',
+    grill_question_hash: 'sha256:abc',
+  })
 })
 
 test('normalize app merges persistent failure details with authoritative app generation', () => {

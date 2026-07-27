@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import A01_Routing_LayerPlanning as routing_stage
 from tmux_core.stage_kernel import detailed_design, requirements_review, reviewer_orchestration, shared_review
+from tmux_core.prompt_contracts.common import check_reviewer_job
 from tmux_core.runtime.tmux_runtime import TmuxControlUnavailable, TmuxMutationOutcomeUnknown
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 from T09_terminal_ops import PromptBackRequested
@@ -18,6 +19,39 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class StageKernelSharedTests(unittest.TestCase):
+    def test_reviewer_contract_repair_derives_unique_status_from_markdown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            agent_name = "开发工程师-地杰星"
+            json_pattern = "BetterHealthCheck_详细设计评审记录_*.json"
+            md_pattern = "BetterHealthCheck_详细设计评审记录_*.md"
+            json_path = root / json_pattern.replace("*", agent_name)
+            md_path = root / md_pattern.replace("*", agent_name)
+            json_path.write_text("[]", encoding="utf-8")
+            md_path.write_text("", encoding="utf-8")
+
+            empty_prompt = check_reviewer_job(
+                [agent_name],
+                root,
+                task_name="详细设计",
+                json_pattern=json_pattern,
+                md_pattern=md_pattern,
+            )[agent_name]
+            md_path.write_text("- [阻断问题]：缺少边界条件。\n", encoding="utf-8")
+            nonempty_prompt = check_reviewer_job(
+                [agent_name],
+                root,
+                task_name="详细设计",
+                json_pattern=json_pattern,
+                md_pattern=md_pattern,
+            )[agent_name]
+
+        self.assertIn(f"《{md_path.name}》当前为**空**", empty_prompt)
+        self.assertIn('"review_pass": true', empty_prompt)
+        self.assertIn(f"《{md_path.name}》当前为**非空**", nonempty_prompt)
+        self.assertIn('"review_pass": false', nonempty_prompt)
+        self.assertIn("禁止反问人类选择", empty_prompt)
+
     def test_reviewer_artifact_agent_name_is_stable_after_session_rename(self):
         cases = (
             ("需求A_评审记录_开发工程师-天孤星.json", "开发工程师-天孤星"),
@@ -368,7 +402,20 @@ class StageKernelSharedTests(unittest.TestCase):
             },
         )()
 
-        config = shared_review.resolve_stage_agent_config(args)
+        with patch.object(
+            shared_review,
+            "get_default_model_for_vendor",
+            return_value="gpt-5.4",
+        ), patch.object(
+            shared_review,
+            "normalize_model_choice",
+            side_effect=lambda vendor, model: model,
+        ), patch.object(
+            shared_review,
+            "normalize_effort_choice",
+            side_effect=lambda vendor, model, effort: effort,
+        ):
+            config = shared_review.resolve_stage_agent_config(args)
 
         self.assertIsNotNone(config.main)
         self.assertEqual(config.main.vendor, "codex")
@@ -424,6 +471,10 @@ class StageKernelSharedTests(unittest.TestCase):
 
     def test_prompt_effort_falls_back_when_default_is_not_allowed(self):
         with patch.object(routing_stage, "normalize_vendor_choice", return_value="codex"), patch.object(
+            routing_stage,
+            "ensure_vendor_catalog_current",
+            return_value=object(),
+        ), patch.object(
             routing_stage,
             "normalize_model_choice",
             return_value="gpt-x",

@@ -231,6 +231,36 @@ textarea {
   border-color: rgba(0, 210, 255, 0.8);
 }
 
+.prompt-guidance {
+  display: grid;
+  gap: 5px;
+  border-left: 3px solid rgba(247, 201, 72, 0.6);
+  padding: 9px 12px;
+  background: rgba(247, 201, 72, 0.07);
+}
+
+.prompt-guidance span {
+  color: var(--yellow);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.prompt-guidance p {
+  margin: 0;
+  color: #d9e4ea;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.prompt-recommendation {
+  border-left-color: rgba(0, 210, 255, 0.72);
+  background: rgba(0, 210, 255, 0.08);
+}
+
+.prompt-recommendation span {
+  color: var(--cyan);
+}
+
 .failure-card {
   border-color: rgba(255, 93, 93, 0.72);
   background:

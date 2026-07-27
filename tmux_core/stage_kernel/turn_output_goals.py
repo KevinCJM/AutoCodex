@@ -443,6 +443,14 @@ def _build_completion_goal_error(
     )
 
 
+def _prepare_graphify_turn_profile(worker: object, prompt: str) -> object | None:
+    """Freeze one graph snapshot/evidence payload for the whole repair cycle."""
+    prepare = getattr(worker, "prepare_graphify_turn_profile", None)
+    if not callable(prepare):
+        return None
+    return prepare(prompt)
+
+
 def run_task_result_turn_with_repair(
     *,
     worker: TmuxBatchWorker,
@@ -469,6 +477,7 @@ def run_task_result_turn_with_repair(
         if turn_goal is not None and turn_goal.repair_prompt_builder is not None
         else build_default_task_repair_prompt
     )
+    graphify_profile = _prepare_graphify_turn_profile(worker, prompt)
     current_prompt = prompt
     for repair_attempt in range(0, repair_budget + 1):
         current_label = label if repair_attempt == 0 else f"{label}_repair_{repair_attempt}"
@@ -483,6 +492,8 @@ def run_task_result_turn_with_repair(
             "result_contract": active_result_contract,
             "timeout_sec": timeout_sec,
         }
+        if graphify_profile is not None:
+            run_turn_kwargs["graphify_profile"] = graphify_profile
         if turn_start_timeout_sec is not None:
             run_turn_kwargs["turn_start_timeout_sec"] = turn_start_timeout_sec
         if prompt_submit_timeout_sec is not None:
@@ -671,6 +682,7 @@ def run_completion_turn_with_repair(
         if turn_goal is not None and turn_goal.repair_prompt_builder is not None
         else build_default_completion_repair_prompt
     )
+    graphify_profile = _prepare_graphify_turn_profile(worker, prompt)
     current_prompt = prompt
     for repair_attempt in range(0, repair_budget + 1):
         current_label = label if repair_attempt == 0 else f"{label}_repair_{repair_attempt}"
@@ -690,6 +702,8 @@ def run_completion_turn_with_repair(
             "completion_contract": completion_contract,
             "timeout_sec": timeout_sec,
         }
+        if graphify_profile is not None:
+            run_turn_kwargs["graphify_profile"] = graphify_profile
         if turn_start_timeout_sec is not None:
             run_turn_kwargs["turn_start_timeout_sec"] = turn_start_timeout_sec
         if prompt_submit_timeout_sec is not None:

@@ -35,6 +35,7 @@ from A03_RequirementsReview import (
     resolve_review_max_rounds,
     _shutdown_workers,
     cleanup_existing_review_artifacts,
+    _reopen_confirmed_grill_session_for_review_ambiguity,
 )
 from T05_hitl_runtime import build_prefixed_sha256
 from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, PromptBackRequested, use_terminal_ui
@@ -43,6 +44,7 @@ from T08_pre_development import (
     ensure_pre_development_task_record,
 )
 from tmux_core.runtime.contracts import TASK_STATUS_DONE, TASK_STATUS_RUNNING, read_task_status, write_task_status
+from tmux_core.runtime.hitl import GrillSessionState, load_grill_session_state, save_grill_session_state
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
 
@@ -78,6 +80,145 @@ class _FakeWorker:
 
 
 class A03RequirementsReviewTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+        vendor_id: str,
+        requested_model: str,
+        requested_effort: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            resolved_model=str(
+                requested_model
+                if requested_model and requested_model != "default"
+                else f"{vendor_id}/test-default"
+            ),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor_id}",
+        )
+
+    def setUp(self) -> None:
+        patches = (
+            patch(
+                "tmux_core.runtime.tmux_runtime.resolve_launch",
+                side_effect=self._runtime_test_resolution,
+            ),
+            patch(
+                "tmux_core.stage_kernel.shared_review.get_default_model_for_vendor",
+                return_value="gpt-5.4",
+            ),
+        )
+        for catalog_patch in patches:
+            catalog_patch.start()
+            self.addCleanup(catalog_patch.stop)
+
+    def test_a04_ambiguity_reopens_confirmed_grill_session_without_second_hitl(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            requirement_name = "需求A"
+            question_path = root / f"{requirement_name}_与人类交流.md"
+            question_path.write_text("是否允许结算日跨自然月？", encoding="utf-8")
+            context_path = root / "CONTEXT.md"
+            context_path.write_text("## Language\n\n**结算日**: 完成资金交割的业务日期。\n", encoding="utf-8")
+            grill_root = root / ".tmux_workflow" / requirement_name / "grill"
+            session_path = grill_root / "session.json"
+            draft_path = grill_root / "domain_drafts.json"
+            draft_path.parent.mkdir(parents=True, exist_ok=True)
+            draft_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "1.0",
+                        "context_markdown": "## Language\n\n**结算日**: 完成资金交割的业务日期。",
+                        "adrs": [
+                            {
+                                "title": "结算日期口径",
+                                "slug": "settlement-date",
+                                "markdown": "# 结算日期口径\n\n采用交易日口径。",
+                                "hard_to_reverse": True,
+                                "surprising": True,
+                                "real_tradeoff": True,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            save_grill_session_state(
+                session_path,
+                GrillSessionState(
+                    session_id="session-a03",
+                    requirements_mode="grill-with-docs",
+                    state="confirmed",
+                    turn_seq=4,
+                    question_seq=3,
+                    candidate_turn_id="requirements_clarification_4",
+                    candidate_round=4,
+                    final_artifact_hashes={str(question_path): build_prefixed_sha256(question_path)},
+                    final_confirmation={"status": "confirmed", "candidate_turn_id": "old"},
+                    domain_draft_path=str(draft_path),
+                    published_paths=[str(context_path)],
+                    publish_intent={"state": "committed", "intent_id": "old"},
+                    turn_stage_status_path=str(root / "old-stage-status.json"),
+                    turn_prompt_kind="grill_contract_repair",
+                    turn_prompt_text="old prompt",
+                    turn_prompt_hash="old-hash",
+                    turn_contract_repair_attempts=2,
+                    turn_manual_intervention_used=True,
+                    turn_fresh_baseline_hashes={str(question_path): "sha256:old"},
+                ),
+            )
+
+            reopened = _reopen_confirmed_grill_session_for_review_ambiguity(
+                project_dir=root,
+                requirement_name=requirement_name,
+                question_path=question_path,
+            )
+
+            self.assertTrue(reopened)
+            state = load_grill_session_state(
+                session_path,
+                requirements_mode="grill-with-docs",
+                domain_draft_path=draft_path,
+            )
+            self.assertEqual(state.state, "answer_pending")
+            self.assertIn("是否允许结算日跨自然月", state.pending_answer)
+            self.assertEqual(state.candidate_turn_id, "")
+            self.assertEqual(state.final_artifact_hashes, {})
+            self.assertEqual(state.final_confirmation, {})
+            self.assertEqual(state.published_paths, [])
+            self.assertEqual(state.publish_intent, {})
+            self.assertEqual(state.turn_stage_status_path, "")
+            self.assertEqual(state.turn_prompt_kind, "")
+            self.assertEqual(state.turn_prompt_text, "")
+            self.assertEqual(state.turn_prompt_hash, "")
+            self.assertEqual(state.turn_contract_repair_attempts, 0)
+            self.assertFalse(state.turn_manual_intervention_used)
+            self.assertEqual(state.turn_fresh_baseline_hashes, {})
+            self.assertFalse(draft_path.exists())
+            self.assertEqual(len(tuple(grill_root.glob("domain_drafts.confirmed.*.json"))), 1)
+            self.assertIn(str(context_path.resolve()), state.context_preimage_hashes)
+            self.assertFalse(state.context_map_exists)
+            self.assertEqual(state.context_target_snapshot, [str(context_path.resolve())])
+
+    def test_a04_ambiguity_keeps_standard_flow_without_confirmed_grill_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            question_path = root / "question.md"
+            question_path.write_text("需要确认吗？", encoding="utf-8")
+            self.assertFalse(
+                _reopen_confirmed_grill_session_for_review_ambiguity(
+                    project_dir=root,
+                    requirement_name="需求A",
+                    question_path=question_path,
+                )
+            )
+
     def test_resolve_review_max_rounds_supports_default_and_infinite(self):
         args = build_parser().parse_args([])
         self.assertEqual(resolve_review_max_rounds(args), 5)
@@ -169,7 +310,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
             review_md_path, review_json_path = build_reviewer_artifact_paths(root, "需求A", "R1")
             reviewer = ReviewerRuntime(
                 reviewer_name="R1",
-                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                selection=ReviewAgentSelection("codex", "default", "high", ""),
                 worker=_FakeWorker(runtime_root=root / ".requirements_review_runtime", runtime_dir=root / ".requirements_review_runtime" / "r1"),
                 review_md_path=review_md_path,
                 review_json_path=review_json_path,
@@ -231,7 +372,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 project_dir=tmpdir,
                 requirement_name="需求A",
                 reviewer_name="R1",
-                selection=ReviewAgentSelection("codex", "gpt-5.4", "high", ""),
+                selection=ReviewAgentSelection("codex", "default", "high", ""),
             )
 
         self.assertEqual(reviewer.worker.session_name, "审核器-鬼金羊")
@@ -639,7 +780,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
 
         def fake_prompt_review_agent_selection(default_vendor, default_model="", default_reasoning_effort="high", default_proxy_url="", *, role_label="", progress=None, **kwargs):  # noqa: ANN001
             observed["role_label"] = role_label
-            return ReviewAgentSelection("codex", "gpt-5.4", "high", "")
+            return ReviewAgentSelection("codex", "default", "high", "")
 
         with tempfile.TemporaryDirectory() as tmpdir, patch(
             "A04_RequirementsReview.build_session_name",
@@ -789,7 +930,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
             "A03_RequirementsReview.prompt_review_agent_selection",
             return_value=ReviewAgentSelection(
                 vendor="codex",
-                model="gpt-5.4",
+                model="default",
                 reasoning_effort="high",
                 proxy_url="",
             ),
@@ -806,7 +947,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
             )
 
         self.assertEqual(handoff.vendor, "codex")
-        self.assertEqual(handoff.model, "gpt-5.4")
+        self.assertEqual(handoff.model, "default")
         self.assertEqual(handoff.reasoning_effort, "high")
         self.assertEqual(len(created_workers), 1)
         self.assertEqual(observed[0][0], "resume_requirements_review_ba")
@@ -2329,7 +2470,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 return_value=True,
             ), patch(
                 "A03_RequirementsReview.prompt_review_agent_selection",
-                return_value=ReviewAgentSelection("codex", "gpt-5.4-mini", "high", ""),
+                return_value=ReviewAgentSelection("codex", "default", "high", ""),
             ), patch("sys.stdout", io.StringIO()):
                 result = run_reviewer_turn_with_recreation(
                     original,
@@ -2376,7 +2517,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 return_value=True,
             ), patch(
                 "A03_RequirementsReview.prompt_review_agent_selection",
-                return_value=ReviewAgentSelection("codex", "gpt-5.4-mini", "high", ""),
+                return_value=ReviewAgentSelection("codex", "default", "high", ""),
             ), patch(
                 "A03_RequirementsReview.TmuxBatchWorker",
                 return_value=recreated_worker,
@@ -2393,7 +2534,7 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 )
 
             self.assertEqual(payload["status"], "completed")
-            self.assertEqual(handoff.model, "gpt-5.4-mini")
+            self.assertEqual(handoff.model, "default")
             self.assertEqual(call_counter["count"], 2)
             replacement_metadata = worker_constructor.call_args.kwargs["runtime_metadata"]
             self.assertEqual(replacement_metadata["requirement_name"], "需求A")

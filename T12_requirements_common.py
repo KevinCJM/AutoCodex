@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
 
@@ -23,7 +23,10 @@ from T09_terminal_ops import prompt_with_default as terminal_prompt_with_default
 
 
 DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR = "codex"
-DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL = "gpt-5.4"
+# Resolve the installed catalog's current default at AgentRunConfig time.
+# A fixed historical Codex model makes direct A02/A03 execution fail as soon
+# as that model disappears from the locally scanned catalog.
+DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL = "default"
 DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT = "high"
 
 DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR = DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR
@@ -44,6 +47,9 @@ class RequirementsAnalystHandoff:
     model: str
     reasoning_effort: str
     proxy_url: str
+    ponytail_mode: str = "off"
+    graphify_mode: str = "off"
+    graphify_config: dict[str, object] = field(default_factory=dict)
 
 
 def prompt_with_default(prompt_text: str, default: str = "", allow_empty: bool = False) -> str:

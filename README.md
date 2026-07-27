@@ -23,6 +23,7 @@ This repository has been flattened into the current project root. The documentat
 - Launch multiple reviewer agents in parallel to review requirements clarification, detailed design, task lists, code changes, and final code quality.
 - Split detailed designs into trackable Markdown task lists and JSON progress files.
 - Drive development agents through long-running tmux sessions, then perform task-level review, repair, and status updates.
+- Build a project-local, code-only Graphify relationship graph and expose bounded static evidence to every supported agent vendor.
 - Support stage rollback, runtime recovery, worker reconstruction, model/vendor selection, proxy configuration, and review-round limits.
 - Provide three user interfaces: OpenTUI terminal UI, Web console, and legacy Python CLI.
 
@@ -60,7 +61,10 @@ This repository has been flattened into the current project root. The documentat
 │   ├── tui/                     # Bun + Solid + OpenTUI terminal UI
 │   └── web/                     # Bun + Vite + Solid Web console
 ├── docs/                        # Machine-first routing facts
-├── scripts/tmux-tui             # OpenTUI launcher
+├── scripts/
+│   ├── tmux-tui                 # OpenTUI launcher
+│   └── tmux-graphify            # Read-only Graphify setup/build/query wrapper
+├── tools/graphify/              # Pinned, isolated Graphify tool manifest and lock
 └── tests/                       # Python regression tests
 ```
 
@@ -75,6 +79,8 @@ Some top-level files are compatibility entry points and map into real implementa
 - At least one available agent CLI: `codex`, `claude`, `gemini`, `opencode`, `mimo`, `agy`, or `deveco` (DevEco Code).
 - Login, API authentication, and network proxy setup for the selected agent CLI.
 - Optional: Node.js. Some provider/model detection code reads Node package metadata.
+- Optional: `uv` for installing the isolated, project-managed Graphify 0.9.27 environment. The main workflow never replaces a user-global Graphify installation.
+- Ponytail requires no separate plugin, Node.js process, MCP server, or network access; the audited skills are bundled under `third_party/ponytail`.
 
 ## Installation
 
@@ -157,8 +163,11 @@ Common non-interactive usage:
 python3 A00_main_tui.py \
   --project-dir /absolute/path/to/target-project \
   --requirement-name new-feature \
-  --main-agent vendor=codex,model=gpt-5.4,effort=high \
-  --reviewer-agent name=R1,vendor=codex,model=gpt-5.4-mini,effort=medium \
+  --ponytail-mode full \
+  --requirements-mode standard \
+  --graphify-mode auto \
+  --main-agent vendor=codex,model=default,effort=high \
+  --reviewer-agent name=R1,vendor=codex,model=default,effort=medium \
   --requirements-review-max-rounds 5 \
   --detailed-design-review-max-rounds 5 \
   --task-split-review-max-rounds 5 \
@@ -185,7 +194,7 @@ cd /path/to/TmuxCodingTeam
 python3 A01_Routing_LayerPlanning.py \
   --project-dir /tmp/tmuxcodingteam-demo \
   --vendor codex \
-  --model gpt-5.4 \
+  --model default \
   --effort medium \
   --yes
 ```
@@ -205,7 +214,7 @@ To try the full interactive workflow:
 python3 A00_main_tui.py \
   --project-dir /tmp/tmuxcodingteam-demo \
   --requirement-name demo-requirement \
-  --main-agent vendor=codex,model=gpt-5.4,effort=medium
+  --main-agent vendor=codex,model=default,effort=medium
 ```
 
 ### 4. Run a single stage directly
@@ -229,6 +238,9 @@ Most stages support:
 - `--model <model>`
 - `--effort low|medium|high|xhigh|max`
 - `--proxy-url <port-or-url>` or the routing-stage `--proxy-port`
+- `--ponytail-mode off|lite|full|ultra`
+- `--graphify-mode off|auto|required`
+- A00/A03: `--requirements-mode standard|grill|grill-with-docs`
 - `--reviewer-agent name=<key>,vendor=...,model=...,effort=...,proxy=...`
 - `--review-max-rounds <number|infinite>`
 - `--yes`
@@ -240,42 +252,60 @@ Most stages support:
 `--main-agent` and `--reviewer-agent` use comma-separated `key=value` strings:
 
 ```bash
---main-agent vendor=codex,model=gpt-5.4,effort=high,proxy=10809
---reviewer-agent name=Architect,vendor=claude,model=sonnet,effort=high
---reviewer-agent name=Tester,vendor=gemini,model=flash,effort=medium
+--main-agent vendor=codex,model=default,effort=high,proxy=10809
+--reviewer-agent name=Architect,vendor=claude,model=sonnet,effort=high,ponytail=ultra
+--reviewer-agent name=Tester,vendor=gemini,model=flash,effort=medium,ponytail_mode=lite
 ```
 
 You can also write configuration into a JSON file and pass it with `--agent-config`. Global configuration acts as the default, and `stages.<stage_key>` can override a single stage:
 
 ```json
 {
+  "ponytail_mode": "full",
+  "requirements_mode": "grill",
+  "graphify_mode": "auto",
+  "graphify": {
+    "include": ["src/**", "tests/**"],
+    "exclude": ["generated/**"],
+    "max_workers": 1,
+    "initial_timeout_sec": 120,
+    "incremental_timeout_sec": 30
+  },
   "main": {
     "vendor": "codex",
-    "model": "gpt-5.4",
+    "model": "default",
     "effort": "high"
   },
   "reviewers": [
     {
       "name": "R1",
       "vendor": "codex",
-      "model": "gpt-5.4-mini",
+      "model": "default",
       "effort": "medium"
     }
   ],
   "stages": {
+    "requirements_clarification": {
+      "requirements_mode": "grill-with-docs"
+    },
+    "routing": {
+      "graphify_mode": "required"
+    },
     "development": {
       "main": {
         "vendor": "gemini",
         "model": "flash",
         "effort": "medium",
-        "proxy": "10809"
+        "proxy": "10809",
+        "ponytail_mode": "ultra"
       },
       "reviewers": [
         {
           "name": "CodeReview",
           "vendor": "opencode",
           "model": "default",
-          "effort": "high"
+          "effort": "high",
+          "ponytail": "lite"
         }
       ]
     }
@@ -294,6 +324,49 @@ Current stage keys used by the main entry point:
 - `overall_review`
 
 Command-line `--main-agent` and `--reviewer-agent` options take precedence over the `--agent-config` file.
+
+## Bundled Ponytail Modes
+
+Ponytail is an optional behavior profile, not an agent vendor. A new workflow selects it once and all main and review agents inherit that mode. Interactive choices are Full, Lite, Ultra, and Off; Full is the default for new, `--yes`, and non-interactive workflows. A role can override the workflow mode with `ponytail_mode=...` or the compatible `ponytail=...` key. Existing worker state without this field resumes as Off, so old sessions do not receive new instructions unexpectedly.
+
+The first task in each new tmux session receives the complete selected rules. Later tasks receive a compact reminder. Explicit task instructions, repository rules, artifact contracts, completion protocols, safety, and permissions always take priority. The project also preserves the upstream `ponytail-review`, `ponytail-audit`, `ponytail-debt`, `ponytail-gain`, and `ponytail-help` skills for provenance, but this release does not expose or invoke them automatically.
+
+The bundled source version, commit, license, and integrity hashes are recorded in `third_party/ponytail/UPSTREAM.json`. A user-installed Ponytail plugin is not required.
+
+## Bundled Grill Requirements Modes
+
+Grill is an optional A03 requirements-interview strategy, not an agent vendor. `standard` keeps the existing behavior, `grill` asks one decision question at a time with a recommended answer, and `grill-with-docs` additionally maintains controlled `CONTEXT.md` and ADR drafts. Standard is the default. Grill modes require an interactive human, so `--yes` and headless runs must use Standard.
+
+The workflow injects a self-contained, vendor-neutral rules block through the shared tmux prompt path. Therefore Codex, Claude, Gemini, OpenCode, MiMo, AGY, and DevEco can all act as the A03 analyst without installing skills or using vendor-specific slash commands. Reviewers and development agents do not receive Grill instructions.
+
+The first confirmed Grill turn in a tmux session receives the complete rules; later turns receive a compact reminder. A03 cannot complete until the human explicitly confirms shared understanding. In `grill-with-docs`, drafts stay in the requirement runtime and are atomically published only after that confirmation; ADR paths and numbers remain host-controlled. The pinned upstream commit, MIT license, and integrity hashes are recorded in `third_party/mattpocock-skills/UPSTREAM.json`.
+
+## Project Code Graph With Graphify
+
+Graphify is an optional project-level code relationship service, not an eighth coding-agent vendor. This integration is pinned to the Apache-2.0 `graphifyy==0.9.27` package and runs from an isolated Python 3.11 environment described by `tools/graphify/pyproject.toml` and `tools/graphify/uv.lock`. It does not upgrade or overwrite a Graphify executable already installed by the user.
+
+`--graphify-mode` supports `off`, `auto`, and `required`. New workflows default to `auto`; restored legacy runner or worker state without the field remains `off`. CLI configuration takes precedence over `stages.<stage>.graphify_mode`, then the top-level `graphify_mode`. Graphify is project-level, so role-level overrides are rejected. In `auto`, missing tools or failed refreshes degrade to the existing routing workflow and can reuse a stale successful graph. In `required`, tool, build, or schema failures stop the stage before an agent is created.
+
+Use the maintenance wrapper from the repository root:
+
+```bash
+scripts/tmux-graphify setup
+scripts/tmux-graphify doctor
+scripts/tmux-graphify status
+scripts/tmux-graphify build --project /absolute/path/to/project
+scripts/tmux-graphify query "callers of calculate_total"
+scripts/tmux-graphify affected "calculate_total"
+scripts/tmux-graphify path "HTTP handler" "calculate_total"
+scripts/tmux-graphify prune
+```
+
+`setup` installs only the pinned managed environment under `$XDG_DATA_HOME/tmux_coding_team/tools/graphify/0.9.27/` (or `~/.local/share/...`) and requires an explicit command plus network access. It never runs Graphify platform installers, Git hooks, watch mode, MCP, or global graph commands. `doctor` verifies the exact version and CLI contract. The agent-facing wrapper permits only read operations such as `query`, `affected`, `path`, `explain`, and `god-nodes`.
+
+Graph builds use `--code-only`, `--no-cluster`, and a controlled source snapshot. Symlinks are not followed, secret-like files and runtime/build/vendor directories are excluded, and bounded file/count/size limits fail explicitly instead of silently truncating input. Graphify subprocesses receive `GRAPHIFY_QUERY_LOG_DISABLE=1` and no model-provider credentials. Immutable generations live in the user cache (`$XDG_CACHE_HOME/tmux_coding_team/graphify/` or `~/.cache/...`); partial builds are staged and never replace the last valid graph. Neither the raw graph nor cache paths are exposed through TUI/Web snapshots.
+
+Codex, Claude, Gemini, OpenCode, MiMo, AGY, and DevEco receive the same bounded Graphify evidence through the ordinary prompt chain and the same read-only command environment. No vendor needs a Graphify Skill, MCP server, hook, or plugin. The project injects only bounded `EXTRACTED` relationships and at most a few clearly marked `INFERRED` candidates; retries reuse the same evidence rather than rebuilding or resending a task.
+
+Routing authority does not change: active code, tests, and configuration are implementation truth; `AGENTS.md`, `repo_map.json`, `task_routes.json`, and `pitfalls.json` remain the machine-routing authority; Graphify only supplies static navigation and impact candidates. A01 creation may consume that evidence, while A01 audit/refine turns intentionally disable it and stay within the four routing files. Dynamic imports, reflection, generated code, runtime configuration, and cross-service behavior always require direct code or runtime confirmation.
 
 ## Runtime Files And State
 
@@ -341,6 +414,7 @@ The Python bridge layer lives under `tmux_core/bridge`:
 - `T11_web_backend.py` is the Web HTTP/SSE backend compatibility entry point.
 - `tmux_core/bridge/backend.py` handles action dispatch, snapshot construction, worker control, file preview, prompt responses, HITL state, and runtime events.
 - `tmux_core/bridge/web_backend.py` exposes the local HTTP API.
+- Graphify is exposed only as optional project-level `snapshot.app.graphify` state and a sanitized evidence report preview; it does not add an endpoint or change the NDJSON protocol version.
 
 Main Web backend endpoints:
 

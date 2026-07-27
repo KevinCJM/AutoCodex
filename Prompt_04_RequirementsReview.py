@@ -44,6 +44,13 @@ auditor = f"""* 角色属性：逻辑网关 / 确定性校验器 / 审核器
     * 逻辑单射：确保下游 Agent 拿到的指令集是唯一的、无歧义的。"""
 
 
+def _project_context_reading_guard(requirements_clear_md: str) -> str:
+    return f"""## 项目读取顺序与证据边界
+1. 读取项目文件前，必须先定位并遵循当前项目根目录的 `AGENTS.md`；若其中定义了路由层，必须按其规定的读取顺序与选择器定位代码、测试和配置。
+2. 对 CONTEXT/ADR 文档，仅可读取《{requirements_clear_md}》明确引用且位于当前项目内的具体文件；禁止扫描、枚举、搜索或批量读取项目中的其他 CONTEXT/ADR 文档。
+3. CONTEXT/ADR 仅提供领域语义、约束和决策背景，不能作为当前代码实现事实；任何实现结论都必须由当前代码、测试或配置核验。"""
+
+
 # 触发 [HITL] 之后的通用提示词
 @prompt_helper(no_turn=True)
 def human_reply_sop(human_msg, *, ask_human_md='name_与人类交流.md',
@@ -129,6 +136,8 @@ def human_feed_bck(human_msg, *, ask_human_md='name_与人类交流.md',
     human_feed_bck_prompt = f"""## 角色定位
 你是一个【严苛的需求对齐专家】，负责处理人类反馈信息并同步工程契约。
 
+{_project_context_reading_guard(requirements_clear_md)}
+
 {human_reply_sop_prompt}"""
     return human_feed_bck_prompt
 
@@ -161,6 +170,8 @@ def resume_ba(human_msg=None, ba_desc=fintech_ba, init_prompt=task_start_prompt,
                                            hitl_record_md=hitl_record_md)
     requirements_understand_prompt = f"""## 角色定位
 {ba_desc}
+
+{_project_context_reading_guard(requirements_clear_md)}
 
 ## Context & Scope
 - 系统已经基于代码现状以及《{original_requirement_md}》和《{hitl_record_md}》生成《{requirements_clear_md}》。 
@@ -219,6 +230,8 @@ def requirements_review_init(auditor_desc=auditor, init_prompt=task_start_prompt
                                                        blocked_condition="需求澄清文档中发现逻辑错误、需求遗漏、或其他潜在隐患。")
     requirements_review_init_prompt = f"""## 角色定位
 {auditor_desc}
+
+{_project_context_reading_guard(requirements_clear_md)}
 
 ## 任务指令 (Core Task)
 对比《{original_requirement_md}》+《{hitl_record_md}》（统称为 **Source**）与《{requirements_clear_md}》（统称为 **Target**）。
@@ -312,7 +325,9 @@ def review_feedback(review_msg, *, original_requirement_md='name_原始需求.md
 - 无论是否修改《{requirements_clear_md}》，都必须覆盖写入《{what_just_change}》说明修复/驳回/裁决结果。
 - 《{ask_human_md}》必须为空。
 - 返回：`修改完成`"""
-    review_feedback_prompt = f"""## 任务背景
+    review_feedback_prompt = f"""{_project_context_reading_guard(requirements_clear_md)}
+
+## 任务背景
 审计员已基于《{original_requirement_md}》+《{hitl_record_md}》对比了你的《{requirements_clear_md}》。
 你需要对这些审计员提出的评审意见进行鉴定、修复，并在信息不足时向人类发起求助。
 
@@ -376,7 +391,9 @@ def requirements_review_reply(ba_reply, task_name="需求评审", *,
                                                        review_json=requirement_review_json,
                                                        pass_condition="需求澄清审核通过, 符合审计准则。",
                                                        blocked_condition="需求澄清文档中发现逻辑错误、需求遗漏、或其他潜在隐患。")
-    requirements_review_reply_prompt = f"""## Context
+    requirements_review_reply_prompt = f"""{_project_context_reading_guard(requirements_clear_md)}
+
+## Context
 根据你上一轮对《{requirements_clear_md}》提出的评审结论, 以下是需求分析师根据《{requirement_review_md}》返回的信息:
 [ANALYST_FEEDBACK_START]
 {ba_reply}

@@ -33,6 +33,13 @@ export type WorkerSnapshot = {
   model?: string
   resolvedModel?: string
   reasoningEffort?: string
+  ponytailMode?: string
+  ponytailBundleVersion?: string
+  ponytailDelivery?: string
+  requirementsMode?: string
+  grillBundleCommit?: string
+  grillDelivery?: string
+  grillQuestionSeq?: number
   retryCount: number
   note: string
   transcriptPath: string
@@ -191,6 +198,22 @@ export type StageFailureSnapshot = {
   orphanedWorkers: StageFailureWorker[]
 }
 
+export type GraphifyStatus = {
+  mode: string
+  state: string
+  version: string
+  freshness: string
+  generatedAt: string
+  sourceFingerprint: string
+  nodeCount: number
+  edgeCount: number
+  evidenceId: string
+  directCount: number
+  inferredCount: number
+  reportPath: string
+  lastError: string
+}
+
 export type AppSnapshot = {
   projectDir: string
   requirementName: string
@@ -208,6 +231,7 @@ export type AppSnapshot = {
   pendingAttention: boolean
   pendingAttentionReason: string
   pendingAttentionSince: string
+  graphify?: GraphifyStatus
   recentArtifacts: ArtifactItem[]
   availableRuns: RunOption[]
   capabilities: Record<string, unknown>

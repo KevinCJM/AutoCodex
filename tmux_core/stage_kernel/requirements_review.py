@@ -11,10 +11,11 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import uuid
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Callable, Sequence
+from typing import Callable, Mapping, Sequence
 
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
@@ -40,7 +41,16 @@ from tmux_core.runtime.contracts import (
     validate_turn_file_artifact_rules,
     write_task_status,
 )
-from tmux_core.runtime.hitl import HitlPromptContext, build_prefixed_sha256, run_hitl_agent_loop
+from tmux_core.runtime.hitl import (
+    GRILL_WITH_DOCS_MODE,
+    HitlPromptContext,
+    apply_grill_context_snapshot,
+    build_prefixed_sha256,
+    load_grill_session_state,
+    read_grill_session_header,
+    run_hitl_agent_loop,
+    save_grill_session_state,
+)
 from tmux_core.runtime.tmux_runtime import (
     CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -92,6 +102,8 @@ from tmux_core.stage_kernel.shared_review import (
     ensure_empty_file,
     ensure_review_artifacts,
     ensure_review_artifacts_exist,
+    inherit_legacy_handoff_ponytail_mode,
+    inherit_legacy_handoff_graphify_mode,
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
@@ -102,6 +114,7 @@ from tmux_core.stage_kernel.shared_review import (
     render_tmux_start_summary,
     resolve_reviewer_artifact_agent_name,
     resolve_agent_run_config_with_recovery,
+    resolve_main_ponytail_mode,
     resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
@@ -175,6 +188,98 @@ class _SkipToDetailedDesign(RuntimeError):
         self.handoff = handoff
 
 
+def _requirements_grill_paths(project_dir: str | Path, requirement_name: str) -> tuple[Path, Path]:
+    project_root = Path(project_dir).expanduser().resolve()
+    grill_root = (
+        project_root
+        / ".tmux_workflow"
+        / sanitize_requirement_name(requirement_name)
+        / "grill"
+    )
+    return grill_root / "session.json", grill_root / "domain_drafts.json"
+
+
+def _reopen_confirmed_grill_session_for_review_ambiguity(
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    question_path: str | Path,
+) -> bool:
+    """Return an A04 ambiguity to the authoritative A03 Grill session.
+
+    Review agents remain standard workers.  The persisted interview is reopened
+    with the review question as its next input, so A00 can route back to A03
+    without creating a second HITL protocol or asking the same question in A04.
+    """
+
+    session_path, domain_draft_path = _requirements_grill_paths(
+        project_dir,
+        requirement_name,
+    )
+    header = read_grill_session_header(session_path)
+    if header is None or header.state != "confirmed":
+        return False
+    question_file = Path(question_path).expanduser().resolve()
+    question_text = get_markdown_content(question_file).strip()
+    if not question_text:
+        raise RuntimeError("A04 请求返回 Grill，但歧义问题文档为空")
+    state = load_grill_session_state(
+        session_path,
+        requirements_mode=header.requirements_mode,
+        domain_draft_path=domain_draft_path,
+    )
+    state.state = "answer_pending"
+    state.pending_answer = (
+        "A04 需求评审发现了新的业务歧义。请先核实已有需求产物和代码可查事实，"
+        "然后继续一次只问一个问题；不要在没有人类最终确认时返回 A04。\n\n"
+        f"A04 问题：\n{question_text}"
+    )
+    state.pending_question_path = ""
+    state.pending_question_hash = ""
+    state.candidate_turn_id = ""
+    state.candidate_round = 0
+    state.final_artifact_hashes = {}
+    state.final_confirmation = {}
+    state.force_finalize = False
+    state.published_paths = []
+    state.publish_intent = {}
+    # A03 deliberately closes its Grill worker after confirmation.  Reopening
+    # from A04 is a new launch generation and must receive the full rule block,
+    # never try to reuse the completed interview's process or turn cursor.
+    state.active_worker_state_path = ""
+    state.active_runtime_dir = ""
+    state.active_session_name = ""
+    state.active_pane_id = ""
+    state.active_worker_generation = ""
+    state.turn_id = ""
+    state.turn_label = ""
+    state.turn_status_path = ""
+    state.turn_stage_status_path = ""
+    state.turn_submission_cursor = ""
+    state.turn_worker_state_revision = 0
+    state.turn_prompt_kind = ""
+    state.turn_prompt_text = ""
+    state.turn_prompt_hash = ""
+    state.turn_contract_repair_attempts = 0
+    state.turn_manual_intervention_used = False
+    state.turn_fresh_baseline_hashes = {}
+    if header.requirements_mode == GRILL_WITH_DOCS_MODE:
+        # A confirmed draft may contain ADRs that were already numbered and
+        # published.  Archive it before reopening so a no-op reconfirmation can
+        # never publish duplicate ADRs; the next A03 turn creates a fresh draft
+        # only when the new ambiguity changes domain documents.
+        if domain_draft_path.exists() and domain_draft_path.is_file():
+            archived = domain_draft_path.with_name(
+                f"domain_drafts.confirmed.{uuid.uuid4().hex}.json"
+            )
+            domain_draft_path.replace(archived)
+        apply_grill_context_snapshot(state, project_dir)
+        state.selected_context_target = ""
+    save_grill_session_state(session_path, state)
+    message("A04 检测到新的业务歧义，已恢复原 Grill 会话并返回 A03 逐问澄清。")
+    return True
+
+
 def _sync_shared_review_bindings() -> None:
     shared_review.DEFAULT_MODEL_BY_VENDOR = DEFAULT_MODEL_BY_VENDOR
     shared_review.prompt_effort = prompt_effort
@@ -230,8 +335,11 @@ def prompt_proxy_url(default: str = "", *, role_label: str = "") -> str:
 def prompt_review_agent_selection(
         default_vendor: str = DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
         default_model: str = "",
-        default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
-        default_proxy_url: str = "",
+    default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+    default_proxy_url: str = "",
+    default_ponytail_mode: str = "full",
+    default_graphify_mode: str = "off",
+    default_graphify_config: Mapping[str, object] | None = None,
         *,
         role_label: str = "",
         progress: ReviewStageProgress | None = None,
@@ -244,6 +352,9 @@ def prompt_review_agent_selection(
         default_model=default_model,
         default_reasoning_effort=default_reasoning_effort,
         default_proxy_url=default_proxy_url,
+        default_ponytail_mode=default_ponytail_mode,
+        default_graphify_mode=default_graphify_mode,
+        default_graphify_config=default_graphify_config,
         role_label=role_label,
         progress=progress,
         allow_back_first_step=allow_back_first_step,
@@ -314,6 +425,11 @@ def prompt_replacement_review_agent_selection(
             role_label=role_label,
             progress=progress,
         )
+        selection = replace(
+            selection,
+            ponytail_mode=previous_selection.ponytail_mode,
+            graphify_mode=previous_selection.graphify_mode,
+        )
         if (
                 not force_model_change
                 or selection.vendor != previous_selection.vendor
@@ -346,6 +462,11 @@ def prompt_required_replacement_review_agent_selection(
             role_label=role_label,
             progress=progress,
         )
+        selection = replace(
+            selection,
+            ponytail_mode=previous_selection.ponytail_mode,
+            graphify_mode=previous_selection.graphify_mode,
+        )
         if (
                 not force_model_change
                 or selection.vendor != previous_selection.vendor
@@ -362,6 +483,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--requirement-name", help="需求名称")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--review-max-rounds", default="", help="需求评审最多重试几轮；传 infinite 表示不设上限")
+    parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=R1,vendor=...,model=...,effort=...,proxy=...")
     parser.add_argument("--yes", action="store_true", help="跳过非关键确认")
     parser.add_argument("--no-tui", action="store_true", help="显式禁用 OpenTUI")
@@ -1055,6 +1180,9 @@ def run_ba_turn_with_recreation(
                         current_handoff.model,
                         current_handoff.reasoning_effort,
                         current_handoff.proxy_url,
+                        current_handoff.ponytail_mode,
+                        current_handoff.graphify_mode,
+                        current_handoff.graphify_config,
                     ),
                     force_model_change=True,
                     role_label=ba_display_name,
@@ -1081,6 +1209,9 @@ def run_ba_turn_with_recreation(
                     model=selection.model,
                     reasoning_effort=selection.reasoning_effort,
                     proxy_url=selection.proxy_url,
+                    ponytail_mode=selection.ponytail_mode,
+                    graphify_mode=selection.graphify_mode,
+                    graphify_config=selection.graphify_config,
                 )
                 message(render_tmux_start_summary(str(current_handoff.worker.session_name).strip() or ba_display_name, current_handoff.worker))
                 continue
@@ -1094,6 +1225,9 @@ def run_ba_turn_with_recreation(
                         current_handoff.model,
                         current_handoff.reasoning_effort,
                         current_handoff.proxy_url,
+                        current_handoff.ponytail_mode,
+                        current_handoff.graphify_mode,
+                        current_handoff.graphify_config,
                     ),
                     force_model_change=True,
                     role_label=ba_display_name,
@@ -1120,6 +1254,9 @@ def run_ba_turn_with_recreation(
                     model=selection.model,
                     reasoning_effort=selection.reasoning_effort,
                     proxy_url=selection.proxy_url,
+                    ponytail_mode=selection.ponytail_mode,
+                    graphify_mode=selection.graphify_mode,
+                    graphify_config=selection.graphify_config,
                 )
                 message(render_tmux_start_summary(str(current_handoff.worker.session_name).strip() or ba_display_name, current_handoff.worker))
                 continue
@@ -1307,6 +1444,8 @@ def prepare_ba_handoff(
         ba_handoff: RequirementsAnalystHandoff | None,
         paths: dict[str, Path],
         progress: ReviewStageProgress | None = None,
+        ponytail_mode: str = "full",
+        graphify_mode: str = "off",
 ) -> tuple[RequirementsAnalystHandoff, tuple[str, ...]]:
     progress = _resolve_review_progress(progress)
     if ba_handoff is not None:
@@ -1315,11 +1454,13 @@ def prepare_ba_handoff(
     if progress is not None:
         progress.set_phase("需求评审准备中")
     message("当前没有可复用的需求分析师，将新建需求分析师处理评审反馈")
-    handoff = _create_review_ba_handoff(
+    handoff = _create_review_ba_handoff_compat(
         project_dir=project_dir,
         requirement_name=requirement_name,
         selection_title="进入需求评审阶段（需求分析师）",
         progress=progress,
+        ponytail_mode=ponytail_mode,
+        graphify_mode=graphify_mode,
     )
     handoff, payload = run_ba_turn_with_recreation(
         handoff,
@@ -1346,11 +1487,15 @@ def _create_review_ba_handoff(
         requirement_name: str = "",
         selection_title: str,
         progress: ReviewStageProgress | None = None,
+        ponytail_mode: str = "full",
+        graphify_mode: str = "off",
 ) -> RequirementsAnalystHandoff:
     progress = _resolve_review_progress(progress)
     ba_display_name = _review_ba_display_name(project_dir=project_dir)
     selection = prompt_review_agent_selection(
         DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
+        default_ponytail_mode=ponytail_mode,
+        default_graphify_mode=graphify_mode,
         role_label=ba_display_name,
         progress=progress,
     )
@@ -1378,7 +1523,30 @@ def _create_review_ba_handoff(
         model=selection.model,
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
+        ponytail_mode=selection.ponytail_mode,
+        graphify_mode=selection.graphify_mode,
+        graphify_config=selection.graphify_config,
     )
+
+
+def _create_review_ba_handoff_compat(**kwargs) -> RequirementsAnalystHandoff:
+    """Keep patched/legacy factories callable while carrying the new mode in production."""
+    compatible_kwargs = dict(kwargs)
+    while True:
+        try:
+            return _create_review_ba_handoff(**compatible_kwargs)
+        except TypeError as error:
+            optional_key = next(
+                (
+                    key
+                    for key in ("graphify_mode", "ponytail_mode")
+                    if f"unexpected keyword argument '{key}'" in str(error)
+                ),
+                "",
+            )
+            if not optional_key or optional_key not in compatible_kwargs:
+                raise
+            compatible_kwargs.pop(optional_key, None)
 
 
 def recreate_ba_handoff(
@@ -1396,6 +1564,9 @@ def recreate_ba_handoff(
             previous_handoff.model,
             previous_handoff.reasoning_effort,
             previous_handoff.proxy_url,
+            previous_handoff.ponytail_mode,
+            previous_handoff.graphify_mode,
+            previous_handoff.graphify_config,
         ),
         force_model_change=True,
         role_label=ba_display_name,
@@ -1424,6 +1595,9 @@ def recreate_ba_handoff(
         model=selection.model,
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
+        ponytail_mode=selection.ponytail_mode,
+        graphify_mode=selection.graphify_mode,
+        graphify_config=selection.graphify_config,
     )
 
 
@@ -1519,7 +1693,10 @@ def run_human_check_loop(
         requirement_name: str,
         progress: ReviewStageProgress | None = None,
         allow_previous_stage_back: bool = False,
+        return_to_grill_on_ambiguity: bool = False,
         auto_confirm: bool = False,
+        ponytail_mode: str = "full",
+        graphify_mode: str = "off",
 ) -> RequirementsAnalystHandoff | None:
     progress = _resolve_review_progress(progress)
     message("进入需求评审阶段")
@@ -1529,11 +1706,13 @@ def run_human_check_loop(
         message("--yes 已跳过需求评审前人工建议确认，继续执行需求评审。")
         if current_handoff is None:
             message("当前没有可复用的需求分析师，将新建需求分析师处理后续需求评审")
-            current_handoff = _create_review_ba_handoff(
+            current_handoff = _create_review_ba_handoff_compat(
                 project_dir=paths["project_root"],
                 requirement_name=requirement_name,
                 selection_title="进入需求评审阶段（需求分析师）",
                 progress=progress,
+                ponytail_mode=ponytail_mode,
+                graphify_mode=graphify_mode,
             )
         return current_handoff
     while True:
@@ -1566,11 +1745,13 @@ def run_human_check_loop(
                 raise _SkipToDetailedDesign(current_handoff)
             if current_handoff is None:
                 message("当前没有可复用的需求分析师，将新建需求分析师处理后续需求评审")
-                current_handoff = _create_review_ba_handoff(
+                current_handoff = _create_review_ba_handoff_compat(
                     project_dir=paths["project_root"],
                     requirement_name=requirement_name,
                     selection_title="进入需求评审阶段（需求分析师）",
                     progress=progress,
+                    ponytail_mode=ponytail_mode,
+                    graphify_mode=graphify_mode,
                 )
             return current_handoff
         with progress.suspended() if progress is not None else nullcontext():
@@ -1583,11 +1764,13 @@ def run_human_check_loop(
         if current_handoff is None:
             if progress is not None:
                 progress.set_phase("需求评审 / 处理人类建议")
-            current_handoff = _create_review_ba_handoff(
+            current_handoff = _create_review_ba_handoff_compat(
                 project_dir=paths["project_root"],
                 requirement_name=requirement_name,
                 selection_title="按人类建议启动需求分析师",
                 progress=progress,
+                ponytail_mode=ponytail_mode,
+                graphify_mode=graphify_mode,
             )
         if reuse_existing_handoff:
             initial_prompt = human_feed_bck(
@@ -1604,12 +1787,19 @@ def run_human_check_loop(
                 requirements_clear_md=str(paths["requirements_clear_path"].resolve()),
                 hitl_record_md=str(paths["hitl_record_path"].resolve()),
             )
+        continuation_kwargs: dict[str, object] = {}
+        if return_to_grill_on_ambiguity:
+            continuation_kwargs.update(
+                requirement_name=requirement_name,
+                return_to_grill_on_ambiguity=True,
+            )
         current_handoff = _run_review_clarification_continuation(
             handoff=current_handoff,
             paths=paths,
             initial_prompt=initial_prompt,
             label_prefix="requirements_review_human_audit",
             progress=progress,
+            **continuation_kwargs,
         )
         response = get_markdown_content(paths["ask_human_path"]).strip()
         if response:
@@ -1657,6 +1847,8 @@ def _run_review_clarification_continuation(
         initial_prompt: str,
         label_prefix: str,
         progress: ReviewStageProgress | None = None,
+        requirement_name: str = "",
+        return_to_grill_on_ambiguity: bool = False,
 ) -> RequirementsAnalystHandoff:
     progress = _resolve_review_progress(progress)
     current_handoff = handoff
@@ -1692,6 +1884,23 @@ def _run_review_clarification_continuation(
         )
         return current_handoff.worker
 
+    def collect_review_answer(question_path: str | Path, hitl_round: int) -> str:
+        if (
+            return_to_grill_on_ambiguity
+            and _reopen_confirmed_grill_session_for_review_ambiguity(
+                project_dir=paths["project_root"],
+                requirement_name=requirement_name,
+                question_path=question_path,
+            )
+        ):
+            raise PromptBackRequested()
+        return _collect_review_hitl_response(
+            question_path,
+            hitl_round=hitl_round,
+            answer_path=paths["hitl_record_path"],
+            progress=progress,
+        )
+
     if progress is not None:
         progress.set_phase("需求评审 / 澄清中")
     loop_result = run_hitl_agent_loop(
@@ -1706,12 +1915,7 @@ def _run_review_clarification_continuation(
         hitl_prompt_builder=hitl_prompt_builder,
         label_prefix=label_prefix,
         turn_phase=REVIEW_CLARIFICATION_TURN_PHASE,
-        human_input_provider=lambda question_path, hitl_round: _collect_review_hitl_response(
-            question_path,
-            hitl_round=hitl_round,
-            answer_path=paths["hitl_record_path"],
-            progress=progress,
-        ),
+        human_input_provider=collect_review_answer,
         on_worker_starting=lambda live_worker: progress.set_phase("需求评审 / 澄清中") if progress is not None else None,
         on_agent_turn_started=lambda context, live_worker: progress.set_phase(
             f"需求评审 / 澄清中 | HITL 第 {context.hitl_round} 轮"
@@ -1745,7 +1949,10 @@ def build_reviewer_workers(
     progress = _resolve_review_progress(progress)
     if progress is not None:
         progress.set_phase("启动审核器中")
-    agent_config = resolve_stage_agent_config(args or argparse.Namespace(reviewer_agent=[]))
+    agent_config = resolve_stage_agent_config(
+        args or argparse.Namespace(reviewer_agent=[], ponytail_mode="full"),
+        stage_key="requirements_review",
+    )
     if agent_config.reviewer_order:
         reviewer_names = list(agent_config.reviewer_order)
     else:
@@ -1777,6 +1984,12 @@ def build_reviewer_workers(
                 progress=progress,
                 allow_back_first_step=next_allow_back,
                 stage_key="requirements_review_reviewer_selection",
+            )
+            selection = replace(selection, ponytail_mode=agent_config.ponytail_mode)
+            selection = replace(
+                selection,
+                graphify_mode=agent_config.graphify_mode,
+                graphify_config=agent_config.graphify_config,
             )
             next_allow_back = False
             message(render_review_agent_selection(f"审核器 {reviewer_display_name} 配置", selection))
@@ -1882,6 +2095,9 @@ def _run_review_feedback_loop(
         progress: ReviewStageProgress | None = None,
         skip_ba_feedback: bool = False,
         audit_context: StageAuditRunContext | None = None,
+        ponytail_mode: str = "full",
+        graphify_mode: str = "off",
+        return_to_grill_on_ambiguity: bool = False,
 ) -> tuple[RequirementsAnalystHandoff, list[ReviewerRuntime]]:
     progress = _resolve_review_progress(progress)
     reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"审核智能体 {index}"  # noqa: E731
@@ -1896,6 +2112,8 @@ def _run_review_feedback_loop(
             ba_handoff=None,
             paths=paths,
             progress=progress,
+            ponytail_mode=ponytail_mode,
+            graphify_mode=graphify_mode,
         )
     if not skip_ba_feedback:
         if audit_context is not None:
@@ -1910,10 +2128,14 @@ def _run_review_feedback_loop(
             )
         ensure_empty_file(paths["ask_human_path"])
         ensure_empty_file(paths["ba_feedback_path"])
-        _, reviewers, current_handoff = run_main_phase_with_death_handling(
-            current_handoff,
-            reviewers=reviewers,
-            run_phase=lambda active_handoff: _run_review_clarification_continuation(
+        def run_clarification_feedback(active_handoff: RequirementsAnalystHandoff) -> RequirementsAnalystHandoff:
+            continuation_kwargs: dict[str, object] = {}
+            if return_to_grill_on_ambiguity:
+                continuation_kwargs.update(
+                    requirement_name=requirement_name,
+                    return_to_grill_on_ambiguity=True,
+                )
+            return _run_review_clarification_continuation(
                 handoff=active_handoff,
                 paths=paths,
                 initial_prompt=review_feedback(
@@ -1926,7 +2148,13 @@ def _run_review_feedback_loop(
                 ),
                 label_prefix=f"requirements_review_feedback_round_{round_index}",
                 progress=progress,
-            ),
+                **continuation_kwargs,
+            )
+
+        _, reviewers, current_handoff = run_main_phase_with_death_handling(
+            current_handoff,
+            reviewers=reviewers,
+            run_phase=run_clarification_feedback,
             replace_dead_main_owner=lambda owner: _replace_dead_review_ba(
                 owner,
                 project_dir=paths["project_root"],
@@ -2025,6 +2253,8 @@ def run_requirements_review_limit_hitl_loop(
         progress: ReviewStageProgress | None = None,
         human_input_provider=None,
         audit_context: StageAuditRunContext | None = None,
+        ponytail_mode: str = "full",
+        graphify_mode: str = "off",
 ) -> tuple[RequirementsAnalystHandoff, list[ReviewerRuntime], bool]:
     progress = _resolve_review_progress(progress)
     reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"审核智能体 {index}"  # noqa: E731
@@ -2036,6 +2266,8 @@ def run_requirements_review_limit_hitl_loop(
             ba_handoff=None,
             paths=paths,
             progress=progress,
+            ponytail_mode=ponytail_mode,
+            graphify_mode=graphify_mode,
         )
     if audit_context is not None:
         record_before_cleanup(
@@ -2181,13 +2413,44 @@ def run_requirements_review_stage(
 ) -> RequirementsReviewStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if ba_handoff is not None:
+        inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
+        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
+    agent_config = resolve_stage_agent_config(args, stage_key="requirements_review")
+    main_ponytail_mode = resolve_main_ponytail_mode(args, agent_config=agent_config)
+    graphify_mode = agent_config.graphify_mode
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
+    return_to_grill_on_ambiguity = allow_previous_stage_back
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     if args.requirement_name:
         requirement_name = str(args.requirement_name).strip()
     else:
         requirement_name = prompt_requirement_name_selection(project_dir, "").requirement_name
 
+    if (
+        ba_handoff is not None
+        and str(ba_handoff.ponytail_mode or "off").strip() != main_ponytail_mode
+    ):
+        message("需求分析师的 Ponytail 模式与需求评审配置不一致，将重建会话")
+        with suppress(Exception):
+            ba_handoff.worker.request_kill()
+        ba_handoff = None
+    if (
+        ba_handoff is not None
+        and str(
+            getattr(
+                getattr(ba_handoff.worker, "config", None),
+                "graphify_mode",
+                ba_handoff.graphify_mode,
+            )
+            or "off"
+        ).strip()
+        != graphify_mode
+    ):
+        message("需求分析师的 Graphify 模式与需求评审配置不一致，将重建会话")
+        with suppress(Exception):
+            ba_handoff.worker.request_kill()
+        ba_handoff = None
     if ba_handoff is not None:
         _scope_requirements_review_worker(
             ba_handoff.worker,
@@ -2234,7 +2497,10 @@ def run_requirements_review_stage(
                 paths=paths,
                 requirement_name=requirement_name,
                 allow_previous_stage_back=allow_previous_stage_back,
+                return_to_grill_on_ambiguity=return_to_grill_on_ambiguity,
                 auto_confirm=bool(getattr(args, "yes", False)),
+                ponytail_mode=main_ponytail_mode,
+                graphify_mode=graphify_mode,
             )
             allow_previous_stage_back = False
         except _SkipToDetailedDesign as skip_to_design:
@@ -2265,7 +2531,6 @@ def run_requirements_review_stage(
             preserve_workers=preserved_workers,
         )
         cleanup_existing_review_artifacts(paths, requirement_name, audit_context)
-        agent_config = resolve_stage_agent_config(args or argparse.Namespace(reviewer_agent=[]))
         reviewer_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
             stdin_is_interactive() and (
@@ -2353,6 +2618,9 @@ def run_requirements_review_stage(
                     round_index=round_index,
                     skip_ba_feedback=post_hitl_continue_completed,
                     audit_context=audit_context,
+                    ponytail_mode=main_ponytail_mode,
+                    graphify_mode=graphify_mode,
+                    return_to_grill_on_ambiguity=return_to_grill_on_ambiguity,
                 )
                 post_hitl_continue_completed = False
 
@@ -2428,9 +2696,28 @@ def run_requirements_review_stage(
                         )
                     ) if bool(getattr(args, "yes", False)) else None,
                     audit_context=audit_context,
+                    ponytail_mode=main_ponytail_mode,
+                    graphify_mode=graphify_mode,
                 )
                 review_round_policy.reset_after_hitl()
             round_index += 1
+    except PromptBackRequested:
+        append_stage_audit_record(
+            audit_context,
+            event_type="stage_returned_to_clarification",
+            source_paths={
+                "requirements_clear": paths["requirements_clear_path"],
+                "ask_human": paths["ask_human_path"],
+            },
+            metadata={"reason": "grill_business_ambiguity"},
+        )
+        _shutdown_workers(
+            active_ba_handoff,
+            reviewer_workers,
+            cleanup_runtime=True,
+            preserve_ba_worker=False,
+        )
+        raise
     except Exception as error:
         append_stage_audit_record(
             audit_context,

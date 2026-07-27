@@ -30,9 +30,11 @@ import { DevelopmentRoute } from './routes/DevelopmentRoute'
 import { OverallReviewRoute } from './routes/OverallReviewRoute'
 import { ControlRoute } from './routes/ControlRoute'
 import { resolveFooterProgressLine } from './footerProgress'
+import { normalizeGraphifyStatus } from './graphifyStatus'
 import { buildHomeAgents } from './homeAgents'
 import { promptAllowsBack, resolvePromptBackValue, withPromptBackOption } from './promptBack'
 import { writePromptDraft } from './promptMemory'
+import { buildPromptMetadataHintLines, promptCanSubmit, promptRecoveryMessage, resolvePromptMetadata } from './promptMetadata'
 import {
   dismissPromptSyncState,
   EMPTY_PROMPT_SYNC_STATE,
@@ -323,6 +325,7 @@ function resolvePromptRequiresAttention(promptType: string, payload: Record<stri
 
 function resolvePromptAttentionReason(promptType: string, payload: Record<string, unknown> | null | undefined) {
   if (resolvePromptIsHitl(payload)) return 'hitl'
+  if (payload && resolvePromptMetadata(payload).isGrill) return 'grill'
   const explicit = payload?.attention_reason ?? payload?.attentionReason
   if (explicit !== undefined && explicit !== null && String(explicit).trim()) return String(explicit).trim()
   return String(promptType || 'prompt').trim() || 'prompt'
@@ -347,6 +350,7 @@ function resolvePromptDocumentTitle(payload: Record<string, unknown> | null | un
 function isHitlPrompt(active: PromptState | null): boolean {
   if (!active) return false
   if (resolvePromptIsHitl(active.payload)) return true
+  if (resolvePromptMetadata(active.payload).isGrill) return true
   const title = String(active.payload.title ?? '')
   const promptText = String(active.payload.prompt_text ?? '')
   return `${active.promptType} ${title} ${promptText}`.toLowerCase().includes('hitl')
@@ -443,10 +447,10 @@ function FooterPromptHost(props: FooterPromptHostProps) {
   const title = createMemo(() => String(props.active.payload.title ?? props.active.payload.prompt_text ?? '请输入'))
   const allowBack = createMemo(() => promptAllowsBack(props.active.payload))
   const backValue = createMemo(() => resolvePromptBackValue(props.active.payload))
-  const hitlHints = createMemo(() => {
-    if (!isHitlPrompt(props.active)) return []
+  const promptHints = createMemo(() => {
     const questionPath = resolveHitlQuestionPath(props.active.payload)
     const lines: string[] = [...buildPromptHintLines(props.active.payload)]
+    if (!isHitlPrompt(props.active)) return lines
     if (questionPath) lines.push(`问题文件: ${questionPath.split('/').pop() || questionPath}`)
     lines.push('Ctrl+K 查看完整问题')
     if (!questionPath) return lines
@@ -470,20 +474,30 @@ function FooterPromptHost(props: FooterPromptHostProps) {
       height={props.height}
       minHeight={props.height}
     >
-      <PromptInputPanel
-        title={title()}
-        defaultValue={String(props.active.payload.default ?? '')}
-        draftKey={props.active.draftKey}
-        focusToken={props.focusToken}
-        focused={props.focused}
-        mode={props.active.promptType === 'multiline' ? 'multiline' : 'singleline'}
-        hintLines={hitlHints()}
-        textareaHeight={isHitlPrompt(props.active) ? 4 : undefined}
-        rememberHistory={!isHitlPrompt(props.active)}
-        showSubmitHelper={false}
-        onBack={allowBack() ? () => void props.onSubmit(backValue()) : undefined}
-        onSubmit={(value) => void props.onSubmit(value)}
-      />
+      <Show
+        when={promptCanSubmit(props.active.payload)}
+        fallback={
+          <box flexDirection="column" paddingLeft={1} paddingRight={1} paddingTop={1}>
+            <text fg="#f6c177">{title()}</text>
+            <For each={promptHints()}>{(line) => <text fg="#888888">{line}</text>}</For>
+          </box>
+        }
+      >
+        <PromptInputPanel
+          title={title()}
+          defaultValue={String(props.active.payload.default ?? '')}
+          draftKey={props.active.draftKey}
+          focusToken={props.focusToken}
+          focused={props.focused}
+          mode={props.active.promptType === 'multiline' ? 'multiline' : 'singleline'}
+          hintLines={promptHints()}
+          textareaHeight={isHitlPrompt(props.active) ? 4 : undefined}
+          rememberHistory={!isHitlPrompt(props.active)}
+          showSubmitHelper={false}
+          onBack={allowBack() ? () => void props.onSubmit(backValue()) : undefined}
+          onSubmit={(value) => void props.onSubmit(value)}
+        />
+      </Show>
     </box>
   )
 }
@@ -519,6 +533,18 @@ function DialogOverlay(props: DialogOverlayProps) {
 
 function stringPromptPayloadValue(value: unknown): string {
   return String(value ?? '').trim()
+}
+
+function grillPromptResponseCursor(payload: Record<string, unknown>) {
+  if (!resolvePromptMetadata(payload).isGrill) return undefined
+  const rawQuestionSeq = payload.question_seq ?? payload.questionSeq ?? 0
+  const parsedQuestionSeq = Number(rawQuestionSeq)
+  return {
+    runnerId: stringPromptPayloadValue(payload.owner_runner_id ?? payload.ownerRunnerId),
+    questionSeq: Number.isSafeInteger(parsedQuestionSeq) && parsedQuestionSeq >= 0 ? parsedQuestionSeq : 0,
+    grillSessionId: stringPromptPayloadValue(payload.grill_session_id ?? payload.grillSessionId) || undefined,
+    grillQuestionHash: stringPromptPayloadValue(payload.grill_question_hash ?? payload.grillQuestionHash) || undefined,
+  }
 }
 
 function normalizeAttachCommand(value: unknown): string {
@@ -566,48 +592,61 @@ function buildAgentRecoveryHintLines(payload: Record<string, unknown>): string[]
 }
 
 function buildPromptHintLines(payload: Record<string, unknown>): string[] {
-  const lines: string[] = [...buildAgentRecoveryHintLines(payload)]
+  const recoveryMessage = promptRecoveryMessage(payload)
+  const lines: string[] = recoveryMessage ? [recoveryMessage] : []
+  lines.push(...buildAgentRecoveryHintLines(payload))
   const attachCommand = resolveAgentAttachCommand(payload)
   if (attachCommand && !lines.includes(attachCommand)) lines.push(attachCommand)
-  const reasonText = stringPromptPayloadValue(payload.reason_text ?? payload.reasonText)
-  const reasonLines = reasonText.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).slice(0, 3)
-  lines.push(...reasonLines.map((line, index) => (index === 0 ? `原因: ${line}` : line)))
+  lines.push(...buildPromptMetadataHintLines(payload))
   const targetPaths = normalizeStringList(payload.target_paths ?? payload.targetPaths).slice(0, 3)
   lines.push(...targetPaths.map((path) => `文件: ${path}`))
   return lines
 }
 
 function DialogPromptLayer(props: { active: PromptState; dialogActive: boolean; onSubmit: (value: unknown) => void }) {
-  const hasPreview = createMemo(() => Boolean(resolvePreviewPath(props.active.payload)))
+  const hasPreview = createMemo(() => Boolean(resolvePromptDocumentPath(props.active.payload)))
   const hintLines = createMemo(() => buildPromptHintLines(props.active.payload))
   const selectOptions = createMemo(() => withPromptBackOption(
     Array.isArray(props.active.payload.options) ? (props.active.payload.options as { value: string; label: string }[]) : [],
     props.active.payload,
   ))
   return (
-    <DialogOverlay helperText={hasPreview() ? '↑/↓ 或 j/k 选择，Enter 提交，Ctrl+K 查看文档' : '↑/↓ 或 j/k 选择，Enter 提交'}>
-      <Switch>
-        <Match when={props.active.promptType === 'confirm'}>
-          <DialogConfirm
-            title={String(props.active.payload.prompt_text ?? '请确认')}
-            defaultValue={Boolean(props.active.payload.default)}
-            active={props.dialogActive}
-            allowBack={promptAllowsBack(props.active.payload)}
-            backValue={resolvePromptBackValue(props.active.payload)}
-            onSubmit={(value) => void props.onSubmit(value)}
-          />
-        </Match>
-        <Match when={true}>
-          <DialogSelect
-            title={String(props.active.payload.title ?? props.active.payload.prompt_text ?? '请选择')}
-            defaultValue={String(props.active.payload.default_value ?? '')}
-            options={selectOptions()}
-            hintLines={hintLines()}
-            active={props.dialogActive}
-            onSubmit={(value) => void props.onSubmit(value)}
-          />
-        </Match>
-      </Switch>
+    <DialogOverlay helperText={promptCanSubmit(props.active.payload)
+      ? (hasPreview() ? '↑/↓ 或 j/k 选择，Enter 提交，Ctrl+K 查看文档' : '↑/↓ 或 j/k 选择，Enter 提交')
+      : (hasPreview() ? 'Ctrl+K 查看文档' : '等待需求澄清 runner 恢复')}>
+      <Show
+        when={promptCanSubmit(props.active.payload)}
+        fallback={
+          <box flexDirection="column" paddingLeft={1} paddingRight={1}>
+            <text fg="#f6c177">{String(props.active.payload.title ?? props.active.payload.prompt_text ?? '待回答问题')}</text>
+            <For each={hintLines()}>{(line) => <text fg="#888888">{line}</text>}</For>
+          </box>
+        }
+      >
+        <Switch>
+          <Match when={props.active.promptType === 'confirm'}>
+            <DialogConfirm
+              title={String(props.active.payload.prompt_text ?? '请确认')}
+              defaultValue={Boolean(props.active.payload.default)}
+              active={props.dialogActive}
+              allowBack={promptAllowsBack(props.active.payload)}
+              backValue={resolvePromptBackValue(props.active.payload)}
+              hintLines={hintLines()}
+              onSubmit={(value) => void props.onSubmit(value)}
+            />
+          </Match>
+          <Match when={true}>
+            <DialogSelect
+              title={String(props.active.payload.title ?? props.active.payload.prompt_text ?? '请选择')}
+              defaultValue={String(props.active.payload.default_value ?? '')}
+              options={selectOptions()}
+              hintLines={hintLines()}
+              active={props.dialogActive}
+              onSubmit={(value) => void props.onSubmit(value)}
+            />
+          </Match>
+        </Switch>
+      </Show>
     </DialogOverlay>
   )
 }
@@ -771,6 +810,30 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     model: String(value.model ?? ''),
     resolvedModel: String(value.resolved_model ?? value.resolvedModel ?? ''),
     reasoningEffort: String(value.reasoning_effort ?? value.reasoningEffort ?? ''),
+    ponytailMode: value.ponytail_mode === undefined && value.ponytailMode === undefined
+      ? undefined
+      : String(value.ponytail_mode ?? value.ponytailMode ?? ''),
+    ponytailBundleVersion: value.ponytail_bundle_version === undefined && value.ponytailBundleVersion === undefined
+      ? undefined
+      : String(value.ponytail_bundle_version ?? value.ponytailBundleVersion ?? ''),
+    ponytailDelivery: value.ponytail_delivery === undefined && value.ponytailDelivery === undefined
+      ? undefined
+      : String(value.ponytail_delivery ?? value.ponytailDelivery ?? ''),
+    requirementsMode: value.requirements_mode === undefined && value.requirementsMode === undefined
+      ? undefined
+      : String(value.requirements_mode ?? value.requirementsMode ?? ''),
+    grillBundleCommit: value.grill_bundle_commit === undefined && value.grillBundleCommit === undefined
+      ? undefined
+      : String(value.grill_bundle_commit ?? value.grillBundleCommit ?? ''),
+    grillDelivery: value.grill_delivery === undefined && value.grillDelivery === undefined
+      ? undefined
+      : String(value.grill_delivery ?? value.grillDelivery ?? ''),
+    grillQuestionSeq: (() => {
+      const raw = value.grill_question_seq ?? value.grillQuestionSeq
+      if (raw === undefined || raw === null || raw === '') return undefined
+      const parsed = Number(raw)
+      return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
+    })(),
     retryCount: Number(value.retry_count ?? value.retryCount ?? 0),
     note: String(value.note ?? ''),
     transcriptPath: String(value.transcript_path ?? value.transcriptPath ?? ''),
@@ -955,6 +1018,7 @@ function normalizeAppSnapshot(payload: Record<string, unknown>): AppSnapshot {
     pendingAttention: Boolean(payload.pending_attention ?? payload.pendingAttention),
     pendingAttentionReason: String(payload.pending_attention_reason ?? payload.pendingAttentionReason ?? ''),
     pendingAttentionSince: String(payload.pending_attention_since ?? payload.pendingAttentionSince ?? ''),
+    graphify: normalizeGraphifyStatus(payload.graphify),
     recentArtifacts: Array.isArray(payload.recent_artifacts)
       ? payload.recent_artifacts.map((item) => ({
         path: String((item as Record<string, unknown>).path ?? ''),
@@ -1790,6 +1854,7 @@ export function App(props: StartupOptions) {
   const sendPromptValue = async (value: unknown) => {
     const current = prompt()
     if (!current) return
+    if (!promptCanSubmit(current.payload)) return
     if (promptSubmitInFlight.has(current.id)) return
     promptSubmitInFlight.add(current.id)
 
@@ -1815,7 +1880,9 @@ export function App(props: StartupOptions) {
     }
 
     try {
-      const response = normalizePayload<Record<string, unknown>>(await client.submitPrompt(current.id, value))
+      const response = normalizePayload<Record<string, unknown>>(
+        await client.submitPrompt(current.id, value, grillPromptResponseCursor(current.payload)),
+      )
       const accepted = response.accepted === true
       if (!accepted) {
         preserveRejectedPrompt('后端未接受本次输入，已保留当前内容，可重试。', 'warning')

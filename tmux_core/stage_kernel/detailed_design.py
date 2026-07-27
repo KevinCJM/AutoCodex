@@ -13,7 +13,7 @@ import json
 import time
 from collections import Counter
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -60,6 +60,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     list_registered_tmux_workers,
+    normalize_graphify_config,
 )
 from tmux_core.stage_kernel.reviewer_orchestration import (
     repair_reviewer_round_outputs,
@@ -98,6 +99,8 @@ from tmux_core.stage_kernel.shared_review import (
     ensure_empty_file,
     ensure_review_artifacts,
     ensure_review_artifacts_exist,
+    inherit_legacy_handoff_ponytail_mode,
+    inherit_legacy_handoff_graphify_mode,
     mark_reviewer_turn_succeeded_from_materialized_outputs,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
@@ -117,6 +120,9 @@ from tmux_core.stage_kernel.shared_review import (
     reviewer_worker_needs_terminal_success_normalization,
     resolve_reviewer_artifact_agent_name,
     resolve_agent_run_config_with_recovery,
+    resolve_main_ponytail_mode,
+    resolve_workflow_graphify_config,
+    resolve_workflow_graphify_mode,
     resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
@@ -205,6 +211,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", help="需求分析师模型名称")
     parser.add_argument("--effort", help="需求分析师推理强度")
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
+    parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--reuse-review-ba", action="store_true", help="优先复用需求评审阶段的需求分析师")
     parser.add_argument("--rebuild-review-ba", action="store_true", help="强制重建需求分析师")
     parser.add_argument("--review-max-rounds", default="", help="详设评审最多重试几轮；传 infinite 表示不设上限")
@@ -488,12 +498,19 @@ def _is_live_ba_handoff(handoff: RequirementsAnalystHandoff | None) -> bool:
     return True
 
 
-def _reviewer_default_selection() -> ReviewAgentSelection:
+def _reviewer_default_selection(
+        ponytail_mode: str = "full",
+        graphify_mode: str = "off",
+        graphify_config: dict[str, object] | None = None,
+) -> ReviewAgentSelection:
     return ReviewAgentSelection(
         vendor=DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
         model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
         reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
         proxy_url="",
+        ponytail_mode=str(ponytail_mode or "full").strip() or "full",
+        graphify_mode=str(graphify_mode or "off").strip() or "off",
+        graphify_config=dict(graphify_config or {}),
     )
 
 
@@ -741,7 +758,7 @@ def resolve_reviewer_specs(
     progress: ReviewStageProgress | None = None,
     allow_back_first_prompt: bool = False,
 ) -> list[DetailedDesignReviewerSpec]:
-    agent_config = resolve_stage_agent_config(args)
+    agent_config = resolve_stage_agent_config(args, stage_key="detailed_design")
     role_names = [str(item).strip() for item in getattr(args, "reviewer_role", []) if str(item).strip()]
     prompt_values = [str(item).strip() for item in getattr(args, "reviewer_role_prompt", []) if str(item).strip()]
     if agent_config.reviewer_order and not role_names and not prompt_values:
@@ -796,12 +813,26 @@ def collect_ba_agent_selection(
     model_value = str(getattr(args, "model", "") or "").strip()
     effort_value = str(getattr(args, "effort", "") or "").strip()
     proxy_value = str(getattr(args, "proxy_url", "") or "").strip()
+    ponytail_stage_key = next(
+        (
+            candidate
+            for candidate in ("detailed_design", "task_split", "development", "overall_review")
+            if str(stage_key or "").startswith(candidate)
+        ),
+        "detailed_design",
+    )
+    ponytail_mode = resolve_main_ponytail_mode(args, stage_key=ponytail_stage_key)
+    graphify_mode = resolve_workflow_graphify_mode(args, stage_key=ponytail_stage_key)
+    graphify_config = resolve_workflow_graphify_config(args)
     if interactive and not any((vendor_value, model_value, effort_value, proxy_value)):
         return prompt_review_agent_selection(
             DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
             default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
             default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
             default_proxy_url="",
+            default_ponytail_mode=ponytail_mode,
+            default_graphify_mode=graphify_mode,
+            default_graphify_config=graphify_config,
             role_label=role_label,
             allow_back_first_step=allow_back_first_step,
             stage_key=stage_key,
@@ -819,6 +850,9 @@ def collect_ba_agent_selection(
             default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
             default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
             default_proxy_url=proxy_value,
+            default_ponytail_mode=ponytail_mode,
+            default_graphify_mode=graphify_mode,
+            default_graphify_config=graphify_config,
             role_label=role_label,
             allow_back_first_step=allow_back_first_step,
             stage_key=stage_key,
@@ -828,6 +862,9 @@ def collect_ba_agent_selection(
         model=model,
         reasoning_effort=reasoning_effort,
         proxy_url=proxy_value,
+        ponytail_mode=ponytail_mode,
+        graphify_mode=graphify_mode,
+        graphify_config=graphify_config,
     )
 
 
@@ -960,6 +997,9 @@ def create_design_ba_handoff(
         model=selection.model,
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
+        ponytail_mode=selection.ponytail_mode,
+        graphify_mode=selection.graphify_mode,
+        graphify_config=selection.graphify_config,
     )
 
 
@@ -971,6 +1011,12 @@ def prepare_design_ba_handoff(
     ba_handoff: RequirementsAnalystHandoff | None,
     allow_back_first_prompt: bool = False,
 ) -> tuple[RequirementsAnalystHandoff, bool]:
+    if ba_handoff is not None:
+        inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
+        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
+    expected_ponytail_mode = resolve_main_ponytail_mode(args, stage_key="detailed_design")
+    expected_graphify_mode = resolve_workflow_graphify_mode(args, stage_key="detailed_design")
+    expected_graphify_config = resolve_workflow_graphify_config(args)
     strategy_prompted = (
         ba_handoff is not None
         and stdin_is_interactive()
@@ -984,9 +1030,33 @@ def prepare_design_ba_handoff(
         ba_handoff=ba_handoff,
         allow_back=allow_back_first_prompt and strategy_prompted,
     )
-    if strategy == "reuse" and _is_live_ba_handoff(ba_handoff):
+    mode_compatible = (
+        ba_handoff is not None
+        and str(ba_handoff.ponytail_mode or "off").strip() == expected_ponytail_mode
+        and str(
+            getattr(
+                getattr(ba_handoff.worker, "config", None),
+                "graphify_mode",
+                ba_handoff.graphify_mode,
+            )
+            or "off"
+        ).strip()
+        == expected_graphify_mode
+        and normalize_graphify_config(
+            getattr(
+                getattr(ba_handoff.worker, "config", None),
+                "graphify_config",
+                ba_handoff.graphify_config,
+            )
+        )
+        == expected_graphify_config
+    )
+    handoff_live = _is_live_ba_handoff(ba_handoff) if strategy == "reuse" else False
+    if strategy == "reuse" and handoff_live and mode_compatible:
         message("复用需求评审阶段的需求分析师继续生成详细设计")
         return ba_handoff, False
+    if strategy == "reuse" and handoff_live and not mode_compatible:
+        message("需求分析师的 Ponytail 模式与当前阶段不一致，将重建会话")
     if strategy == "reuse":
         message("请求复用需求评审阶段的需求分析师，但当前没有可复用的 live worker，将回退为重建需求分析师")
     role_label = _detailed_design_ba_display_name(project_dir=project_dir)
@@ -1294,6 +1364,9 @@ def recreate_design_ba_handoff(
         previous_handoff.model,
         previous_handoff.reasoning_effort,
         previous_handoff.proxy_url,
+        previous_handoff.ponytail_mode,
+        previous_handoff.graphify_mode,
+        previous_handoff.graphify_config,
     )
     selection = (
         prompt_required_replacement_review_agent_selection(
@@ -1823,7 +1896,7 @@ def build_reviewer_workers(
     reviewers: list[ReviewerRuntime] = []
     predicted_session_names: set[str] = set()
     interactive = stdin_is_interactive()
-    agent_config = resolve_stage_agent_config(args)
+    agent_config = resolve_stage_agent_config(args, stage_key="detailed_design")
     for reviewer_spec in reviewer_specs:
         reviewer_display_name = _predict_reviewer_display_name(
             project_dir=project_dir,
@@ -1842,9 +1915,19 @@ def build_reviewer_workers(
                 role_label=reviewer_display_name,
                 progress=progress,
             )
+            selection = replace(selection, ponytail_mode=agent_config.ponytail_mode)
+            selection = replace(
+                selection,
+                graphify_mode=agent_config.graphify_mode,
+                graphify_config=agent_config.graphify_config,
+            )
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
         elif selection is None:
-            selection = _reviewer_default_selection()
+            selection = _reviewer_default_selection(
+                agent_config.ponytail_mode,
+                agent_config.graphify_mode,
+                agent_config.graphify_config,
+            )
         reviewers.append(
             create_reviewer_runtime(
                 project_dir=project_dir,
@@ -2303,6 +2386,9 @@ def run_detailed_design_stage(
 ) -> DetailedDesignStageResult:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if ba_handoff is not None:
+        inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
+        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     if args.project_dir:
         project_dir = str(Path(args.project_dir).expanduser().resolve())
@@ -2425,7 +2511,7 @@ def run_detailed_design_stage(
             )
             reviewer_specs_prompted = stdin_is_interactive() and not any(
                 str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
-            ) and not resolve_stage_agent_config(args).reviewer_order
+            ) and not resolve_stage_agent_config(args, stage_key="detailed_design").reviewer_order
             reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
                 allow_previous_stage_back,
                 reviewer_specs_prompted,
@@ -2436,7 +2522,7 @@ def run_detailed_design_stage(
                 allow_back_first_prompt=reviewer_specs_allow_back,
             )
             reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
-            agent_config = resolve_stage_agent_config(args)
+            agent_config = resolve_stage_agent_config(args, stage_key="detailed_design")
             reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
                 allow_previous_stage_back,
                 stdin_is_interactive() and not bool(agent_config.reviewers),
@@ -2452,6 +2538,9 @@ def run_detailed_design_stage(
                 progress=progress,
                 allow_back_first_prompt=reviewer_selection_allow_back,
                 stage_key="detailed_design_reviewer_selection",
+                default_ponytail_mode=agent_config.ponytail_mode,
+                default_graphify_mode=agent_config.graphify_mode,
+                default_graphify_config=agent_config.graphify_config,
             )
             _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
                 active_ba_handoff,
@@ -2486,7 +2575,7 @@ def run_detailed_design_stage(
             pending_discard_ba_handoff = ba_handoff
             reviewer_specs_prompted = stdin_is_interactive() and not any(
                 str(item).strip() for item in [*getattr(args, "reviewer_role", []), *getattr(args, "reviewer_role_prompt", [])]
-            ) and not resolve_stage_agent_config(args).reviewer_order
+            ) and not resolve_stage_agent_config(args, stage_key="detailed_design").reviewer_order
             reviewer_specs_allow_back, allow_previous_stage_back = _consume_stage_back(
                 allow_previous_stage_back,
                 reviewer_specs_prompted,
@@ -2497,7 +2586,7 @@ def run_detailed_design_stage(
                 allow_back_first_prompt=reviewer_specs_allow_back,
             )
             reviewer_specs_by_name = {_reviewer_spec_identity(item): item for item in reviewer_specs}
-            agent_config = resolve_stage_agent_config(args)
+            agent_config = resolve_stage_agent_config(args, stage_key="detailed_design")
             reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
                 allow_previous_stage_back,
                 stdin_is_interactive() and not bool(agent_config.reviewers),
@@ -2513,6 +2602,9 @@ def run_detailed_design_stage(
                 progress=progress,
                 allow_back_first_prompt=reviewer_selection_allow_back,
                 stage_key="detailed_design_reviewer_selection",
+                default_ponytail_mode=agent_config.ponytail_mode,
+                default_graphify_mode=agent_config.graphify_mode,
+                default_graphify_config=agent_config.graphify_config,
             )
             reviewer_workers = build_reviewer_workers(
                 args,

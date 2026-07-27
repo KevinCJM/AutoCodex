@@ -102,6 +102,11 @@ class TurnOutputGoalsTests(unittest.TestCase):
                 return SimpleNamespace(ok=True, clean_output=json.dumps({"status": "hitl"}, ensure_ascii=False))
 
             worker = _FakeTaskWorker([first_response, second_response])
+            graphify_profile = object()
+            prepared_prompts: list[str] = []
+            worker.prepare_graphify_turn_profile = (  # type: ignore[attr-defined]
+                lambda current_prompt: prepared_prompts.append(current_prompt) or graphify_profile
+            )
             payload = run_task_result_turn_with_repair(
                 worker=worker,
                 label="force_hitl_turn",
@@ -117,6 +122,9 @@ class TurnOutputGoalsTests(unittest.TestCase):
             )
             self.assertEqual(payload["status"], "hitl")
             self.assertEqual(len(worker.prompts), 2)
+            self.assertEqual(prepared_prompts, ["原始 prompt"])
+            self.assertIs(worker.run_turn_kwargs[0]["graphify_profile"], graphify_profile)
+            self.assertIs(worker.run_turn_kwargs[1]["graphify_profile"], graphify_profile)
             self.assertIn("遗漏了本轮协议要求的产物", worker.prompts[1])
             self.assertIn(str(ask_human), worker.prompts[1])
             self.assertNotIn("result.json", worker.prompts[1])
@@ -502,6 +510,11 @@ class TurnOutputGoalsTests(unittest.TestCase):
                 return SimpleNamespace(ok=True, clean_output="")
 
             worker = _FakeTaskWorker([first_response, second_response])
+            graphify_profile = object()
+            prepared_prompts: list[str] = []
+            worker.prepare_graphify_turn_profile = (  # type: ignore[attr-defined]
+                lambda current_prompt: prepared_prompts.append(current_prompt) or graphify_profile
+            )
             run_completion_turn_with_repair(
                 worker=worker,
                 label="reviewer_turn",
@@ -520,6 +533,9 @@ class TurnOutputGoalsTests(unittest.TestCase):
             observation = observe_completion_state(contract)
             self.assertEqual(observation.observed_status, "review_fail")
             self.assertEqual(len(worker.prompts), 2)
+            self.assertEqual(prepared_prompts, ["评审 prompt"])
+            self.assertIs(worker.run_turn_kwargs[0]["graphify_profile"], graphify_profile)
+            self.assertIs(worker.run_turn_kwargs[1]["graphify_profile"], graphify_profile)
             self.assertIn("评审输出未通过协议校验", worker.prompts[1])
             self.assertIn(str(review_md), worker.prompts[1])
 

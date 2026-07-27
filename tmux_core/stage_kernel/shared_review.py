@@ -8,6 +8,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
 from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor
+from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
+from tmux_core.runtime.grill import RequirementsMode, normalize_requirements_mode
+from tmux_core.runtime.graphify import (
+    GraphifyMode,
+    enable_graphify_interactive_recovery,
+    normalize_graphify_mode,
+)
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
     normalize_effort_choice,
@@ -15,6 +22,7 @@ from A01_Routing_LayerPlanning import (
     normalize_vendor_choice,
     prompt_effort,
     prompt_model,
+    prompt_ponytail_mode,
     prompt_vendor,
 )
 from tmux_core.runtime.contracts import TASK_STATUS_DONE, TurnFileContract, validate_turn_file_artifact_rules, write_task_status
@@ -24,6 +32,7 @@ from tmux_core.runtime.tmux_runtime import (
     TmuxBatchWorker,
     Vendor,
     WorkerStatus,
+    normalize_graphify_config,
     is_agent_ready_timeout_error,
     is_agent_startup_intervention_error,
     is_provider_auth_error,
@@ -69,6 +78,9 @@ class ReviewAgentSelection:
     model: str
     reasoning_effort: str
     proxy_url: str
+    ponytail_mode: str = PonytailMode.OFF.value
+    graphify_mode: str = GraphifyMode.OFF.value
+    graphify_config: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -107,6 +119,9 @@ class StageAgentConfig:
     reviewer_order: tuple[str, ...] = ()
     invalid_main: InvalidAgentSelection | None = None
     invalid_reviewers: dict[str, InvalidAgentSelection] = field(default_factory=dict)
+    ponytail_mode: str = PonytailMode.OFF.value
+    graphify_mode: str = GraphifyMode.OFF.value
+    graphify_config: dict[str, object] = field(default_factory=dict)
 
     def reviewer_selection(self, reviewer_key: str) -> ReviewAgentSelection | None:
         selections = self.reviewers or {}
@@ -128,6 +143,30 @@ class ReviewRoundPolicy:
 
     def reset_after_hitl(self) -> None:
         self.quota_count = 0
+
+
+def refresh_graphify_workers_for_checkpoint(
+    workers: Sequence[object],
+    *,
+    prompt: str,
+) -> object | None:
+    """Refresh one shared project graph, then let peers reuse that generation."""
+
+    eligible = [
+        worker
+        for worker in workers
+        if callable(getattr(worker, "refresh_graphify_generation", None))
+        and str(getattr(worker, "graphify_mode", GraphifyMode.OFF.value) or "").strip()
+        != GraphifyMode.OFF.value
+    ]
+    if not eligible:
+        return None
+    profile = eligible[0].refresh_graphify_generation(prompt)
+    for worker in eligible[1:]:
+        marker = getattr(worker, "mark_graphify_generation_current", None)
+        if callable(marker):
+            marker()
+    return profile
 
 
 @dataclass(frozen=True)
@@ -503,9 +542,16 @@ def parse_agent_selection_spec(
     default_vendor: str = DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
     default_model: str = "",
     default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
+    default_ponytail_mode: str = PonytailMode.OFF.value,
+    default_graphify_mode: str = GraphifyMode.OFF.value,
+    default_graphify_config: Mapping[str, object] | None = None,
     source: str = "agent",
 ) -> tuple[str, ReviewAgentSelection]:
     fields = _coerce_agent_spec_fields(spec, source=source)
+    if "graphify_mode" in fields or "graphify_config" in fields or "graphify" in fields:
+        raise RuntimeError(
+            f"{source} 不支持角色级 graphify_mode；请在顶层或 stages.<stage> 配置。"
+        )
     raw_vendor = fields.get("vendor") or default_vendor
     vendor = normalize_vendor_choice(raw_vendor)
     model_default = default_model if default_model and vendor == default_vendor else get_default_model_for_vendor(vendor)
@@ -522,6 +568,14 @@ def parse_agent_selection_spec(
         or fields.get("port")
         or ""
     )
+    ponytail_mode = normalize_ponytail_mode(
+        fields.get("ponytail_mode") or fields.get("ponytail") or default_ponytail_mode,
+        default=PonytailMode.OFF,
+    ).value
+    graphify_mode = normalize_graphify_mode(
+        default_graphify_mode,
+        default=GraphifyMode.OFF,
+    ).value
     name = (
         fields.get("name")
         or fields.get("key")
@@ -536,6 +590,9 @@ def parse_agent_selection_spec(
             model=model,
             reasoning_effort=effort,
             proxy_url=str(proxy_url or "").strip(),
+            ponytail_mode=ponytail_mode,
+            graphify_mode=graphify_mode,
+            graphify_config=normalize_graphify_config(default_graphify_config),
         ),
     )
 
@@ -593,6 +650,226 @@ def _stage_config_payload(payload: Mapping[str, Any], stage_key: str) -> Mapping
     return stage_payload
 
 
+def resolve_workflow_ponytail_mode(
+    args: object,
+    *,
+    config_payload: Mapping[str, Any] | None = None,
+) -> str:
+    cached = str(getattr(args, "_resolved_ponytail_mode", "") or "").strip()
+    if cached:
+        return normalize_ponytail_mode(cached).value
+    payload = dict(config_payload) if config_payload is not None else _load_agent_config_payload(getattr(args, "agent_config", ""))
+    explicit = str(getattr(args, "ponytail_mode", "") or "").strip()
+    configured = str(payload.get("ponytail_mode") or payload.get("ponytail") or "").strip()
+    if explicit or configured:
+        mode = normalize_ponytail_mode(explicit or configured).value
+    elif bool(getattr(args, "yes", False)) or not stdin_is_interactive():
+        mode = PonytailMode.FULL.value
+    else:
+        mode = prompt_ponytail_mode(PonytailMode.FULL.value)
+    try:
+        setattr(args, "ponytail_mode", mode)
+        setattr(args, "_resolved_ponytail_mode", mode)
+    except Exception:
+        pass
+    return mode
+
+
+def resolve_workflow_graphify_mode(
+    args: object,
+    *,
+    config_payload: Mapping[str, Any] | None = None,
+    stage_key: str = "",
+) -> str:
+    """Resolve the project graph policy without mutating cross-stage CLI state.
+
+    A00 resolves every stage from the same ``argparse.Namespace``.  A
+    stage-scoped value therefore must be cached per stage instead of being
+    written back to ``args.graphify_mode`` and accidentally becoming the next
+    stage's CLI override.
+    """
+
+    cache_key = str(stage_key or "__workflow__").strip() or "__workflow__"
+    cached_modes = getattr(args, "_resolved_graphify_modes", None)
+    if isinstance(cached_modes, Mapping) and cache_key in cached_modes:
+        return normalize_graphify_mode(cached_modes[cache_key]).value
+
+    payload = (
+        dict(config_payload)
+        if config_payload is not None
+        else _load_agent_config_payload(getattr(args, "agent_config", ""))
+    )
+    stage_payload = _stage_config_payload(payload, stage_key)
+    explicit = str(getattr(args, "graphify_mode", "") or "").strip()
+    stage_configured = str(stage_payload.get("graphify_mode", "") or "").strip()
+    root_configured = str(payload.get("graphify_mode", "") or "").strip()
+    mode = normalize_graphify_mode(
+        explicit or stage_configured or root_configured or GraphifyMode.AUTO.value,
+        default=GraphifyMode.AUTO,
+    ).value
+    if not bool(getattr(args, "yes", False)) and stdin_is_interactive():
+        # Actual tool decisions happen immediately before the first worker
+        # launch.  Keeping config resolution side-effect free avoids inserting
+        # a surprise prompt into requirement/model selection flows that may not
+        # create any coding agent at all.
+        project_dir = str(getattr(args, "project_dir", "") or "").strip()
+        if project_dir:
+            enable_graphify_interactive_recovery(project_dir)
+    next_cache = dict(cached_modes) if isinstance(cached_modes, Mapping) else {}
+    next_cache[cache_key] = mode
+    with suppress(Exception):
+        setattr(args, "_resolved_graphify_modes", next_cache)
+    return mode
+
+
+def resolve_workflow_graphify_config(
+    args: object,
+    *,
+    config_payload: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    payload = (
+        dict(config_payload)
+        if config_payload is not None
+        else _load_agent_config_payload(getattr(args, "agent_config", ""))
+    )
+    return normalize_graphify_config(
+        payload.get("graphify", {}) if isinstance(payload.get("graphify", {}), Mapping) else payload.get("graphify")
+    )
+
+
+def prompt_requirements_mode(default: str = RequirementsMode.STANDARD.value) -> str:
+    normalized_default = normalize_requirements_mode(default).value
+    candidate = prompt_select_option(
+        title="选择需求澄清模式",
+        options=(
+            (RequirementsMode.STANDARD.value, "Standard（默认）— 使用现有需求澄清流程"),
+            (RequirementsMode.GRILL.value, "Grill Me — 一次只确认一个业务决策"),
+            (
+                RequirementsMode.GRILL_WITH_DOCS.value,
+                "Grill with Docs — 逐问澄清并维护领域词汇表/ADR 草稿",
+            ),
+        ),
+        default_value=normalized_default,
+        prompt_text="选择需求澄清模式",
+    )
+    return normalize_requirements_mode(candidate).value
+
+
+def configured_workflow_requirements_mode(
+    args: object,
+    *,
+    config_payload: Mapping[str, Any] | None = None,
+    stage_key: str = "requirements_clarification",
+) -> str:
+    """Return an explicitly configured mode without prompting or applying defaults.
+
+    The A00 workflow cannot safely ask this question until the project and
+    requirement scope are known: an unfinished Grill session in that scope is
+    authoritative and must be resumed without presenting a mode switch.  This
+    helper preserves the public precedence rules while allowing A03 to perform
+    the scope-aware interactive/default resolution.
+    """
+
+    payload = (
+        dict(config_payload)
+        if config_payload is not None
+        else _load_agent_config_payload(getattr(args, "agent_config", ""))
+    )
+    stage_payload = _stage_config_payload(payload, stage_key)
+    explicit = str(getattr(args, "requirements_mode", "") or "").strip()
+    stage_configured = str(stage_payload.get("requirements_mode", "") or "").strip()
+    root_configured = str(payload.get("requirements_mode", "") or "").strip()
+    configured = explicit or stage_configured or root_configured
+    if not configured:
+        return ""
+    return normalize_requirements_mode(configured).value
+
+
+def resolve_workflow_requirements_mode(
+    args: object,
+    *,
+    config_payload: Mapping[str, Any] | None = None,
+    stage_key: str = "requirements_clarification",
+) -> str:
+    cached = str(getattr(args, "_resolved_requirements_mode", "") or "").strip()
+    if cached:
+        return normalize_requirements_mode(cached).value
+    configured = configured_workflow_requirements_mode(
+        args,
+        config_payload=config_payload,
+        stage_key=stage_key,
+    )
+    if configured:
+        mode = normalize_requirements_mode(configured).value
+        if mode != RequirementsMode.STANDARD.value and (
+            bool(getattr(args, "yes", False)) or not stdin_is_interactive()
+        ):
+            raise RuntimeError(
+                "Grill 需求澄清必须由人类逐题确认；--yes 或非交互模式仅支持 requirements_mode=standard。"
+            )
+    elif bool(getattr(args, "yes", False)) or not stdin_is_interactive():
+        mode = RequirementsMode.STANDARD.value
+    else:
+        mode = prompt_requirements_mode(RequirementsMode.STANDARD.value)
+    try:
+        setattr(args, "requirements_mode", mode)
+        setattr(args, "_resolved_requirements_mode", mode)
+    except Exception:
+        pass
+    return mode
+
+
+def inherit_legacy_handoff_ponytail_mode(args: object, mode: object) -> None:
+    """Preserve an explicit legacy handoff when no new workflow policy was supplied."""
+    if any(
+        str(getattr(args, key, "") or "").strip()
+        for key in ("ponytail_mode", "main_ponytail_mode", "agent_config")
+    ):
+        return
+    inherited = normalize_ponytail_mode(mode or PonytailMode.OFF.value).value
+    with suppress(Exception):
+        setattr(args, "ponytail_mode", inherited)
+        setattr(args, "_resolved_ponytail_mode", inherited)
+
+
+def inherit_legacy_handoff_graphify_mode(args: object, mode: object) -> None:
+    """Keep an active legacy handoff on its persisted graph policy.
+
+    A00 always passes an explicit mode for a new workflow.  A direct stage
+    invocation that only carries an existing handoff must instead treat the
+    handoff as the runner's frozen policy; otherwise the new-workflow ``auto``
+    default would silently switch an old ``off`` session mid-run.
+    """
+
+    if any(
+        str(getattr(args, key, "") or "").strip()
+        for key in ("graphify_mode", "agent_config")
+    ):
+        return
+    inherited = normalize_graphify_mode(
+        mode or GraphifyMode.OFF.value,
+        default=GraphifyMode.OFF,
+    ).value
+    with suppress(Exception):
+        setattr(args, "graphify_mode", inherited)
+        setattr(args, "_resolved_graphify_modes", {})
+
+
+def resolve_main_ponytail_mode(
+    args: object,
+    *,
+    agent_config: StageAgentConfig | None = None,
+    stage_key: str = "",
+) -> str:
+    explicit = str(getattr(args, "main_ponytail_mode", "") or "").strip()
+    if explicit:
+        return normalize_ponytail_mode(explicit).value
+    config = agent_config or resolve_stage_agent_config(args, stage_key=stage_key)
+    if config.main is not None:
+        return normalize_ponytail_mode(config.main.ponytail_mode, default=PonytailMode.FULL).value
+    return normalize_ponytail_mode(config.ponytail_mode, default=PonytailMode.FULL).value
+
+
 def resolve_stage_agent_config(
     args: object,
     *,
@@ -600,6 +877,13 @@ def resolve_stage_agent_config(
     default_reviewer_names: Sequence[str] = (),
 ) -> StageAgentConfig:
     config_payload = _load_agent_config_payload(getattr(args, "agent_config", ""))
+    ponytail_mode = resolve_workflow_ponytail_mode(args, config_payload=config_payload)
+    graphify_mode = resolve_workflow_graphify_mode(
+        args,
+        config_payload=config_payload,
+        stage_key=stage_key,
+    )
+    graphify_config = resolve_workflow_graphify_config(args, config_payload=config_payload)
     stage_payload = _stage_config_payload(config_payload, stage_key)
     main_spec = stage_payload.get("main") or stage_payload.get("main_agent") or config_payload.get("main") or config_payload.get("main_agent")
     cli_main = getattr(args, "main_agent", "")
@@ -609,7 +893,13 @@ def resolve_stage_agent_config(
     invalid_main: InvalidAgentSelection | None = None
     if main_spec:
         try:
-            _, main_selection = parse_agent_selection_spec(main_spec, source="main-agent")
+            _, main_selection = parse_agent_selection_spec(
+                main_spec,
+                default_ponytail_mode=ponytail_mode,
+                default_graphify_mode=graphify_mode,
+                default_graphify_config=graphify_config,
+                source="main-agent",
+            )
         except Exception as error:  # noqa: BLE001
             invalid_main = InvalidAgentSelection(
                 name=_agent_spec_name(main_spec, default_name="main", source="main-agent"),
@@ -640,6 +930,9 @@ def resolve_stage_agent_config(
             _, selection = parse_agent_selection_spec(
                 reviewer_spec,
                 default_name=default_name,
+                default_ponytail_mode=ponytail_mode,
+                default_graphify_mode=graphify_mode,
+                default_graphify_config=graphify_config,
                 source=source,
             )
         except Exception as error:  # noqa: BLE001
@@ -657,6 +950,9 @@ def resolve_stage_agent_config(
         reviewer_order=tuple(reviewer_order),
         invalid_main=invalid_main,
         invalid_reviewers=invalid_reviewers,
+        ponytail_mode=ponytail_mode,
+        graphify_mode=graphify_mode,
+        graphify_config=graphify_config,
     )
 
 
@@ -665,6 +961,9 @@ def prompt_review_agent_selection(
     default_model: str = "",
     default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
     default_proxy_url: str = "",
+    default_ponytail_mode: str = PonytailMode.FULL.value,
+    default_graphify_mode: str = GraphifyMode.OFF.value,
+    default_graphify_config: Mapping[str, object] | None = None,
     *,
     role_label: str = "",
     progress: ReviewStageProgress | None = None,
@@ -678,6 +977,11 @@ def prompt_review_agent_selection(
             model = default_model
             reasoning_effort = default_reasoning_effort
             proxy_url = default_proxy_url
+            ponytail_mode = normalize_ponytail_mode(default_ponytail_mode, default=PonytailMode.FULL).value
+            graphify_mode = normalize_graphify_mode(
+                default_graphify_mode,
+                default=GraphifyMode.OFF,
+            ).value
             step = 0
             while step < 4:
                 try:
@@ -719,6 +1023,9 @@ def prompt_review_agent_selection(
                 model=model,
                 reasoning_effort=reasoning_effort,
                 proxy_url=proxy_url,
+                ponytail_mode=ponytail_mode,
+                graphify_mode=graphify_mode,
+                graphify_config=normalize_graphify_config(default_graphify_config),
             )
         except Exception as error:  # noqa: BLE001
             if not is_agent_config_error(error):
@@ -746,6 +1053,9 @@ def resolve_agent_run_config_with_recovery(
                 model=current_selection.model,
                 reasoning_effort=current_selection.reasoning_effort,
                 proxy_url=current_selection.proxy_url,
+                ponytail_mode=current_selection.ponytail_mode,
+                graphify_mode=current_selection.graphify_mode,
+                graphify_config=current_selection.graphify_config,
             )
             return current_selection, config
         except Exception as error:  # noqa: BLE001
@@ -758,6 +1068,9 @@ def resolve_agent_run_config_with_recovery(
                 str(reason_text or "").strip()
                 or f"{role_text} 模型配置不可用: {error}\n请重新选择模型配置后继续当前阶段。"
             )
+            preserved_ponytail_mode = current_selection.ponytail_mode
+            preserved_graphify_mode = current_selection.graphify_mode
+            preserved_graphify_config = current_selection.graphify_config
             current_selection = prompt_review_agent_selection(
                 default_vendor=current_selection.vendor,
                 default_model=current_selection.model,
@@ -765,6 +1078,12 @@ def resolve_agent_run_config_with_recovery(
                 default_proxy_url=current_selection.proxy_url,
                 role_label=role_text,
                 progress=progress,
+            )
+            current_selection = replace(
+                current_selection,
+                ponytail_mode=preserved_ponytail_mode,
+                graphify_mode=preserved_graphify_mode,
+                graphify_config=preserved_graphify_config,
             )
             message(render_review_agent_selection(f"{role_text} 新配置", current_selection))
 
@@ -777,6 +1096,8 @@ def render_review_agent_selection(title: str, selection: ReviewAgentSelection) -
             f"model: {selection.model}",
             f"reasoning_effort: {selection.reasoning_effort}",
             f"proxy_url: {selection.proxy_url or '(none)'}",
+            f"ponytail_mode: {selection.ponytail_mode}",
+            f"graphify_mode: {selection.graphify_mode}",
         ]
     )
 
@@ -791,6 +1112,9 @@ def collect_reviewer_agent_selections(
     reserved_session_names: Sequence[str] = (),
     allow_back_first_prompt: bool = False,
     stage_key: str = "reviewer_selection",
+    default_ponytail_mode: str = PonytailMode.FULL.value,
+    default_graphify_mode: str = GraphifyMode.OFF.value,
+    default_graphify_config: Mapping[str, object] | None = None,
 ) -> dict[str, ReviewAgentSelection]:
     selections: dict[str, ReviewAgentSelection] = {}
     predicted_session_names: set[str] = {str(name).strip() for name in reserved_session_names if str(name).strip()}
@@ -811,10 +1135,24 @@ def collect_reviewer_agent_selections(
                 default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
                 default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
                 default_proxy_url="",
+                default_graphify_mode=default_graphify_mode,
+                default_graphify_config=default_graphify_config,
                 role_label=reviewer_display_name,
                 progress=progress,
                 allow_back_first_step=next_allow_back,
                 stage_key=stage_key,
+            )
+            selection = replace(
+                selection,
+                ponytail_mode=normalize_ponytail_mode(
+                    default_ponytail_mode,
+                    default=PonytailMode.FULL,
+                ).value,
+                graphify_mode=normalize_graphify_mode(
+                    default_graphify_mode,
+                    default=GraphifyMode.OFF,
+                ).value,
+                graphify_config=normalize_graphify_config(default_graphify_config),
             )
             next_allow_back = False
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
@@ -824,6 +1162,15 @@ def collect_reviewer_agent_selections(
                 model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
                 reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
                 proxy_url="",
+                ponytail_mode=normalize_ponytail_mode(
+                    default_ponytail_mode,
+                    default=PonytailMode.FULL,
+                ).value,
+                graphify_mode=normalize_graphify_mode(
+                    default_graphify_mode,
+                    default=GraphifyMode.OFF,
+                ).value,
+                graphify_config=normalize_graphify_config(default_graphify_config),
             )
         selections[reviewer_key] = selection
     return selections
@@ -877,6 +1224,7 @@ def prompt_replacement_review_agent_selection(
             role_label=role_label,
             progress=progress,
         )
+        selection = replace(selection, ponytail_mode=previous_selection.ponytail_mode)
         if not force_model_change or (
             selection.vendor != previous_selection.vendor
             or selection.model != previous_selection.model
@@ -907,6 +1255,7 @@ def prompt_required_replacement_review_agent_selection(
             role_label=role_label,
             progress=progress,
         )
+        selection = replace(selection, ponytail_mode=previous_selection.ponytail_mode)
         if not force_model_change or (
             selection.vendor != previous_selection.vendor
             or selection.model != previous_selection.model

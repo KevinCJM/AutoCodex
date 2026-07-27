@@ -21,6 +21,15 @@ test('route files exist with expected exports', () => {
   }
 })
 
+test('home app snapshot renders optional project-level Graphify status without changing agent labels', () => {
+  const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  const homeContent = readFileSync(join(import.meta.dir, 'routes/HomeRoute.tsx'), 'utf8')
+  const agentContent = readFileSync(join(import.meta.dir, 'homeAgents.ts'), 'utf8')
+  expect(appContent.includes('graphify: normalizeGraphifyStatus(payload.graphify)')).toBe(true)
+  expect(homeContent.includes('代码图谱: ${graphifyStatusLabel(graphify)}')).toBe(true)
+  expect(agentContent.includes('graphify')).toBe(false)
+})
+
 test('index cleans tmux for human and terminal-failure shutdown', () => {
   const content = readFileSync(join(import.meta.dir, 'index.tsx'), 'utf8')
   const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
@@ -129,6 +138,7 @@ test('app derives pending HITL from active prompt so home snapshot stays consist
 
 test('HITL prompts display tmux attach, reason, and target file hints', () => {
   const content = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  const promptMetadata = readFileSync(join(import.meta.dir, 'promptMetadata.ts'), 'utf8')
   expect(content.includes('function buildAgentRecoveryHintLines')).toBe(true)
   expect(content.includes('function buildPromptHintLines')).toBe(true)
   expect(content.includes("recoveryKind === 'agent_manual_intervention' || recoveryKind === 'agent_ready_timeout'")).toBe(true)
@@ -137,7 +147,10 @@ test('HITL prompts display tmux attach, reason, and target file hints', () => {
   expect(content.includes('`tmux attach -t ${sessionName}`')).toBe(true)
   expect(content.includes("title.includes('需要人工介入') || title.includes('智能体启动超时')")).toBe(true)
   expect(content.includes('const lines: string[] = [...buildPromptHintLines(props.active.payload)]')).toBe(true)
-  expect(content.includes('payload.reason_text ?? payload.reasonText')).toBe(true)
+  expect(content.includes('buildPromptMetadataHintLines(payload)')).toBe(true)
+  expect(promptMetadata.includes('payload.reason_text ?? payload.reasonText')).toBe(true)
+  expect(promptMetadata.includes('payload.recommendation')).toBe(true)
+  expect(promptMetadata.includes('payload.question_index ?? payload.questionIndex')).toBe(true)
   expect(content.includes('payload.target_paths ?? payload.targetPaths')).toBe(true)
   expect(content.includes('hintLines={hintLines()}')).toBe(true)
 })
@@ -344,6 +357,10 @@ test('app aggregates running workers for home overview and HomeRoute uses the ne
   expect(types.includes('model?: string')).toBe(true)
   expect(types.includes('resolvedModel?: string')).toBe(true)
   expect(types.includes('reasoningEffort?: string')).toBe(true)
+  expect(types.includes('requirementsMode?: string')).toBe(true)
+  expect(types.includes('grillBundleCommit?: string')).toBe(true)
+  expect(types.includes('grillDelivery?: string')).toBe(true)
+  expect(types.includes('grillQuestionSeq?: number')).toBe(true)
   expect(types.includes('agentConfigLabel: string')).toBe(true)
   expect(types.includes('attachCommand: string')).toBe(true)
   expect(content.includes("const activeStageLabel = String(payload.active_stage_label ?? payload.activeStageLabel ?? '等待中')")).toBe(true)
@@ -365,6 +382,13 @@ test('app aggregates running workers for home overview and HomeRoute uses the ne
   expect(content.includes("model: String(value.model ?? '')")).toBe(true)
   expect(content.includes("resolvedModel: String(value.resolved_model ?? value.resolvedModel ?? '')")).toBe(true)
   expect(content.includes("reasoningEffort: String(value.reasoning_effort ?? value.reasoningEffort ?? '')")).toBe(true)
+  expect(content.includes('ponytailMode: value.ponytail_mode === undefined && value.ponytailMode === undefined')).toBe(true)
+  expect(content.includes('ponytailBundleVersion: value.ponytail_bundle_version === undefined && value.ponytailBundleVersion === undefined')).toBe(true)
+  expect(content.includes('ponytailDelivery: value.ponytail_delivery === undefined && value.ponytailDelivery === undefined')).toBe(true)
+  expect(content.includes('requirementsMode: value.requirements_mode === undefined && value.requirementsMode === undefined')).toBe(true)
+  expect(content.includes('grillBundleCommit: value.grill_bundle_commit === undefined && value.grillBundleCommit === undefined')).toBe(true)
+  expect(content.includes('grillDelivery: value.grill_delivery === undefined && value.grillDelivery === undefined')).toBe(true)
+  expect(content.includes('value.grill_question_seq ?? value.grillQuestionSeq')).toBe(true)
   expect(content.includes('{ source: \'control\', workers: controlSnapshot()?.workers ?? [] }')).toBe(true)
   expect(content.includes('displayAppSnapshot().activeStage,')).toBe(true)
   expect(homeRoute.includes('智能体状态')).toBe(true)

@@ -1,5 +1,6 @@
 import { For, Show, createMemo, createSignal, onCleanup } from 'solid-js'
-import type { AppSnapshot, HitlSnapshot, HomeAgentItem, StageFailureSnapshot } from '../types'
+import { graphifyStatusColor, graphifyStatusLabel } from '../graphifyStatus'
+import type { AppSnapshot, GraphifyStatus, HitlSnapshot, HomeAgentItem, StageFailureSnapshot } from '../types'
 
 type Props = {
   snapshot: AppSnapshot
@@ -49,6 +50,21 @@ export function HomeRoute(props: Props) {
       <text fg="#888888">{`项目目录: ${props.snapshot.projectDir || '(unset)'}`}</text>
       <Show when={props.snapshot.requirementName}>
         <text fg="#888888">{`需求名称: ${props.snapshot.requirementName}`}</text>
+      </Show>
+      <Show when={props.snapshot.graphify} keyed>
+        {(graphify: GraphifyStatus) => (
+          <box flexDirection="column">
+            <text fg={graphifyStatusColor(graphify)}>
+              {`代码图谱: ${graphifyStatusLabel(graphify)}${graphify.version ? ` · v${graphify.version}` : ''}`}
+            </text>
+            <Show when={graphify.nodeCount > 0 || graphify.edgeCount > 0}>
+              <text fg="#888888">{`${graphify.nodeCount} nodes / ${graphify.edgeCount} edges`}</text>
+            </Show>
+            <Show when={graphify.lastError}>
+              <text fg="#888888">{graphify.lastError}</text>
+            </Show>
+          </box>
+        )}
       </Show>
       <Show when={props.snapshot.activeStageFailure} keyed>
         {(failure: StageFailureSnapshot) => (

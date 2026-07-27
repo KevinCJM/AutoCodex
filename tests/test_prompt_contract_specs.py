@@ -45,6 +45,66 @@ PROMPT_MODULES = (
 
 
 class PromptContractSpecTests(unittest.TestCase):
+    def assert_downstream_context_reading_guard(self, prompt: str) -> None:
+        self.assertIn("当前项目根目录的 `AGENTS.md`", prompt)
+        self.assertIn("若其中定义了路由层", prompt)
+        self.assertIn("对 CONTEXT/ADR 文档，仅可读取", prompt)
+        self.assertIn("明确引用且位于当前项目内", prompt)
+        self.assertIn("禁止扫描、枚举、搜索或批量读取", prompt)
+        self.assertIn("不能作为当前代码实现事实", prompt)
+        self.assertIn("由当前代码、测试或配置核验", prompt)
+
+    def test_a04_prompts_limit_downstream_context_and_adr_reads(self):
+        from Prompt_04_RequirementsReview import (
+            human_feed_bck,
+            requirements_review_init,
+            requirements_review_reply,
+            resume_ba,
+            review_feedback,
+        )
+
+        requirements_clear = "/tmp/需求A_需求澄清.md"
+        prompts = (
+            human_feed_bck("人类反馈", requirements_clear_md=requirements_clear),
+            resume_ba(requirements_clear_md=requirements_clear),
+            requirements_review_init(requirements_clear_md=requirements_clear),
+            review_feedback("评审意见", requirements_clear_md=requirements_clear),
+            requirements_review_reply("分析师反馈", requirements_clear_md=requirements_clear),
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt[:80]):
+                self.assert_downstream_context_reading_guard(prompt)
+                self.assertIn(f"《{requirements_clear}》", prompt)
+
+    def test_a05_prompts_limit_downstream_context_and_adr_reads(self):
+        from Prompt_05_DetailedDesign import (
+            again_review_detailed_design,
+            create_detailed_design_ba,
+            detailed_design,
+            hitl_relpy,
+            modify_detailed_design,
+            review_detailed_design,
+        )
+
+        requirements_clear = "/tmp/需求A_需求澄清.md"
+        prompts_with_path = (
+            create_detailed_design_ba(requirements_clear_md=requirements_clear),
+            detailed_design(requirements_clear_md=requirements_clear),
+            review_detailed_design("详设审核员", requirements_clear_md=requirements_clear),
+            modify_detailed_design("评审意见", requirements_clear_md=requirements_clear),
+            again_review_detailed_design("修复摘要", requirements_clear_md=requirements_clear),
+        )
+
+        for prompt in prompts_with_path:
+            with self.subTest(prompt=prompt[:80]):
+                self.assert_downstream_context_reading_guard(prompt)
+                self.assertIn(f"《{requirements_clear}》", prompt)
+
+        hitl_prompt = hitl_relpy("人类反馈", "评审意见")
+        self.assert_downstream_context_reading_guard(hitl_prompt)
+        self.assertIn("《需求澄清》明确引用", hitl_prompt)
+
     def test_every_prompt_function_has_turn_metadata_or_helper_marker(self):
         missing: list[str] = []
         for module_name in PROMPT_MODULES:

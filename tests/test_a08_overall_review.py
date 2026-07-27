@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from A07_Development import (
@@ -44,7 +45,12 @@ from tmux_core.runtime.tmux_runtime import (
     TmuxControlUnavailable,
     TmuxMutationOutcomeUnknown,
 )
-from tmux_core.stage_kernel.shared_review import ReviewAgentHandoff, ReviewAgentSelection, ReviewerRuntime
+from tmux_core.stage_kernel.shared_review import (
+    ReviewAgentHandoff,
+    ReviewAgentSelection,
+    ReviewerRuntime,
+    ReviewLimitHitlResult,
+)
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
 
@@ -112,6 +118,67 @@ def _write_required_inputs(paths: dict[str, Path]) -> None:
 
 
 class A08OverallReviewTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+        vendor_id: str,
+        requested_model: str,
+        requested_effort: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            resolved_model=str(
+                requested_model
+                if requested_model and requested_model != "default"
+                else f"{vendor_id}/test-default"
+            ),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor_id}",
+        )
+
+    def setUp(self) -> None:
+        # A08 tests cover stage orchestration and A07 handoff reuse, not host
+        # CLI discovery. Isolate both runtime launch resolution and the shared
+        # selection helpers so cold OpenCode-like probes cannot delay a test or
+        # make it depend on the machine's installed model inventory.
+        catalog_patches = (
+            patch(
+                "tmux_core.runtime.tmux_runtime.resolve_launch",
+                side_effect=self._runtime_test_resolution,
+            ),
+            patch(
+                "tmux_core.stage_kernel.detailed_design.get_default_model_for_vendor",
+                return_value="gpt-5.4",
+            ),
+            patch(
+                "tmux_core.stage_kernel.detailed_design.normalize_model_choice",
+                side_effect=lambda vendor, model: str(model or f"{vendor}/test-default"),
+            ),
+            patch(
+                "tmux_core.stage_kernel.detailed_design.normalize_effort_choice",
+                side_effect=lambda _vendor, _model, effort: str(effort or "high"),
+            ),
+            patch(
+                "tmux_core.stage_kernel.shared_review.get_default_model_for_vendor",
+                return_value="gpt-5.4",
+            ),
+            patch(
+                "tmux_core.stage_kernel.shared_review.normalize_model_choice",
+                side_effect=lambda vendor, model: str(model or f"{vendor}/test-default"),
+            ),
+            patch(
+                "tmux_core.stage_kernel.shared_review.normalize_effort_choice",
+                side_effect=lambda _vendor, _model, effort: str(effort or "high"),
+            ),
+        )
+        for catalog_patch in catalog_patches:
+            catalog_patch.start()
+            self.addCleanup(catalog_patch.stop)
+
     def test_discovery_propagates_tmux_liveness_uncertainty(self):
         errors = (
             TmuxControlUnavailable(
@@ -1066,7 +1133,7 @@ class A08OverallReviewTests(unittest.TestCase):
             create_developer_runtime_mock.assert_not_called()
             refine_mock.assert_not_called()
 
-    def test_run_overall_review_stage_stops_at_review_max_rounds(self):
+    def test_run_overall_review_stage_enters_critical_hitl_at_review_max_rounds(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
             paths = build_overall_review_paths(project_dir, "需求A")
@@ -1088,9 +1155,13 @@ class A08OverallReviewTests(unittest.TestCase):
                 worker=_FakeWorker(session_name="测试工程师-天英星"),
             )
 
+            task_done_results = iter((False, True))
+
             def fake_task_done(**kwargs):  # noqa: ANN001
-                paths["merged_review_path"].write_text("- [Error] 缺少关键测试覆盖\n", encoding="utf-8")
-                return False
+                passed = next(task_done_results)
+                if not passed:
+                    paths["merged_review_path"].write_text("- [Error] 缺少关键测试覆盖\n", encoding="utf-8")
+                return passed
 
             with patch("A08_OverallReview.initialize_overall_review_reviewers", side_effect=lambda reviewers, **kwargs: list(reviewers)), patch(
                 "A08_OverallReview._run_parallel_overall_reviewers",
@@ -1104,24 +1175,45 @@ class A08OverallReviewTests(unittest.TestCase):
             ), patch(
                 "A08_OverallReview.create_developer_runtime",
             ) as create_developer_runtime_mock, patch(
+                "A08_OverallReview.initialize_overall_review_developer",
+                side_effect=lambda current_developer, **kwargs: current_developer,
+            ) as initialize_developer_mock, patch(
+                "A08_OverallReview.run_overall_review_limit_hitl_loop",
+                return_value=ReviewLimitHitlResult(
+                    owner=developer,
+                    rounds_used=1,
+                    post_hitl_continue_completed=True,
+                ),
+            ) as hitl_mock, patch(
                 "A08_OverallReview.refine_overall_review_code",
             ) as refine_mock, patch(
                 "A08_OverallReview._shutdown_workers",
                 return_value=(),
             ):
-                with self.assertRaisesRegex(RuntimeError, "整体复核超过最大审核轮次 1"):
-                    run_overall_review_stage(
-                        ["--project-dir", str(project_dir), "--requirement-name", "需求A", "--review-max-rounds", "1"],
-                        developer_handoff=DevelopmentAgentHandoff(
-                            selection=developer.selection,
-                            role_prompt=developer.role_prompt,
-                            worker=developer.worker,
-                        ),
-                        reviewer_handoff=(reviewer_handoff,),
-                    )
+                result = run_overall_review_stage(
+                    [
+                        "--project-dir",
+                        str(project_dir),
+                        "--requirement-name",
+                        "需求A",
+                        "--review-max-rounds",
+                        "1",
+                        "--yes",
+                    ],
+                    developer_handoff=DevelopmentAgentHandoff(
+                        selection=developer.selection,
+                        role_prompt=developer.role_prompt,
+                        worker=developer.worker,
+                    ),
+                    reviewer_handoff=(reviewer_handoff,),
+                )
 
-            self.assertFalse(json.loads(paths["state_path"].read_text(encoding="utf-8"))["passed"])
+            self.assertTrue(result.completed)
+            self.assertTrue(json.loads(paths["state_path"].read_text(encoding="utf-8"))["passed"])
             create_developer_runtime_mock.assert_not_called()
+            initialize_developer_mock.assert_called_once()
+            hitl_mock.assert_called_once()
+            self.assertIsNone(hitl_mock.call_args.kwargs["human_input_provider"])
             refine_mock.assert_not_called()
 
     def test_run_overall_review_turn_with_recreation_rebinds_recreated_reviewer_runtime(self):

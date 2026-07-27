@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { buildHomeAgents, isBusyTurnWorker, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState } from './agents'
+import { buildAgentConfigLabel, buildHomeAgents, isBusyTurnWorker, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState } from './agents'
 import type { WorkerSnapshot } from './types'
 
 function worker(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
@@ -31,6 +31,21 @@ test('home agents reject old runner and prefer the newest state revision', () =>
 
   expect(agents).toHaveLength(1)
   expect(agents[0]).toMatchObject({ agentState: 'READY', agentConfigLabel: 'DevEco Code | deveco/GLM-5.1, Max' })
+})
+
+test('agent config label appends Ponytail mode and keeps legacy labels unchanged', () => {
+  expect(buildAgentConfigLabel(worker({ ponytailMode: 'full' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Ponytail Full')
+  expect(buildAgentConfigLabel(worker({ ponytailMode: 'off' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Ponytail Off')
+  expect(buildAgentConfigLabel(worker())).toBe('DevEco Code | deveco/GLM-5.1, Max')
+})
+
+test('agent config label appends Grill modes and hides Standard', () => {
+  expect(buildAgentConfigLabel(worker({ requirementsMode: 'grill' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Grill Me')
+  expect(buildAgentConfigLabel(worker({ requirementsMode: 'grill-with-docs' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Grill with Docs')
+  expect(buildAgentConfigLabel(worker({ requirementsMode: 'standard' }))).toBe('DevEco Code | deveco/GLM-5.1, Max')
+  expect(buildAgentConfigLabel(worker({ ponytailMode: 'full', requirementsMode: 'grill' }))).toBe(
+    'DevEco Code | deveco/GLM-5.1, Max | Ponytail Full | Grill Me',
+  )
 })
 
 test('completed turn does not count as active work even if terminal tail is BUSY', () => {

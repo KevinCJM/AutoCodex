@@ -7,6 +7,7 @@ import unittest
 import zipfile
 from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from A02_RequirementsAnalysis import (
@@ -20,6 +21,7 @@ from A02_RequirementsAnalysis import (
     REQUIREMENTS_ANALYSIS_TURN_PHASE,
     NOTION_STAGE_NAME,
     NOTION_TURN_PHASE,
+    RequirementsClarificationAgentSelection,
     build_notion_retry_message,
     build_notion_hitl_paths,
     build_notion_followup_prompt,
@@ -38,6 +40,7 @@ from A02_RequirementsAnalysis import (
     extract_text_from_local_file,
     extract_text_from_pdf,
     format_notion_failure_message,
+    get_default_model_for_vendor,
     main,
     render_agent_boot_progress_line,
     render_requirements_analysis_progress_line,
@@ -53,6 +56,7 @@ from A02_RequirementsAnalysis import (
     sanitize_requirement_name,
     stdin_is_interactive,
     validate_notion_status,
+    _materialize_workflow_requirements_args,
 )
 from Prompt_02_RequirementIntake import (
     NOTION_STATUS_ERROR,
@@ -71,6 +75,12 @@ from Prompt_03_RequirementsClarification import (
     resume_requirements_understand,
 )
 from T09_terminal_ops import PromptBackRequested
+from T05_hitl_runtime import (
+    GrillSessionState,
+    load_grill_session_state,
+    save_grill_session_state,
+)
+from tmux_core.runtime.vendor_catalog import get_model_choices
 
 
 def _make_simple_pdf(text: str) -> bytes:
@@ -120,6 +130,42 @@ def _make_simple_docx(path: Path, lines: list[str]) -> None:
         archive.writestr("[Content_Types].xml", "<?xml version='1.0' encoding='UTF-8'?><Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'></Types>")
         archive.writestr("_rels/.rels", "<?xml version='1.0' encoding='UTF-8'?><Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'></Relationships>")
         archive.writestr("word/document.xml", document_xml)
+
+
+_TEST_REQUIREMENTS_MODEL = "gpt-5.4"
+
+
+def _select_test_requirements_vendor(_default: str) -> str:
+    from T09_terminal_ops import prompt_select_option
+
+    return prompt_select_option(
+        title="选择厂商",
+        options=((DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR, DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),),
+        default_value=DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR,
+        prompt_text="选择厂商",
+    )
+
+
+def _select_test_requirements_model(_vendor: str, _default: str) -> str:
+    from T09_terminal_ops import prompt_select_option
+
+    return prompt_select_option(
+        title="选择模型",
+        options=((_TEST_REQUIREMENTS_MODEL, _TEST_REQUIREMENTS_MODEL),),
+        default_value=_TEST_REQUIREMENTS_MODEL,
+        prompt_text="选择模型",
+    )
+
+
+def _select_test_requirements_effort(_vendor: str, _model: str, _default: str) -> str:
+    from T09_terminal_ops import prompt_select_option
+
+    return prompt_select_option(
+        title="选择推理强度",
+        options=(("low", "low"), ("medium", "medium"), (DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)),
+        default_value=DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT,
+        prompt_text="选择推理强度",
+    )
 
 
 def _write_stage_status(
@@ -191,6 +237,127 @@ def _write_turn_status(
 
 
 class RequirementsAnalysisIntakeTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+        vendor_id: str,
+        requested_model: str,
+        requested_effort: str,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            resolved_model=str(requested_model or f"{vendor_id}/test-default"),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path=f"/test/bin/{vendor_id}",
+        )
+
+    def setUp(self) -> None:
+        test_models = (
+            SimpleNamespace(model_id=_TEST_REQUIREMENTS_MODEL),
+            SimpleNamespace(model_id="gpt-5.4-alt"),
+        )
+        patches = (
+            patch(f"{__name__}.get_default_model_for_vendor", return_value=_TEST_REQUIREMENTS_MODEL),
+            patch(f"{__name__}.get_model_choices", return_value=test_models),
+            patch(
+                "A02_RequirementsAnalysis.get_default_model_for_vendor",
+                return_value=_TEST_REQUIREMENTS_MODEL,
+            ),
+            patch(
+                "A02_RequirementsAnalysis.normalize_model_choice",
+                side_effect=lambda _vendor, model: _TEST_REQUIREMENTS_MODEL if model == "default" else model,
+            ),
+            patch(
+                "A02_RequirementsAnalysis.normalize_effort_choice",
+                side_effect=lambda _vendor, _model, effort: effort,
+            ),
+            patch(
+                "A02_RequirementsAnalysis.prompt_vendor",
+                side_effect=_select_test_requirements_vendor,
+            ),
+            patch(
+                "A02_RequirementsAnalysis.prompt_model",
+                side_effect=_select_test_requirements_model,
+            ),
+            patch(
+                "A02_RequirementsAnalysis.prompt_effort",
+                side_effect=_select_test_requirements_effort,
+            ),
+            patch(
+                "tmux_core.runtime.tmux_runtime.resolve_launch",
+                side_effect=self._runtime_test_resolution,
+            ),
+        )
+        for catalog_patch in patches:
+            catalog_patch.start()
+            self.addCleanup(catalog_patch.stop)
+
+    def test_explicit_grill_still_rejects_yes_before_intake_worker_creation(self):
+        with patch(
+            "tmux_core.stage_kernel.shared_review.stdin_is_interactive",
+            return_value=True,
+        ), self.assertRaisesRegex(RuntimeError, "必须由人类逐题确认"):
+            _materialize_workflow_requirements_args(
+                ["--requirements-mode", "grill", "--yes"]
+            )
+
+    def test_configured_grill_does_not_reuse_legacy_clarification_without_confirmed_session(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            intake_result = type(
+                "IntakeResult",
+                (),
+                {"project_dir": tmpdir, "requirement_name": "需求A"},
+            )()
+            selection = RequirementsClarificationAgentSelection(
+                vendor="codex",
+                model="model",
+                reasoning_effort="high",
+                proxy_url="",
+                ponytail_mode="full",
+                requirements_mode="grill",
+            )
+            with patch(
+                "A02_RequirementsAnalysis.maybe_launch_tui",
+                return_value=(False, [
+                    "--requirements-mode", "grill",
+                    "--ponytail-mode", "full",
+                ]),
+            ), patch(
+                "tmux_core.stage_kernel.shared_review.stdin_is_interactive",
+                return_value=True,
+            ), patch(
+                "A02_RequirementsAnalysis.stdin_is_interactive",
+                return_value=True,
+            ), patch(
+                "A02_RequirementsAnalysis.run_requirement_intake_stage",
+                return_value=intake_result,
+            ), patch(
+                "A02_RequirementsAnalysis.read_grill_session_header",
+                return_value=None,
+            ), patch(
+                "A02_RequirementsAnalysis.has_existing_requirements_clarification",
+                return_value=True,
+            ), patch(
+                "A02_RequirementsAnalysis.should_reuse_existing_requirements_clarification",
+            ) as reuse, patch(
+                "A02_RequirementsAnalysis.collect_requirements_analysis_agent_selection",
+                return_value=selection,
+            ), patch(
+                "A02_RequirementsAnalysis.run_requirements_analysis",
+                return_value=self._stub_analysis_result(tmpdir, "需求A"),
+            ) as run_analysis, patch(
+                "A02_RequirementsAnalysis.mark_requirement_clarification_completed",
+            ), patch("A02_RequirementsAnalysis.message"):
+                self.assertEqual(main([]), 0)
+
+            reuse.assert_not_called()
+            run_analysis.assert_called_once()
+            self.assertEqual(run_analysis.call_args.kwargs["requirements_mode"], "grill")
+
     @staticmethod
     def _stub_analysis_result(project_dir: str | Path, requirement_name: str):
         clear_path = Path(project_dir) / f"{sanitize_requirement_name(requirement_name)}_需求澄清.md"
@@ -271,6 +438,58 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
             self.assertTrue(request.reuse_existing_original_requirement)
             self.assertEqual(ask_human_path.read_text(encoding="utf-8"), "")
 
+    def test_collect_request_preserves_active_grill_question(self):
+        parser = build_parser()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            ask_human_path = root / "需求A_与人类交流.md"
+            ask_human_path.write_text("## 问题\n是否启用严格模式？\n", encoding="utf-8")
+            session_path = (
+                root
+                / ".tmux_workflow"
+                / "需求A"
+                / "grill"
+                / "session.json"
+            )
+            save_grill_session_state(
+                session_path,
+                GrillSessionState(
+                    session_id="active-intake-resume",
+                    requirements_mode="grill",
+                    state="awaiting_answer",
+                    question_seq=1,
+                    pending_question_path=str(ask_human_path.resolve()),
+                    pending_question_hash=build_prefixed_sha256(ask_human_path),
+                ),
+            )
+            args = parser.parse_args(
+                [
+                    "--project-dir",
+                    tmpdir,
+                    "--requirement-name",
+                    "需求A",
+                    "--input-type",
+                    "text",
+                ]
+            )
+
+            request = collect_request(args)
+
+            self.assertEqual(request.requirement_name, "需求A")
+            self.assertEqual(
+                ask_human_path.read_text(encoding="utf-8"),
+                "## 问题\n是否启用严格模式？\n",
+            )
+            restored = load_grill_session_state(
+                session_path,
+                requirements_mode="grill",
+            )
+            self.assertEqual(restored.state, "awaiting_answer")
+            self.assertEqual(
+                restored.pending_question_hash,
+                build_prefixed_sha256(ask_human_path),
+            )
+
     def test_collect_request_can_reuse_existing_requirement_from_args(self):
         parser = build_parser()
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -347,7 +566,9 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                     "EOF",
                 ],
             ), patch("sys.stdin", _TTYStringIO("")):
-                result = run_requirement_intake_stage(["--project-dir", tmpdir])
+                result = run_requirement_intake_stage(
+                    ["--project-dir", tmpdir, "--ponytail-mode", "full"]
+                )
 
             new_path = root / "需求B_原始需求.md"
             self.assertEqual(result.requirement_name, "需求B")
@@ -464,7 +685,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
         self.assertEqual(captured_requests[0].payload["back_value"], PROMPT_BACK_VALUE)
         self.assertEqual(captured_requests[0].payload["stage_step_index"], 1)
 
-    def test_clarification_collect_request_clears_existing_human_exchange_file(self):
+    def test_clarification_collect_request_does_not_mutate_human_exchange_before_session_check(self):
         from A03_RequirementsClarification import build_parser as build_clarification_parser, collect_request as collect_clarification_request
 
         parser = build_clarification_parser()
@@ -476,7 +697,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
             project_dir, requirement_name = collect_clarification_request(args)
             self.assertEqual(project_dir, str(root.resolve()))
             self.assertEqual(requirement_name, "需求A")
-            self.assertEqual(ask_human_path.read_text(encoding="utf-8"), "")
+            self.assertEqual(ask_human_path.read_text(encoding="utf-8"), "旧的 HITL 提问\n")
 
     def test_list_existing_requirements_returns_non_empty_original_requirement_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -519,10 +740,22 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
         with patch("A02_RequirementsAnalysis.stdin_is_interactive", return_value=True), patch(
             "builtins.input",
             side_effect=["1", "1", "3", ""],
+        ), patch(
+            "A02_RequirementsAnalysis.prompt_vendor",
+            side_effect=_select_test_requirements_vendor,
+        ), patch(
+            "A02_RequirementsAnalysis.prompt_model",
+            side_effect=_select_test_requirements_model,
+        ), patch(
+            "A02_RequirementsAnalysis.prompt_effort",
+            side_effect=_select_test_requirements_effort,
+        ), patch(
+            "A02_RequirementsAnalysis.get_default_model_for_vendor",
+            return_value=_TEST_REQUIREMENTS_MODEL,
         ):
             selection = collect_requirements_analysis_agent_selection(args)
         self.assertEqual(selection.vendor, DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
-        self.assertEqual(selection.model, DEFAULT_REQUIREMENTS_ANALYSIS_MODEL)
+        self.assertEqual(selection.model, _TEST_REQUIREMENTS_MODEL)
         self.assertEqual(selection.reasoning_effort, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)
         self.assertEqual(selection.proxy_url, "")
 
@@ -536,7 +769,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
     def test_collect_requirements_analysis_agent_selection_prompts_under_bridge_interactive_ui(self):
         parser = build_parser()
         args = parser.parse_args([])
-        from T09_terminal_ops import BridgeTerminalUI, BridgePromptRequest, use_terminal_ui
+        from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, use_terminal_ui
 
         select_calls = 0
 
@@ -550,13 +783,26 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 return {"value": str(request.payload.get("default_value", ""))}
             return {"value": ""}
 
-        with use_terminal_ui(BridgeTerminalUI(emit_event=emit_event, request_prompt=request_prompt)):
+        with use_terminal_ui(BridgeTerminalUI(emit_event=emit_event, request_prompt=request_prompt)), patch(
+            "A02_RequirementsAnalysis.prompt_vendor",
+            side_effect=_select_test_requirements_vendor,
+        ), patch(
+            "A02_RequirementsAnalysis.prompt_model",
+            side_effect=_select_test_requirements_model,
+        ), patch(
+            "A02_RequirementsAnalysis.prompt_effort",
+            side_effect=_select_test_requirements_effort,
+        ), patch(
+            "A02_RequirementsAnalysis.get_default_model_for_vendor",
+            return_value=_TEST_REQUIREMENTS_MODEL,
+        ):
             selection = collect_requirements_analysis_agent_selection(args)
         self.assertEqual(selection.vendor, DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
-        self.assertEqual(selection.model, DEFAULT_REQUIREMENTS_ANALYSIS_MODEL)
+        self.assertEqual(selection.model, _TEST_REQUIREMENTS_MODEL)
         self.assertEqual(selection.reasoning_effort, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)
         self.assertEqual(selection.proxy_url, "")
-        self.assertEqual(select_calls, 3)
+        self.assertEqual(selection.ponytail_mode, "full")
+        self.assertEqual(select_calls, 4)
 
     def test_collect_requirements_analysis_agent_selection_can_bubble_previous_stage_back_from_first_prompt(self):
         args = type(
@@ -588,6 +834,8 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
 
         def request_prompt(request: BridgePromptRequest) -> dict[str, object]:
             captured_requests.append(request)
+            if request.payload.get("title") == "选择需求澄清模式":
+                return {"value": str(request.payload.get("default_value", "standard"))}
             return {"value": "__tmux_back__"}
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -607,8 +855,11 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                     )
 
         self.assertEqual(captured_requests[0].prompt_type, "select")
+        self.assertEqual(captured_requests[0].payload["prompt_text"], "选择需求澄清模式")
         self.assertTrue(captured_requests[0].payload["allow_back"])
-        self.assertEqual(captured_requests[0].payload["prompt_text"], "是否直接复用已有的需求澄清并跳入需求评审阶段")
+        self.assertEqual(captured_requests[1].prompt_type, "select")
+        self.assertTrue(captured_requests[1].payload["allow_back"])
+        self.assertEqual(captured_requests[1].payload["prompt_text"], "是否直接复用已有的需求澄清并跳入需求评审阶段")
 
     def test_stdin_is_interactive_reflects_stdin_capability(self):
         with patch("sys.stdin", _TTYStringIO("")):
@@ -920,7 +1171,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                         "--effort",
                         "high",
                     ]
@@ -936,9 +1187,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 str(Path(tmpdir).resolve()),
                 "需求A",
                 vendor="codex",
-                model="gpt-5.4",
+                model=get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                 reasoning_effort="high",
                 proxy_url="",
+                ponytail_mode="full",
+                requirements_mode="standard",
+                graphify_mode="auto",
                 resume_existing=False,
                 preserve_ba_worker=False,
             )
@@ -964,7 +1218,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                         "--effort",
                         "high",
                         "--yes",
@@ -1018,7 +1272,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                         "--effort",
                         "high",
                     ]
@@ -1050,11 +1304,11 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
             stdout = io.StringIO()
             with patch(
                 "builtins.input",
-                side_effect=[tmpdir, "1", "yes"],
+                side_effect=[tmpdir, "1", "standard", "yes"],
             ), patch("sys.stdout", stdout), patch("sys.stdin", _TTYStringIO("")), patch(
                 "A02_RequirementsAnalysis.run_requirements_analysis",
             ) as mocked_analysis:
-                exit_code = main([])
+                exit_code = main(["--ponytail-mode", "full"])
 
             self.assertEqual(exit_code, 0)
             payload = json.loads((root / "需求A_开发前期.json").read_text(encoding="utf-8"))
@@ -1078,12 +1332,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
 
             with patch(
                 "builtins.input",
-                side_effect=[tmpdir, "1", "no", "1", "1", "3", ""],
+                side_effect=[tmpdir, "1", "standard", "no", "1", "1", "3", ""],
             ), patch("sys.stdout", stdout), patch("sys.stdin", _TTYStringIO("")), patch(
                 "A02_RequirementsAnalysis.run_requirements_analysis",
                 side_effect=_resume_stub,
             ) as mocked_analysis:
-                exit_code = main([])
+                exit_code = main(["--ponytail-mode", "full"])
 
             self.assertEqual(exit_code, 0)
             self.assertIn("不直接复用已有需求澄清，将启动需求分析师基于现有澄清继续核验", stdout.getvalue())
@@ -1091,9 +1345,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 str(Path(tmpdir).resolve()),
                 "需求A",
                 vendor="codex",
-                model="gpt-5.4",
+                model=get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                 reasoning_effort="high",
                 proxy_url="",
+                ponytail_mode="full",
+                requirements_mode="standard",
+                graphify_mode="auto",
                 resume_existing=True,
                 preserve_ba_worker=False,
             )
@@ -1107,12 +1364,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
 
             with patch(
                 "builtins.input",
-                side_effect=[tmpdir, "1", "1", "1", "3", ""],
+                side_effect=[tmpdir, "1", "standard", "1", "1", "3", ""],
             ), patch("sys.stdout", stdout), patch("sys.stderr", stderr), patch("sys.stdin", _TTYStringIO("")), patch(
                 "A02_RequirementsAnalysis.run_requirements_analysis",
                 side_effect=lambda *args, **kwargs: self._stub_analysis_result(tmpdir, "需求A"),
             ) as mocked_analysis:
-                exit_code = main([])
+                exit_code = main(["--ponytail-mode", "full"])
 
             self.assertEqual(exit_code, 0)
             self.assertIn(
@@ -1124,9 +1381,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 str(Path(tmpdir).resolve()),
                 "需求A",
                 vendor="codex",
-                model="gpt-5.4",
+                model=get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                 reasoning_effort="high",
                 proxy_url="",
+                ponytail_mode="full",
+                requirements_mode="standard",
+                graphify_mode="auto",
                 resume_existing=False,
                 preserve_ba_worker=False,
             )
@@ -1139,7 +1399,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
             stdout = io.StringIO()
             with patch(
                 "builtins.input",
-                side_effect=["1", "重新录入的正文", "EOF", "1", "1", "3", ""],
+                side_effect=["1", "重新录入的正文", "EOF", "standard", "1", "1", "3", ""],
             ), patch("sys.stdout", stdout), patch("sys.stdin", _TTYStringIO("")), patch(
                 "A02_RequirementsAnalysis.run_requirements_analysis",
                 side_effect=lambda *args, **kwargs: self._stub_analysis_result(tmpdir, "需求A"),
@@ -1154,6 +1414,8 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "file",
                         "--input-value",
                         str(empty_file),
+                        "--ponytail-mode",
+                        "full",
                     ]
                 )
 
@@ -1170,12 +1432,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
             stdout = io.StringIO()
             with patch(
                 "builtins.input",
-                side_effect=[tmpdir, "2", "需求A", "1", "yes", "新内容", "EOF", "1", "1", "3", ""],
+                side_effect=[tmpdir, "2", "需求A", "1", "yes", "新内容", "EOF", "standard", "1", "1", "3", ""],
             ), patch("sys.stdout", stdout), patch("sys.stdin", _TTYStringIO("")), patch(
                 "A02_RequirementsAnalysis.run_requirements_analysis",
                 side_effect=lambda *args, **kwargs: self._stub_analysis_result(tmpdir, "需求A"),
             ) as mocked_analysis:
-                exit_code = main([])
+                exit_code = main(["--ponytail-mode", "full"])
             self.assertEqual(exit_code, 0)
             self.assertEqual(output_path.read_text(encoding="utf-8"), "新内容\n")
             self.assertIn("需求录入完成", stdout.getvalue())
@@ -1184,9 +1446,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 str(Path(tmpdir).resolve()),
                 "需求A",
                 vendor="codex",
-                model="gpt-5.4",
+                model=get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                 reasoning_effort="high",
                 proxy_url="",
+                ponytail_mode="full",
+                requirements_mode="standard",
+                graphify_mode="auto",
                 resume_existing=False,
                 preserve_ba_worker=False,
             )
@@ -1258,7 +1523,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                         "--effort",
                         "high",
                     ]
@@ -1342,7 +1607,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                         "--effort",
                         "high",
                     ]
@@ -1419,7 +1684,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                         "--effort",
                         "high",
                     ]
@@ -1432,11 +1697,14 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
     def test_main_reprompts_for_input_type_after_notion_failure_question(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             stdout = io.StringIO()
+            notion_modes: list[str] = []
+            clarification_modes: list[str] = []
             output_path, question_path, record_path = build_notion_hitl_paths(tmpdir, "需求A")
             runtime_root = Path(tmpdir) / NOTION_RUNTIME_ROOT_NAME
 
             class FakeTmuxWorker:
                 def __init__(self, *, worker_id, work_dir, config, runtime_root, **kwargs):  # noqa: ANN001
+                    notion_modes.append(config.ponytail_mode)
                     self.runtime_root = Path(runtime_root)
                     self.runtime_root.mkdir(parents=True, exist_ok=True)
                     self.runtime_dir = self.runtime_root / "requirements-notion-reader-demo"
@@ -1455,10 +1723,14 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 def request_kill(self):
                     return self.session_name
 
+            def fake_analysis(*args, **kwargs):  # noqa: ANN002, ANN003
+                clarification_modes.append(kwargs["ponytail_mode"])
+                return self._stub_analysis_result(tmpdir, "需求A")
+
             with patch("A02_RequirementsAnalysis.TmuxBatchWorker", FakeTmuxWorker), patch(
                 "A02_RequirementsAnalysis.run_requirements_analysis",
-                side_effect=lambda *args, **kwargs: self._stub_analysis_result(tmpdir, "需求A"),
-            ), patch("builtins.input", side_effect=["1", "重新录入的正文", "EOF", ""]), patch(
+                side_effect=fake_analysis,
+            ), patch("builtins.input", side_effect=["1", "重新录入的正文", "EOF", "standard", ""]), patch(
                 "sys.stdin", _TTYStringIO("")
             ), patch("sys.stdout", stdout):
                 exit_code = main(
@@ -1474,9 +1746,11 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                         "--vendor",
                         "codex",
                         "--model",
-                        "gpt-5.4",
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
                         "--effort",
                         "high",
+                        "--ponytail-mode",
+                        "full",
                     ]
                 )
 
@@ -1484,6 +1758,8 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
             self.assertEqual(output_path.read_text(encoding="utf-8"), "重新录入的正文\n")
             self.assertIn("请先为该 Notion 页面授权读取权限", stdout.getvalue())
             self.assertIn("请重新选择需求录入方式", stdout.getvalue())
+            self.assertEqual(notion_modes, ["full"])
+            self.assertEqual(clarification_modes, ["full"])
 
     def test_run_requirements_analysis_runs_hitl_until_completed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1516,7 +1792,10 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                     self.runtime_dir.mkdir(parents=True, exist_ok=True)
                     self.session_name = "agreq-analysis-demo"
                     self.round = 0
-                    test_case.assertEqual(config.model, DEFAULT_REQUIREMENTS_ANALYSIS_MODEL)
+                    test_case.assertEqual(
+                        config.model,
+                        get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
+                    )
                     test_case.assertEqual(config.reasoning_effort, DEFAULT_REQUIREMENTS_ANALYSIS_EFFORT)
 
                 def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ANN001
@@ -1542,7 +1821,11 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 "A02_RequirementsAnalysis.SingleLineSpinnerMonitor",
                 FakeSpinnerMonitor,
             ), patch("builtins.input", side_effect=human_inputs), patch("sys.stdout", stdout):
-                result = run_requirements_analysis(root, "需求A")
+                result = run_requirements_analysis(
+                    root,
+                    "需求A",
+                    model=get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR),
+                )
 
             self.assertEqual(result.requirements_clear_path, str(clear_path.resolve()))
             self.assertEqual(monitor_events, ["init:0.2", "init:0.2", "start", "stop", "start", "stop", "start", "stop"])
@@ -1681,9 +1964,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
 
             with patch(
                 "builtins.input",
-                side_effect=["1", "yes"],
+                side_effect=["1", "standard", "yes"],
             ), patch("sys.stdin", _TTYStringIO("")), patch("sys.stdout", stdout):
-                result = run_requirements_stage(["--project-dir", tmpdir], preserve_ba_worker=True)
+                result = run_requirements_stage(
+                    ["--project-dir", tmpdir, "--ponytail-mode", "full"],
+                    preserve_ba_worker=True,
+                )
 
             self.assertEqual(result.requirement_name, "需求A")
             self.assertIsNone(result.ba_handoff)
@@ -1693,6 +1979,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
     def test_run_requirements_analysis_recreates_dead_ba_when_user_confirms(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            current_model = get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+            replacement_model = next(
+                item.model_id
+                for item in get_model_choices(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+                if item.model_id != current_model
+            )
             original_path = root / "需求A_原始需求.md"
             original_path.write_text("原始需求正文\n", encoding="utf-8")
             _, clear_path, ask_path, record_path = build_requirements_analysis_paths(root, "需求A")
@@ -1750,7 +2042,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 return_value="codex",
             ), patch(
                 "A02_RequirementsAnalysis.prompt_model",
-                return_value="gpt-5.4-mini",
+                return_value=replacement_model,
             ), patch(
                 "A02_RequirementsAnalysis.prompt_effort",
                 return_value="high",
@@ -1758,7 +2050,11 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 "A02_RequirementsAnalysis.prompt_proxy_url",
                 return_value="",
             ), patch("sys.stdout", io.StringIO()):
-                result = run_requirements_analysis(root, "需求A")
+                result = run_requirements_analysis(
+                    root,
+                    "需求A",
+                    model=current_model,
+                )
 
             self.assertEqual(result.requirements_clear_path, str(clear_path.resolve()))
             self.assertEqual(len(created_workers), 2)
@@ -1766,6 +2062,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
     def test_run_requirements_analysis_recreates_dead_ba_when_run_turn_returns_dead_output(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            current_model = get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+            replacement_model = next(
+                item.model_id
+                for item in get_model_choices(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+                if item.model_id != current_model
+            )
             original_path = root / "需求A_原始需求.md"
             original_path.write_text("原始需求正文\n", encoding="utf-8")
             _, clear_path, ask_path, record_path = build_requirements_analysis_paths(root, "需求A")
@@ -1831,7 +2133,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 return_value="codex",
             ), patch(
                 "A02_RequirementsAnalysis.prompt_model",
-                return_value="gpt-5.4-mini",
+                return_value=replacement_model,
             ), patch(
                 "A02_RequirementsAnalysis.prompt_effort",
                 return_value="high",
@@ -1839,7 +2141,11 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 "A02_RequirementsAnalysis.prompt_proxy_url",
                 return_value="",
             ), patch("sys.stdout", io.StringIO()):
-                result = run_requirements_analysis(root, "需求A")
+                result = run_requirements_analysis(
+                    root,
+                    "需求A",
+                    model=current_model,
+                )
 
             self.assertEqual(result.requirements_clear_path, str(clear_path.resolve()))
             self.assertEqual(len(created_workers), 2)
@@ -1848,6 +2154,12 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
     def test_run_requirements_analysis_recreates_auth_failed_ba_with_new_model(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            current_model = get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+            replacement_model = next(
+                item.model_id
+                for item in get_model_choices(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+                if item.model_id != current_model
+            )
             original_path = root / "需求A_原始需求.md"
             original_path.write_text("原始需求正文\n", encoding="utf-8")
             _, clear_path, _, record_path = build_requirements_analysis_paths(root, "需求A")
@@ -1914,7 +2226,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 return_value="codex",
             ), patch(
                 "A02_RequirementsAnalysis.prompt_model",
-                return_value="gpt-5.4-mini",
+                return_value=replacement_model,
             ), patch(
                 "A02_RequirementsAnalysis.prompt_effort",
                 return_value="high",
@@ -1922,16 +2234,29 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 "A02_RequirementsAnalysis.prompt_proxy_url",
                 return_value="",
             ), patch("sys.stdout", io.StringIO()):
-                result = run_requirements_analysis(root, "需求A")
+                result = run_requirements_analysis(
+                    root,
+                    "需求A",
+                    model=current_model,
+                )
 
             self.assertEqual(result.requirements_clear_path, str(clear_path.resolve()))
             self.assertEqual(len(created_workers), 2)
-            self.assertEqual(created_workers[1].config.model, "gpt-5.4-mini")
+            self.assertEqual(
+                created_workers[1].config.model,
+                replacement_model,
+            )
             self.assertTrue(created_workers[0].killed)
 
     def test_run_requirements_analysis_recreates_ba_after_agent_ready_timeout(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
+            current_model = get_default_model_for_vendor(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+            replacement_model = next(
+                item.model_id
+                for item in get_model_choices(DEFAULT_REQUIREMENTS_ANALYSIS_VENDOR)
+                if item.model_id != current_model
+            )
             original_path = root / "需求A_原始需求.md"
             original_path.write_text("原始需求正文\n", encoding="utf-8")
             _, clear_path, _, record_path = build_requirements_analysis_paths(root, "需求A")
@@ -1993,7 +2318,7 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 return_value="codex",
             ), patch(
                 "A02_RequirementsAnalysis.prompt_model",
-                return_value="gpt-5.4-mini",
+                return_value=replacement_model,
             ), patch(
                 "A02_RequirementsAnalysis.prompt_effort",
                 return_value="high",
@@ -2001,11 +2326,18 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 "A02_RequirementsAnalysis.prompt_proxy_url",
                 return_value="",
             ), patch("sys.stdout", io.StringIO()):
-                result = run_requirements_analysis(root, "需求A")
+                result = run_requirements_analysis(
+                    root,
+                    "需求A",
+                    model=current_model,
+                )
 
             self.assertEqual(result.requirements_clear_path, str(clear_path.resolve()))
             self.assertEqual(len(created_workers), 2)
-            self.assertEqual(created_workers[1].config.model, "gpt-5.4-mini")
+            self.assertEqual(
+                created_workers[1].config.model,
+                replacement_model,
+            )
             self.assertTrue(created_workers[0].killed)
 
 

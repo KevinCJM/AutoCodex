@@ -40,6 +40,16 @@ const EFFORT_LABELS: Record<string, string> = {
   xhigh: 'XHigh',
   max: 'Max',
 }
+const PONYTAIL_MODE_LABELS: Record<string, string> = {
+  off: 'Off',
+  lite: 'Lite',
+  full: 'Full',
+  ultra: 'Ultra',
+}
+const REQUIREMENTS_MODE_LABELS: Record<string, string> = {
+  grill: 'Grill Me',
+  'grill-with-docs': 'Grill with Docs',
+}
 
 function normalized(value: unknown): string {
   return String(value ?? '').trim().toLowerCase()
@@ -156,7 +166,15 @@ export function buildAgentConfigLabel(worker: WorkerSnapshot): string {
   const effortId = normalized(worker.reasoningEffort)
   const effort = EFFORT_LABELS[effortId] || titleCase(effortId)
   const modelAndEffort = [model, effort].filter(Boolean).join(', ')
-  return [vendor, modelAndEffort].filter(Boolean).join(' | ')
+  const ponytailMode = normalized(worker.ponytailMode)
+  const ponytail = ponytailMode
+    ? `Ponytail ${PONYTAIL_MODE_LABELS[ponytailMode] || titleCase(ponytailMode)}`
+    : ''
+  const requirementsMode = normalized(worker.requirementsMode).replaceAll('_', '-')
+  const requirements = requirementsMode && requirementsMode !== 'standard'
+    ? REQUIREMENTS_MODE_LABELS[requirementsMode] || `Requirements ${titleCase(requirementsMode)}`
+    : ''
+  return [vendor, modelAndEffort, ponytail, requirements].filter(Boolean).join(' | ')
 }
 
 function effectiveSource(

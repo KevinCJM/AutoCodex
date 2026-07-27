@@ -167,6 +167,8 @@ test('DialogConfirm forwards dialog active state to the shared select renderer',
   expect(content.includes('active={props.active}')).toBe(true)
   expect(content.includes('allowBack?: boolean')).toBe(true)
   expect(content.includes('backValue?: string')).toBe(true)
+  expect(content.includes('hintLines?: string[]')).toBe(true)
+  expect(content.includes('hintLines={props.hintLines}')).toBe(true)
   expect(content.includes('withPromptBackOption')).toBe(true)
   expect(content.includes("value === backValue() ? backValue() : value === 'yes'")).toBe(true)
 })

@@ -349,7 +349,8 @@ def run_reviewer_phase_with_death_handling(
     )
     # Reviewer startup is intentionally lazy here: stage-specific reviewer turn
     # wrappers know how to recreate or drop a reviewer after provider/auth/ready
-    # failures, while this shared layer only guarantees the main owner is ready.
+    # failures, while this shared layer only guarantees the main owner's
+    # contract-complete turn cannot be blocked by a lagging BUSY terminal.
     current_main = _ensure_main_ready_with_replacement(
         current_main,
         (),
@@ -357,14 +358,9 @@ def run_reviewer_phase_with_death_handling(
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,
         timeout_sec=timeout_sec,
+        allow_completed_nonready=True,
     )
     updated_reviewers = run_phase(current_reviewers)
-    updated_reviewers = drop_dead_reviewers(
-        updated_reviewers,
-        replace_reviewer=replace_dead_reviewer,
-        reviewer_label_getter=reviewer_label_getter,
-        notify=notify,
-    )
     current_main = _ensure_main_ready_with_replacement(
         current_main,
         updated_reviewers,
@@ -376,9 +372,13 @@ def run_reviewer_phase_with_death_handling(
     )
     ready_reviewers: list[TReviewer] = []
     for index, reviewer in enumerate(updated_reviewers, start=1):
-        label = reviewer_label_getter(reviewer, index) if reviewer_label_getter is not None else f"审核智能体 {index}"
         current_reviewer = reviewer
         while True:
+            label = (
+                reviewer_label_getter(current_reviewer, index)
+                if reviewer_label_getter is not None
+                else f"审核智能体 {index}"
+            )
             error: Exception | None = None
             if _is_dead(current_reviewer):
                 error = _build_dead_ready_error(current_reviewer, role_label=label)
@@ -416,7 +416,18 @@ def run_reviewer_phase_with_death_handling(
                     if notify is not None:
                         notify(f"{label} 重新创建失败，请重新选择恢复方式。")
                     continue
-                current_reviewer = replacement
+                if notify is not None:
+                    notify(f"{label} 已重建，重新执行当前审核步骤。")
+                rerun_reviewers = run_phase([replacement])
+                if not rerun_reviewers:
+                    if notify is not None:
+                        notify(f"{label} 重建后未产生有效审核智能体，后续将忽略该角色。")
+                    break
+                if len(rerun_reviewers) != 1:
+                    raise RuntimeError(
+                        f"{label} 重建后当前审核步骤返回了 {len(rerun_reviewers)} 个智能体，无法确定恢复对象"
+                    )
+                current_reviewer = rerun_reviewers[0]
                 continue
             if decision == AGENT_INTERVENTION_RECHECK:
                 continue

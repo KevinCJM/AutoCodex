@@ -52,29 +52,15 @@ def _resolve_worker(owner: object | None):
 
 
 def _state_name(worker: object) -> str:
-    def normalize_idle_surface(state_name: str) -> str:
-        normalized = str(state_name or "").strip().upper()
-        if normalized not in {"BUSY", "STARTING"}:
-            return normalized
-        if worker_state_has_unresolved_turn(_read_worker_state(worker)):
-            return normalized
-        observe = getattr(worker, "observe", None)
-        idle_checker = getattr(worker, "_observation_indicates_ready_or_idle_surface", None)
-        if not callable(observe) or not callable(idle_checker):
-            return normalized
+    refresh_turn_start_state = getattr(worker, "refresh_turn_start_agent_state", None)
+    if callable(refresh_turn_start_state):
         try:
-            observation = observe(tail_lines=120)
-            if not bool(idle_checker(observation)):
-                return normalized
-            mark_ready = getattr(worker, "_mark_agent_ready_from_observation", None)
-            if callable(mark_ready):
-                try:
-                    mark_ready(observation, note="role_ready_from_idle_surface")
-                except TypeError:
-                    mark_ready(observation)
-            return "READY"
+            state = refresh_turn_start_state(label="role_ready_check")
+            state_name = str(getattr(state, "value", state) or "").strip().upper()
+            if state_name:
+                return state_name
         except Exception:
-            return normalized
+            pass
 
     refresh_health = getattr(worker, "refresh_health", None)
     if callable(refresh_health):
@@ -82,7 +68,7 @@ def _state_name(worker: object) -> str:
             snapshot = refresh_health(notify_on_change=False)
             state_name = str(getattr(snapshot, "agent_state", "") or "").strip().upper()
             if state_name:
-                return normalize_idle_surface(state_name)
+                return state_name
         except Exception:
             pass
     observe = getattr(worker, "observe", None)
@@ -93,13 +79,13 @@ def _state_name(worker: object) -> str:
             state = get_state(observation)
             state_name = str(getattr(state, "value", state) or "").strip().upper()
             if state_name:
-                return normalize_idle_surface(state_name)
+                return state_name
         except Exception:
             pass
     if not callable(get_state):
         return ""
     state = get_state()
-    return normalize_idle_surface(str(getattr(state, "value", state) or "").strip().upper())
+    return str(getattr(state, "value", state) or "").strip().upper()
 
 
 def _read_worker_state(worker: object) -> dict[str, object]:
@@ -115,6 +101,8 @@ def _read_worker_state(worker: object) -> dict[str, object]:
 
 def _current_turn_completed(worker: object) -> bool:
     state = _read_worker_state(worker)
+    if worker_state_has_unresolved_turn(state):
+        return False
     status = str(state.get("status", getattr(worker, "status", "")) or "").strip().lower()
     result_status = str(state.get("result_status", getattr(worker, "result_status", "")) or "").strip().lower()
     runtime_status = str(
@@ -329,8 +317,19 @@ def run_reviewer_phase(
     reviewer_label_getter: Callable[[object, int], str] | None = None,
     timeout_sec: float = DEFAULT_COMMAND_TIMEOUT_SEC,
 ) -> list[TReviewer]:
-    ensure_reviewers_ready(
+    # The main owner's previous turn is already contract-complete before a
+    # reviewer round starts.  Its terminal may still be rendering BUSY, which
+    # must not delay reviewer dispatch.  Reviewers, however, are about to
+    # receive a new prompt and therefore still require a strict READY check.
+    ensure_main_ready(
         main_owner,
+        (),
+        main_label=main_label,
+        timeout_sec=timeout_sec,
+        allow_completed_nonready=True,
+    )
+    ensure_reviewers_ready(
+        None,
         reviewers,
         main_label=main_label,
         reviewer_label_getter=reviewer_label_getter,

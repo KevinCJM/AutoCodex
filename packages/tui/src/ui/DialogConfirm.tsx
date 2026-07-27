@@ -9,6 +9,7 @@ type Props = {
   active?: boolean
   allowBack?: boolean
   backValue?: string
+  hintLines?: string[]
   onSubmit: (value: boolean | string) => void
 }
 
@@ -29,6 +30,7 @@ export function DialogConfirm(props: Props) {
       defaultValue={props.defaultValue === false ? 'no' : 'yes'}
       active={props.active}
       options={options()}
+      hintLines={props.hintLines}
       onSubmit={(value) => props.onSubmit(value === backValue() ? backValue() : value === 'yes')}
     />
   )

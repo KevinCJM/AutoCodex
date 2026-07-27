@@ -5,6 +5,36 @@ export type BootstrapPromptState = {
   draftKey: string
 }
 
+const PROMPT_METADATA_KEYS = [
+  ['interaction_kind', 'interactionKind'],
+  ['question_index', 'questionIndex'],
+  ['owner_runner_id', 'ownerRunnerId'],
+  ['question_seq', 'questionSeq'],
+  ['recommendation', 'recommendation'],
+  ['reason_text', 'reasonText'],
+] as const
+
+const AUTHORITATIVE_PROMPT_CURSOR_KEYS = new Set(['owner_runner_id', 'question_seq'])
+
+function promptPayloadWithMetadata(
+  container: Record<string, unknown>,
+  payload: Record<string, unknown>,
+): Record<string, unknown> {
+  const normalized = { ...payload }
+  for (const [snakeKey, camelKey] of PROMPT_METADATA_KEYS) {
+    const value = container[snakeKey] ?? container[camelKey]
+    if (AUTHORITATIVE_PROMPT_CURSOR_KEYS.has(snakeKey) && value !== undefined) {
+      delete normalized[snakeKey]
+      delete normalized[camelKey]
+      normalized[snakeKey] = value
+      continue
+    }
+    if (normalized[snakeKey] !== undefined || normalized[camelKey] !== undefined) continue
+    if (value !== undefined) normalized[snakeKey] = value
+  }
+  return normalized
+}
+
 export type PromptSyncSource = 'bootstrap' | 'live'
 
 export type PromptSyncUpdate = {
@@ -55,9 +85,10 @@ export function promptStateFromSnapshot(
   if (!Boolean(value.pending)) return null
   const promptId = String(value.prompt_id ?? value.promptId ?? '').trim()
   const promptType = String(value.prompt_type ?? value.promptType ?? '').trim()
-  const payload = value.payload && typeof value.payload === 'object'
+  const rawPayload = value.payload && typeof value.payload === 'object'
     ? value.payload as Record<string, unknown>
     : {}
+  const payload = promptPayloadWithMetadata(value, rawPayload)
   if (!promptId || !promptType) return null
   return {
     id: promptId,
@@ -89,12 +120,13 @@ export function promptSyncUpdateFromRequest(
   const promptId = String(payload.id ?? payload.prompt_id ?? payload.promptId ?? '').trim()
   const promptType = String(payload.prompt_type ?? payload.promptType ?? 'text').trim()
   if (!promptId || !promptType) return null
+  const normalizedPayload = promptPayloadWithMetadata(payload, payload)
   return {
     prompt: {
       id: promptId,
       promptType,
-      payload,
-      draftKey: buildDraftKey(promptType, payload),
+      payload: normalizedPayload,
+      draftKey: buildDraftKey(promptType, normalizedPayload),
     },
     revision: promptRevisionFromPayload(payload),
     source: 'live',

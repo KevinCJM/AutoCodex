@@ -270,6 +270,30 @@ test('buildAgentConfigLabel formats vendor model and effort for home display', (
   }))).toBe('DevEco Code | deveco/GLM-5.1, High')
 })
 
+test('buildAgentConfigLabel appends the optional Ponytail mode', () => {
+  expect(buildAgentConfigLabel(worker({
+    vendor: 'codex',
+    model: 'gpt-5.5',
+    reasoningEffort: 'high',
+    ponytailMode: 'full',
+  }))).toBe('Codex | GPT-5.5, High | Ponytail Full')
+  expect(buildAgentConfigLabel(worker({ ponytailMode: 'lite' }))).toBe('Ponytail Lite')
+  expect(buildAgentConfigLabel(worker({ ponytailMode: 'ultra' }))).toBe('Ponytail Ultra')
+  expect(buildAgentConfigLabel(worker({ ponytailMode: 'off' }))).toBe('Ponytail Off')
+})
+
+test('buildAgentConfigLabel shows Grill modes but hides Standard and legacy absence', () => {
+  expect(buildAgentConfigLabel(worker({
+    vendor: 'deveco',
+    model: 'deveco/GLM-5.1',
+    reasoningEffort: 'max',
+    requirementsMode: 'grill-with-docs',
+  }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Grill with Docs')
+  expect(buildAgentConfigLabel(worker({ requirementsMode: 'grill' }))).toBe('Grill Me')
+  expect(buildAgentConfigLabel(worker({ requirementsMode: 'standard' }))).toBe('')
+  expect(buildAgentConfigLabel(worker())).toBe('')
+})
+
 test('buildHomeAgents omits config label when worker config is missing', () => {
   const agents = buildHomeAgents([
     {

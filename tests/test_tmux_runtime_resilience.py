@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import T02_tmux_agents as runtime_module
@@ -38,8 +39,35 @@ from T02_tmux_agents import (
 
 
 class TmuxRuntimeResilienceTests(unittest.TestCase):
+    @staticmethod
+    def _runtime_test_resolution(
+            vendor_id: str,
+            requested_model: str,
+            requested_effort: str,
+    ) -> SimpleNamespace:
+        """Keep tmux resilience tests independent from the host model catalog."""
+        del vendor_id
+        return SimpleNamespace(
+            resolved_model=str(requested_model or "test/default"),
+            resolved_variant="",
+            reasoning_control_mode="implicit_default",
+            catalog_source_kind="test_fixture",
+            confidence="high",
+            native_reasoning_level=str(requested_effort or "high"),
+            normalized_effort=str(requested_effort or "high"),
+            supports_reasoning=True,
+            notes=(),
+            executable_path="",
+        )
+
     def setUp(self) -> None:
         clear_runtime_shutdown_request()
+        resolver = mock.patch(
+            "tmux_core.runtime.tmux_runtime.resolve_launch",
+            side_effect=self._runtime_test_resolution,
+        )
+        resolver.start()
+        self.addCleanup(resolver.stop)
 
     def test_cleanup_context_bypasses_shutdown_only_for_current_context(self):
         request_runtime_shutdown("unit-test")
@@ -224,6 +252,25 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
         ):
             self.assertEqual(backend.probe_target_exists("%1").status, TmuxProbeStatus.MISSING)
 
+    def test_absent_tmux_server_socket_is_missing_not_control_unavailable(self):
+        backend = TmuxBackend()
+        missing = subprocess.CompletedProcess(
+            ["tmux", "has-session", "-t", "missing-session"],
+            1,
+            stdout="",
+            stderr=(
+                "error connecting to /tmp/tmux-test/default "
+                "(No such file or directory)"
+            ),
+        )
+        with mock.patch.object(backend, "run", side_effect=[missing, missing]), mock.patch.object(
+            runtime_module.time, "sleep", return_value=None
+        ):
+            probe = backend.probe_has_session("missing-session")
+
+        self.assertEqual(probe.status, TmuxProbeStatus.MISSING)
+        self.assertEqual(probe.attempts, 2)
+
     def test_session_missing_requires_pane_cross_confirmation_before_dead(self):
         class CrossConfirmWorker(TmuxBatchWorker):
             session_present = False
@@ -377,12 +424,13 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
         backend = TmuxBackend()
         probe_result = runtime_module.TmuxProbeResult(
             status=TmuxProbeStatus.PRESENT,
-            value="visible pane",
+            value="old viewport line\ncurrent line one\ncurrent line two\n",
         )
         with mock.patch.object(backend, "_probe_readonly", return_value=probe_result) as probe:  # noqa: SLF001
-            visible = backend.capture_visible("%1", tail_lines=120)
+            visible = backend.capture_visible("%1", tail_lines=2)
 
-        self.assertEqual(visible, "visible pane")
+        self.assertEqual(visible, "old viewport line\ncurrent line one\ncurrent line two\n")
+        self.assertNotIn("-S", probe.call_args.args)
         self.assertEqual(
             probe.call_args.kwargs["recovery_timeout_sec"],
             runtime_module.TMUX_CAPTURE_RECOVERY_TIMEOUT_SEC,
@@ -1501,6 +1549,148 @@ class TmuxRuntimeResilienceTests(unittest.TestCase):
         )
         self.assertEqual(detector.classify_agent_state(active_permission), AgentRuntimeState.STARTING)
         self.assertEqual(detector.classify_agent_state(stale_permission), AgentRuntimeState.READY)
+
+    def test_opencode_question_intervention_uses_current_visible_surface_only(self):
+        detector = runtime_module.OpenCodeOutputDetector()
+        question_surface = """
+→ Asked 1 question
+详细设计 的评审结论是审核通过还是不通过？
+3. Type your own answer
+↑↓ select  enter submit  esc dismiss
+"""
+        ready_surface = "Ask anything...\nctrl+p commands"
+
+        def observation(*, visible_text: str, raw_log_tail: str):
+            return runtime_module.WorkerObservation(
+                visible_text=visible_text,
+                raw_log_delta="",
+                raw_log_tail=raw_log_tail,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-07-22T00:00:00",
+                pane_title="OpenCode",
+            )
+
+        active_question = observation(
+            visible_text=question_surface,
+            raw_log_tail=ready_surface,
+        )
+        stale_question = observation(
+            visible_text=ready_surface,
+            raw_log_tail=question_surface,
+        )
+        incomplete_marker = observation(
+            visible_text="→ Asked 1 question",
+            raw_log_tail=question_surface,
+        )
+        worker = object.__new__(TmuxBatchWorker)
+        worker.config = mock.Mock(vendor=runtime_module.Vendor.OPENCODE)
+        worker.session_name = "开发工程师-地杰星"
+        worker.state_path = Path("/tmp/opencode-question.state.json")
+
+        error = worker._runtime_question_intervention(  # noqa: SLF001
+            active_question,
+            context="等待评审输出",
+        )
+
+        self.assertIsInstance(error, AgentRuntimeInterventionRequired)
+        self.assertEqual(error.blocker_kind, "opencode_question")
+        self.assertIn("tmux attach -t 开发工程师-地杰星", str(error))
+        self.assertIsNone(
+            worker._runtime_question_intervention(stale_question, context="等待评审输出")  # noqa: SLF001
+        )
+        self.assertIsNone(
+            worker._runtime_question_intervention(incomplete_marker, context="等待评审输出")  # noqa: SLF001
+        )
+        self.assertEqual(detector.classify_agent_state(active_question), AgentRuntimeState.STARTING)
+        self.assertEqual(detector.classify_agent_state(stale_question), AgentRuntimeState.READY)
+
+    def test_codex_hook_trust_intervention_uses_current_visible_surface_only(self):
+        detector = runtime_module.CodexOutputDetector()
+        hook_review_surface = """
+SessionStart hooks
+1 hook needs review before it can run.
+[!] Hook 1 · new
+New hook - review required
+Press t to trust; esc to go back
+"""
+        ready_surface = """
+› Write tests for @filename
+  gpt-5.6-sol xhigh · ~/project
+"""
+
+        def observation(*, visible_text: str, raw_log_tail: str, pane_title: str):
+            return runtime_module.WorkerObservation(
+                visible_text=visible_text,
+                raw_log_delta="",
+                raw_log_tail=raw_log_tail,
+                current_command="node",
+                current_path="/tmp/project",
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-07-22T17:09:00",
+                pane_title=pane_title,
+            )
+
+        active_review = observation(
+            visible_text=hook_review_surface,
+            raw_log_tail=ready_surface,
+            pane_title="⠋ project",
+        )
+        stale_review = observation(
+            visible_text=ready_surface,
+            raw_log_tail=hook_review_surface,
+            pane_title="project",
+        )
+        worker = object.__new__(TmuxBatchWorker)
+        worker.config = mock.Mock(vendor=runtime_module.Vendor.CODEX)
+        worker.config.expected_current_commands.return_value = ("codex", "node")
+        worker.session_name = "需求分析师-氐土貉"
+        worker.state_path = Path("/tmp/codex-hook-trust.state.json")
+        worker.current_command = "node"
+
+        error = worker._runtime_codex_hook_trust_intervention(  # noqa: SLF001
+            active_review,
+            context="等待详细设计反馈",
+        )
+
+        self.assertIsInstance(error, AgentRuntimeInterventionRequired)
+        self.assertEqual(error.blocker_kind, "codex_hook_trust")
+        self.assertIn("tmux attach -t 需求分析师-氐土貉", str(error))
+        self.assertIsNone(
+            worker._runtime_codex_hook_trust_intervention(  # noqa: SLF001
+                stale_review,
+                context="等待详细设计反馈",
+            )
+        )
+        self.assertEqual(detector.classify_agent_state(active_review), AgentRuntimeState.STARTING)
+        self.assertEqual(detector.classify_agent_state(stale_review), AgentRuntimeState.READY)
+        self.assertFalse(worker._observation_indicates_ready_or_idle_surface(active_review))  # noqa: SLF001
+
+        worker.observe = mock.Mock(side_effect=[active_review, stale_review])  # type: ignore[method-assign]
+        self.assertFalse(worker.runtime_intervention_is_resolved("codex_hook_trust"))
+        self.assertTrue(worker.runtime_intervention_is_resolved("codex_hook_trust"))
+
+    def test_file_wait_reobserves_after_runtime_intervention(self):
+        worker = object.__new__(TmuxBatchWorker)
+        worker.config = mock.Mock(vendor=runtime_module.Vendor.OPENCODE)
+        worker.current_task_runtime_status = "running"
+        worker.agent_state = AgentRuntimeState.BUSY
+        blocked = mock.sentinel.blocked_observation
+        ready = mock.sentinel.ready_observation
+        worker.observe = mock.Mock(side_effect=[blocked, ready])  # type: ignore[method-assign]
+        worker._handle_runtime_intervention_if_needed = mock.Mock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=[True, False]
+        )
+
+        observation = worker._probe_agent_liveness_for_file_wait()  # noqa: SLF001
+
+        self.assertIs(observation, ready)
+        self.assertEqual(worker.observe.call_count, 2)
 
 
 if __name__ == "__main__":

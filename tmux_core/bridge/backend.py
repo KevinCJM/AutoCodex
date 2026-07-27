@@ -30,6 +30,13 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from tmux_core.requirements_scope import resolve_requirement_name_from_prompt_response
+from tmux_core.runtime.hitl import (
+    GRILL_SESSION_SCHEMA_VERSION,
+    build_prefixed_sha256,
+    load_grill_session_state,
+    save_grill_session_state,
+    validate_grill_question_file,
+)
 from tmux_core.runtime.tmux_runtime import (
     RuntimeShutdownRequested,
     TMUX_IDENTITY_REQUIREMENT_NAME_OPTION,
@@ -54,6 +61,7 @@ from tmux_core.runtime.tmux_runtime import (
     try_resume_worker,
     worker_state_is_prelaunch_active,
 )
+from tmux_core.runtime.graphify import cancel_graphify_processes
 from tmux_core.stage_kernel.detailed_design import (
     DETAILED_DESIGN_RUNTIME_ROOT_NAME,
     build_detailed_design_paths,
@@ -95,6 +103,7 @@ from tmux_core.stage_kernel.requirement_intake import (
     build_parser as build_a02_parser,
     run_requirement_intake_stage,
 )
+from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
 from tmux_core.stage_kernel.requirements_clarification import (
     REQUIREMENTS_RUNTIME_ROOT_NAME,
     build_parser as build_a03_parser,
@@ -249,6 +258,16 @@ class PromptBroker:
             return False
         return True
 
+    def pending_prompt_ids(self) -> tuple[str, ...]:
+        """Return unclaimed prompt ids without exposing their response queues."""
+
+        with self._lock:
+            return tuple(
+                prompt_id
+                for prompt_id in self._pending
+                if prompt_id not in self._claimed_prompts
+            )
+
     def shutdown(self, reason: str = "TUI backend 已关闭，取消等待中的输入。") -> None:
         normalized_reason = str(reason or "").strip() or "TUI backend 已关闭，取消等待中的输入。"
         with self._lock:
@@ -284,6 +303,7 @@ class PendingPromptState:
     payload: dict[str, Any]
     created_at: str = ""
     owner_runner_id: str = ""
+    question_seq: int = 0
 
 
 @dataclass
@@ -475,6 +495,31 @@ def _prompt_is_hitl(payload: Mapping[str, Any] | None) -> bool:
         ]
     ).strip()
     return "hitl" in marker.lower()
+
+
+def _prompt_is_grill(payload: Mapping[str, Any] | None) -> bool:
+    if not isinstance(payload, Mapping):
+        return False
+    interaction_kind = str(
+        payload.get("interaction_kind", payload.get("interactionKind", "")) or ""
+    ).strip().lower().replace("_", "-")
+    recovery_kind = str(
+        payload.get("recovery_kind", payload.get("recoveryKind", "")) or ""
+    ).strip().lower().replace("_", "-")
+    return interaction_kind.startswith("grill") or recovery_kind == "grill-decision"
+
+
+def _prompt_grill_question_seq(payload: Mapping[str, Any] | None) -> int:
+    if not isinstance(payload, Mapping):
+        return 0
+    raw_value = payload.get(
+        "question_seq",
+        payload.get("questionSeq", payload.get("question_index", payload.get("questionIndex", 0))),
+    )
+    try:
+        return max(int(raw_value or 0), 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _prompt_attach_command(payload: Mapping[str, Any] | None) -> str:
@@ -887,6 +932,111 @@ def _stage_hitl_audit_answered_state(
 
 def _workflow_stage_order(action: str) -> int:
     return WORKFLOW_STAGE_ACTION_ORDER.get(str(action or "").strip(), 0)
+
+
+_GRAPHIFY_PUBLIC_STATES = {
+    "off",
+    "unavailable",
+    "building",
+    "ready",
+    "stale",
+    "degraded",
+    "failed",
+}
+_GRAPHIFY_PUBLIC_TEXT_KEYS = (
+    "version",
+    "freshness",
+    "generated_at",
+    "source_fingerprint",
+    "evidence_id",
+)
+_GRAPHIFY_PUBLIC_COUNT_KEYS = (
+    "node_count",
+    "edge_count",
+    "direct_count",
+    "inferred_count",
+)
+
+
+def _graphify_public_text(value: object) -> str:
+    if isinstance(value, Enum):
+        value = value.value
+    return str(value or "").strip()
+
+
+def _redact_graphify_error(value: object) -> str:
+    text = " ".join(str(value or "").split())[:500]
+    if not text:
+        return ""
+    # The app snapshot is public protocol data. Keep the diagnostic useful while
+    # preventing cache, executable, and home-directory paths from leaking.
+    return re.sub(r"(?<![A-Za-z0-9_.])(?:~|/)[^\s,;]+", "<redacted-path>", text)
+
+
+def _read_graphify_app_status(project_dir: str) -> dict[str, Any]:
+    project_text = str(project_dir or "").strip()
+    if not project_text:
+        return {}
+    try:
+        from tmux_core.runtime.graphify import read_graphify_project_status
+    except (ImportError, AttributeError):
+        return {}
+    try:
+        raw_status = read_graphify_project_status(project_text)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "mode": "auto",
+            "state": "degraded",
+            "last_error": f"Graphify status unavailable ({type(exc).__name__})",
+        }
+    if raw_status is None:
+        return {}
+    if isinstance(raw_status, Mapping):
+        payload = dict(raw_status)
+    elif is_dataclass(raw_status):
+        payload = asdict(raw_status)
+    else:
+        to_public_dict = getattr(raw_status, "to_public_dict", None)
+        if not callable(to_public_dict):
+            return {
+                "mode": "auto",
+                "state": "degraded",
+                "last_error": "Graphify status has an unsupported shape",
+            }
+        candidate = to_public_dict()
+        if not isinstance(candidate, Mapping):
+            return {
+                "mode": "auto",
+                "state": "degraded",
+                "last_error": "Graphify status has an unsupported public shape",
+            }
+        payload = dict(candidate)
+
+    mode = _graphify_public_text(payload.get("mode", "")).lower()
+    state = _graphify_public_text(payload.get("state", "")).lower()
+    if state not in _GRAPHIFY_PUBLIC_STATES:
+        state = "off" if mode == "off" else "degraded"
+    public: dict[str, Any] = {"mode": mode, "state": state}
+    for key in _GRAPHIFY_PUBLIC_TEXT_KEYS:
+        public[key] = _graphify_public_text(payload.get(key, ""))
+    for key in _GRAPHIFY_PUBLIC_COUNT_KEYS:
+        try:
+            public[key] = max(0, int(payload.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            public[key] = 0
+
+    report_text = _graphify_public_text(payload.get("report_path", ""))
+    if report_text:
+        try:
+            project_root = Path(project_text).expanduser().resolve()
+            report_path = Path(report_text).expanduser().resolve()
+            report_path.relative_to(project_root)
+            if report_path.is_file():
+                public["report_path"] = str(report_path)
+        except (OSError, ValueError):
+            pass
+    public["last_error"] = _redact_graphify_error(payload.get("last_error", ""))
+    return public
 
 
 def _osascript_quote(value: str) -> str:
@@ -1739,9 +1889,112 @@ def _worker_snapshot_is_actively_running(snapshot: Mapping[str, Any]) -> bool:
     return agent_state in {"BUSY", "STARTING"}
 
 
+def _flatten_ponytail_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, str]:
+    config_payload = snapshot.get("config", {})
+    if not isinstance(config_payload, Mapping):
+        config_payload = {}
+    policy_payload = snapshot.get("ponytail_policy", {})
+    if not isinstance(policy_payload, Mapping):
+        policy_payload = {}
+
+    candidates = {
+        "ponytail_mode": (
+            snapshot.get("ponytail_mode")
+            or config_payload.get("ponytail_mode")
+            or config_payload.get("ponytail")
+            or policy_payload.get("delivered_mode")
+        ),
+        "ponytail_bundle_version": (
+            snapshot.get("ponytail_bundle_version")
+            or policy_payload.get("bundle_version")
+        ),
+        "ponytail_delivery": (
+            snapshot.get("ponytail_delivery")
+            or policy_payload.get("delivery")
+            or config_payload.get("ponytail_delivery")
+        ),
+    }
+    return {
+        field_name: str(value).strip()
+        for field_name, value in candidates.items()
+        if str(value or "").strip()
+    }
+
+
+def _flatten_grill_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    config_payload = snapshot.get("config", {})
+    if not isinstance(config_payload, Mapping):
+        config_payload = {}
+    policy_payload = snapshot.get("grill_policy", {})
+    if not isinstance(policy_payload, Mapping):
+        policy_payload = {}
+
+    mode = str(
+        snapshot.get("requirements_mode")
+        or config_payload.get("requirements_mode")
+        or policy_payload.get("delivered_mode")
+        or ""
+    ).strip()
+    commit = str(
+        snapshot.get("grill_bundle_commit")
+        or policy_payload.get("bundle_commit")
+        or ""
+    ).strip()
+    delivery = str(
+        snapshot.get("grill_delivery")
+        or policy_payload.get("delivery")
+        or ""
+    ).strip()
+    raw_question_seq = snapshot.get("grill_question_seq", policy_payload.get("question_seq", ""))
+    flattened: dict[str, Any] = {}
+    if mode:
+        flattened["requirements_mode"] = mode
+    if commit:
+        flattened["grill_bundle_commit"] = commit
+    if delivery:
+        flattened["grill_delivery"] = delivery
+    if str(raw_question_seq or "").strip():
+        try:
+            flattened["grill_question_seq"] = max(int(raw_question_seq), 0)
+        except (TypeError, ValueError):
+            pass
+    return flattened
+
+
+def _flatten_graphify_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, str]:
+    """Expose only the current turn's safe graph identity, never cache config."""
+
+    config_payload = snapshot.get("config", {})
+    if not isinstance(config_payload, Mapping):
+        config_payload = {}
+    candidates = {
+        "graphify_mode": snapshot.get("graphify_mode") or config_payload.get("graphify_mode"),
+        "graphify_evidence_id": snapshot.get("graphify_evidence_id"),
+        "graphify_fingerprint": snapshot.get("graphify_fingerprint"),
+        "graphify_freshness": snapshot.get("graphify_freshness"),
+    }
+    flattened: dict[str, str] = {}
+    for field_name, value in candidates.items():
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if field_name == "graphify_mode" and text not in {"off", "auto", "required"}:
+            continue
+        if field_name in {"graphify_evidence_id", "graphify_fingerprint"} and not re.fullmatch(
+            r"[A-Za-z0-9_.:-]{1,128}", text
+        ):
+            continue
+        flattened[field_name] = text
+    return flattened
+
+
 def _normalize_routing_worker_snapshot(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     # Routing turn progress and terminal health are independent lifecycles.
-    return dict(snapshot)
+    normalized = dict(snapshot)
+    normalized.update(_flatten_ponytail_worker_fields(snapshot))
+    normalized.update(_flatten_grill_worker_fields(snapshot))
+    normalized.update(_flatten_graphify_worker_fields(snapshot))
+    return normalized
 
 
 def _read_worker_state_snapshot(
@@ -1850,7 +2103,7 @@ def _read_worker_state_snapshot(
     config_payload = state.get("config", {})
     if not isinstance(config_payload, Mapping):
         config_payload = {}
-    return {
+    snapshot = {
         "worker_id": str(
             state.get("worker_id")
             or state.get("raw_worker_id")
@@ -1907,6 +2160,10 @@ def _read_worker_state_snapshot(
         "startup_blocker_kind": str(state.get("startup_blocker_kind", "")).strip(),
         "startup_blocker_requires_manual": bool(state.get("startup_blocker_requires_manual", False)),
     }
+    snapshot.update(_flatten_ponytail_worker_fields(state))
+    snapshot.update(_flatten_grill_worker_fields(state))
+    snapshot.update(_flatten_graphify_worker_fields(state))
+    return snapshot
 
 
 ProtocolLogSink = BridgeLogSink
@@ -1924,6 +2181,7 @@ class BridgeCore:
         self._prompt_revision = 0
         self._pending_prompt: PendingPromptState | None = None
         self._pending_prompts: dict[str, PendingPromptState] = {}
+        self._resolved_grill_question_keys: set[str] = set()
         self._last_resolved_hitl = ResolvedHitlState()
         self._prompt_broker = PromptBroker(
             self.emit_event,
@@ -1983,6 +2241,7 @@ class BridgeCore:
         self._artifact_index_scope: tuple[str, str] = ("", "")
         self._artifact_index_items: list[dict[str, Any]] = []
         self._pending_prompt_display_state: dict[str, Any] | None = None
+        self._grill_recovery_prompt_id = ""
         self._routing_manifest_worker_suppressed_projects: set[str] = set()
         self._active_control_id = ""
         self._tmux_runtime = TmuxRuntimeController()
@@ -2063,6 +2322,25 @@ class BridgeCore:
         return self._pending_prompts[latest_prompt_id]
 
     @staticmethod
+    def _prompt_cursor_payload(prompt: PendingPromptState) -> dict[str, Any]:
+        if not _prompt_is_grill(prompt.payload):
+            return {}
+        return {
+            "owner_runner_id": str(prompt.owner_runner_id or "").strip(),
+            "question_seq": max(int(prompt.question_seq or 0), 0),
+        }
+
+    @staticmethod
+    def _grill_question_key(payload: Mapping[str, Any], question_seq: int = 0) -> str:
+        question_id = str(payload.get("question_id", payload.get("questionId", "")) or "").strip()
+        if question_id:
+            return question_id
+        question_path = str(payload.get("question_path", payload.get("questionPath", "")) or "").strip()
+        if not question_path:
+            return ""
+        return f"{question_path}:{max(int(question_seq or 0), 0)}"
+
+    @staticmethod
     def _build_prompt_request_payload(
         prompt: PendingPromptState,
         *,
@@ -2073,6 +2351,7 @@ class BridgeCore:
             "id": prompt.prompt_id,
             "prompt_type": prompt.prompt_type,
             "prompt_revision": max(int(prompt_revision or 0), 0),
+            **BridgeCore._prompt_cursor_payload(prompt),
         }
 
     def _handle_prompt_open(self, prompt_id: str, request: BridgePromptRequest) -> Mapping[str, Any]:
@@ -2080,16 +2359,24 @@ class BridgeCore:
         if not owner_runner_id:
             with self._display_state_lock:
                 owner_runner_id = str(self._display_runner_id or "").strip()
+        if _prompt_is_grill(request.payload) and not owner_runner_id:
+            # A real broker request always has a blocked caller even when it was
+            # opened outside the registered stage-runner wrapper. Give that
+            # caller a prompt-scoped identity so TUI and Web can apply the same
+            # strict cursor check without treating an empty string as a wildcard.
+            owner_runner_id = f"prompt-owner:{str(prompt_id).strip()}"
         pending = PendingPromptState(
             prompt_id=str(prompt_id).strip(),
             prompt_type=str(request.prompt_type or "").strip(),
             payload=dict(request.payload),
             created_at=_iso_now(),
             owner_runner_id=owner_runner_id,
+            question_seq=_prompt_grill_question_seq(request.payload),
         )
         with self._pending_prompt_lock:
             self._pending_prompts[pending.prompt_id] = pending
             self._pending_prompt = pending
+            self._grill_recovery_prompt_id = ""
             prompt_revision = self._next_prompt_revision_locked()
         self._attention_manager.start_prompt(
             prompt_id=prompt_id,
@@ -2134,7 +2421,10 @@ class BridgeCore:
             sections={"app", "hitl", "prompt"},
             stage_routes=stage_routes,
         )
-        return {"prompt_revision": prompt_revision}
+        return {
+            "prompt_revision": prompt_revision,
+            **self._prompt_cursor_payload(pending),
+        }
 
     def _handle_prompt_resolved(self, prompt_id: str, payload: Mapping[str, Any] | None = None) -> None:
         prompt_id_text = str(prompt_id).strip()
@@ -2149,6 +2439,11 @@ class BridgeCore:
             self._update_context_from_prompt_response(current, resolved_payload)
             routing_snapshot_changed = self._update_routing_manifest_suppression_from_prompt(current, resolved_payload)
             self._remember_resolved_hitl_prompt(current)
+            if _prompt_is_grill(current.payload):
+                question_key = self._grill_question_key(current.payload, current.question_seq)
+                if question_key:
+                    with self._pending_prompt_lock:
+                        self._resolved_grill_question_keys.add(question_key)
         # Do not remove pending/attention state until every scope-critical
         # callback above has succeeded. PromptBroker will release its claim and
         # allow the same response to be retried when an exception escapes.
@@ -3276,7 +3571,7 @@ class BridgeCore:
             health_status=health_status,
             health_note=health_note,
         )
-        return _normalize_routing_worker_snapshot({
+        worker_snapshot = {
             "session_name": session_name,
             "work_dir": str(snapshot.get("work_dir") or getattr(entry, "work_dir", "") or "").strip(),
             "status": status,
@@ -3294,7 +3589,11 @@ class BridgeCore:
             "artifact_paths": list(snapshot.get("artifact_paths", [])),
             "session_exists": session_exists,
             "updated_at": str(snapshot.get("updated_at") or "").strip(),
-        })
+        }
+        worker_snapshot.update(_flatten_ponytail_worker_fields(snapshot))
+        worker_snapshot.update(_flatten_grill_worker_fields(snapshot))
+        worker_snapshot.update(_flatten_graphify_worker_fields(snapshot))
+        return _normalize_routing_worker_snapshot(worker_snapshot)
 
     def _infer_workflow_a00_stage_label(self, project_dir: str, requirement_name: str) -> str:
         if not project_dir:
@@ -3696,13 +3995,14 @@ class BridgeCore:
                 workers = [self._manifest_worker_snapshot(entry) for entry in store.manifest.workers]
                 status_text = store.manifest.status or status_text
                 done = store.manifest.status == "completed"
-        return {
+        snapshot = {
             "project_dir": project_dir,
             "files": files,
             "workers": workers,
             "status_text": status_text,
             "done": done,
         }
+        return snapshot
 
     def _build_requirements_snapshot(self) -> dict[str, Any]:
         project_dir = self._resolve_project_dir()
@@ -4226,6 +4526,13 @@ class BridgeCore:
             else:
                 target_path = str(raw_target_paths or "").strip()
                 target_paths = [target_path] if target_path else []
+            try:
+                question_index = max(
+                    int(payload.get("question_index", payload.get("questionIndex", 0)) or 0),
+                    0,
+                )
+            except (TypeError, ValueError):
+                question_index = 0
             reason_summary = reason_text.splitlines()[0].strip() if reason_text else ""
             summary = title or prompt_text or reason_summary or "存在待处理 HITL"
             return {
@@ -4238,6 +4545,11 @@ class BridgeCore:
                 "attach_command": _prompt_attach_command(payload),
                 "recovery_kind": str(payload.get("recovery_kind", payload.get("recoveryKind", "")) or "").strip(),
                 "reason_text": reason_text,
+                "interaction_kind": str(
+                    payload.get("interaction_kind", payload.get("interactionKind", "")) or ""
+                ).strip(),
+                "question_index": question_index,
+                "recommendation": str(payload.get("recommendation", "") or "").strip(),
                 "target_paths": target_paths,
             }
         return {
@@ -4250,6 +4562,9 @@ class BridgeCore:
             "attach_command": "",
             "recovery_kind": "",
             "reason_text": "",
+            "interaction_kind": "",
+            "question_index": 0,
+            "recommendation": "",
             "target_paths": [],
         }
 
@@ -4598,7 +4913,7 @@ class BridgeCore:
             }
         else:
             display_failure = {}
-        return {
+        snapshot = {
             "project_dir": project_dir,
             "requirement_name": requirement_name,
             "current_action": self._context.current_action,
@@ -4628,6 +4943,10 @@ class BridgeCore:
                 "collapsible_logs": True,
             },
         }
+        graphify_status = _read_graphify_app_status(project_dir)
+        if graphify_status:
+            snapshot["graphify"] = graphify_status
+        return snapshot
 
     def _current_stage_workers(self, action: str) -> list[dict[str, Any]]:
         normalized = str(action or "").strip()
@@ -6157,9 +6476,29 @@ class BridgeCore:
         role_label = session_name.split("-", 1)[0] if session_name else "当前智能体"
         attach_command = f"tmux attach -t {session_name}" if session_name else ""
         if runtime_intervention:
-            title = "HITL: 智能体运行期权限介入"
+            runtime_blocker_kind = str(getattr(error, "blocker_kind", "") or "").strip()
+            question_intervention = runtime_blocker_kind == "opencode_question"
+            hook_trust_intervention = runtime_blocker_kind == "codex_hook_trust"
+            long_running_intervention = runtime_blocker_kind == "long_running_task_result"
+            if long_running_intervention:
+                title = "HITL: 智能体任务长时间运行"
+                prompt_text = (
+                    "原任务已经提交且智能体仍存活。请进入原 tmux 会话检查；"
+                    "确认继续后系统不会重发提示词。"
+                )
+            elif question_intervention:
+                title = "HITL: 智能体运行期问题待回答"
+                prompt_text = "请先进入原 tmux 会话回答智能体的问题，然后重新检查。"
+            elif hook_trust_intervention:
+                title = "HITL: Codex Hook 待确认"
+                prompt_text = (
+                    "请先进入原 tmux 会话按你的安全策略处理 Hook；"
+                    "系统不会自动信任或执行它，处理后再重新检查。"
+                )
+            else:
+                title = "HITL: 智能体运行期权限介入"
+                prompt_text = "请先进入原 tmux 会话处理运行期权限确认，然后重新检查。"
             intervention_message = "检测到智能体运行期需要人工处理，已转为 HITL，系统不会标记为失败。"
-            prompt_text = "请先进入原 tmux 会话处理运行期权限确认，然后重新检查。"
         elif startup_intervention:
             title = "HITL: 智能体启动需要人工介入"
             intervention_message = "检测到智能体启动需要人工处理，已转为 HITL，系统不会标记为失败。"
@@ -6232,10 +6571,16 @@ class BridgeCore:
         finally:
             self._pending_prompt_display_state = None
         if recovered:
+            recovered_message = (
+                "人工检查后已确认智能体仍存活；原任务不会自动重发。"
+                if runtime_intervention
+                and str(getattr(error, "blocker_kind", "") or "").strip() == "long_running_task_result"
+                else "人工处理后已确认智能体 READY；原阶段调用栈若已退出，请重新发起当前阶段。"
+            )
             self.emit_event(
                 "log.append",
                 {
-                    "text": "人工处理后已确认智能体 READY；原阶段调用栈若已退出，请重新发起当前阶段。\n",
+                    "text": f"{recovered_message}\n",
                     "log_kind": "success",
                     "log_title": "agent startup recovered",
                 },
@@ -7350,6 +7695,11 @@ class BridgeCore:
         # always owns and cleans its tmux sessions; callers can no longer opt out.
         _ = cleanup_tmux
         request_runtime_shutdown("tui_backend_shutdown")
+        # Graphify builds run in their own process groups and are not tmux
+        # workers. Stop them explicitly on every backend exit path before the
+        # ordinary worker cleanup begins; successful immutable generations are
+        # retained by the Graphify adapter.
+        cancel_graphify_processes()
         self._latch_shutdown_policy(ShutdownPolicy.CLEANUP, reason="tui_backend_shutdown")
         first_shutdown = False
         with self._shutdown_lock:
@@ -7616,11 +7966,342 @@ class BridgeCore:
         for key in ("preview_path", "question_path", "answer_path"):
             cls._add_preview_path(allowed, prompt.payload.get(key, ""))
 
+    def _active_grill_session_record(self) -> tuple[Path, dict[str, Any]] | None:
+        """Read the current scope's unanswered Grill question without mutating it."""
+
+        if self._current_snapshot_action() != "stage.a03.start":
+            return None
+        project_dir = self._resolve_project_dir()
+        requirement_name = self._resolve_requirement_name()
+        if not project_dir or not requirement_name:
+            return None
+        project_root = Path(project_dir).expanduser().resolve()
+        session_path = (
+            project_root
+            / ".tmux_workflow"
+            / sanitize_requirement_name(requirement_name)
+            / "grill"
+            / "session.json"
+        )
+        try:
+            payload = json.loads(session_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return None
+            if str(payload.get("schema_version", "") or "").strip() != GRILL_SESSION_SCHEMA_VERSION:
+                return None
+            mode = str(payload.get("requirements_mode", "") or "").strip().lower().replace("_", "-")
+            if mode not in {"grill", "grill-with-docs"}:
+                return None
+            if str(payload.get("state", "") or "").strip() != "awaiting_answer":
+                return None
+            # An answer already recorded in session.json has crossed the human
+            # input boundary and must never be presented for a second response.
+            if str(payload.get("pending_answer", "") or "").strip():
+                return None
+            question_path = Path(str(payload.get("pending_question_path", "") or "")).expanduser().resolve()
+            question_path.relative_to(project_root)
+            if not question_path.is_file():
+                return None
+            expected_hash = str(payload.get("pending_question_hash", "") or "").strip()
+            if not expected_hash or build_prefixed_sha256(question_path) != expected_hash:
+                return None
+            validate_grill_question_file(question_path)
+        except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError):
+            return None
+        return session_path, payload
+
+    def _grill_session_owner_runner_id(
+        self,
+        session_payload: Mapping[str, Any],
+        *,
+        project_root: Path,
+        requirement_name: str,
+    ) -> str:
+        worker_state_text = str(session_payload.get("active_worker_state_path", "") or "").strip()
+        if worker_state_text:
+            try:
+                worker_state_path = Path(worker_state_text).expanduser().resolve()
+                worker_state_path.relative_to(project_root)
+                worker_state = json.loads(worker_state_path.read_text(encoding="utf-8"))
+                if isinstance(worker_state, Mapping):
+                    worker_project = str(
+                        worker_state.get("project_dir", worker_state.get("work_dir", "")) or ""
+                    ).strip()
+                    worker_requirement = str(worker_state.get("requirement_name", "") or "").strip()
+                    worker_action = str(worker_state.get("workflow_action", "") or "").strip()
+                    if worker_project:
+                        worker_project = str(Path(worker_project).expanduser().resolve())
+                    if (
+                        (not worker_project or worker_project == str(project_root))
+                        and (not worker_requirement or worker_requirement == requirement_name)
+                        and (not worker_action or worker_action == "stage.a03.start")
+                    ):
+                        runner_id = str(worker_state.get("stage_runner_id", "") or "").strip()
+                        if runner_id:
+                            return runner_id
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                pass
+        with self._display_state_lock:
+            return str(self._display_runner_id or "").strip()
+
+    def _active_runner_thread_ident(self, runner_id: str) -> int | None:
+        normalized_runner_id = str(runner_id or "").strip()
+        if not normalized_runner_id:
+            return None
+        with self._worker_registry_lock:
+            entries = [
+                (self._workers.get(worker_key), execution)
+                for worker_key, execution in self._runner_executions.items()
+            ]
+        for thread, execution in entries:
+            if thread is None or not thread.is_alive():
+                continue
+            if str(getattr(execution, "runner_id", "") or "").strip() != normalized_runner_id:
+                continue
+            if str(getattr(execution, "terminal_source", "") or "").strip():
+                continue
+            if self._execution_current_action(execution) != "stage.a03.start":
+                continue
+            ident = getattr(thread, "ident", None)
+            return int(ident) if ident is not None else None
+        return None
+
+    def _scope_has_live_a03_runner(self, *, project_root: Path, requirement_name: str) -> bool:
+        with self._worker_registry_lock:
+            entries = [
+                (self._workers.get(worker_key), execution)
+                for worker_key, execution in self._runner_executions.items()
+            ]
+        for thread, execution in entries:
+            if thread is None or not thread.is_alive():
+                continue
+            if str(getattr(execution, "terminal_source", "") or "").strip():
+                continue
+            if self._execution_current_action(execution) != "stage.a03.start":
+                continue
+            runner_project = str(getattr(execution, "project_dir", "") or "").strip()
+            runner_requirement = str(getattr(execution, "requirement_name", "") or "").strip()
+            if not runner_project or not runner_requirement:
+                # An unbound live A03 runner may be about to claim this scope;
+                # prefer a retry over racing a recovered human answer.
+                return True
+            try:
+                runner_project = str(Path(runner_project).expanduser().resolve())
+            except (OSError, ValueError):
+                return True
+            if runner_project == str(project_root) and runner_requirement == requirement_name:
+                return True
+        return False
+
+    @staticmethod
+    def _grill_recovery_prompt_payload(
+        session_payload: Mapping[str, Any],
+        *,
+        question_path: Path,
+        can_submit: bool,
+        synthetic: bool = False,
+    ) -> dict[str, Any]:
+        question = validate_grill_question_file(question_path)
+        question_seq = max(int(session_payload.get("question_seq", 0) or 0), 0)
+        question_hash = str(session_payload.get("pending_question_hash", "") or "").strip()
+        session_id = str(session_payload.get("session_id", "") or "").strip()
+        metadata: dict[str, Any] = {
+            "interaction_kind": "grill",
+            "question_index": question_seq,
+            "question_id": f"grill:{question_hash.split(':', 1)[-1][:16]}:{question_seq}",
+            "question_text": question.question,
+            "recommendation": question.recommended_answer,
+            "reason_text": question.why_it_matters,
+            "recovery_kind": "grill_decision",
+            "question_path": str(question_path),
+            "preview_path": str(question_path),
+            "preview_title": f"Grill 第 {question_seq} 题",
+            "is_hitl": True,
+            "answer_kind": question.answer_kind,
+            "answer_options": list(question.options),
+            "verified_facts": list(question.verified_facts),
+            "can_submit": bool(can_submit),
+            "synthetic_recovery": bool(synthetic),
+            "grill_session_id": session_id,
+            "grill_question_hash": question_hash,
+        }
+        if can_submit:
+            metadata.update(
+                {
+                    "recovery_pending": False,
+                    "recovery_message": "待回答问题已从持久状态恢复；提交后答案会安全写入 Grill 会话。",
+                }
+            )
+        else:
+            metadata.update(
+                {
+                    "recovery_pending": True,
+                    "recovery_message": "待回答问题已安全恢复；正在等待需求澄清 runner 恢复，恢复前不能提交。",
+                }
+            )
+        if synthetic:
+            metadata.update(
+                {
+                    "title": f"Grill 第 {question_seq} 题回复",
+                    "prompt_text": question.question,
+                    "default": question.recommended_answer,
+                    "default_value": question.recommended_answer,
+                    "empty_retry_message": "回复不能为空，请重新输入。",
+                }
+            )
+            return metadata
+        if question.answer_kind == "select":
+            options = [
+                {"value": f"option_{index}", "label": label}
+                for index, label in enumerate(question.options, start=1)
+            ]
+            options.append({"value": "custom", "label": "自定义回答"})
+            metadata.update(
+                {
+                    "title": f"Grill 第 {question_seq} 题：{question.question}",
+                    "prompt_text": "请选择回答",
+                    "options": options,
+                    "default_value": next(
+                        item["value"]
+                        for item in options
+                        if item["label"] == question.recommended_answer
+                    ),
+                }
+            )
+        else:
+            metadata.update(
+                {
+                    "title": f"Grill 第 {question_seq} 题回复",
+                    "prompt_text": question.question,
+                    "empty_retry_message": "回复不能为空，请重新输入。",
+                }
+            )
+        return metadata
+
+    def _build_grill_recovery_prompt_snapshot(self) -> dict[str, Any] | None:
+        session_record = self._active_grill_session_record()
+        if session_record is None:
+            return None
+        _session_path, session_payload = session_record
+        project_root = Path(self._resolve_project_dir()).expanduser().resolve()
+        requirement_name = self._resolve_requirement_name()
+        question_path = Path(str(session_payload["pending_question_path"])).expanduser().resolve()
+        question_seq = max(int(session_payload.get("question_seq", 0) or 0), 0)
+        owner_runner_id = self._grill_session_owner_runner_id(
+            session_payload,
+            project_root=project_root,
+            requirement_name=requirement_name,
+        )
+        session_id = str(session_payload.get("session_id", "") or "").strip()
+        recovery_owner_id = f"grill-session:{session_id}"
+        question_hash = str(session_payload.get("pending_question_hash", "") or "").strip()
+        question_key = f"grill:{question_hash.split(':', 1)[-1][:16]}:{question_seq}"
+        with self._pending_prompt_lock:
+            if question_key and question_key in self._resolved_grill_question_keys:
+                return None
+
+        # A live response queue proves that the original stage runner is still
+        # blocked on this prompt. Rebind only the queue owned by that runner
+        # thread; never guess among unrelated prompts.
+        thread_ident = self._active_runner_thread_ident(owner_runner_id)
+        broker_prompt_id = ""
+        if thread_ident is not None:
+            prefix = f"prompt_{thread_ident}_"
+            candidates = [
+                prompt_id
+                for prompt_id in self._prompt_broker.pending_prompt_ids()
+                if prompt_id.startswith(prefix)
+            ]
+            if len(candidates) == 1:
+                broker_prompt_id = candidates[0]
+        if broker_prompt_id:
+            live_payload = self._grill_recovery_prompt_payload(
+                session_payload,
+                question_path=question_path,
+                can_submit=True,
+            )
+            recovered = PendingPromptState(
+                prompt_id=broker_prompt_id,
+                prompt_type=str(live_payload.get("answer_kind", "multiline")),
+                payload=live_payload,
+                created_at=str(session_payload.get("updated_at", "") or "").strip(),
+                owner_runner_id=owner_runner_id,
+                question_seq=question_seq,
+            )
+            with self._pending_prompt_lock:
+                current = self._current_pending_prompt_locked()
+                if current is None:
+                    self._pending_prompts[broker_prompt_id] = recovered
+                    self._pending_prompt = recovered
+                    self._grill_recovery_prompt_id = ""
+                    prompt_revision = self._next_prompt_revision_locked()
+                    return {
+                        "pending": True,
+                        "prompt_id": recovered.prompt_id,
+                        "prompt_type": recovered.prompt_type,
+                        "payload": dict(recovered.payload),
+                        "prompt_revision": prompt_revision,
+                        **self._prompt_cursor_payload(recovered),
+                    }
+
+        with self._pending_prompt_lock:
+            no_pending_prompt = self._current_pending_prompt_locked() is None
+        synthetic_can_submit = bool(
+            no_pending_prompt
+            and not self._prompt_broker.pending_prompt_ids()
+            and not self._scope_has_live_a03_runner(
+                project_root=project_root,
+                requirement_name=requirement_name,
+            )
+        )
+        recovery_payload = self._grill_recovery_prompt_payload(
+            session_payload,
+            question_path=question_path,
+            can_submit=synthetic_can_submit,
+            synthetic=True,
+        )
+
+        recovery_id = (
+            f"grill_recovery_{session_id}_{question_seq}_{question_hash.split(':')[-1][:12]}"
+        )
+        with self._pending_prompt_lock:
+            if self._grill_recovery_prompt_id != recovery_id:
+                self._grill_recovery_prompt_id = recovery_id
+                prompt_revision = self._next_prompt_revision_locked()
+            else:
+                prompt_revision = self._prompt_revision
+        return {
+            "pending": True,
+            "prompt_id": recovery_id,
+            "prompt_type": "multiline",
+            "payload": recovery_payload,
+            "prompt_revision": prompt_revision,
+            "owner_runner_id": recovery_owner_id,
+            "question_seq": question_seq,
+            "grill_session_id": session_id,
+            "grill_question_hash": question_hash,
+        }
+
     def build_prompt_snapshot(self) -> dict[str, Any]:
         with self._pending_prompt_lock:
             prompt = self._current_pending_prompt_locked()
             prompt_revision = self._prompt_revision
         if prompt is None:
+            try:
+                recovery_snapshot = self._build_grill_recovery_prompt_snapshot()
+            except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError):
+                # Recovery reads multiple files that may be atomically replaced
+                # by the live A03 runner. A transient or invalid record must not
+                # break bootstrap/SSE snapshot delivery.
+                recovery_snapshot = None
+            if recovery_snapshot is not None:
+                return recovery_snapshot
+            with self._pending_prompt_lock:
+                if self._grill_recovery_prompt_id:
+                    self._grill_recovery_prompt_id = ""
+                    prompt_revision = self._next_prompt_revision_locked()
+                else:
+                    prompt_revision = self._prompt_revision
             return {
                 "pending": False,
                 "prompt_id": "",
@@ -7634,6 +8315,7 @@ class BridgeCore:
             "prompt_type": prompt.prompt_type,
             "payload": dict(prompt.payload),
             "prompt_revision": prompt_revision,
+            **self._prompt_cursor_payload(prompt),
         }
 
     def _allowed_file_preview_paths(
@@ -7654,6 +8336,11 @@ class BridgeCore:
         )
         for prompt in self._iter_pending_prompts():
             self._add_preview_paths_from_prompt(allowed, prompt)
+        prompt_snapshot = self.build_prompt_snapshot()
+        prompt_payload = prompt_snapshot.get("payload", {})
+        if isinstance(prompt_payload, Mapping):
+            for key in ("preview_path", "question_path", "answer_path"):
+                self._add_preview_path(allowed, prompt_payload.get(key, ""))
         for key in ("question_path", "answer_path"):
             self._add_preview_path(allowed, hitl_snapshot.get(key, ""))
         for snapshot in stage_snapshots.values():
@@ -7686,6 +8373,8 @@ class BridgeCore:
             and str(persisted_state.get("source", "") or "").strip() == "runner_failure"
         ):
             self._add_preview_path(allowed, persisted_state.get("failure_path", ""))
+        graphify_status = _read_graphify_app_status(self._resolve_project_dir())
+        self._add_preview_path(allowed, graphify_status.get("report_path", ""))
         return allowed
 
     def build_file_preview(self, path_value: str | Path, *, max_bytes: int = WEB_FILE_PREVIEW_MAX_BYTES) -> dict[str, Any]:
@@ -7760,11 +8449,250 @@ class BridgeCore:
     def bootstrap(self) -> dict[str, Any]:
         return self.build_bootstrap_payload()
 
+    def _schedule_grill_recovery_refresh(self) -> None:
+        self._schedule_flow_snapshot_update(
+            sections={"app", "hitl", "prompt"},
+            stage_routes=self._stage_routes_for_action(self._current_snapshot_action()),
+        )
+
+    def _synthetic_grill_submission_is_clear(
+        self,
+        *,
+        project_root: Path,
+        requirement_name: str,
+    ) -> bool:
+        with self._pending_prompt_lock:
+            if self._current_pending_prompt_locked() is not None:
+                return False
+        if self._prompt_broker.pending_prompt_ids():
+            return False
+        return not self._scope_has_live_a03_runner(
+            project_root=project_root,
+            requirement_name=requirement_name,
+        )
+
+    @staticmethod
+    def _synthetic_grill_answer(value: object, *, question: Any) -> str:
+        answer = str(value or "").strip()
+        if not answer or answer == "custom":
+            return ""
+        option_match = re.fullmatch(r"option_(\d+)", answer)
+        if option_match:
+            option_index = int(option_match.group(1)) - 1
+            options = tuple(str(item) for item in getattr(question, "options", ()))
+            if option_index < 0 or option_index >= len(options):
+                return ""
+            return options[option_index].strip()
+        return answer
+
+    def _resolve_synthetic_grill_prompt(
+        self,
+        prompt_id: str,
+        response_payload: Mapping[str, Any],
+    ) -> bool:
+        prompt_id_text = str(prompt_id or "").strip()
+        if not prompt_id_text.startswith("grill_recovery_"):
+            return False
+
+        response_prompt_id = str(
+            response_payload.get("prompt_id", response_payload.get("promptId", "")) or ""
+        ).strip()
+        response_owner_id = str(
+            response_payload.get(
+                "runner_id",
+                response_payload.get(
+                    "runnerId",
+                    response_payload.get(
+                        "owner_runner_id",
+                        response_payload.get("ownerRunnerId", ""),
+                    ),
+                ),
+            )
+            or ""
+        ).strip()
+        response_session_id = str(
+            response_payload.get(
+                "grill_session_id",
+                response_payload.get("grillSessionId", ""),
+            )
+            or ""
+        ).strip()
+        response_question_hash = str(
+            response_payload.get(
+                "grill_question_hash",
+                response_payload.get("grillQuestionHash", ""),
+            )
+            or ""
+        ).strip()
+        try:
+            response_question_seq = int(
+                response_payload.get("question_seq", response_payload.get("questionSeq", -1))
+            )
+        except (TypeError, ValueError):
+            response_question_seq = -1
+
+        session_record = self._active_grill_session_record()
+        if session_record is None:
+            self._schedule_grill_recovery_refresh()
+            return False
+        session_path, raw_session = session_record
+        project_root = Path(self._resolve_project_dir()).expanduser().resolve()
+        requirement_name = self._resolve_requirement_name()
+        session_id = str(raw_session.get("session_id", "") or "").strip()
+        question_seq = max(int(raw_session.get("question_seq", 0) or 0), 0)
+        question_hash = str(raw_session.get("pending_question_hash", "") or "").strip()
+        expected_prompt_id = (
+            f"grill_recovery_{session_id}_{question_seq}_{question_hash.split(':')[-1][:12]}"
+        )
+        expected_owner_id = f"grill-session:{session_id}"
+        with self._pending_prompt_lock:
+            recovery_prompt_is_current = self._grill_recovery_prompt_id == expected_prompt_id
+        if (
+            not recovery_prompt_is_current
+            or response_prompt_id != prompt_id_text
+            or prompt_id_text != expected_prompt_id
+            or response_session_id != session_id
+            or response_owner_id != expected_owner_id
+            or response_question_seq != question_seq
+            or response_question_hash != question_hash
+            or str(raw_session.get("state", "") or "").strip() != "awaiting_answer"
+            or str(raw_session.get("pending_answer", "") or "").strip()
+        ):
+            self._schedule_grill_recovery_refresh()
+            return False
+        if not self._synthetic_grill_submission_is_clear(
+            project_root=project_root,
+            requirement_name=requirement_name,
+        ):
+            self._schedule_grill_recovery_refresh()
+            return False
+
+        requirements_mode = str(raw_session.get("requirements_mode", "") or "").strip()
+        committed_question_key = f"grill:{question_hash.split(':', 1)[-1][:16]}:{question_seq}"
+        try:
+            with requirement_concurrency_lock(
+                project_root,
+                requirement_name,
+                action="bridge.grill.recovery_answer",
+            ):
+                if not self._synthetic_grill_submission_is_clear(
+                    project_root=project_root,
+                    requirement_name=requirement_name,
+                ):
+                    self._schedule_grill_recovery_refresh()
+                    return False
+                state = load_grill_session_state(
+                    session_path,
+                    requirements_mode=requirements_mode,
+                )
+                current_question_path = Path(state.pending_question_path).expanduser().resolve()
+                expected_question_path = Path(
+                    str(raw_session.get("pending_question_path", "") or "")
+                ).expanduser().resolve()
+                current_question_path.relative_to(project_root)
+                if (
+                    state.session_id != session_id
+                    or state.requirements_mode != requirements_mode
+                    or state.state != "awaiting_answer"
+                    or state.pending_answer
+                    or state.question_seq != question_seq
+                    or state.pending_question_hash != question_hash
+                    or current_question_path != expected_question_path
+                    or build_prefixed_sha256(current_question_path) != question_hash
+                    or any(
+                        str(item.get("question_hash", "") or "").strip() == question_hash
+                        for item in state.accepted_answers
+                        if isinstance(item, Mapping)
+                    )
+                ):
+                    self._schedule_grill_recovery_refresh()
+                    return False
+                question = validate_grill_question_file(current_question_path)
+                answer = self._synthetic_grill_answer(
+                    response_payload.get("value"),
+                    question=question,
+                )
+                if not answer:
+                    return False
+                state.accepted_answers.append(
+                    {
+                        "question_seq": question_seq,
+                        "question": question.question,
+                        "answer": answer,
+                        "question_hash": question_hash,
+                        "answered_at": _iso_now(),
+                    }
+                )
+                state.pending_answer = answer
+                state.state = "answer_pending"
+                state.pending_question_path = ""
+                state.pending_question_hash = ""
+                save_grill_session_state(session_path, state)
+        except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError):
+            self._schedule_grill_recovery_refresh()
+            return False
+
+        with self._pending_prompt_lock:
+            self._resolved_grill_question_keys.add(committed_question_key)
+            self._grill_recovery_prompt_id = ""
+            self._next_prompt_revision_locked()
+        self._schedule_grill_recovery_refresh()
+        return True
+
     def resolve_prompt(self, prompt_id: str, payload: Mapping[str, Any] | None = None) -> dict[str, Any]:
         prompt_id_text = str(prompt_id or "").strip()
         if not prompt_id_text:
             raise ValueError("prompt.response 缺少 prompt_id")
         response_payload = dict(payload or {})
+        with self._pending_prompt_lock:
+            pending = self._pending_prompts.get(prompt_id_text)
+            if (
+                pending is None
+                and self._pending_prompt is not None
+                and self._pending_prompt.prompt_id == prompt_id_text
+            ):
+                pending = self._pending_prompt
+        if pending is None and prompt_id_text.startswith("grill_recovery_"):
+            return {
+                "accepted": self._resolve_synthetic_grill_prompt(
+                    prompt_id_text,
+                    response_payload,
+                )
+            }
+        response_has_cursor = any(
+            key in response_payload
+            for key in ("runner_id", "runnerId", "owner_runner_id", "ownerRunnerId", "question_seq", "questionSeq")
+        )
+        if pending is None and response_has_cursor:
+            return {"accepted": False}
+        if pending is not None and _prompt_is_grill(pending.payload):
+            runner_key_present = any(
+                key in response_payload
+                for key in ("runner_id", "runnerId", "owner_runner_id", "ownerRunnerId")
+            )
+            question_key_present = "question_seq" in response_payload or "questionSeq" in response_payload
+            response_runner_id = str(
+                response_payload.get(
+                    "runner_id",
+                    response_payload.get(
+                        "runnerId",
+                        response_payload.get("owner_runner_id", response_payload.get("ownerRunnerId", "")),
+                    ),
+                )
+                or ""
+            ).strip()
+            raw_question_seq = response_payload.get("question_seq", response_payload.get("questionSeq", -1))
+            try:
+                response_question_seq = int(raw_question_seq)
+            except (TypeError, ValueError):
+                response_question_seq = -1
+            if (
+                not runner_key_present
+                or not question_key_present
+                or response_runner_id != str(pending.owner_runner_id or "").strip()
+                or response_question_seq != max(int(pending.question_seq or 0), 0)
+            ):
+                return {"accepted": False}
         accepted = self._prompt_broker.resolve(prompt_id_text, response_payload)
         return {"accepted": accepted}
 
