@@ -212,6 +212,12 @@ export type GraphifyStatus = {
   inferredCount: number
   reportPath: string
   lastError: string
+  queryCountStage: number
+  lastQueryCommand: string
+  lastQueryAt: string
+  lastQueryStatus: string
+  lastQueryFreshness: string
+  lastQueryTruncated: boolean
 }
 
 export type AppSnapshot = {

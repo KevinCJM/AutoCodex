@@ -20,6 +20,10 @@ const GRAPHIFY_LABELS: Record<string, string> = {
   failed: 'Failed',
 }
 
+const GRAPHIFY_QUERY_COMMANDS = new Set(['query', 'affected', 'path', 'explain', 'god-nodes'])
+const GRAPHIFY_QUERY_STATUSES = new Set(['ok', 'error', 'failed', 'timeout', 'unavailable'])
+const GRAPHIFY_FRESHNESS = new Set(['fresh', 'stale', 'unknown', 'cache_fallback', 'degraded'])
+
 function objectOf(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' ? value as Record<string, unknown> : {}
 }
@@ -31,6 +35,18 @@ function text(value: unknown): string {
 function count(value: unknown): number {
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0
+}
+
+function allowedText(value: unknown, allowed: Set<string>): string {
+  const normalized = text(value).toLowerCase()
+  return allowed.has(normalized) ? normalized : ''
+}
+
+function timestamp(value: unknown): string {
+  const normalized = text(value)
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?$/.test(normalized)
+    ? normalized
+    : ''
 }
 
 export function normalizeGraphifyStatus(value: unknown): GraphifyStatus | undefined {
@@ -55,12 +71,31 @@ export function normalizeGraphifyStatus(value: unknown): GraphifyStatus | undefi
     inferredCount: count(item.inferred_count ?? item.inferredCount),
     reportPath: text(item.report_path ?? item.reportPath),
     lastError: text(item.last_error ?? item.lastError),
+    queryCountStage: count(item.query_count_stage ?? item.queryCountStage),
+    lastQueryCommand: allowedText(item.last_query_command ?? item.lastQueryCommand, GRAPHIFY_QUERY_COMMANDS),
+    lastQueryAt: timestamp(item.last_query_at ?? item.lastQueryAt),
+    lastQueryStatus: allowedText(item.last_query_status ?? item.lastQueryStatus, GRAPHIFY_QUERY_STATUSES),
+    lastQueryFreshness: allowedText(item.last_query_freshness ?? item.lastQueryFreshness, GRAPHIFY_FRESHNESS),
+    lastQueryTruncated: (item.last_query_truncated ?? item.lastQueryTruncated) === true,
   }
 }
 
 export function graphifyStatusLabel(status: GraphifyStatus | undefined): string {
   if (!status) return ''
   return GRAPHIFY_LABELS[status.state] ?? 'Degraded'
+}
+
+export function graphifyStatusSummary(status: GraphifyStatus | undefined): string {
+  if (!status) return ''
+  const parts = [graphifyStatusLabel(status)]
+  if (status.version) parts.push(`v${status.version}`)
+  if (status.queryCountStage > 0) {
+    parts.push(`本阶段 ${status.queryCountStage} 次查询`)
+    if (status.lastQueryCommand || status.lastQueryFreshness) {
+      parts.push(`最近 ${status.lastQueryCommand || 'unknown'}/${status.lastQueryFreshness || 'unknown'}`)
+    }
+  }
+  return parts.join(' · ')
 }
 
 export function graphifyStatusTone(status: GraphifyStatus | undefined): string {

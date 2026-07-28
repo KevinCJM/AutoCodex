@@ -61,7 +61,13 @@ from tmux_core.runtime.grill import (
     RequirementsMode,
     normalize_requirements_mode,
 )
-from tmux_core.runtime.graphify import GraphifyMode
+from tmux_core.runtime.graphify import (
+    GraphifyMode,
+    GraphifyQueryIntent,
+)
+from tmux_core.stage_kernel.graphify_route_context import (
+    build_stage_graphify_turn_context,
+)
 from tmux_core.stage_kernel.agent_intervention import (
     request_file_noncompliance_intervention,
     wait_for_worker_startup_intervention,
@@ -988,6 +994,24 @@ def run_requirements_clarification(
                 hitl_loop_kwargs: dict[str, object] = {}
                 if human_input_provider is not None:
                     hitl_loop_kwargs["human_input_provider"] = human_input_provider
+                hitl_loop_kwargs["graphify_context_factory"] = (
+                    lambda hitl_context: build_stage_graphify_turn_context(
+                        project_root,
+                        stage_key="A03",
+                        phase=hitl_context.turn_phase,
+                        role="requirements_analyst",
+                        intent=GraphifyQueryIntent.CODE_FACT_DISCOVERY,
+                        requirement_name=requirement_name,
+                        task_name=f"requirements_question_{hitl_context.hitl_round}",
+                        query_seeds=(requirement_name, "code-verifiable requirement facts"),
+                        business_artifact_paths=(
+                            original_requirement_path,
+                            requirements_clear_path,
+                            hitl_record_path,
+                        ),
+                        resolve_route_hints=current_graphify_mode != GraphifyMode.OFF.value,
+                    )
+                )
 
                 def replace_dead_grill_worker(
                     dead_worker: object,

@@ -45,6 +45,7 @@ from tmux_core.runtime.contracts import (
     write_task_status,
 )
 from tmux_core.runtime.hitl import build_prefixed_sha256
+from tmux_core.runtime.graphify import GraphifyQueryIntent
 from tmux_core.runtime.tmux_runtime import (
     CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -73,6 +74,11 @@ from tmux_core.stage_kernel.death_orchestration import (
     run_reviewer_phase_with_death_handling,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from tmux_core.stage_kernel.graphify_route_context import (
+    build_stage_graphify_turn_context,
+    worker_graphify_route_hints_enabled,
+    worker_graphify_scope,
+)
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
     StageAuditRunContext,
@@ -171,6 +177,41 @@ DETAILED_DESIGN_TASK_NAME = "详细设计"
 DETAILED_DESIGN_RUNTIME_ROOT_NAME = ".detailed_design_runtime"
 MAX_DETAILED_DESIGN_REVIEW_ROUNDS = 5
 MAX_DETAILED_DESIGN_HITL_ROUNDS = 8
+
+
+def _detailed_design_graphify_context(
+    worker: object,
+    *,
+    phase: str,
+    role: str,
+):
+    project_root, requirement_name = worker_graphify_scope(worker)
+    paths = build_detailed_design_paths(project_root, requirement_name) if requirement_name else {}
+    return build_stage_graphify_turn_context(
+        project_root,
+        stage_key="A05",
+        phase=phase,
+        role=role,
+        intent=GraphifyQueryIntent.ARCHITECTURE_BOUNDARY,
+        requirement_name=requirement_name,
+        task_name=DETAILED_DESIGN_TASK_NAME,
+        query_seeds=(requirement_name, "architecture boundaries", "shared dependencies"),
+        business_artifact_paths=tuple(
+            paths[key]
+            for key in (
+                "original_requirement_path",
+                "requirements_clear_path",
+                "merged_review_path",
+                "detailed_design_path",
+                "ba_feedback_path",
+                "hitl_record_path",
+            )
+            if key in paths
+        ),
+        resolve_route_hints=worker_graphify_route_hints_enabled(worker),
+    )
+
+
 PLACEHOLDER_NEXT_STEP = "下一步进入任务拆分阶段（待接入）"
 
 DEFAULT_REVIEWER_PROMPTS: dict[str, str] = {
@@ -1342,6 +1383,11 @@ def _run_ba_turn(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         stage_label=DETAILED_DESIGN_TASK_NAME,
         role_label=str(getattr(handoff.worker, "session_name", "") or "需求分析师"),
+        graphify_context=_detailed_design_graphify_context(
+            handoff.worker,
+            phase=result_contract.phase,
+            role="design_analyst",
+        ),
     )
 
 
@@ -1765,6 +1811,11 @@ def run_reviewer_turn_with_recreation(
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
                 stage_label=DETAILED_DESIGN_TASK_NAME,
                 role_label=_reviewer_artifact_agent_name(current_reviewer),
+                graphify_context=_detailed_design_graphify_context(
+                    current_reviewer.worker,
+                    phase=current_reviewer.contract.phase,
+                    role="design_reviewer",
+                ),
             )
             if _reviewer_outputs_satisfy_contract(current_reviewer):
                 _mark_reviewer_turn_succeeded_from_materialized_outputs(

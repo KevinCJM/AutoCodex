@@ -899,7 +899,17 @@
         "graphify_evidence",
         "tmux-graphify",
         "affected",
-        "god-nodes"
+        "god-nodes",
+        "graphify_turn_context",
+        "query_intent",
+        "graphify_freshness",
+        "graphify_change_ledger",
+        "graphify_route_context",
+        "previous_generation",
+        "session_generation",
+        "query_scope",
+        "validation.json",
+        "query_audit"
       ],
       "negative_keywords": [
         "vendor_catalog",
@@ -909,6 +919,7 @@
       "route_priority": 95,
       "first_read_modules": [
         "M12_project_graph_service",
+        "M03_stage_family",
         "M05_tmux_runtime_hitl",
         "M06_bridge_protocol_backends",
         "M07_frontend_packages",

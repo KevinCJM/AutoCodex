@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -34,6 +35,11 @@ GRAPHIFY_ADAPTER_VERSION = "1"
 GRAPHIFY_GRAPH_SCHEMA = "graphify-code-graph-v1"
 GRAPHIFY_MAX_GRAPH_BYTES = 256 * 1024 * 1024
 GRAPHIFY_EVIDENCE_MAX_CHARS = 6_000
+GRAPHIFY_QUERY_MAX_CHARS = 6_000
+GRAPHIFY_GUIDE_VERSION = "2"
+GRAPHIFY_FULL_GUIDE_MARKER = f"[Graphify Full Usage Guide v{GRAPHIFY_GUIDE_VERSION}]"
+GRAPHIFY_QUERY_RESULT_SCHEMA = "tmux-graphify-query-result/1"
+GRAPHIFY_QUERY_AUDIT_MAX_BYTES = 1024 * 1024
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -51,6 +57,17 @@ class GraphifyState(str, enum.Enum):
     STALE = "stale"
     DEGRADED = "degraded"
     FAILED = "failed"
+
+
+class GraphifyQueryIntent(str, enum.Enum):
+    ROUTING_DISCOVERY = "routing_discovery"
+    CODE_FACT_DISCOVERY = "code_fact_discovery"
+    REQUIREMENT_IMPACT = "requirement_impact"
+    ARCHITECTURE_BOUNDARY = "architecture_boundary"
+    TASK_DEPENDENCY = "task_dependency"
+    IMPLEMENTATION = "implementation"
+    CHANGE_REVIEW = "change_review"
+    WHOLE_CHANGE_REVIEW = "whole_change_review"
 
 
 class GraphifyError(RuntimeError):
@@ -110,17 +127,154 @@ class GraphifyProjectSnapshot:
 
 
 @dataclasses.dataclass(frozen=True)
+class GraphifyTurnContext:
+    stage_key: str
+    phase: str
+    role: str
+    intent: GraphifyQueryIntent | str
+    requirement_name: str = ""
+    task_name: str = ""
+    routed_paths: tuple[str, ...] = ()
+    changed_files: tuple[str, ...] = ()
+    deleted_files: tuple[str, ...] = ()
+    symbols: tuple[str, ...] = ()
+    query_seeds: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        try:
+            intent = self.intent if isinstance(self.intent, GraphifyQueryIntent) else GraphifyQueryIntent(str(self.intent))
+        except ValueError as exc:
+            allowed = ", ".join(item.value for item in GraphifyQueryIntent)
+            raise ValueError(f"非法 Graphify query intent: {self.intent!r}; 合法值: {allowed}") from exc
+        object.__setattr__(self, "intent", intent)
+        for field_name in (
+            "stage_key", "phase", "role", "requirement_name", "task_name",
+        ):
+            object.__setattr__(self, field_name, str(getattr(self, field_name) or "").strip())
+        for field_name in ("routed_paths", "changed_files", "deleted_files", "symbols", "query_seeds"):
+            values = getattr(self, field_name)
+            if isinstance(values, (str, Path)):
+                values = (str(values),)
+            object.__setattr__(
+                self,
+                field_name,
+                tuple(dict.fromkeys(str(value).strip() for value in (values or ()) if str(value).strip())),
+            )
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphifyQuerySuggestion:
+    command: str
+    values: tuple[str, ...]
+    purpose: str
+    generation_scope: str = "current"
+
+    def __post_init__(self) -> None:
+        scope = str(self.generation_scope or "current").strip().lower()
+        if scope not in {"current", "previous"}:
+            raise ValueError(f"非法 Graphify query generation scope: {scope!r}")
+        if scope == "previous" and self.command != "affected":
+            raise ValueError("Graphify previous generation 仅支持 affected 查询")
+        object.__setattr__(self, "generation_scope", scope)
+
+    @property
+    def shell_command(self) -> str:
+        rendered = " ".join(shlex.quote(str(value)) for value in self.values)
+        suffix = " --previous" if self.generation_scope == "previous" else ""
+        return f'"$TMUX_GRAPHIFY_CMD" {self.command}' + (f" {rendered}" if rendered else "") + suffix
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphifyFreshnessAssessment:
+    state: str
+    graph_fingerprint: str
+    changed_paths: tuple[str, ...]
+    checked_at: str
+    reason: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphifyQueryResult:
+    ok: bool
+    query_id: str
+    command: str
+    graph_fingerprint: str
+    freshness: str
+    warnings: tuple[str, ...]
+    truncated: bool
+    duration_ms: int
+    result_text: str
+    error_kind: str = ""
+    generation_scope: str = "current"
+
+    def to_public_dict(self) -> dict[str, Any]:
+        return {
+            "schema": GRAPHIFY_QUERY_RESULT_SCHEMA,
+            "ok": self.ok,
+            "query_id": self.query_id,
+            "command": self.command,
+            "graph": {
+                "version": GRAPHIFY_VERSION,
+                "fingerprint": self.graph_fingerprint,
+                "freshness": self.freshness,
+                "generation_scope": self.generation_scope,
+            },
+            "warnings": list(self.warnings),
+            "truncated": self.truncated,
+            "duration_ms": self.duration_ms,
+            "result_text": self.result_text,
+            "error_kind": self.error_kind,
+        }
+
+    def to_text(self) -> str:
+        lines = [
+            "[TMUX_GRAPHIFY_QUERY]",
+            f"schema: {GRAPHIFY_QUERY_RESULT_SCHEMA}",
+            f"query_id: {self.query_id}",
+            f"command: {self.command}",
+            f"graph_fingerprint: {self.graph_fingerprint}",
+            f"freshness: {self.freshness}",
+            f"generation_scope: {self.generation_scope}",
+            f"ok: {str(self.ok).lower()}",
+            f"truncated: {str(self.truncated).lower()}",
+            f"duration_ms: {self.duration_ms}",
+        ]
+        lines.extend(f"warning: {warning}" for warning in self.warnings)
+        if self.error_kind:
+            lines.append(f"error_kind: {self.error_kind}")
+        lines.append("[RESULT]")
+        if self.result_text:
+            lines.append(self.result_text)
+        lines.append("[END_TMUX_GRAPHIFY_QUERY]")
+        return "\n".join(lines)
+
+
+@dataclasses.dataclass(frozen=True)
+class _GraphifyQueryScope:
+    active: bool = False
+    accepted: bool = True
+    runner_id: str = ""
+    stage_key: str = ""
+    scope_key: str = ""
+
+
+@dataclasses.dataclass(frozen=True)
 class GraphifyEvidence:
     evidence_id: str
     graph_fingerprint: str
     freshness: str
     extracted_nodes: tuple[str, ...] = ()
     extracted_edges: tuple[str, ...] = ()
+    ambiguous_candidates: tuple[str, ...] = ()
     inferred_candidates: tuple[str, ...] = ()
+    old_generation_candidates: tuple[str, ...] = ()
+    old_generation_fingerprint: str = ""
     related_paths: tuple[str, ...] = ()
     routed_module_candidates: tuple[str, ...] = ()
     report_path: str = ""
     block_text: str = ""
+    compact_block_text: str = ""
+    suggestions: tuple[GraphifyQuerySuggestion, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -145,6 +299,12 @@ class GraphifyStatus:
     inferred_count: int = 0
     report_path: str = ""
     last_error: str = ""
+    query_count_stage: int = 0
+    last_query_command: str = ""
+    last_query_at: str = ""
+    last_query_status: str = ""
+    last_query_freshness: str = ""
+    last_query_truncated: bool = False
 
     def to_public_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -157,9 +317,12 @@ class GraphifyTurnProfile:
     status: GraphifyStatus | None = None
     routed_paths: tuple[str, ...] = ()
     changed_files: tuple[str, ...] = ()
+    deleted_files: tuple[str, ...] = ()
     symbols: tuple[str, ...] = ()
     query_seeds: tuple[str, ...] = ()
     prompt_file_references: tuple[str, ...] = ()
+    turn_context: GraphifyTurnContext | None = None
+    suggestions: tuple[GraphifyQuerySuggestion, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -170,6 +333,7 @@ class GraphifyTurnProfile:
         for field_name in (
             "routed_paths",
             "changed_files",
+            "deleted_files",
             "symbols",
             "query_seeds",
             "prompt_file_references",
@@ -418,6 +582,47 @@ def _status_path(project_dir: str | Path) -> Path:
     return project_cache_dir(project_dir) / "status.json"
 
 
+def _runner_query_scope_path(project_dir: str | Path) -> Path:
+    return project_cache_dir(project_dir) / "runner-query-scope.json"
+
+
+def _normalize_query_scope_component(value: object, *, max_length: int = 128) -> str:
+    return re.sub(r"[^A-Za-z0-9_.:-]", "", str(value or "").strip())[:max_length]
+
+
+def _normalize_graphify_stage_key(value: object) -> str:
+    normalized = str(value or "").strip()
+    match = re.search(r"(?i)(?:^|[._-])(a(?:0[0-9]|1[0-9]))(?:$|[._-])", normalized)
+    if match:
+        return match.group(1).upper()
+    if re.fullmatch(r"(?i)a(?:0[0-9]|1[0-9])", normalized):
+        return normalized.upper()
+    return _normalize_query_scope_component(normalized)
+
+
+def _runner_query_scope_key(
+    runner_id: str,
+    mode: GraphifyMode,
+    stage_key: str = "",
+) -> str:
+    material = (
+        f"{_normalize_query_scope_component(runner_id)}\0"
+        f"{_normalize_graphify_stage_key(stage_key)}\0{mode.value}"
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _read_runner_query_scope(project_dir: str | Path) -> dict[str, Any]:
+    scope_path = _runner_query_scope_path(project_dir)
+    if not scope_path.is_file():
+        return {}
+    try:
+        payload = json.loads(scope_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _write_status(project_dir: str | Path, status: GraphifyStatus) -> None:
     _atomic_write_json(_status_path(project_dir), status.to_public_dict())
 
@@ -439,22 +644,99 @@ def publish_graphify_off_status(project_dir: str | Path) -> bool:
 def publish_graphify_pending_status(
     project_dir: str | Path,
     mode: GraphifyMode | str,
+    *,
+    runner_id: str = "",
+    stage_key: str = "",
+    session_generation: str = "",
 ) -> bool:
     normalized = normalize_graphify_mode(mode, default=GraphifyMode.AUTO)
     if normalized == GraphifyMode.OFF:
         return publish_graphify_off_status(project_dir)
-    previous = read_graphify_project_status(project_dir) or {}
+    project = _project_root(project_dir)
+    cache_dir = project_cache_dir(project)
+    normalized_runner_id = _normalize_query_scope_component(runner_id)
+    normalized_stage_key = _normalize_graphify_stage_key(stage_key)
+    normalized_session_generation = _normalize_query_scope_component(
+        session_generation,
+        max_length=64,
+    )
     try:
-        _write_status(
-            project_dir,
-            GraphifyStatus(
-                mode=normalized.value,
-                state=GraphifyState.BUILDING.value,
-                version=str(previous.get("version", "") or ""),
-                freshness="pending_refresh",
-            ),
-        )
-    except OSError:
+        with _metadata_lock(cache_dir):
+            previous = read_graphify_project_status(project) or {}
+            scope_path = _runner_query_scope_path(project)
+            scope_payload = _read_runner_query_scope(project)
+
+            if normalized_runner_id and normalized_stage_key:
+                scope_key = _runner_query_scope_key(
+                    normalized_runner_id,
+                    normalized,
+                    normalized_stage_key,
+                )
+                if (
+                    str(scope_payload.get("scope_key", "") or "") == scope_key
+                    and previous
+                ):
+                    # Multiple workers in one runner share one project graph.
+                    # Their constructors must not regress Ready to Building or
+                    # erase the runner's already-recorded query aggregate.
+                    generations = {
+                        _normalize_query_scope_component(value, max_length=64)
+                        for value in scope_payload.get("session_generations", ())
+                        if _normalize_query_scope_component(value, max_length=64)
+                    }
+                    if (
+                        normalized_session_generation
+                        and normalized_session_generation not in generations
+                    ):
+                        generations.add(normalized_session_generation)
+                        _atomic_write_json(
+                            scope_path,
+                            {
+                                **scope_payload,
+                                "schema": "tmux-graphify-query-scope/2",
+                                "runner_id": normalized_runner_id,
+                                "stage_key": normalized_stage_key,
+                                "mode": normalized.value,
+                                "session_generations": sorted(generations),
+                                "updated_at": _now_iso(),
+                            },
+                        )
+                    return True
+                aggregate: dict[str, Any] = {}
+            else:
+                # Legacy callers have no generation identity. Preserve query
+                # observations because clearing them cannot be scoped safely.
+                scope_key = ""
+                aggregate = _query_aggregate_fields(project, reset=False)
+
+            _write_status(
+                project,
+                GraphifyStatus(
+                    mode=normalized.value,
+                    state=GraphifyState.BUILDING.value,
+                    version=str(previous.get("version", "") or ""),
+                    freshness="pending_refresh",
+                    **aggregate,
+                ),
+            )
+            if normalized_runner_id and normalized_stage_key:
+                _atomic_write_json(
+                    scope_path,
+                    {
+                        "schema": "tmux-graphify-query-scope/2",
+                        "scope_key": scope_key,
+                        "runner_id": normalized_runner_id,
+                        "stage_key": normalized_stage_key,
+                        "mode": normalized.value,
+                        "session_generations": (
+                            [normalized_session_generation]
+                            if normalized_session_generation
+                            else []
+                        ),
+                        "updated_at": _now_iso(),
+                    },
+                )
+    except (GraphifyError, OSError):
         return False
     return True
 
@@ -475,6 +757,21 @@ def read_graphify_project_status(project_dir: str | Path) -> dict[str, Any] | No
         return None
     allowed = {field.name for field in dataclasses.fields(GraphifyStatus)}
     return {key: payload[key] for key in allowed if key in payload}
+
+
+def _query_aggregate_fields(project_dir: str | Path, *, reset: bool) -> dict[str, Any]:
+    if reset:
+        return {}
+    previous = read_graphify_project_status(project_dir) or {}
+    names = {
+        "query_count_stage",
+        "last_query_command",
+        "last_query_at",
+        "last_query_status",
+        "last_query_freshness",
+        "last_query_truncated",
+    }
+    return {name: previous[name] for name in names if name in previous}
 
 
 def _version_from_output(output: str) -> str:
@@ -688,13 +985,89 @@ def _run_graphify_process(
     return completed
 
 
+def _run_bounded_graphify_query(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_sec: float,
+    max_chars: int = GRAPHIFY_QUERY_MAX_CHARS,
+) -> tuple[subprocess.CompletedProcess[str], bool]:
+    try:
+        process = subprocess.Popen(
+            [str(value) for value in args],
+            cwd=str(cwd),
+            env=_sanitized_graphify_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            start_new_session=(os.name != "nt"),
+        )
+    except OSError as exc:
+        raise GraphifyBuildFailed(f"Graphify process launch failed: {exc}") from exc
+    _register_process(process)
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    lengths = {"stdout": 0, "stderr": 0}
+    truncated = {"stdout": False, "stderr": False}
+
+    def drain(stream: Any, chunks: list[str], key: str) -> None:
+        try:
+            while True:
+                chunk = stream.read(4096)
+                if not chunk:
+                    break
+                remaining = max_chars - lengths[key]
+                if remaining > 0:
+                    kept = chunk[:remaining]
+                    chunks.append(kept)
+                    lengths[key] += len(kept)
+                if len(chunk) > max(remaining, 0):
+                    truncated[key] = True
+        finally:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+    stdout_thread = threading.Thread(target=drain, args=(process.stdout, stdout_chunks, "stdout"), daemon=True)
+    stderr_thread = threading.Thread(target=drain, args=(process.stderr, stderr_chunks, "stderr"), daemon=True)
+    stdout_thread.start()
+    stderr_thread.start()
+    try:
+        try:
+            process.wait(timeout=max(float(timeout_sec), 0.1))
+        except subprocess.TimeoutExpired as exc:
+            _terminate_process_group(process)
+            raise GraphifyBuildFailed(f"Graphify query timed out after {timeout_sec:g}s") from exc
+        except BaseException:
+            _terminate_process_group(process)
+            raise
+    finally:
+        stdout_thread.join(timeout=3)
+        stderr_thread.join(timeout=3)
+        _unregister_process(process)
+    return (
+        subprocess.CompletedProcess(
+            args=list(args),
+            returncode=int(process.returncode or 0),
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+        ),
+        bool(truncated["stdout"] or truncated["stderr"]),
+    )
+
+
 def _project_lock(project_key: str) -> threading.RLock:
     with _PROJECT_LOCKS_GUARD:
         return _PROJECT_LOCKS.setdefault(project_key, threading.RLock())
 
 
 @contextlib.contextmanager
-def _build_lock(cache_dir: Path, *, timeout_sec: float = 180.0) -> Iterator[None]:
+def _graph_lock(
+    cache_dir: Path,
+    *,
+    exclusive: bool,
+    timeout_sec: float = 180.0,
+) -> Iterator[None]:
     lock = _project_lock(cache_dir.name)
     with lock:
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -705,12 +1078,42 @@ def _build_lock(cache_dir: Path, *, timeout_sec: float = 180.0) -> Iterator[None
                 deadline = time.monotonic() + max(timeout_sec, 0.1)
                 while True:
                     try:
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+                        fcntl.flock(handle.fileno(), operation | fcntl.LOCK_NB)
                         break
                     except BlockingIOError:
                         if time.monotonic() >= deadline:
                             raise GraphifyBuildFailed("等待 Graphify 项目构建锁超时")
                         time.sleep(0.1)
+            yield
+        finally:
+            if fcntl is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+
+
+@contextlib.contextmanager
+def _build_lock(cache_dir: Path, *, timeout_sec: float = 180.0) -> Iterator[None]:
+    with _graph_lock(cache_dir, exclusive=True, timeout_sec=timeout_sec):
+        yield
+
+
+@contextlib.contextmanager
+def _query_lock(cache_dir: Path, *, timeout_sec: float = 35.0) -> Iterator[None]:
+    with _graph_lock(cache_dir, exclusive=False, timeout_sec=timeout_sec):
+        yield
+
+
+@contextlib.contextmanager
+def _metadata_lock(cache_dir: Path) -> Iterator[None]:
+    lock = _project_lock(cache_dir.name + ":metadata")
+    with lock:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        handle = (cache_dir / "metadata.lock").open("a+", encoding="utf-8")
+        try:
+            if fcntl is not None:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
             yield
         finally:
             if fcntl is not None:
@@ -935,16 +1338,23 @@ def _git_blob_content_id(blob_id: str, content: bytes) -> str:
     return f"sha256:{hashlib.sha256(content).hexdigest()}"
 
 
-def create_graphify_snapshot(
-    project_dir: str | Path,
-    destination: str | Path,
+def _source_stat_hint(path: Path) -> dict[str, int]:
+    details = os.stat(path, follow_symlinks=False)
+    return {
+        "size": int(details.st_size),
+        "mtime_ns": int(details.st_mtime_ns),
+        "ctime_ns": int(details.st_ctime_ns),
+        "dev": int(details.st_dev),
+        "ino": int(details.st_ino),
+    }
+
+
+def _capture_graphify_source_records(
+    project: Path,
+    config: GraphifyBuildConfig,
     *,
-    config: GraphifyBuildConfig | None = None,
-) -> GraphifyProjectSnapshot:
-    config = config or GraphifyBuildConfig()
-    project = _project_root(project_dir)
-    destination_path = Path(destination).expanduser().resolve()
-    destination_path.mkdir(parents=True, exist_ok=True)
+    destination: Path | None = None,
+) -> tuple[list[dict[str, Any]], int]:
     candidates = _git_source_candidates(project)
     clean_blob_ids: dict[str, str] = {}
     if candidates is None:
@@ -967,6 +1377,31 @@ def create_graphify_snapshot(
             continue
         if _has_symlink_component(project, source) or not resolved.is_file():
             continue
+        blob_id = clean_blob_ids.get(relative.as_posix(), "")
+        if destination is None and blob_id:
+            details = _source_stat_hint(source)
+            size = int(details["size"])
+            if size > config.max_file_bytes:
+                raise GraphifySnapshotError(
+                    f"Graphify 源文件超过 {config.max_file_bytes} bytes 上限: "
+                    f"{relative.as_posix()} ({size})"
+                )
+            total_bytes += size
+            if total_bytes > config.max_total_bytes:
+                raise GraphifySnapshotError(
+                    f"Graphify 输入超过总量上限 {config.max_total_bytes} bytes；不会静默截断"
+                )
+            if len(records) + 1 > config.max_files:
+                raise GraphifySnapshotError(
+                    f"Graphify 输入超过文件数上限 {config.max_files}；不会静默截断"
+                )
+            records.append({
+                "path": relative.as_posix(),
+                "size": size,
+                "content_id": f"git:{blob_id}",
+                "stat": details,
+            })
+            continue
         content = _read_snapshot_source(
             project=project,
             source=source,
@@ -985,19 +1420,61 @@ def create_graphify_snapshot(
             raise GraphifySnapshotError(
                 f"Graphify 输入超过文件数上限 {config.max_files}；不会静默截断"
             )
-        blob_id = clean_blob_ids.get(relative.as_posix(), "")
-        content_hash = _git_blob_content_id(blob_id, content)
-        target = destination_path / relative
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        records.append({"path": relative.as_posix(), "size": size, "content_id": content_hash})
+        record = {
+            "path": relative.as_posix(),
+            "size": size,
+            "content_id": _git_blob_content_id(blob_id, content),
+            "stat": _source_stat_hint(source),
+        }
+        records.append(record)
+        if destination is not None:
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+    return records, total_bytes
+
+
+def capture_graphify_source_manifest(
+    project_dir: str | Path,
+    *,
+    config: GraphifyBuildConfig | None = None,
+) -> dict[str, str]:
+    """Capture the controlled source content IDs without building a graph."""
+
+    project = _project_root(project_dir)
+    records, _ = _capture_graphify_source_records(project, config or GraphifyBuildConfig())
+    return {
+        str(record["path"]): str(record["content_id"])
+        for record in records
+    }
+
+
+def create_graphify_snapshot(
+    project_dir: str | Path,
+    destination: str | Path,
+    *,
+    config: GraphifyBuildConfig | None = None,
+) -> GraphifyProjectSnapshot:
+    config = config or GraphifyBuildConfig()
+    project = _project_root(project_dir)
+    destination_path = Path(destination).expanduser().resolve()
+    destination_path.mkdir(parents=True, exist_ok=True)
+    records, total_bytes = _capture_graphify_source_records(
+        project,
+        config,
+        destination=destination_path,
+    )
+    fingerprint_records = [
+        {key: record[key] for key in ("path", "size", "content_id")}
+        for record in records
+    ]
     fingerprint_payload = {
         "graphify_version": GRAPHIFY_VERSION,
         "adapter_version": GRAPHIFY_ADAPTER_VERSION,
         "schema": GRAPHIFY_GRAPH_SCHEMA,
         "include": list(config.include),
         "exclude": list(config.exclude),
-        "files": records,
+        "files": fingerprint_records,
     }
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1007,6 +1484,7 @@ def create_graphify_snapshot(
         manifest_path,
         {
             **fingerprint_payload,
+            "files": records,
             "project_key": project_cache_key(project),
             "source_fingerprint": fingerprint,
             "file_count": len(records),
@@ -1022,6 +1500,162 @@ def create_graphify_snapshot(
         file_count=len(records),
         total_bytes=total_bytes,
     )
+
+
+def _manifest_config(manifest: Mapping[str, Any]) -> GraphifyBuildConfig:
+    include = manifest.get("include", [])
+    exclude = manifest.get("exclude", [])
+    return GraphifyBuildConfig(
+        include=tuple(str(value) for value in include) if isinstance(include, list) else (),
+        exclude=tuple(str(value) for value in exclude) if isinstance(exclude, list) else (),
+    )
+
+
+def _eligible_source_paths(project: Path, config: GraphifyBuildConfig) -> tuple[list[str], bool]:
+    candidates = _git_source_candidates(project)
+    is_git = candidates is not None
+    if candidates is None:
+        candidates = _filesystem_source_candidates(project)
+    eligible: list[str] = []
+    for candidate in sorted(set(candidates)):
+        relative = Path(candidate)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or _is_sensitive_path(relative)
+            or not _is_source_path(relative)
+            or not _matches_scan_policy(relative, config)
+        ):
+            continue
+        source = project / relative
+        try:
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(project)
+        except (OSError, ValueError):
+            continue
+        if _has_symlink_component(project, source) or not resolved.is_file():
+            continue
+        eligible.append(relative.as_posix())
+    return eligible, is_git
+
+
+def _content_matches_manifest(
+    path: Path,
+    expected_content_id: str,
+    *,
+    clean_blob_id: str = "",
+) -> bool:
+    expected = str(expected_content_id or "").strip().lower()
+    clean_blob = str(clean_blob_id or "").strip().lower()
+    if clean_blob and expected == f"git:{clean_blob}":
+        return True
+    content = path.read_bytes()
+    if expected.startswith("sha256:"):
+        return hashlib.sha256(content).hexdigest() == expected.removeprefix("sha256:")
+    if expected.startswith("git:"):
+        return _git_blob_content_id(expected.removeprefix("git:"), content) == expected
+    return False
+
+
+def assess_graphify_freshness(
+    project_dir: str | Path,
+    generation: _GraphGeneration | None = None,
+) -> GraphifyFreshnessAssessment:
+    project = _project_root(project_dir)
+    checked_at = _now_iso()
+    try:
+        current_generation = generation or _current_graph_or_raise(project)
+        manifest = _read_json_object(current_generation.graph_path.parent / "source-manifest.json")
+        records = manifest.get("files", [])
+        if not isinstance(records, list):
+            raise GraphifySnapshotError("source manifest files must be a list")
+        record_by_path = {
+            str(record.get("path", "") or ""): record
+            for record in records
+            if isinstance(record, Mapping) and str(record.get("path", "") or "")
+        }
+        config = _manifest_config(manifest)
+        current_paths, is_git = _eligible_source_paths(project, config)
+        changed = set(record_by_path).symmetric_difference(current_paths)
+        clean_blob_ids = _git_clean_blob_ids(project) if is_git else {}
+        for relative in sorted(set(record_by_path).intersection(current_paths)):
+            if relative in changed:
+                continue
+            record = record_by_path[relative]
+            source = project / relative
+            try:
+                if os.stat(source, follow_symlinks=False).st_size > config.max_file_bytes:
+                    changed.add(relative)
+                    continue
+            except OSError:
+                changed.add(relative)
+                continue
+            if is_git:
+                if not _content_matches_manifest(
+                    source,
+                    str(record.get("content_id", "") or ""),
+                    clean_blob_id=clean_blob_ids.get(relative, ""),
+                ):
+                    changed.add(relative)
+                continue
+            stat_hint = record.get("stat")
+            if isinstance(stat_hint, Mapping):
+                try:
+                    current_hint = _source_stat_hint(source)
+                    keys = ("size", "mtime_ns", "ctime_ns", "dev", "ino")
+                    if all(int(stat_hint.get(key, -1)) == current_hint[key] for key in keys):
+                        continue
+                except (OSError, TypeError, ValueError):
+                    pass
+            if not _content_matches_manifest(source, str(record.get("content_id", "") or "")):
+                changed.add(relative)
+        state = "stale" if changed else "fresh"
+        reason = f"{len(changed)} controlled source path(s) changed" if changed else "controlled source matches graph manifest"
+        return GraphifyFreshnessAssessment(
+            state=state,
+            graph_fingerprint=current_generation.fingerprint,
+            changed_paths=tuple(sorted(changed)[:10]),
+            checked_at=checked_at,
+            reason=reason,
+        )
+    except Exception as exc:
+        fingerprint = generation.fingerprint if generation is not None else ""
+        return GraphifyFreshnessAssessment(
+            state="unknown",
+            graph_fingerprint=fingerprint,
+            changed_paths=(),
+            checked_at=checked_at,
+            reason="freshness check failed: " + " ".join(str(exc).split())[:300],
+        )
+
+
+def _publish_freshness_assessment(
+    project: Path,
+    assessment: GraphifyFreshnessAssessment,
+) -> None:
+    cache_dir = project_cache_dir(project)
+    with _metadata_lock(cache_dir):
+        current_path = cache_dir / "current.json"
+        current = _read_json_object(current_path)
+        if str(current.get("fingerprint", "") or "") != assessment.graph_fingerprint:
+            return
+        current["freshness"] = assessment.state
+        current["freshness_checked_at"] = assessment.checked_at
+        current["freshness_reason"] = assessment.reason
+        _atomic_write_json(current_path, current)
+        public = read_graphify_project_status(project)
+        if not public or str(public.get("mode", "") or "") == GraphifyMode.OFF.value:
+            return
+        allowed = {field.name for field in dataclasses.fields(GraphifyStatus)}
+        payload = {key: value for key, value in public.items() if key in allowed}
+        payload["freshness"] = assessment.state
+        if assessment.state == "fresh":
+            payload["state"] = GraphifyState.READY.value
+        elif assessment.state == "unknown":
+            payload["state"] = GraphifyState.DEGRADED.value
+        else:
+            payload["state"] = GraphifyState.STALE.value
+        _write_status(project, GraphifyStatus(**payload))
 
 
 def _graph_lists(payload: Mapping[str, Any]) -> tuple[list[Any], list[Any]]:
@@ -1154,6 +1788,57 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return dict(payload) if isinstance(payload, dict) else {}
 
 
+def _validation_file_record(path: Path, *, include_hash: bool = True) -> dict[str, Any]:
+    details = path.stat()
+    record: dict[str, Any] = {
+        "size": int(details.st_size),
+        "mtime_ns": int(details.st_mtime_ns),
+    }
+    if include_hash:
+        record["sha256"] = _hash_file(path)
+    return record
+
+
+def _validation_stamp_is_current(
+    generation_dir: Path,
+    *,
+    metadata: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+) -> bool:
+    validation = _read_json_object(generation_dir / "validation.json")
+    if (
+        str(validation.get("schema", "") or "") != GRAPHIFY_GRAPH_SCHEMA
+        or str(validation.get("graphify_version", "") or "") != GRAPHIFY_VERSION
+        or str(validation.get("adapter_version", "") or "") != GRAPHIFY_ADAPTER_VERSION
+        or str(validation.get("source_fingerprint", "") or "")
+        != str(metadata.get("source_fingerprint", "") or "")
+    ):
+        return False
+    files = validation.get("files", {})
+    if not isinstance(files, Mapping):
+        return False
+    for name in ("graph.json", "source-manifest.json", "metadata.json"):
+        expected = files.get(name)
+        if not isinstance(expected, Mapping):
+            return False
+        try:
+            details = (generation_dir / name).stat()
+        except OSError:
+            return False
+        if (
+            int(expected.get("size", -1) or -1) != int(details.st_size)
+            or int(expected.get("mtime_ns", -1) or -1) != int(details.st_mtime_ns)
+        ):
+            return False
+    if str(files["graph.json"].get("sha256", "") or "") != str(metadata.get("graph_sha256", "") or ""):
+        return False
+    if str(files["source-manifest.json"].get("sha256", "") or "") != str(metadata.get("manifest_sha256", "") or ""):
+        return False
+    if str(manifest.get("source_fingerprint", "") or "") != str(metadata.get("source_fingerprint", "") or ""):
+        return False
+    return True
+
+
 def _validate_cached_generation(
     cache_dir: Path,
     fingerprint: str,
@@ -1175,6 +1860,27 @@ def _validate_cached_generation(
         or str(manifest.get("source_fingerprint", "") or "") != fingerprint
     ):
         return None
+    if _validation_stamp_is_current(
+        generation_dir,
+        metadata=metadata,
+        manifest=manifest,
+    ):
+        try:
+            node_count = int(metadata.get("node_count", 0) or 0)
+            edge_count = int(metadata.get("edge_count", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if node_count < 0 or edge_count < 0:
+            return None
+        return _GraphGeneration(
+            graph_path=graph_path,
+            fingerprint=fingerprint,
+            source_fingerprint=fingerprint,
+            node_count=node_count,
+            edge_count=edge_count,
+            freshness=str(freshness or "fresh"),
+            generated_at=str(metadata.get("generated_at", "") or ""),
+        )
     expected_graph_hash = str(metadata.get("graph_sha256", "") or "").strip()
     expected_manifest_hash = str(metadata.get("manifest_sha256", "") or "").strip()
     try:
@@ -1242,6 +1948,32 @@ def _current_generation(cache_dir: Path) -> _GraphGeneration | None:
     )
 
 
+def _previous_generation(cache_dir: Path) -> _GraphGeneration | None:
+    """Return only the immutable generation immediately before current.
+
+    Unlike ``_current_generation`` this helper never treats the previous graph
+    as a transparent cache fallback.  Callers use it only for explicitly
+    labelled, navigation-only evidence about files deleted by the latest
+    checkpoint.
+    """
+
+    current = _read_json_object(cache_dir / "current.json")
+    if (
+        str(current.get("version", "") or "") != GRAPHIFY_VERSION
+        or str(current.get("schema", "") or "") != GRAPHIFY_GRAPH_SCHEMA
+    ):
+        return None
+    fingerprint = str(current.get("fingerprint", "") or "").strip()
+    previous_fingerprint = str(current.get("previous_fingerprint", "") or "").strip()
+    if not previous_fingerprint or previous_fingerprint == fingerprint:
+        return None
+    return _validate_cached_generation(
+        cache_dir,
+        previous_fingerprint,
+        freshness="old_generation",
+    )
+
+
 def _cleanup_staging(cache_dir: Path, *, max_age_sec: float = 24 * 60 * 60) -> None:
     staging_root = cache_dir / "staging"
     if not staging_root.is_dir():
@@ -1303,6 +2035,23 @@ def _publish_generation(
                 "generated_at": generated_at,
                 "graph_sha256": hashlib.sha256(graph_text.encode("utf-8")).hexdigest(),
                 "manifest_sha256": _hash_file(temporary_dir / "source-manifest.json"),
+            },
+        )
+        metadata_payload = _read_json_object(temporary_dir / "metadata.json")
+        _atomic_write_json(
+            temporary_dir / "validation.json",
+            {
+                "schema": GRAPHIFY_GRAPH_SCHEMA,
+                "graphify_version": GRAPHIFY_VERSION,
+                "adapter_version": GRAPHIFY_ADAPTER_VERSION,
+                "source_fingerprint": snapshot.source_fingerprint,
+                "validated_at": _now_iso(),
+                "files": {
+                    name: _validation_file_record(temporary_dir / name)
+                    for name in ("graph.json", "source-manifest.json", "metadata.json")
+                },
+                "node_count": int(metadata_payload.get("node_count", 0) or 0),
+                "edge_count": int(metadata_payload.get("edge_count", 0) or 0),
             },
         )
         if generation_dir.exists():
@@ -1378,6 +2127,12 @@ def _build_or_refresh_graph(
             )
             snapshot = create_graphify_snapshot(project, source_dir, config=config)
             if previous and previous.source_fingerprint == snapshot.source_fingerprint:
+                current_payload = _read_json_object(cache_dir / "current.json")
+                if str(current_payload.get("fingerprint", "") or "") == previous.fingerprint:
+                    current_payload["freshness"] = "fresh"
+                    current_payload["freshness_checked_at"] = _now_iso()
+                    current_payload["freshness_reason"] = "checkpoint source matches current graph"
+                    _atomic_write_json(cache_dir / "current.json", current_payload)
                 return dataclasses.replace(previous, freshness="fresh")
             _write_status(
                 project,
@@ -1453,12 +2208,45 @@ def _node_label(node: Mapping[str, Any], index: int) -> str:
     return _node_identity(node, index)
 
 
+def _node_line_number(node: Mapping[str, Any]) -> int | None:
+    containers = [node]
+    metadata = node.get("metadata")
+    if isinstance(metadata, Mapping):
+        containers.append(metadata)
+    location = node.get("source_location")
+    if isinstance(location, Mapping):
+        containers.append(location)
+    for container in containers:
+        for key in ("start_line", "line_start", "line", "lineno", "line_number"):
+            value = container.get(key)
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                return number
+    return None
+
+
 def _edge_relation(edge: Mapping[str, Any]) -> str:
     for key in ("relation", "type", "kind", "label"):
         value = edge.get(key)
         if value is not None and str(value).strip():
             return str(value).strip()
     return "related_to"
+
+
+def _edge_evidence_kind(edge: Mapping[str, Any]) -> str:
+    values = " ".join(
+        str(edge.get(key, "") or "")
+        for key in ("confidence", "provenance", "evidence", "status", "kind")
+    ).lower()
+    relation = _edge_relation(edge).lower()
+    if "ambig" in values or "ambig" in relation:
+        return "AMBIGUOUS"
+    if "infer" in values or "infer" in relation:
+        return "INFERRED"
+    return "EXTRACTED"
 
 
 def _relative_graph_path(raw_path: str, *, graph_path: Path) -> str:
@@ -1535,6 +2323,94 @@ def _normalize_text_seeds(values: Sequence[str] | None) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+def _old_generation_deleted_candidates(
+    *,
+    project: Path,
+    generation: _GraphGeneration | None,
+    deleted_files: Sequence[str],
+) -> tuple[str, ...]:
+    """Extract bounded old incoming-edge candidates for deleted source files.
+
+    Every returned item is deliberately labelled OLD_GENERATION/AMBIGUOUS.
+    The previous graph can only guide inspection; it cannot establish a fact
+    about the current source tree.
+    """
+
+    if generation is None or not deleted_files:
+        return ()
+    payload, _, _ = _load_and_validate_graph(generation.graph_path)
+    raw_nodes, raw_edges = _graph_lists(payload)
+    nodes = [item for item in raw_nodes if isinstance(item, Mapping)]
+    deleted = {
+        normalized
+        for value in deleted_files
+        if (normalized := _normalize_project_relative_path(project, value))
+    }
+    if not deleted:
+        return ()
+
+    reference_to_node: dict[str, tuple[Mapping[str, Any], int]] = {}
+    deleted_references: set[str] = set()
+    deleted_nodes: list[tuple[Mapping[str, Any], int]] = []
+    for index, node in enumerate(nodes):
+        path = _normalize_project_relative_path(
+            project,
+            _relative_graph_path(_node_source_path(node), graph_path=generation.graph_path),
+        )
+        references = _node_references(node)
+        for reference in references:
+            reference_to_node[reference] = (node, index)
+        if path in deleted:
+            deleted_nodes.append((node, index))
+            deleted_references.update(references)
+    if not deleted_references:
+        return ()
+
+    def render_node(reference: str) -> str:
+        item = reference_to_node.get(reference)
+        if item is None:
+            return reference
+        node, index = item
+        label = _node_label(node, index)
+        path = _normalize_project_relative_path(
+            project,
+            _relative_graph_path(_node_source_path(node), graph_path=generation.graph_path),
+        )
+        line = _node_line_number(node)
+        location = f"{path}:L{line}" if path and line else path
+        return f"{label} ({location})" if location else label
+
+    candidates: list[str] = []
+    for edge in raw_edges:
+        if not isinstance(edge, Mapping):
+            continue
+        source = _edge_end(edge, _EDGE_SOURCE_KEYS)
+        target = _edge_end(edge, _EDGE_TARGET_KEYS)
+        if not source or target not in deleted_references or source in deleted_references:
+            continue
+        rendered = (
+            "[OLD_GENERATION][AMBIGUOUS] possible old caller: "
+            f"{render_node(source)} --{_edge_relation(edge)}--> {render_node(target)}"
+        )
+        if rendered not in candidates:
+            candidates.append(rendered)
+        if len(candidates) >= 3:
+            break
+    if candidates:
+        return tuple(candidates)
+
+    # Some parsers expose a deleted node but no resolvable incoming edge.  Keep
+    # that bounded navigation clue explicit instead of fabricating a caller.
+    for node, index in deleted_nodes[:3]:
+        references = _node_references(node)
+        reference = references[0] if references else _node_identity(node, index)
+        candidates.append(
+            "[OLD_GENERATION][AMBIGUOUS] deleted node without resolved old caller: "
+            + render_node(reference)
+        )
+    return tuple(candidates)
+
+
 def _prompt_file_references(project: Path, prompt: str) -> tuple[str, ...]:
     references: list[str] = []
     for match in _PROMPT_FILE_REFERENCE_RE.finditer(str(prompt or "")):
@@ -1573,59 +2449,160 @@ def _path_seed_score(node_path: str, seeds: Sequence[str], *, exact_score: int) 
     return best
 
 
-def _routed_module_candidates(project: Path, related_paths: Sequence[str]) -> tuple[str, ...]:
-    repo_map_path = project / "docs" / "repo_map.json"
-    try:
-        resolved_repo_map = repo_map_path.resolve(strict=True)
-        resolved_repo_map.relative_to(project)
-        payload = json.loads(resolved_repo_map.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError, json.JSONDecodeError):
-        return ()
-    modules = payload.get("modules", []) if isinstance(payload, Mapping) else []
-    if not isinstance(modules, list):
-        return ()
-    normalized_related = _normalize_path_seeds(project, related_paths)
-    candidates: list[str] = []
-    for module in modules:
-        if not isinstance(module, Mapping):
-            continue
-        module_id = str(module.get("id", "") or "").strip()
-        owned_paths = module.get("owned_paths", [])
-        if not module_id or not isinstance(owned_paths, list):
-            continue
-        matched_paths: list[str] = []
-        for owned in owned_paths:
-            if not isinstance(owned, Mapping):
-                continue
-            owned_path = _normalize_project_relative_path(project, str(owned.get("path", "") or ""))
-            match_kind = str(owned.get("match", owned.get("type", "")) or "").strip().lower()
-            if not owned_path or match_kind not in {"exact", "subtree"}:
-                continue
-            for related in normalized_related:
-                matched = related == owned_path
-                if match_kind == "subtree":
-                    matched = matched or related.startswith(owned_path.rstrip("/") + "/")
-                if matched and related not in matched_paths:
-                    matched_paths.append(related)
-        if matched_paths:
-            rendered_paths = ", ".join(matched_paths[:3])
-            candidates.append(f"{module_id} <- {rendered_paths} [needs_code_confirmation]")
-        if len(candidates) >= 12:
+def _safe_query_value(value: str, *, max_chars: int = 160) -> str:
+    text = " ".join(str(value or "").replace("`", "").split())
+    return text[:max_chars].strip()
+
+
+def _query_suggestions(
+    *,
+    context: GraphifyTurnContext | None,
+    routed_paths: Sequence[str],
+    changed_files: Sequence[str],
+    deleted_files: Sequence[str],
+    previous_deleted_files: Sequence[str],
+    symbols: Sequence[str],
+    query_seeds: Sequence[str],
+    prompt_file_references: Sequence[str],
+    path_degrees: Mapping[str, int] | None = None,
+) -> tuple[GraphifyQuerySuggestion, ...]:
+    intent = context.intent if context is not None else GraphifyQueryIntent.CODE_FACT_DISCOVERY
+    degrees = path_degrees or {}
+
+    def ordered_paths(values: Sequence[str]) -> tuple[str, ...]:
+        unique = {
+            safe
+            for value in values
+            if (safe := _safe_query_value(value))
+        }
+        return tuple(sorted(unique, key=lambda path: (-int(degrees.get(path, 0) or 0), path)))
+
+    deleted_ordered = ordered_paths(deleted_files)
+    previous_deleted_ordered = ordered_paths(previous_deleted_files)
+    changed_ordered = tuple(
+        path for path in ordered_paths(changed_files) if path not in deleted_ordered
+    )
+    routed_ordered = tuple(path for path in ordered_paths(routed_paths) if path not in changed_ordered)
+    prompt_ordered = tuple(
+        path
+        for path in ordered_paths(prompt_file_references)
+        if path not in changed_ordered and path not in routed_ordered
+    )
+    paths = (*changed_ordered, *routed_ordered, *prompt_ordered)
+    symbol_values = tuple(
+        dict.fromkeys(_safe_query_value(value) for value in symbols if _safe_query_value(value))
+    )
+    broad_seeds: list[str] = []
+    if context is not None:
+        broad_seeds.extend((context.requirement_name, context.task_name))
+    broad_seeds.extend(query_seeds)
+    broad = " ".join(
+        dict.fromkeys(_safe_query_value(value, max_chars=80) for value in broad_seeds if _safe_query_value(value, max_chars=80))
+    )[:240].strip()
+    candidates: list[GraphifyQuerySuggestion] = []
+
+    def add(
+        command: str,
+        values: Sequence[str],
+        purpose: str,
+        *,
+        generation_scope: str = "current",
+    ) -> None:
+        normalized = tuple(_safe_query_value(value) for value in values if _safe_query_value(value))
+        if command != "god-nodes" and not normalized:
+            return
+        suggestion = GraphifyQuerySuggestion(
+            command=command,
+            values=normalized,
+            purpose=purpose,
+            generation_scope=generation_scope,
+        )
+        if suggestion not in candidates:
+            candidates.append(suggestion)
+
+    impact_intents = {
+        GraphifyQueryIntent.REQUIREMENT_IMPACT,
+        GraphifyQueryIntent.TASK_DEPENDENCY,
+        GraphifyQueryIntent.CHANGE_REVIEW,
+        GraphifyQueryIntent.WHOLE_CHANGE_REVIEW,
+    }
+    if intent in impact_intents and previous_deleted_ordered:
+        add(
+            "affected",
+            (previous_deleted_ordered[0],),
+            "从上一代不可变图检查已删除路径的旧调用者候选；结果不是当前代码事实",
+            generation_scope="previous",
+        )
+    if intent in impact_intents and paths:
+        add("affected", (paths[0],), "检查当前变更或目标路径的静态影响候选")
+    if intent == GraphifyQueryIntent.IMPLEMENTATION and symbol_values:
+        add("explain", (symbol_values[0],), "定位当前实现符号及其直接关系")
+    if intent == GraphifyQueryIntent.CODE_FACT_DISCOVERY and symbol_values:
+        add("explain", (symbol_values[0],), "在询问人类前核对可从代码确认的事实")
+    path_seeds = (*symbol_values, *paths)
+    if intent in {
+        GraphifyQueryIntent.CODE_FACT_DISCOVERY,
+        GraphifyQueryIntent.REQUIREMENT_IMPACT,
+        GraphifyQueryIntent.ARCHITECTURE_BOUNDARY,
+        GraphifyQueryIntent.TASK_DEPENDENCY,
+        GraphifyQueryIntent.IMPLEMENTATION,
+        GraphifyQueryIntent.CHANGE_REVIEW,
+        GraphifyQueryIntent.WHOLE_CHANGE_REVIEW,
+    } and len(path_seeds) >= 2:
+        add("path", path_seeds[:2], "检查两个明确节点之间的静态关系路径")
+    if broad:
+        add("query", (broad,), "补充当前需求或任务的相关代码候选")
+    if intent in {GraphifyQueryIntent.ROUTING_DISCOVERY, GraphifyQueryIntent.ARCHITECTURE_BOUNDARY}:
+        add("god-nodes", (), "发现高连接节点，仅作为扩大代码阅读范围的候选")
+    if not candidates and paths:
+        add("affected", (paths[0],), "检查目标路径的静态影响候选")
+    if not candidates and symbol_values:
+        add("explain", (symbol_values[0],), "查看目标符号的静态关系")
+    return tuple(candidates[:3])
+
+
+def _render_bounded_evidence(
+    sections: Sequence[tuple[str, Sequence[str]]],
+    *,
+    required_tail: Sequence[str],
+) -> str:
+    end = "[End Graphify Code Graph Evidence]"
+    truncation = "- [truncated within evidence budget]"
+    output: list[str] = []
+    truncated = False
+    for heading, lines in sections:
+        section_lines = ([heading] if heading else []) + list(lines)
+        for line in section_lines:
+            candidate = "\n".join((*output, line, *required_tail, end))
+            if len(candidate) > GRAPHIFY_EVIDENCE_MAX_CHARS:
+                truncated = True
+                break
+            output.append(line)
+        if truncated:
             break
-    return tuple(candidates)
+    if truncated:
+        while output and len("\n".join((*output, truncation, *required_tail, end))) > GRAPHIFY_EVIDENCE_MAX_CHARS:
+            output.pop()
+        output.append(truncation)
+    output.extend(required_tail)
+    output.append(end)
+    return "\n".join(output)
 
 
 def _build_evidence(
     *,
     project: Path,
     generation: _GraphGeneration,
+    previous_generation: _GraphGeneration | None,
     prompt: str,
     runtime_dir: Path | None,
     routed_paths: Sequence[str] = (),
     changed_files: Sequence[str] = (),
+    deleted_files: Sequence[str] = (),
     symbols: Sequence[str] = (),
     query_seeds: Sequence[str] = (),
     prompt_file_references: Sequence[str] = (),
+    turn_context: GraphifyTurnContext | None = None,
 ) -> GraphifyEvidence:
     payload, _, _ = _load_and_validate_graph(generation.graph_path)
     raw_nodes, raw_edges = _graph_lists(payload)
@@ -1639,7 +2616,8 @@ def _build_evidence(
     for index, node in enumerate(nodes):
         identity = _node_identity(node, index)
         label = _node_label(node, index)
-        identity_to_label[identity] = label
+        for reference in _node_references(node):
+            identity_to_label[reference] = label
         raw_path = _normalize_project_relative_path(
             project,
             _relative_graph_path(_node_source_path(node), graph_path=generation.graph_path),
@@ -1670,7 +2648,11 @@ def _build_evidence(
             scored.append((0, degree_hint, node))
     scored.sort(key=lambda item: (item[0], item[1], _node_label(item[2], 0)), reverse=True)
     selected_nodes = [item[2] for item in scored[:12]]
-    selected_ids = {_node_identity(node, nodes.index(node)) for node in selected_nodes}
+    selected_ids = {
+        reference
+        for node in selected_nodes
+        for reference in _node_references(node)
+    }
     extracted_nodes: list[str] = []
     related_paths: list[str] = []
     for node in selected_nodes:
@@ -1680,12 +2662,15 @@ def _build_evidence(
             project,
             _relative_graph_path(_node_source_path(node), graph_path=generation.graph_path),
         )
-        rendered = f"{label} ({path})" if path else label
+        line = _node_line_number(node)
+        rendered_path = f"{path}:L{line}" if path and line else path
+        rendered = f"{label} ({rendered_path})" if rendered_path else label
         if rendered not in extracted_nodes:
             extracted_nodes.append(rendered)
         if path and path not in related_paths:
             related_paths.append(path)
     extracted_edges: list[str] = []
+    ambiguous: list[str] = []
     inferred: list[str] = []
     for edge in edges:
         source = _edge_end(edge, _EDGE_SOURCE_KEYS)
@@ -1696,55 +2681,176 @@ def _build_evidence(
         source_label = identity_to_label.get(source, source)
         target_label = identity_to_label.get(target, target)
         rendered = f"{source_label} --{relation}--> {target_label}"
-        confidence = str(edge.get("confidence", edge.get("provenance", "")) or "").lower()
-        if "infer" in confidence or "infer" in relation.lower():
+        evidence_kind = _edge_evidence_kind(edge)
+        if evidence_kind == "INFERRED":
             if rendered not in inferred and len(inferred) < 3:
                 inferred.append(rendered)
+        elif evidence_kind == "AMBIGUOUS":
+            if rendered not in ambiguous and len(ambiguous) < 3:
+                ambiguous.append(rendered)
         elif rendered not in extracted_edges and len(extracted_edges) < 20:
             extracted_edges.append(rendered)
-        if len(extracted_edges) >= 20 and len(inferred) >= 3:
+        if len(extracted_edges) >= 20 and len(ambiguous) >= 3 and len(inferred) >= 3:
             break
-    routed_candidates = _routed_module_candidates(project, related_paths)
+    reference_degrees: dict[str, int] = {}
+    for edge in edges:
+        source = _edge_end(edge, _EDGE_SOURCE_KEYS)
+        target = _edge_end(edge, _EDGE_TARGET_KEYS)
+        if source:
+            reference_degrees[source] = reference_degrees.get(source, 0) + 1
+        if target:
+            reference_degrees[target] = reference_degrees.get(target, 0) + 1
+    path_degrees: dict[str, int] = {}
+    for index, node in enumerate(nodes):
+        path = _normalize_project_relative_path(
+            project,
+            _relative_graph_path(_node_source_path(node), graph_path=generation.graph_path),
+        )
+        if not path:
+            continue
+        explicit_degree = int(node.get("degree", 0) or 0) if str(node.get("degree", 0) or "0").isdigit() else 0
+        observed_degree = max((reference_degrees.get(reference, 0) for reference in _node_references(node)), default=0)
+        path_degrees[path] = max(path_degrees.get(path, 0), explicit_degree, observed_degree)
+    current_manifest_paths = _manifest_path_set(
+        generation.graph_path.parent / "source-manifest.json"
+    )
+    previous_manifest_paths = (
+        _manifest_path_set(previous_generation.graph_path.parent / "source-manifest.json")
+        if previous_generation is not None
+        else set()
+    )
+    previous_deleted_files = tuple(
+        path
+        for path in deleted_files
+        if path in previous_manifest_paths and path not in current_manifest_paths
+    )
+    suggestions = _query_suggestions(
+        context=turn_context,
+        routed_paths=routed_paths,
+        changed_files=changed_files,
+        deleted_files=deleted_files,
+        previous_deleted_files=previous_deleted_files,
+        symbols=symbols,
+        query_seeds=query_seeds,
+        prompt_file_references=prompt_file_references,
+        path_degrees=path_degrees,
+    )
+    old_generation_candidates = _old_generation_deleted_candidates(
+        project=project,
+        generation=previous_generation,
+        deleted_files=previous_deleted_files,
+    )
+    context_payload = {}
+    if turn_context is not None:
+        context_payload = {
+            "stage_key": turn_context.stage_key,
+            "phase": turn_context.phase,
+            "role": turn_context.role,
+            "intent": turn_context.intent.value,
+            "requirement_name": turn_context.requirement_name,
+            "task_name": turn_context.task_name,
+        }
     evidence_seed_payload = json.dumps(
         {
             "prompt": prompt,
             "routed_paths": list(routed_paths),
             "changed_files": list(changed_files),
+            "deleted_files": list(deleted_files),
             "symbols": list(symbols),
             "query_seeds": list(query_seeds),
             "prompt_file_references": list(prompt_file_references),
+            "turn_context": context_payload,
         },
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     )
+    previous_fingerprint = previous_generation.fingerprint if previous_generation is not None else ""
     evidence_id = hashlib.sha256(
-        f"{generation.fingerprint}\0{evidence_seed_payload}".encode("utf-8")
+        f"{generation.fingerprint}\0{previous_fingerprint}\0{evidence_seed_payload}".encode("utf-8")
     ).hexdigest()[:20]
-    lines = [
-        "[Graphify Code Graph Evidence]",
+    intent_text = turn_context.intent.value if turn_context is not None else "code_fact_discovery"
+    header = [
         f"- evidence_id: {evidence_id}",
         f"- graph_fingerprint: {generation.fingerprint[:16]}",
         f"- freshness: {generation.freshness}",
-        "- authority: navigation evidence only; code/tests/config and AI Hermes routing remain authoritative",
+        f"- query_intent: {intent_text}",
+        "- authority: navigation evidence only; code/tests/config and AI Hermes routing remains authoritative",
         "- limitation: static extraction cannot prove dynamic import, reflection, generated code, runtime config, or cross-service behavior",
-        "EXTRACTED:",
     ]
-    lines.extend(f"- node: {item}" for item in extracted_nodes)
-    lines.extend(f"- edge: {item}" for item in extracted_edges)
+    guide = [
+        GRAPHIFY_FULL_GUIDE_MARKER,
+        "- Query only when the injected evidence is insufficient; do not query on every turn.",
+        '- `"$TMUX_GRAPHIFY_CMD" query "<question>"`',
+        '- `"$TMUX_GRAPHIFY_CMD" affected "<file-or-symbol>"`',
+        '- For a ledger-confirmed deleted path only: `"$TMUX_GRAPHIFY_CMD" affected "<deleted-file>" --previous`',
+        '- `"$TMUX_GRAPHIFY_CMD" path "<source>" "<target>"`',
+        '- `"$TMUX_GRAPHIFY_CMD" explain "<symbol>"`',
+        '- `"$TMUX_GRAPHIFY_CMD" god-nodes`',
+        "- Query output reports fresh/stale/unknown; stale or unknown results are old navigation evidence and require source verification.",
+        "- The wrapper is read-only and rejects setup, build, update, prune, install, hooks, watch, serve, global, and write operations.",
+    ]
+    recommendation_lines = [
+        f"- `{suggestion.shell_command}` — {suggestion.purpose}"
+        for suggestion in suggestions
+    ] or ["- No concrete query is recommended for this turn."]
+    old_generation_sections: list[tuple[str, Sequence[str]]] = []
+    if old_generation_candidates:
+        old_generation_sections.append((
+            "OLD_GENERATION_CANDIDATES (previous immutable graph; current code confirmation required):",
+            [
+                f"- old_graph_fingerprint: {previous_fingerprint[:16]}",
+                *[f"- {item}" for item in old_generation_candidates],
+            ],
+        ))
+    full_sections: list[tuple[str, Sequence[str]]] = [
+        ("[Graphify Code Graph Evidence]", header),
+        ("FURTHER_QUERY (optional; read-only):", guide),
+        ("RECOMMENDED_QUERIES (optional; max 3):", recommendation_lines),
+        *old_generation_sections,
+        ("EXTRACTED:", [
+            *[f"- [EXTRACTED] node: {item}" for item in extracted_nodes],
+            *[f"- [EXTRACTED] edge: {item}" for item in extracted_edges],
+        ]),
+    ]
+    compact_sections: list[tuple[str, Sequence[str]]] = [
+        ("[Graphify Code Graph Evidence]", header),
+        ("GRAPHIFY_REMINDER:", [
+            "- Optional read-only wrapper is available; query only when current evidence is insufficient.",
+            "- Verify every graph result against AGENTS.md, source, tests, and config.",
+        ]),
+        ("RECOMMENDED_QUERIES (optional; max 3):", recommendation_lines),
+        *old_generation_sections,
+        ("EXTRACTED:", [
+            *[f"- [EXTRACTED] node: {item}" for item in extracted_nodes],
+            *[f"- [EXTRACTED] edge: {item}" for item in extracted_edges],
+        ]),
+    ]
+    optional_sections: list[tuple[str, Sequence[str]]] = []
     if related_paths:
-        lines.append("RELATED_PATHS:")
-        lines.extend(f"- {path}" for path in related_paths[:20])
-    if routed_candidates:
-        lines.append("ROUTED_MODULE_CANDIDATES (needs_code_confirmation; AI Hermes routing remains authoritative):")
-        lines.extend(f"- {candidate}" for candidate in routed_candidates)
+        optional_sections.append(("RELATED_PATHS:", [f"- {path}" for path in related_paths[:20]]))
+    if ambiguous:
+        optional_sections.append((
+            "AMBIGUOUS_CANDIDATES (must confirm in code):",
+            [f"- [AMBIGUOUS] {item}" for item in ambiguous[:3]],
+        ))
     if inferred:
-        lines.append("INFERRED_CANDIDATES (must confirm in code):")
-        lines.extend(f"- {item}" for item in inferred[:3])
-    lines.append("[End Graphify Code Graph Evidence]")
-    block_text = "\n".join(lines)
-    if len(block_text) > GRAPHIFY_EVIDENCE_MAX_CHARS:
-        block_text = block_text[: GRAPHIFY_EVIDENCE_MAX_CHARS - 80].rstrip() + "\n- [truncated within evidence budget]\n[End Graphify Code Graph Evidence]"
+        optional_sections.append((
+            "INFERRED_CANDIDATES (must confirm in code):",
+            [f"- [INFERRED] {item}" for item in inferred[:3]],
+        ))
+    verification_tail = [
+        "VERIFY_BEFORE_ACTING:",
+        "- Treat graph results as navigation candidates; verify them in AGENTS.md (when present), source, tests, and config before acting.",
+    ]
+    block_text = _render_bounded_evidence(
+        [*full_sections, *optional_sections],
+        required_tail=verification_tail,
+    )
+    compact_block_text = _render_bounded_evidence(
+        [*compact_sections, *optional_sections],
+        required_tail=verification_tail,
+    )
     report_path = ""
     if runtime_dir is not None:
         try:
@@ -1762,11 +2868,16 @@ def _build_evidence(
         freshness=generation.freshness,
         extracted_nodes=tuple(extracted_nodes),
         extracted_edges=tuple(extracted_edges),
+        ambiguous_candidates=tuple(ambiguous),
         inferred_candidates=tuple(inferred),
+        old_generation_candidates=old_generation_candidates,
+        old_generation_fingerprint=previous_fingerprint,
         related_paths=tuple(related_paths[:20]),
-        routed_module_candidates=routed_candidates,
+        routed_module_candidates=(),
         report_path=report_path,
         block_text=block_text,
+        compact_block_text=compact_block_text,
+        suggestions=suggestions,
     )
 
 
@@ -1780,23 +2891,42 @@ def resolve_graphify_turn_profile(
     refresh: bool = True,
     routed_paths: Sequence[str | Path] | None = None,
     changed_files: Sequence[str | Path] | None = None,
+    deleted_files: Sequence[str | Path] | None = None,
     symbols: Sequence[str] | None = None,
     query_seeds: Sequence[str] | None = None,
+    turn_context: GraphifyTurnContext | None = None,
 ) -> GraphifyTurnProfile:
     normalized_mode = normalize_graphify_mode(mode)
     project = _project_root(project_dir)
+    # Runner generation registration owns the single query-count reset.
+    # Refreshing a graph checkpoint in that same runner must retain the
+    # aggregate instead of making every worker appear to start a new stage.
+    query_aggregate_fields = _query_aggregate_fields(project, reset=False)
     runtime_path = Path(runtime_dir) if runtime_dir is not None else None
-    normalized_routed_paths = _normalize_path_seeds(project, routed_paths)
-    normalized_changed_files = _normalize_path_seeds(project, changed_files)
-    normalized_symbols = _normalize_text_seeds(symbols)
-    normalized_query_seeds = _normalize_text_seeds(query_seeds)
+    context_routed_paths = turn_context.routed_paths if turn_context is not None else ()
+    context_changed_files = turn_context.changed_files if turn_context is not None else ()
+    context_deleted_files = turn_context.deleted_files if turn_context is not None else ()
+    context_symbols = turn_context.symbols if turn_context is not None else ()
+    context_query_seeds = turn_context.query_seeds if turn_context is not None else ()
+    explicit_routed = (routed_paths,) if isinstance(routed_paths, (str, Path)) else tuple(routed_paths or ())
+    explicit_changed = (changed_files,) if isinstance(changed_files, (str, Path)) else tuple(changed_files or ())
+    explicit_deleted = (deleted_files,) if isinstance(deleted_files, (str, Path)) else tuple(deleted_files or ())
+    explicit_symbols = (symbols,) if isinstance(symbols, str) else tuple(symbols or ())
+    explicit_query_seeds = (query_seeds,) if isinstance(query_seeds, str) else tuple(query_seeds or ())
+    normalized_routed_paths = _normalize_path_seeds(project, (*context_routed_paths, *explicit_routed))
+    normalized_changed_files = _normalize_path_seeds(project, (*context_changed_files, *explicit_changed))
+    normalized_deleted_files = _normalize_path_seeds(project, (*context_deleted_files, *explicit_deleted))
+    normalized_symbols = _normalize_text_seeds((*context_symbols, *explicit_symbols))
+    normalized_query_seeds = _normalize_text_seeds((*context_query_seeds, *explicit_query_seeds))
     prompt_references = _prompt_file_references(project, prompt)
     profile_seed_fields = {
         "routed_paths": normalized_routed_paths,
         "changed_files": normalized_changed_files,
+        "deleted_files": normalized_deleted_files,
         "symbols": normalized_symbols,
         "query_seeds": normalized_query_seeds,
         "prompt_file_references": prompt_references,
+        "turn_context": turn_context,
     }
     if normalized_mode == GraphifyMode.OFF:
         status = GraphifyStatus(mode=normalized_mode.value, state=GraphifyState.OFF.value)
@@ -1822,6 +2952,7 @@ def resolve_graphify_turn_profile(
                 state=GraphifyState.FAILED.value,
                 version=GRAPHIFY_VERSION,
                 last_error=resolution.error,
+                **query_aggregate_fields,
             )
             _write_status(project, status)
             raise GraphifyUnavailable(resolution.error)
@@ -1845,6 +2976,7 @@ def resolve_graphify_turn_profile(
                     state=GraphifyState.FAILED.value,
                     version=resolution.version,
                     last_error=error_text,
+                    **query_aggregate_fields,
                 )
                 _write_status(project, status)
                 raise
@@ -1859,6 +2991,7 @@ def resolve_graphify_turn_profile(
                 state=GraphifyState.FAILED.value,
                 version=resolution.version,
                 last_error=error_text,
+                **query_aggregate_fields,
             )
             _write_status(project, status)
             raise GraphifyUnavailable(error_text)
@@ -1872,20 +3005,31 @@ def resolve_graphify_turn_profile(
             state=state,
             version=resolution.version,
             last_error=error_text,
+            **query_aggregate_fields,
         )
         _write_status(project, status)
         return GraphifyTurnProfile(mode=normalized_mode.value, status=status, **profile_seed_fields)
     try:
+        previous_generation = (
+            _previous_generation(project_cache_dir(project))
+            if normalized_deleted_files
+            else None
+        )
+        if previous_generation is not None and previous_generation.fingerprint == generation.fingerprint:
+            previous_generation = None
         evidence = _build_evidence(
             project=project,
             generation=generation,
+            previous_generation=previous_generation,
             prompt=prompt,
             runtime_dir=runtime_path,
             routed_paths=normalized_routed_paths,
             changed_files=normalized_changed_files,
+            deleted_files=normalized_deleted_files,
             symbols=normalized_symbols,
             query_seeds=normalized_query_seeds,
             prompt_file_references=prompt_references,
+            turn_context=turn_context,
         )
     except GraphifyError as exc:
         if normalized_mode == GraphifyMode.REQUIRED:
@@ -1900,6 +3044,7 @@ def resolve_graphify_turn_profile(
             node_count=generation.node_count,
             edge_count=generation.edge_count,
             last_error=str(exc),
+            **query_aggregate_fields,
         )
         _write_status(project, status)
         return GraphifyTurnProfile(mode=normalized_mode.value, status=status, **profile_seed_fields)
@@ -1918,20 +3063,32 @@ def resolve_graphify_turn_profile(
         inferred_count=len(evidence.inferred_candidates),
         report_path=evidence.report_path,
         last_error=error_text,
+        **query_aggregate_fields,
     )
     _write_status(project, status)
     return GraphifyTurnProfile(
         mode=normalized_mode.value,
         evidence=evidence,
         status=status,
+        suggestions=evidence.suggestions,
         **profile_seed_fields,
     )
 
 
-def build_graphify_evidence_block(profile: GraphifyTurnProfile, business_prompt: str) -> str:
+def build_graphify_evidence_block(
+    profile: GraphifyTurnProfile,
+    business_prompt: str,
+    *,
+    include_full_guide: bool = True,
+) -> str:
     if not isinstance(profile, GraphifyTurnProfile) or not profile.enabled or profile.evidence is None:
         return str(business_prompt or "").strip()
-    return f"{profile.evidence.block_text}\n\n{str(business_prompt or '').strip()}".strip()
+    evidence_text = (
+        profile.evidence.block_text
+        if include_full_guide
+        else profile.evidence.compact_block_text or profile.evidence.block_text
+    )
+    return f"{evidence_text}\n\n{str(business_prompt or '').strip()}".strip()
 
 
 def graphify_turn_context_block(profile: GraphifyTurnProfile) -> TurnContextBlock | None:
@@ -1963,10 +3120,12 @@ def setup_managed_graphify() -> GraphifyToolResolution:
         if current.compatible:
             _clear_tool_resolution_cache()
             return current
-        staging = data_root / f".{GRAPHIFY_VERSION}.{uuid.uuid4().hex}.tmp"
         backup = data_root / f".{GRAPHIFY_VERSION}.{uuid.uuid4().hex}.bak"
-        environment = _sanitized_graphify_env({"UV_PROJECT_ENVIRONMENT": str(staging)})
+        environment = _sanitized_graphify_env({"UV_PROJECT_ENVIRONMENT": str(target)})
+        installed_result = GraphifyToolResolution()
         try:
+            if target.exists():
+                os.replace(target, backup)
             try:
                 _run_graphify_process(
                     [uv, "sync", "--project", str(tool_project), "--locked", "--python", "3.11", "--no-dev"],
@@ -1977,28 +3136,19 @@ def setup_managed_graphify() -> GraphifyToolResolution:
             except GraphifyBuildFailed as exc:
                 raise GraphifyUnavailable(f"managed Graphify setup failed: {exc}") from exc
             scripts_dir = "Scripts" if os.name == "nt" else "bin"
-            staged_executable = staging / scripts_dir / ("graphify.exe" if os.name == "nt" else "graphify")
-            staged_result = _probe_tool(staged_executable, source="managed-staging")
-            if not staged_result.compatible:
-                raise GraphifyUnavailable(staged_result.error or "managed Graphify contract probe failed")
-            if target.exists():
-                os.replace(target, backup)
-            try:
-                os.replace(staging, target)
-            except BaseException:
-                if backup.exists() and not target.exists():
-                    os.replace(backup, target)
-                raise
+            installed_executable = target / scripts_dir / ("graphify.exe" if os.name == "nt" else "graphify")
+            installed_result = _probe_tool(installed_executable, source="managed")
+            if not installed_result.compatible:
+                raise GraphifyUnavailable(installed_result.error or "managed Graphify contract probe failed")
+        except BaseException:
+            shutil.rmtree(target, ignore_errors=True)
+            if backup.exists():
+                os.replace(backup, target)
+            raise
+        else:
             shutil.rmtree(backup, ignore_errors=True)
-        finally:
-            shutil.rmtree(staging, ignore_errors=True)
-            if backup.exists() and target.exists():
-                shutil.rmtree(backup, ignore_errors=True)
         _clear_tool_resolution_cache()
-        result = _probe_tool(managed_graphify_executable(), source="managed")
-        if not result.compatible:
-            raise GraphifyUnavailable(result.error or "managed Graphify contract probe failed")
-        return result
+        return installed_result
 
 
 def _current_graph_or_raise(project_dir: str | Path) -> _GraphGeneration:
@@ -2008,38 +3158,400 @@ def _current_graph_or_raise(project_dir: str | Path) -> _GraphGeneration:
     return generation
 
 
+def _previous_graph_for_deleted_target(
+    project: Path,
+    target: str,
+) -> tuple[_GraphGeneration, str]:
+    """Resolve the previous graph only for a path deleted since that graph."""
+
+    cache_dir = project_cache_dir(project)
+    current_payload = _read_json_object(cache_dir / "current.json")
+    current_fingerprint = str(current_payload.get("fingerprint", "") or "").strip()
+    current = _validate_cached_generation(
+        cache_dir,
+        current_fingerprint,
+        freshness=str(current_payload.get("freshness", "fresh") or "fresh"),
+    )
+    previous = _previous_generation(cache_dir)
+    if current is None or previous is None:
+        raise GraphifyUnavailable("当前项目没有可查询的上一代不可变 Graphify 图")
+    raw_target = str(target or "").strip()
+    raw_path = Path(raw_target).expanduser()
+    if raw_path.is_absolute() or ".." in raw_path.parts:
+        raise GraphifyUnavailable("--previous affected 只接受项目内已删除源码相对路径")
+    relative = _normalize_project_relative_path(project, raw_target)
+    if not relative or not _is_source_path(Path(relative)):
+        raise GraphifyUnavailable("--previous affected 只接受项目内已删除源码相对路径")
+    if (project / relative).exists():
+        raise GraphifyUnavailable("--previous affected 拒绝仍存在于当前项目的源码路径")
+    current_paths = _manifest_path_set(current.graph_path.parent / "source-manifest.json")
+    previous_paths = _manifest_path_set(previous.graph_path.parent / "source-manifest.json")
+    if relative in current_paths or relative not in previous_paths:
+        raise GraphifyUnavailable("目标路径没有通过 current/previous manifest 删除校验")
+    return previous, relative
+
+
 def _sanitize_query_output(text: str, *, project: Path, graph_path: Path) -> str:
     value = str(text or "")
+    value = re.sub(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])", "", value)
+    # URI and network-path forms must be removed before ordinary absolute
+    # paths. Otherwise a leading scheme/UNC prefix can shield the embedded
+    # absolute path from the generic path expressions below.
+    value = re.sub(
+        r"(?i)\b(?:file:(?://+)?|vscode://file/)[^\s\"'`<>]+",
+        "<redacted-uri>",
+        value,
+    )
+    value = re.sub(
+        r"(?<![:/\\\w])(?:\\\\(?:\?\\(?:UNC\\)?|\.\\)?[^\\\s\"'`<>]+"
+        r"(?:\\[^\\\s\"'`<>]+)+|//[^/\s\"'`<>]+/[^\s\"'`<>]+)",
+        "<redacted-path>",
+        value,
+    )
     cache_dir = project_cache_dir(project)
     replacements = {
-        str(cache_dir): "<graph-cache>",
-        str(graph_path): "<graph-cache>/graph.json",
+        str(graph_path): "__TMUX_GRAPHIFY_GRAPH_PATH__",
+        str(cache_dir): "__TMUX_GRAPHIFY_CACHE_PATH__",
+        str(project): "__TMUX_GRAPHIFY_PROJECT_PATH__",
     }
     for source, target in sorted(replacements.items(), key=lambda item: len(item[0]), reverse=True):
         value = value.replace(source, target)
+    value = re.sub(r"(?<![:/\w])/(?!/)[^\s\"'`<>]+", "<redacted-path>", value)
+    value = re.sub(r"(?<![\w])(?:[A-Za-z]:[\\/]|~[/\\])[^\s\"'`<>]+", "<redacted-path>", value)
+    value = value.replace("__TMUX_GRAPHIFY_GRAPH_PATH__", "<graph-cache>/graph.json")
+    value = value.replace("__TMUX_GRAPHIFY_CACHE_PATH__", "<graph-cache>")
+    value = value.replace("__TMUX_GRAPHIFY_PROJECT_PATH__", ".")
+    value = "".join(
+        character
+        for character in value
+        if character in {"\n", "\r", "\t"} or ord(character) >= 32
+    )
     return value
 
 
-def run_readonly_query(project_dir: str | Path, command: str, values: Sequence[str]) -> str:
+def _query_warnings(assessment: GraphifyFreshnessAssessment) -> tuple[str, ...]:
+    if assessment.state == "fresh":
+        return ()
+    if assessment.state == "stale":
+        paths = ", ".join(assessment.changed_paths)
+        suffix = f" Changed paths: {paths}." if paths else ""
+        return (
+            "Graph is older than current controlled source and is navigation-only."
+            + suffix
+            + " Verify results in source, tests, and config.",
+        )
+    return (
+        "Graph freshness could not be confirmed; treat results as old navigation evidence and verify in source.",
+    )
+
+
+def _resolve_query_scope(project: Path) -> _GraphifyQueryScope:
+    scope_payload = _read_runner_query_scope(project)
+    scope_key = str(scope_payload.get("scope_key", "") or "").strip()
+    runner_id = _normalize_query_scope_component(scope_payload.get("runner_id", ""))
+    stage_key = _normalize_graphify_stage_key(scope_payload.get("stage_key", ""))
+    if scope_key and runner_id and stage_key:
+        mode = normalize_graphify_mode(
+            scope_payload.get("mode", GraphifyMode.AUTO.value),
+            default=GraphifyMode.AUTO,
+        )
+        expected_scope_key = _runner_query_scope_key(runner_id, mode, stage_key)
+        generation = _normalize_query_scope_component(
+            os.environ.get("TMUX_GRAPHIFY_SESSION_GENERATION", ""),
+            max_length=64,
+        )
+        generations = {
+            _normalize_query_scope_component(value, max_length=64)
+            for value in scope_payload.get("session_generations", ())
+            if _normalize_query_scope_component(value, max_length=64)
+        }
+        return _GraphifyQueryScope(
+            active=True,
+            accepted=bool(
+                scope_key == expected_scope_key
+                and generation
+                and generation in generations
+            ),
+            runner_id=runner_id,
+            stage_key=stage_key,
+            scope_key=scope_key,
+        )
+    # Compatibility for manual/legacy queries created before scope v2. They
+    # remain queryable, but cannot impersonate a stage key.
+    return _GraphifyQueryScope(
+        runner_id=_normalize_query_scope_component(
+            os.environ.get("TMUX_GRAPHIFY_RUNNER_ID", "")
+        ),
+    )
+
+
+def _rotate_and_append_query_audit(
+    project: Path,
+    result: GraphifyQueryResult,
+    query_scope: _GraphifyQueryScope,
+) -> None:
+    cache_dir = project_cache_dir(project)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    audit_path = cache_dir / "query-audit.jsonl"
+    lock_path = cache_dir / "query-audit.lock"
+    handle = lock_path.open("a+", encoding="utf-8")
+    try:
+        if fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        with contextlib.suppress(OSError):
+            if audit_path.stat().st_size >= GRAPHIFY_QUERY_AUDIT_MAX_BYTES:
+                os.replace(audit_path, audit_path.with_suffix(".jsonl.1"))
+        payload = {
+            "query_id": result.query_id,
+            "runner_id": query_scope.runner_id,
+            "stage_key": query_scope.stage_key,
+            "scope_match": query_scope.accepted,
+            "command": result.command,
+            "generation_scope": result.generation_scope,
+            "fingerprint": result.graph_fingerprint,
+            "freshness": result.freshness,
+            "duration_ms": result.duration_ms,
+            "ok": result.ok,
+            "truncated": result.truncated,
+            "timestamp": _now_iso(),
+            "error_kind": result.error_kind,
+        }
+        with audit_path.open("a", encoding="utf-8") as audit:
+            audit.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+    finally:
+        if fcntl is not None:
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def _publish_query_result(
+    project: Path,
+    result: GraphifyQueryResult,
+    query_scope: _GraphifyQueryScope | None = None,
+) -> None:
+    if query_scope is None:
+        query_scope = _resolve_query_scope(project)
+    cache_dir = project_cache_dir(project)
+    with _metadata_lock(cache_dir):
+        active_scope_key = str(
+            _read_runner_query_scope(project).get("scope_key", "") or ""
+        )
+        if query_scope.active and (
+            not query_scope.accepted
+            or query_scope.scope_key != active_scope_key
+        ):
+            # A query from an unregistered session or a scope superseded while
+            # the query was running remains a valid local result, but must not
+            # contaminate the active stage aggregate.
+            return
+        if not query_scope.active and active_scope_key:
+            return
+        previous = read_graphify_project_status(project) or {}
+        allowed = {field.name for field in dataclasses.fields(GraphifyStatus)}
+        payload = {key: value for key, value in previous.items() if key in allowed}
+        payload.setdefault("mode", normalize_graphify_mode(
+            os.environ.get("TMUX_GRAPHIFY_MODE", GraphifyMode.AUTO.value),
+            default=GraphifyMode.AUTO,
+        ).value)
+        payload.setdefault("state", GraphifyState.READY.value)
+        payload.setdefault("version", GRAPHIFY_VERSION)
+        if result.generation_scope != "previous":
+            payload["freshness"] = result.freshness
+            if result.freshness == "fresh":
+                payload["state"] = GraphifyState.READY.value
+            elif result.freshness in {"stale", "cache_fallback"}:
+                payload["state"] = GraphifyState.STALE.value
+            elif result.freshness == "unknown":
+                payload["state"] = GraphifyState.DEGRADED.value
+        payload["query_count_stage"] = max(0, int(previous.get("query_count_stage", 0) or 0)) + 1
+        payload["last_query_command"] = result.command
+        payload["last_query_at"] = _now_iso()
+        payload["last_query_status"] = "ok" if result.ok else result.error_kind or "error"
+        payload["last_query_freshness"] = result.freshness
+        payload["last_query_truncated"] = result.truncated
+        _write_status(project, GraphifyStatus(**payload))
+
+
+def _validated_readonly_query_values(command: str, values: Sequence[str]) -> tuple[str, ...]:
+    normalized = tuple(str(value) for value in values)
+    expected_arity = {"query": 1, "affected": 1, "explain": 1, "path": 2}
+    if command == "god-nodes":
+        if len(normalized) != 2 or normalized[0] != "--top":
+            raise GraphifyUnavailable("god-nodes 只允许 wrapper 生成的 --top <positive-int>")
+        try:
+            top = int(normalized[1])
+        except ValueError as exc:
+            raise GraphifyUnavailable("god-nodes --top 必须是正整数") from exc
+        if top <= 0 or str(top) != normalized[1].strip():
+            raise GraphifyUnavailable("god-nodes --top 必须是正整数")
+        return ("--top", str(top))
+    if command not in expected_arity or len(normalized) != expected_arity[command]:
+        raise GraphifyUnavailable(
+            f"只读 Graphify 命令 {command} 参数数量非法: expected {expected_arity.get(command, 0)}, got {len(normalized)}"
+        )
+    for value in normalized:
+        if not value.strip():
+            raise GraphifyUnavailable(f"只读 Graphify 命令 {command} 不接受空参数")
+        if value.lstrip().startswith("-"):
+            raise GraphifyUnavailable(f"只读 Graphify 命令 {command} 拒绝 option-like 位置参数")
+    return normalized
+
+
+def execute_readonly_query(
+    project_dir: str | Path,
+    command: str,
+    values: Sequence[str],
+    *,
+    generation_scope: str = "current",
+) -> GraphifyQueryResult:
     command_text = str(command or "").strip().lower()
     if command_text not in _QUERY_COMMANDS:
         raise GraphifyUnavailable(f"只读 Graphify wrapper 不允许命令: {command_text}")
+    validated_values = _validated_readonly_query_values(command_text, values)
+    normalized_generation_scope = str(generation_scope or "current").strip().lower()
+    if normalized_generation_scope not in {"current", "previous"}:
+        raise GraphifyUnavailable(f"非法 Graphify query generation scope: {normalized_generation_scope!r}")
+    if normalized_generation_scope == "previous" and command_text != "affected":
+        raise GraphifyUnavailable("Graphify previous generation 仅支持 affected 查询")
     mode = normalize_graphify_mode(os.environ.get("TMUX_GRAPHIFY_MODE", GraphifyMode.AUTO.value), default=GraphifyMode.AUTO)
     if mode == GraphifyMode.OFF:
         raise GraphifyUnavailable("本 runner 已关闭 Graphify")
     project = _project_root(project_dir)
-    generation = _current_graph_or_raise(project)
-    resolution = resolve_graphify_tool()
-    if not resolution.compatible:
-        raise GraphifyUnavailable(resolution.error)
-    args = [resolution.executable_path, command_text, *[str(value) for value in values], "--graph", str(generation.graph_path)]
-    if command_text == "query" and "--budget" not in values:
-        args.extend(["--budget", "1500"])
-    # Query only the immutable cached graph.  Keeping cwd inside the cache also
-    # prevents a future upstream CLI behavior change from implicitly walking
-    # or writing to the user's target project.
-    completed = _run_graphify_process(args, cwd=generation.graph_path.parent, timeout_sec=30)
-    return _sanitize_query_output(completed.stdout, project=project, graph_path=generation.graph_path).strip()
+    cache_dir = project_cache_dir(project)
+    query_scope = _resolve_query_scope(project)
+    query_id = uuid.uuid4().hex
+    started = time.monotonic()
+    with _query_lock(cache_dir):
+        query_values = validated_values
+        if normalized_generation_scope == "previous":
+            generation, deleted_path = _previous_graph_for_deleted_target(
+                project,
+                validated_values[0],
+            )
+            query_values = (deleted_path,)
+            assessment = GraphifyFreshnessAssessment(
+                state="stale",
+                graph_fingerprint=generation.fingerprint,
+                changed_paths=(deleted_path,),
+                checked_at=_now_iso(),
+                reason="explicit previous-generation query for a manifest-confirmed deleted path",
+            )
+        else:
+            generation = _current_graph_or_raise(project)
+            assessment = assess_graphify_freshness(project, generation)
+            with contextlib.suppress(OSError):
+                _publish_freshness_assessment(project, assessment)
+        resolution = resolve_graphify_tool()
+        completed: subprocess.CompletedProcess[str] | None = None
+        truncated = False
+        error_kind = ""
+        if resolution.compatible:
+            args = [
+                resolution.executable_path,
+                command_text,
+                *query_values,
+                "--graph",
+                str(generation.graph_path),
+            ]
+            if command_text == "query":
+                args.extend(["--budget", "1500"])
+            try:
+                completed, truncated = _run_bounded_graphify_query(
+                    args,
+                    cwd=generation.graph_path.parent,
+                    timeout_sec=30,
+                )
+            except GraphifyBuildFailed as exc:
+                error_kind = "timeout" if "timed out" in str(exc).lower() else "error"
+                completed = subprocess.CompletedProcess(
+                    args=args,
+                    returncode=1,
+                    stdout="",
+                    stderr=str(exc),
+                )
+        else:
+            error_kind = "unavailable"
+            completed = subprocess.CompletedProcess(
+                args=[],
+                returncode=1,
+                stdout="",
+                stderr=resolution.error,
+            )
+        assert completed is not None
+        ok = completed.returncode == 0
+        if not ok and not error_kind:
+            error_kind = "error"
+        raw_output = completed.stdout if ok else completed.stderr or completed.stdout
+        sanitized = _sanitize_query_output(
+            raw_output,
+            project=project,
+            graph_path=generation.graph_path,
+        ).strip()
+        if len(sanitized) > GRAPHIFY_QUERY_MAX_CHARS:
+            sanitized = sanitized[:GRAPHIFY_QUERY_MAX_CHARS].rstrip()
+            truncated = True
+        if truncated:
+            marker = "\n[wrapper output truncated]"
+            sanitized = sanitized[: GRAPHIFY_QUERY_MAX_CHARS - len(marker)].rstrip() + marker
+        effective_freshness = (
+            "stale"
+            if normalized_generation_scope == "previous"
+            else "cache_fallback"
+            if generation.freshness == "cache_fallback" and assessment.state == "fresh"
+            else assessment.state
+        )
+        warnings = list(_query_warnings(assessment))
+        if normalized_generation_scope == "previous":
+            warnings.insert(
+                0,
+                "OLD_GENERATION: result comes from the previous immutable graph for a deleted path; it is ambiguous navigation evidence, never a current source fact.",
+            )
+        if effective_freshness == "cache_fallback":
+            warnings.insert(
+                0,
+                "Current graph generation failed validation; this query uses the previous valid cache and requires source verification.",
+            )
+        result = GraphifyQueryResult(
+            ok=ok,
+            query_id=query_id,
+            command=command_text,
+            graph_fingerprint=generation.fingerprint,
+            freshness=effective_freshness,
+            warnings=tuple(warnings),
+            truncated=truncated,
+            duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+            result_text=sanitized,
+            error_kind=error_kind,
+            generation_scope=normalized_generation_scope,
+        )
+        with contextlib.suppress(OSError):
+            _rotate_and_append_query_audit(project, result, query_scope)
+        with contextlib.suppress(OSError, ValueError):
+            _publish_query_result(project, result, query_scope)
+        return result
+
+
+def run_readonly_query(
+    project_dir: str | Path,
+    command: str,
+    values: Sequence[str],
+    *,
+    output_format: str = "text",
+    generation_scope: str = "current",
+) -> str:
+    result = execute_readonly_query(
+        project_dir,
+        command,
+        values,
+        generation_scope=generation_scope,
+    )
+    normalized_format = str(output_format or "text").strip().lower()
+    if normalized_format == "json":
+        return json.dumps(result.to_public_dict(), ensure_ascii=False)
+    if normalized_format != "text":
+        raise ValueError(f"unsupported Graphify query output format: {output_format}")
+    return result.to_text()
 
 
 def _prune_cache_directory(cache_dir: Path) -> None:
@@ -2068,8 +3580,17 @@ def prune_graphify_cache(project_dir: str | Path, *, all_projects: bool = False)
 
 
 def _cli_project(args: argparse.Namespace) -> Path:
-    value = str(getattr(args, "project", "") or os.environ.get("TMUX_GRAPHIFY_PROJECT_DIR", "") or os.getcwd()).strip()
-    return _project_root(value)
+    requested = str(getattr(args, "project", "") or "").strip()
+    worker_project = str(os.environ.get("TMUX_GRAPHIFY_PROJECT_DIR", "") or "").strip()
+    read_only = str(os.environ.get("TMUX_GRAPHIFY_READ_ONLY", "") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if read_only:
+        if not worker_project:
+            raise GraphifyUnavailable("agent read-only mode requires TMUX_GRAPHIFY_PROJECT_DIR")
+        configured = _project_root(worker_project)
+        if requested and _project_root(requested) != configured:
+            raise GraphifyUnavailable("agent read-only mode rejects --project outside TMUX_GRAPHIFY_PROJECT_DIR")
+        return configured
+    return _project_root(requested or worker_project or os.getcwd())
 
 
 def _build_cli_parser() -> argparse.ArgumentParser:
@@ -2086,19 +3607,29 @@ def _build_cli_parser() -> argparse.ArgumentParser:
     query = subparsers.add_parser("query", help="read-only graph query")
     query.add_argument("question")
     query.add_argument("--project", default="")
+    query.add_argument("--format", choices=("text", "json"), default="text")
     affected = subparsers.add_parser("affected", help="read-only reverse impact query")
     affected.add_argument("symbol")
+    affected.add_argument(
+        "--previous",
+        action="store_true",
+        help="query the previous immutable graph for a manifest-confirmed deleted path",
+    )
     affected.add_argument("--project", default="")
+    affected.add_argument("--format", choices=("text", "json"), default="text")
     path = subparsers.add_parser("path", help="read-only shortest path query")
     path.add_argument("source")
     path.add_argument("target")
     path.add_argument("--project", default="")
+    path.add_argument("--format", choices=("text", "json"), default="text")
     explain = subparsers.add_parser("explain", help="read-only node explanation")
     explain.add_argument("symbol")
     explain.add_argument("--project", default="")
+    explain.add_argument("--format", choices=("text", "json"), default="text")
     god_nodes = subparsers.add_parser("god-nodes", help="read-only hub query")
     god_nodes.add_argument("--top", type=int, default=10)
     god_nodes.add_argument("--project", default="")
+    god_nodes.add_argument("--format", choices=("text", "json"), default="text")
     prune = subparsers.add_parser("prune", help="remove stale staging and old generations")
     prune.add_argument("--project", default="")
     prune.add_argument("--all-projects", action="store_true")
@@ -2160,8 +3691,21 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
                 values = [args.source, args.target]
             else:
                 values = ["--top", str(max(1, int(args.top)))]
-            print(run_readonly_query(project, command, values))
-            return 0
+            result = execute_readonly_query(
+                project,
+                command,
+                values,
+                generation_scope=(
+                    "previous"
+                    if command == "affected" and bool(getattr(args, "previous", False))
+                    else "current"
+                ),
+            )
+            if str(args.format) == "json":
+                print(json.dumps(result.to_public_dict(), ensure_ascii=False))
+            else:
+                print(result.to_text())
+            return 0 if result.ok else 1
         if command == "prune":
             prune_graphify_cache(_cli_project(args), all_projects=bool(args.all_projects))
             print("Graphify cache pruned")
@@ -2175,24 +3719,35 @@ def cli_main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "GRAPHIFY_ADAPTER_VERSION",
+    "GRAPHIFY_FULL_GUIDE_MARKER",
+    "GRAPHIFY_GUIDE_VERSION",
     "GRAPHIFY_PACKAGE",
+    "GRAPHIFY_QUERY_RESULT_SCHEMA",
     "GRAPHIFY_VERSION",
+    "GraphifyFreshnessAssessment",
     "GraphifyBuildConfig",
     "GraphifyBuildFailed",
     "GraphifyEvidence",
     "GraphifyMode",
     "GraphifyProjectSnapshot",
+    "GraphifyQueryIntent",
+    "GraphifyQueryResult",
+    "GraphifyQuerySuggestion",
     "GraphifySchemaError",
     "GraphifySnapshotError",
     "GraphifyStatus",
     "GraphifyToolResolution",
     "GraphifyTurnProfile",
+    "GraphifyTurnContext",
     "GraphifyUnavailable",
     "TurnContextBlock",
+    "assess_graphify_freshness",
     "build_graphify_evidence_block",
     "cancel_graphify_processes",
+    "capture_graphify_source_manifest",
     "cli_main",
     "create_graphify_snapshot",
+    "execute_readonly_query",
     "graphify_cache_root",
     "graphify_data_root",
     "graphify_turn_context_block",

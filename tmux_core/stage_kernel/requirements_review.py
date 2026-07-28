@@ -51,6 +51,7 @@ from tmux_core.runtime.hitl import (
     run_hitl_agent_loop,
     save_grill_session_state,
 )
+from tmux_core.runtime.graphify import GraphifyQueryIntent
 from tmux_core.runtime.tmux_runtime import (
     CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -71,6 +72,11 @@ from tmux_core.stage_kernel.reviewer_orchestration import (
     shutdown_stage_workers,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from tmux_core.stage_kernel.graphify_route_context import (
+    build_stage_graphify_turn_context,
+    worker_graphify_route_hints_enabled,
+    worker_graphify_scope,
+)
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
     StageAuditRunContext,
@@ -170,6 +176,39 @@ REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME = ".requirements_review_runtime"
 MAX_REVIEW_ROUNDS = 5
 REVIEW_CLARIFICATION_STAGE_NAME = "requirements_clarification"
 REVIEW_CLARIFICATION_TURN_PHASE = "requirements_clarification"
+
+
+def _requirements_review_graphify_context(
+    worker: object,
+    *,
+    phase: str,
+    role: str,
+    task_name: str = REQUIREMENTS_REVIEW_TASK_NAME,
+):
+    project_root, requirement_name = worker_graphify_scope(worker)
+    paths = build_requirements_review_paths(project_root, requirement_name) if requirement_name else {}
+    return build_stage_graphify_turn_context(
+        project_root,
+        stage_key="A04",
+        phase=phase,
+        role=role,
+        intent=GraphifyQueryIntent.REQUIREMENT_IMPACT,
+        requirement_name=requirement_name,
+        task_name=task_name,
+        query_seeds=(requirement_name, "requirement impact", "callers and tests"),
+        business_artifact_paths=tuple(
+            paths[key]
+            for key in (
+                "original_requirement_path",
+                "requirements_clear_path",
+                "merged_review_path",
+                "ba_feedback_path",
+                "hitl_record_path",
+            )
+            if key in paths
+        ),
+        resolve_route_hints=worker_graphify_route_hints_enabled(worker),
+    )
 
 @dataclass(frozen=True)
 class RequirementsReviewStageResult:
@@ -1110,6 +1149,11 @@ def _run_ba_turn(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         stage_label=REQUIREMENTS_REVIEW_TASK_NAME,
         role_label=str(getattr(handoff.worker, "session_name", "") or "需求分析师"),
+        graphify_context=_requirements_review_graphify_context(
+            handoff.worker,
+            phase=result_contract.phase,
+            role="requirements_analyst",
+        ),
     )
 
 
@@ -1129,6 +1173,11 @@ def _run_reviewer_turn(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         stage_label=REQUIREMENTS_REVIEW_TASK_NAME,
         role_label=_reviewer_artifact_agent_name(reviewer),
+        graphify_context=_requirements_review_graphify_context(
+            reviewer.worker,
+            phase=reviewer.contract.phase,
+            role="requirements_reviewer",
+        ),
     )
 
 
@@ -1930,6 +1979,22 @@ def _run_review_clarification_continuation(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         fresh_completion_paths=fresh_completion_paths,
         fresh_completion_start_round=2,
+        graphify_context_factory=lambda hitl_context: build_stage_graphify_turn_context(
+            paths["project_root"],
+            stage_key="A04",
+            phase=hitl_context.turn_phase,
+            role="requirements_analyst",
+            intent=GraphifyQueryIntent.REQUIREMENT_IMPACT,
+            requirement_name=requirement_name,
+            task_name=f"review_clarification_{hitl_context.hitl_round}",
+            query_seeds=(requirement_name, "requirement impact"),
+            business_artifact_paths=(
+                paths["original_requirement_path"],
+                paths["requirements_clear_path"],
+                paths["merged_review_path"],
+                paths["hitl_record_path"],
+            ),
+        ),
     )
     if str(loop_result.decision.payload.get("status", "")).strip() != REQUIREMENTS_STATUS_OK:
         raise RuntimeError("需求分析师未完成需求澄清闭环")

@@ -12,7 +12,7 @@ import {
 } from './api/client'
 import { appendLog, classifyLog } from './domain/logs'
 import { buildAgentConfigLabel, buildHomeAgents, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState } from './domain/agents'
-import { graphifyStatusLabel, graphifyStatusTone } from './domain/graphifyStatus'
+import { graphifyStatusSummary, graphifyStatusTone } from './domain/graphifyStatus'
 import {
   EMPTY_APP,
   EMPTY_CONTROL,
@@ -364,7 +364,7 @@ function CurrentCard(props: {
           {(graphify) => (
             <StatLine
               label="代码图谱"
-              value={`${graphifyStatusLabel(graphify)}${graphify.version ? ` · v${graphify.version}` : ''}`}
+              value={graphifyStatusSummary(graphify)}
               tone={graphifyStatusTone(graphify)}
             />
           )}

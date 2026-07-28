@@ -60,9 +60,12 @@ from tmux_core.runtime.grill import (
     validate_grill_bundle,
 )
 from tmux_core.runtime.graphify import (
+    GRAPHIFY_FULL_GUIDE_MARKER,
+    GRAPHIFY_GUIDE_VERSION,
     GraphifyBuildConfig,
     GraphifyError,
     GraphifyMode,
+    GraphifyTurnContext,
     GraphifyTurnProfile,
     build_graphify_evidence_block,
     graphify_interactive_recovery_enabled,
@@ -4237,13 +4240,10 @@ class TmuxBatchWorker:
             default=GraphifyMode.OFF,
         ).value
         self.graphify_generation_refreshed = False
-        if self.graphify_mode == GraphifyMode.OFF.value:
-            # OFF must remain a hard runtime no-op while still replacing a
-            # previous runner's Ready/Failed project badge with the truthful
-            # current mode.
-            publish_graphify_off_status(self.work_dir)
-        else:
-            publish_graphify_pending_status(self.work_dir, self.graphify_mode)
+        self.graphify_session_generation = uuid.uuid4().hex
+        self.graphify_orientation_delivered = False
+        self.graphify_delivered_mode = ""
+        self.graphify_delivered_guide_version = ""
         self.backend = backend or TmuxBackend()
         self.detector = build_output_detector(self.config.vendor)
         self.runtime_root = Path(runtime_root or DEFAULT_RUNTIME_ROOT).expanduser().resolve()
@@ -4321,6 +4321,17 @@ class TmuxBatchWorker:
         self.stage_runner_id = str(
             self._runtime_metadata.get("stage_runner_id", self._runtime_metadata.get("runner_id", "")) or ""
         ).strip()
+        if self.graphify_mode == GraphifyMode.OFF.value:
+            # OFF must remain a hard runtime no-op while still replacing a
+            # previous runner's Ready/Failed project badge with the truthful
+            # current mode.
+            publish_graphify_off_status(self.work_dir)
+        else:
+            publish_graphify_pending_status(
+                self.work_dir,
+                self.graphify_mode,
+                runner_id=self.stage_runner_id,
+            )
         self.last_terminal_signature = ""
         self.last_terminal_changed_at = ""
         self.terminal_recently_changed = False
@@ -4334,7 +4345,7 @@ class TmuxBatchWorker:
         self._runtime_intervention_pause_lock = threading.RLock()
         self._runtime_intervention_pause_total_sec = 0.0
         self._runtime_intervention_pause_started_at = 0.0
-        self.launch_command = self.config.build_launch_command(self.work_dir)
+        self.launch_command = self._build_agent_launch_command()
         if self.state_path.exists():
             existing_state = self.read_state()
             self.graphify_generation_refreshed = bool(
@@ -4440,6 +4451,23 @@ class TmuxBatchWorker:
                 self.grill_delivered_mode = delivered_mode if self.grill_full_delivered else ""
                 with contextlib.suppress(TypeError, ValueError):
                     self.grill_question_seq = max(int(grill_policy.get("question_seq", 0) or 0), 0)
+            graphify_policy = existing_state.get("graphify_policy", {})
+            if isinstance(graphify_policy, Mapping):
+                existing_generation = str(graphify_policy.get("session_generation", "") or "").strip()
+                if existing_generation:
+                    self.graphify_session_generation = existing_generation
+                delivered_mode = str(graphify_policy.get("delivered_mode", "") or "").strip().lower()
+                delivered_guide_version = str(
+                    graphify_policy.get("guide_version", "") or ""
+                ).strip()
+                self.graphify_orientation_delivered = bool(
+                    graphify_policy.get("orientation_delivered", False)
+                    and delivered_mode == self.graphify_mode
+                    and delivered_guide_version == GRAPHIFY_GUIDE_VERSION
+                )
+                if self.graphify_orientation_delivered:
+                    self.graphify_delivered_mode = delivered_mode
+                    self.graphify_delivered_guide_version = delivered_guide_version
             existing_runner_id = str(existing_state.get("stage_runner_id", "") or "").strip()
             if (
                     metadata_owns_runner_id
@@ -4695,6 +4723,193 @@ class TmuxBatchWorker:
             default=GraphifyMode.OFF,
         ).value
 
+    def _build_agent_launch_command(self) -> str:
+        command = self.config.build_launch_command(self.work_dir)
+        runner_id = str(getattr(self, "stage_runner_id", "") or "").strip()
+        graphify_session_generation = ""
+        if self._configured_graphify_mode() != GraphifyMode.OFF.value:
+            graphify_session_generation = str(
+                getattr(self, "graphify_session_generation", "") or ""
+            ).strip()
+        assignments = []
+        if runner_id:
+            assignments.append(
+                shlex.quote(f"TMUX_GRAPHIFY_RUNNER_ID={runner_id}")
+            )
+        if graphify_session_generation:
+            assignments.append(
+                shlex.quote(
+                    "TMUX_GRAPHIFY_SESSION_GENERATION="
+                    f"{graphify_session_generation}"
+                )
+            )
+        if not assignments:
+            return command
+        return " ".join(("env", *assignments, command))
+
+    def _graphify_stage_scope_key(
+            self,
+            turn_context: GraphifyTurnContext | None = None,
+    ) -> str:
+        if turn_context is not None:
+            stage_key = str(getattr(turn_context, "stage_key", "") or "").strip()
+            if stage_key:
+                return stage_key
+        action = str(
+            getattr(self, "_runtime_metadata", {}).get("workflow_action", "") or ""
+        ).strip()
+        match = re.search(r"(?i)(?:^|[._-])(a(?:0[0-9]|1[0-9]))(?:$|[._-])", action)
+        return match.group(1).upper() if match else ""
+
+    def activate_graphify_query_scope(
+            self,
+            turn_context: GraphifyTurnContext | None = None,
+    ) -> bool:
+        if self._configured_graphify_mode() == GraphifyMode.OFF.value:
+            return False
+        return publish_graphify_pending_status(
+            self.work_dir,
+            self._configured_graphify_mode(),
+            runner_id=str(getattr(self, "stage_runner_id", "") or "").strip(),
+            stage_key=self._graphify_stage_scope_key(turn_context),
+            session_generation=str(
+                getattr(self, "graphify_session_generation", "") or ""
+            ).strip(),
+        )
+
+    def _graphify_policy_payload(self) -> dict[str, object]:
+        return {
+            "session_generation": self.graphify_session_generation,
+            "guide_version": GRAPHIFY_GUIDE_VERSION,
+            "orientation_delivered": self.graphify_orientation_delivered,
+            "delivered_mode": self.graphify_delivered_mode,
+        }
+
+    def _graphify_full_guide_required(self, profile: GraphifyTurnProfile) -> bool:
+        return (
+            not bool(getattr(self, "graphify_orientation_delivered", False))
+            or str(getattr(self, "graphify_delivered_mode", "") or "") != profile.mode
+            or str(getattr(self, "graphify_delivered_guide_version", "") or "")
+            != GRAPHIFY_GUIDE_VERSION
+        )
+
+    def _graphify_prompt_kind_for_turn(
+            self,
+            profile: GraphifyTurnProfile | GraphifyMode | str | None,
+    ) -> str:
+        if profile is None:
+            return ""
+        normalized = self._normalize_graphify_profile_for_turn(profile)
+        if not normalized.enabled:
+            return ""
+        return "full" if self._graphify_full_guide_required(normalized) else "reminder"
+
+    @staticmethod
+    def _submitted_prompt_contains_managed_graphify_full_guide(
+            submitted_prompt: str,
+            profile: GraphifyTurnProfile,
+    ) -> bool:
+        evidence = getattr(profile, "evidence", None)
+        if evidence is None:
+            return False
+        authoritative_block = str(evidence.block_text or "").strip()
+        if (
+                not authoritative_block
+                or GRAPHIFY_FULL_GUIDE_MARKER not in authoritative_block
+        ):
+            return False
+        source = str(submitted_prompt or "")
+        start = source.find(authoritative_block)
+        while start >= 0:
+            before = source[:start]
+            after = source[start + len(authoritative_block):]
+            if (
+                    (not before or before.endswith("\n\n"))
+                    and (not after or after.startswith("\n\n"))
+            ):
+                return True
+            start = source.find(authoritative_block, start + 1)
+        return False
+
+    def _reset_graphify_delivery_generation(self) -> None:
+        self.graphify_session_generation = uuid.uuid4().hex
+        self.graphify_orientation_delivered = False
+        self.graphify_delivered_mode = ""
+        self.graphify_delivered_guide_version = ""
+        if not self.state_path.exists():
+            return
+        with self.state_lock:
+            payload = self.read_state()
+            payload["graphify_policy"] = self._graphify_policy_payload()
+            payload["updated_at"] = _now_iso()
+            payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+            payload["last_writer"] = "TmuxBatchWorker.graphify_generation"
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def _persist_graphify_policy_fast(self) -> None:
+        with self.state_lock:
+            payload = self.read_state()
+            payload["graphify_policy"] = self._graphify_policy_payload()
+            payload["updated_at"] = _now_iso()
+            payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+            payload["last_writer"] = "TmuxBatchWorker.graphify_delivery"
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def _confirm_graphify_orientation_delivery(
+            self,
+            submitted_prompt: str,
+            profile: GraphifyTurnProfile | GraphifyMode | str | None,
+            *,
+            prompt_kind: str = "",
+            delivery_guide_version: str = GRAPHIFY_GUIDE_VERSION,
+    ) -> None:
+        """Latch the full Graphify guide only after submission is observed."""
+
+        if profile is None:
+            return
+        normalized = self._normalize_graphify_profile_for_turn(profile)
+        if not normalized.enabled:
+            return
+        if str(delivery_guide_version or "").strip() != GRAPHIFY_GUIDE_VERSION:
+            return
+        managed_prompt_kind = str(prompt_kind or "").strip().lower()
+        if not managed_prompt_kind:
+            managed_prompt_kind = (
+                "full"
+                if self._submitted_prompt_contains_managed_graphify_full_guide(
+                    submitted_prompt,
+                    normalized,
+                )
+                else ""
+            )
+        if managed_prompt_kind != "full":
+            return
+        previous = (
+            self.graphify_orientation_delivered,
+            self.graphify_delivered_mode,
+            self.graphify_delivered_guide_version,
+        )
+        self.graphify_orientation_delivered = True
+        self.graphify_delivered_mode = normalized.mode
+        self.graphify_delivered_guide_version = GRAPHIFY_GUIDE_VERSION
+        if previous == (
+            self.graphify_orientation_delivered,
+            self.graphify_delivered_mode,
+            self.graphify_delivered_guide_version,
+        ):
+            return
+        try:
+            self._persist_graphify_policy_fast()
+        except Exception:
+            (
+                self.graphify_orientation_delivered,
+                self.graphify_delivered_mode,
+                self.graphify_delivered_guide_version,
+            ) = previous
+            raise
+
     def _normalize_graphify_profile_for_turn(
             self,
             profile: GraphifyTurnProfile | GraphifyMode | str,
@@ -4716,6 +4931,7 @@ class TmuxBatchWorker:
             self,
             prompt: str,
             profile: GraphifyTurnProfile | GraphifyMode | str | None,
+            turn_context: GraphifyTurnContext | None = None,
     ) -> GraphifyTurnProfile:
         if profile is not None:
             return self._normalize_graphify_profile_for_turn(profile)
@@ -4732,21 +4948,36 @@ class TmuxBatchWorker:
             runtime_dir=self.runtime_dir,
             config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
             refresh=refresh,
+            turn_context=turn_context,
         )
         if self._configured_graphify_mode() != GraphifyMode.OFF.value:
             self.graphify_generation_refreshed = True
         return resolved
 
-    def prepare_graphify_turn_profile(self, prompt: str) -> GraphifyTurnProfile:
+    def prepare_graphify_turn_profile(
+            self,
+            prompt: str,
+            turn_context: GraphifyTurnContext | None = None,
+    ) -> GraphifyTurnProfile:
         """Resolve one immutable evidence profile for a logical turn/repairs."""
 
-        return self._resolve_graphify_profile_for_turn(str(prompt or ""), None)
+        self.activate_graphify_query_scope(turn_context)
+        return self._resolve_graphify_profile_for_turn(
+            str(prompt or ""),
+            None,
+            turn_context=turn_context,
+        )
 
-    def refresh_graphify_generation(self, prompt: str) -> GraphifyTurnProfile:
+    def refresh_graphify_generation(
+            self,
+            prompt: str,
+            turn_context: GraphifyTurnContext | None = None,
+    ) -> GraphifyTurnProfile:
         """Refresh the shared project graph at an explicit stage checkpoint."""
 
         if self._configured_graphify_mode() == GraphifyMode.OFF.value:
             return GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
+        self.activate_graphify_query_scope(turn_context)
         profile = resolve_graphify_turn_profile(
             project_dir=self.work_dir,
             mode=self._configured_graphify_mode(),
@@ -4754,14 +4985,19 @@ class TmuxBatchWorker:
             runtime_dir=self.runtime_dir,
             config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
             refresh=True,
+            turn_context=turn_context,
         )
         self.graphify_generation_refreshed = True
         return profile
 
-    def mark_graphify_generation_current(self) -> None:
+    def mark_graphify_generation_current(
+            self,
+            turn_context: GraphifyTurnContext | None = None,
+    ) -> None:
         """Tell a peer worker that another worker refreshed their shared graph."""
 
         if self._configured_graphify_mode() != GraphifyMode.OFF.value:
+            self.activate_graphify_query_scope(turn_context)
             self.graphify_generation_refreshed = True
 
     def _grill_policy_payload(self) -> dict[str, object]:
@@ -4999,6 +5235,8 @@ class TmuxBatchWorker:
             ).strip()
             normalized["stage_runner_id"] = self.stage_runner_id
         self._runtime_metadata.update(normalized)
+        with contextlib.suppress(Exception):
+            self.activate_graphify_query_scope()
         if not self.state_path.exists():
             return
         with self.state_lock:
@@ -5698,6 +5936,10 @@ class TmuxBatchWorker:
         raise_if_runtime_shutdown_requested("creating tmux session")
         self._reset_ponytail_delivery_generation()
         self._reset_grill_delivery_generation()
+        self._reset_graphify_delivery_generation()
+        # The Graphify session generation is part of the child process
+        # identity used by the trusted stage query-scope ledger.
+        self.launch_command = self._build_agent_launch_command()
         self._reset_terminal_activity()
         self.agent_started = False
         self.agent_ready = False
@@ -5944,6 +6186,11 @@ class TmuxBatchWorker:
             "terminal_recently_changed": False,
             "ponytail_policy": self._ponytail_policy_payload(),
             "grill_policy": self._grill_policy_payload(),
+            "graphify_policy": self._graphify_policy_payload(),
+            "graphify_evidence_id": "",
+            "graphify_fingerprint": "",
+            "graphify_freshness": "",
+            "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
         }
         payload.update(self._runtime_metadata)
         payload.update(self._tmux_control_state_payload())
@@ -6011,6 +6258,14 @@ class TmuxBatchWorker:
                 "terminal_recently_changed": self.terminal_recently_changed,
                 "ponytail_policy": self._ponytail_policy_payload(),
                 "grill_policy": self._grill_policy_payload(),
+                "graphify_policy": self._graphify_policy_payload(),
+                # A new tmux session is a new delivery generation.  Evidence
+                # identity belongs to the prior session until a new immutable
+                # profile is resolved, so never carry it across this boundary.
+                "graphify_evidence_id": "",
+                "graphify_fingerprint": "",
+                "graphify_freshness": "",
+                "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
             }
             payload.update(self._runtime_metadata)
             previous_runner_id = str(previous.get("stage_runner_id", "") or "").strip()
@@ -6172,6 +6427,11 @@ class TmuxBatchWorker:
                 "terminal_recently_changed": self.terminal_recently_changed,
                 "ponytail_policy": self._ponytail_policy_payload(),
                 "grill_policy": self._grill_policy_payload(),
+                "graphify_policy": self._graphify_policy_payload(),
+                "graphify_evidence_id": str(previous.get("graphify_evidence_id", "") or ""),
+                "graphify_fingerprint": str(previous.get("graphify_fingerprint", "") or ""),
+                "graphify_freshness": str(previous.get("graphify_freshness", "") or ""),
+                "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
             }
             for key in (
                 "project_dir",
@@ -9422,8 +9682,11 @@ class TmuxBatchWorker:
         next_config = copy.copy(self.config)
         object.__setattr__(next_config, "graphify_mode", normalized)
         self.config = next_config
-        self.launch_command = self.config.build_launch_command(self.work_dir)
+        self.launch_command = self._build_agent_launch_command()
         self.graphify_generation_refreshed = False
+        self.graphify_orientation_delivered = False
+        self.graphify_delivered_mode = ""
+        self.graphify_delivered_guide_version = ""
         if normalized == GraphifyMode.OFF.value:
             publish_graphify_off_status(self.work_dir)
 
@@ -9985,7 +10248,13 @@ class TmuxBatchWorker:
             else GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
         )
         graphify_prompt = (
-            build_graphify_evidence_block(normalized_graphify_profile, business_prompt)
+            build_graphify_evidence_block(
+                normalized_graphify_profile,
+                business_prompt,
+                include_full_guide=self._graphify_full_guide_required(
+                    normalized_graphify_profile
+                ),
+            )
             if normalized_graphify_profile.enabled
             else business_prompt
         )
@@ -10316,6 +10585,7 @@ class TmuxBatchWorker:
             file_result: TurnFileResult,
             task_status_path: Path | None,
             grill_profile: GrillTurnProfile | RequirementsMode | str | None,
+            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None,
     ) -> CommandResult:
         persisted_state = self.read_state()
         if task_status_path is not None:
@@ -10326,6 +10596,16 @@ class TmuxBatchWorker:
             grill_profile,
             delivery_bundle_commit=str(
                 persisted_state.get("current_grill_bundle_commit", "") or ""
+            ),
+        )
+        self._confirm_graphify_orientation_delivery(
+            "",
+            graphify_profile,
+            prompt_kind=str(
+                persisted_state.get("current_graphify_prompt_kind", "") or ""
+            ),
+            delivery_guide_version=str(
+                persisted_state.get("current_graphify_guide_version", "") or ""
             ),
         )
         reply = json.dumps(
@@ -10383,6 +10663,7 @@ class TmuxBatchWorker:
             submission_cursor: str = "",
             stage_status_path: str | Path | None = None,
             grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
+            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
             runtime_intervention_handler: Callable[[object, AgentRuntimeInterventionRequired], None] | None = None,
     ) -> CommandResult | None:
         """Resume an interrupted file-contract turn without submitting its prompt again.
@@ -10420,6 +10701,7 @@ class TmuxBatchWorker:
                 file_result=file_result,
                 task_status_path=task_status_path,
                 grill_profile=grill_profile,
+                graphify_profile=graphify_profile,
             )
 
         expected_status_path = str(completion_contract.status_path.expanduser().resolve())
@@ -10497,6 +10779,7 @@ class TmuxBatchWorker:
             file_result=file_result,
             task_status_path=task_status_path,
             grill_profile=grill_profile,
+            graphify_profile=graphify_profile,
         )
 
     def run_turn(
@@ -10576,6 +10859,10 @@ class TmuxBatchWorker:
             self.dispatch_state = "preparing"
             self.dispatch_reason = ""
             prompt_submission_observed = False
+            prompt_confirmation_uncertain = False
+            graphify_prompt_kind = self._graphify_prompt_kind_for_turn(
+                graphify_profile
+            )
             submitted_prompt = self._build_turn_prompt(
                 prompt,
                 turn_token,
@@ -10617,6 +10904,10 @@ class TmuxBatchWorker:
                     ),
                     "graphify_generation_refreshed": bool(
                         getattr(self, "graphify_generation_refreshed", False)
+                    ),
+                    "current_graphify_prompt_kind": graphify_prompt_kind,
+                    "current_graphify_guide_version": (
+                        GRAPHIFY_GUIDE_VERSION if graphify_prompt_kind else ""
                     ),
                     "current_turn_id": completion_contract.turn_id if completion_contract else "",
                     "current_turn_phase": completion_contract.phase if completion_contract else "",
@@ -10800,6 +11091,11 @@ class TmuxBatchWorker:
                 # BUSY/prompt observation or by a completed contract above.
                 if prompt_submission_observed:
                     self._confirm_grill_prompt_delivery(submitted_prompt)
+                    self._confirm_graphify_orientation_delivery(
+                        submitted_prompt,
+                        graphify_profile,
+                        prompt_kind=graphify_prompt_kind,
+                    )
                 self._mark_turn_waiting_result(label=label)
                 prompt_confirmation_timeout = min(
                     timeout_sec,
@@ -10812,6 +11108,11 @@ class TmuxBatchWorker:
                             self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                             prompt_submission_observed = True
                             self._confirm_grill_prompt_delivery(submitted_prompt)
+                            self._confirm_graphify_orientation_delivery(
+                                submitted_prompt,
+                                graphify_profile,
+                                prompt_kind=graphify_prompt_kind,
+                            )
                         except PromptSubmissionRejectedError as error:
                             self._record_prompt_submission_rejected(
                                 label=label,
@@ -10828,6 +11129,7 @@ class TmuxBatchWorker:
                                 submitted_prompt=submitted_prompt,
                             )
                         except TimeoutError as error:
+                            prompt_confirmation_uncertain = True
                             self.dispatch_state = "delayed"
                             self.dispatch_reason = f"prompt_confirm_timeout:{error}"
                             self._write_state(
@@ -10841,7 +11143,6 @@ class TmuxBatchWorker:
                                 },
                             )
                             self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
-                            prompt_submission_observed = True
                     file_result = self.wait_for_turn_artifacts(
                         contract=completion_contract,
                         task_status_path=task_status_path,
@@ -10875,6 +11176,11 @@ class TmuxBatchWorker:
                                 self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                                 prompt_submission_observed = True
                                 self._confirm_grill_prompt_delivery(submitted_prompt)
+                                self._confirm_graphify_orientation_delivery(
+                                    submitted_prompt,
+                                    graphify_profile,
+                                    prompt_kind=graphify_prompt_kind,
+                                )
                             except PromptSubmissionRejectedError as error:
                                 self._record_prompt_submission_rejected(
                                     label=label,
@@ -10891,6 +11197,7 @@ class TmuxBatchWorker:
                                     submitted_prompt=submitted_prompt,
                                 )
                             except TimeoutError as error:
+                                prompt_confirmation_uncertain = True
                                 self.dispatch_state = "delayed"
                                 self.dispatch_reason = f"prompt_confirm_timeout:{error}"
                                 self._write_state(
@@ -10904,7 +11211,6 @@ class TmuxBatchWorker:
                                     },
                                 )
                                 self._log_event("prompt_confirm_timeout", label=label, timeout_sec=prompt_confirmation_timeout)
-                                prompt_submission_observed = True
                         task_result = self.wait_for_task_result(
                             contract=result_contract,
                             task_status_path=task_status_path,
@@ -10924,6 +11230,14 @@ class TmuxBatchWorker:
                         timeout_sec=timeout_sec,
                     )
                 finished_at = _now_iso()
+                # A valid reply/result contract proves that the prompt was
+                # submitted even when the terminal did not expose a distinct
+                # BUSY transition.  Only now may the full guide be latched.
+                self._confirm_graphify_orientation_delivery(
+                    submitted_prompt,
+                    graphify_profile,
+                    prompt_kind=graphify_prompt_kind,
+                )
                 self.current_task_runtime_status = read_task_status(task_status_path)
                 self.dispatch_state = ""
                 self.dispatch_reason = ""
@@ -10986,8 +11300,21 @@ class TmuxBatchWorker:
                         self.turn_state = TurnState.WAITING_RESULT
                         self.dispatch_state = "submitted"
                         self.dispatch_reason = "prompt_submission_confirmed_by_busy_probe"
+                        prompt_confirmation_uncertain = False
                         self._confirm_ponytail_bootstrap_delivery(submitted_prompt)
                         self._confirm_grill_prompt_delivery(submitted_prompt)
+                        self._confirm_graphify_orientation_delivery(
+                            submitted_prompt,
+                            graphify_profile,
+                            prompt_kind=graphify_prompt_kind,
+                        )
+                if prompt_submission_observed:
+                    prompt_confirmation_uncertain = False
+                    self._confirm_graphify_orientation_delivery(
+                        submitted_prompt,
+                        graphify_profile,
+                        prompt_kind=graphify_prompt_kind,
+                    )
                 if completion_contract is not None:
                     file_result = self._try_finalize_turn_artifacts_after_timeout(
                         contract=completion_contract,
@@ -11171,13 +11498,20 @@ class TmuxBatchWorker:
                             },
                         )
                         return result
-                    if prompt_submission_observed and not is_task_result_contract_error(error):
+                    if (
+                            (prompt_submission_observed or prompt_confirmation_uncertain)
+                            and not is_task_result_contract_error(error)
+                    ):
                         if not str(self.dispatch_reason or "").startswith(STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX):
                             self.dispatch_state = "delayed"
                             self.dispatch_reason = (
                                 f"{STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX}:"
                                 f"phase={result_contract.phase} result_path={result_path} "
-                                "task_result_missing_after_timeout"
+                                + (
+                                    "prompt_submission_unconfirmed_and_task_result_missing_after_timeout"
+                                    if prompt_confirmation_uncertain and not prompt_submission_observed
+                                    else "task_result_missing_after_timeout"
+                                )
                             )
                         error = TimeoutError(f"{TASK_RESULT_CONTRACT_ERROR_PREFIX}: {self.dispatch_reason}")
                 last_timeout = error
@@ -11187,6 +11521,7 @@ class TmuxBatchWorker:
                 unresolved_submission = (
                     self.turn_state == TurnState.SUBMISSION_UNKNOWN
                     or self.dispatch_state == "submission_unknown"
+                    or prompt_confirmation_uncertain
                 )
                 output_contract_failed = (
                     is_task_result_contract_error(error)

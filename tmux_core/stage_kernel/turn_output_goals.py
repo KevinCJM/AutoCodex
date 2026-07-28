@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass, field
+import inspect
 from pathlib import Path
 from typing import Callable
 
@@ -443,11 +444,24 @@ def _build_completion_goal_error(
     )
 
 
-def _prepare_graphify_turn_profile(worker: object, prompt: str) -> object | None:
+def _prepare_graphify_turn_profile(
+    worker: object,
+    prompt: str,
+    graphify_context: object | None = None,
+) -> object | None:
     """Freeze one graph snapshot/evidence payload for the whole repair cycle."""
     prepare = getattr(worker, "prepare_graphify_turn_profile", None)
     if not callable(prepare):
         return None
+    try:
+        parameters = inspect.signature(prepare).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    if graphify_context is not None and any(
+        parameter.name == "turn_context" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        return prepare(prompt, turn_context=graphify_context)
     return prepare(prompt)
 
 
@@ -469,6 +483,7 @@ def run_task_result_turn_with_repair(
     role_label: str = "",
     task_name: str = "",
     requirement_name: str = "",
+    graphify_context: object | None = None,
     propagate_file_intervention_action: bool = False,
 ) -> dict[str, object]:
     repair_budget = turn_goal.max_repair_attempts if turn_goal is not None else 0
@@ -477,7 +492,11 @@ def run_task_result_turn_with_repair(
         if turn_goal is not None and turn_goal.repair_prompt_builder is not None
         else build_default_task_repair_prompt
     )
-    graphify_profile = _prepare_graphify_turn_profile(worker, prompt)
+    graphify_profile = _prepare_graphify_turn_profile(
+        worker,
+        prompt,
+        graphify_context,
+    )
     current_prompt = prompt
     for repair_attempt in range(0, repair_budget + 1):
         current_label = label if repair_attempt == 0 else f"{label}_repair_{repair_attempt}"
@@ -674,6 +693,7 @@ def run_completion_turn_with_repair(
     role_label: str = "",
     task_name: str = "",
     requirement_name: str = "",
+    graphify_context: object | None = None,
     propagate_file_intervention_action: bool = False,
 ) -> None:
     repair_budget = turn_goal.max_repair_attempts if turn_goal is not None else 0
@@ -682,7 +702,11 @@ def run_completion_turn_with_repair(
         if turn_goal is not None and turn_goal.repair_prompt_builder is not None
         else build_default_completion_repair_prompt
     )
-    graphify_profile = _prepare_graphify_turn_profile(worker, prompt)
+    graphify_profile = _prepare_graphify_turn_profile(
+        worker,
+        prompt,
+        graphify_context,
+    )
     current_prompt = prompt
     for repair_attempt in range(0, repair_budget + 1):
         current_label = label if repair_attempt == 0 else f"{label}_repair_{repair_attempt}"

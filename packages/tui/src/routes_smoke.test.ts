@@ -26,8 +26,14 @@ test('home app snapshot renders optional project-level Graphify status without c
   const homeContent = readFileSync(join(import.meta.dir, 'routes/HomeRoute.tsx'), 'utf8')
   const agentContent = readFileSync(join(import.meta.dir, 'homeAgents.ts'), 'utf8')
   expect(appContent.includes('graphify: normalizeGraphifyStatus(payload.graphify)')).toBe(true)
-  expect(homeContent.includes('代码图谱: ${graphifyStatusLabel(graphify)}')).toBe(true)
+  expect(homeContent.includes('代码图谱：${graphifyStatusSummary(graphify)}')).toBe(true)
   expect(agentContent.includes('graphify')).toBe(false)
+})
+
+test('stage snapshots cannot replace project Graphify status', () => {
+  const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
+  const stageBranch = appContent.split("if (event.type === 'snapshot.stage')", 2)[1]?.split("if (event.type === 'snapshot.control')", 1)[0] ?? ''
+  expect(stageBranch.includes('graphify')).toBe(false)
 })
 
 test('index cleans tmux for human and terminal-failure shutdown', () => {

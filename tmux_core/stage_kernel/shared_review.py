@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import inspect
 import time
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field, replace
@@ -149,6 +150,7 @@ def refresh_graphify_workers_for_checkpoint(
     workers: Sequence[object],
     *,
     prompt: str,
+    turn_context: object | None = None,
 ) -> object | None:
     """Refresh one shared project graph, then let peers reuse that generation."""
 
@@ -161,11 +163,33 @@ def refresh_graphify_workers_for_checkpoint(
     ]
     if not eligible:
         return None
-    profile = eligible[0].refresh_graphify_generation(prompt)
+    refresh = eligible[0].refresh_graphify_generation
+    try:
+        parameters = inspect.signature(refresh).parameters.values()
+    except (TypeError, ValueError):
+        parameters = ()
+    if turn_context is not None and any(
+        parameter.name == "turn_context" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters
+    ):
+        profile = refresh(prompt, turn_context=turn_context)
+    else:
+        profile = refresh(prompt)
     for worker in eligible[1:]:
         marker = getattr(worker, "mark_graphify_generation_current", None)
         if callable(marker):
-            marker()
+            try:
+                marker_parameters = inspect.signature(marker).parameters.values()
+            except (TypeError, ValueError):
+                marker_parameters = ()
+            if turn_context is not None and any(
+                parameter.name == "turn_context"
+                or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in marker_parameters
+            ):
+                marker(turn_context=turn_context)
+            else:
+                marker()
     return profile
 
 

@@ -11,20 +11,35 @@ from pathlib import Path
 from unittest import mock
 
 from tmux_core.runtime.graphify import (
+    GRAPHIFY_EVIDENCE_MAX_CHARS,
+    GRAPHIFY_FULL_GUIDE_MARKER,
+    GRAPHIFY_QUERY_MAX_CHARS,
     GRAPHIFY_VERSION,
     GraphifyBuildConfig,
+    GraphifyBuildFailed,
     GraphifyMode,
+    GraphifyQueryIntent,
+    GraphifyQuerySuggestion,
     GraphifySchemaError,
     GraphifySnapshotError,
+    GraphifyTurnContext,
+    GraphifyToolResolution,
     GraphifyUnavailable,
+    assess_graphify_freshness,
+    build_graphify_evidence_block,
+    capture_graphify_source_manifest,
     cli_main,
     create_graphify_snapshot,
+    execute_readonly_query,
+    managed_graphify_executable,
     normalize_graphify_mode,
     project_cache_dir,
+    publish_graphify_pending_status,
     read_graphify_project_status,
     resolve_graphify_tool,
     resolve_graphify_turn_profile,
     run_readonly_query,
+    setup_managed_graphify,
 )
 
 
@@ -73,7 +88,7 @@ if command in {"extract", "update"}:
     files = sorted(path for path in source.rglob("*") if path.is_file() and "graphify-out" not in path.parts)
     nodes = []
     for index, path in enumerate(files):
-        nodes.append({"id": "n" + str(index), "label": path.stem, "file_path": str(path)})
+        nodes.append({"id": "n" + str(index), "label": path.stem, "file_path": str(path), "start_line": index + 10})
     edges = []
     if len(nodes) > 1:
         edges.append({"source": nodes[0]["id"], "target": nodes[1]["id"], "relation": "calls"})
@@ -93,7 +108,11 @@ if command in {"extract", "update"}:
     raise SystemExit(0)
 if command in {"query", "affected", "path", "explain", "god-nodes"}:
     graph_path = args[args.index("--graph") + 1]
-    print(command + " graph=" + graph_path)
+    output = os.environ.get("FAKE_GRAPHIFY_QUERY_OUTPUT", command + " graph=" + graph_path)
+    if os.environ.get("FAKE_GRAPHIFY_QUERY_STDERR"):
+        print(output, file=sys.stderr)
+        raise SystemExit(int(os.environ.get("FAKE_GRAPHIFY_QUERY_EXIT", "7")))
+    print(output)
     raise SystemExit(0)
 print("unsupported", file=sys.stderr)
 raise SystemExit(2)
@@ -170,6 +189,69 @@ class GraphifyRuntimeTests(unittest.TestCase):
         self.assertFalse(mismatch.compatible)
         self.assertIn("required 0.9.27", mismatch.error)
 
+    def test_managed_setup_builds_directly_at_final_target_without_moving_venv(self) -> None:
+        target = managed_graphify_executable().parent.parent
+        target.mkdir(parents=True)
+        (target / "old-marker").write_text("old", encoding="utf-8")
+        observed_environment: dict[str, str] = {}
+
+        def install(_args, *, cwd, timeout_sec, environment):
+            del cwd, timeout_sec
+            observed_environment.update(environment)
+            executable = managed_graphify_executable()
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text("#!/final-target/bin/python\n", encoding="utf-8")
+            executable.chmod(0o755)
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+
+        incompatible = GraphifyToolResolution(source="managed", error="broken shebang")
+        compatible = GraphifyToolResolution(
+            executable_path=str(managed_graphify_executable()),
+            version=GRAPHIFY_VERSION,
+            source="managed",
+            compatible=True,
+        )
+        real_replace = os.replace
+        with mock.patch("tmux_core.runtime.graphify.shutil.which", return_value="/usr/bin/uv"), mock.patch(
+            "tmux_core.runtime.graphify._run_graphify_process", side_effect=install,
+        ), mock.patch(
+            "tmux_core.runtime.graphify._probe_tool", side_effect=(incompatible, compatible),
+        ), mock.patch("tmux_core.runtime.graphify.os.replace", wraps=real_replace) as replace:
+            result = setup_managed_graphify()
+        self.assertTrue(result.compatible)
+        self.assertEqual(observed_environment["UV_PROJECT_ENVIRONMENT"], str(target))
+        self.assertTrue(managed_graphify_executable().is_file())
+        self.assertFalse((target / "old-marker").exists())
+        self.assertEqual(len(replace.call_args_list), 1)
+        self.assertEqual(Path(replace.call_args.args[0]), target)
+        self.assertNotEqual(Path(replace.call_args.args[1]), target)
+
+    def test_managed_setup_failure_restores_previous_target(self) -> None:
+        target = managed_graphify_executable().parent.parent
+        target.mkdir(parents=True)
+        marker = target / "old-marker"
+        marker.write_text("keep", encoding="utf-8")
+        observed_environment: dict[str, str] = {}
+
+        def fail_install(_args, *, cwd, timeout_sec, environment):
+            del cwd, timeout_sec
+            observed_environment.update(environment)
+            managed_graphify_executable().parent.mkdir(parents=True, exist_ok=True)
+            managed_graphify_executable().write_text("broken new venv", encoding="utf-8")
+            raise GraphifyBuildFailed("uv failed")
+
+        with mock.patch("tmux_core.runtime.graphify.shutil.which", return_value="/usr/bin/uv"), mock.patch(
+            "tmux_core.runtime.graphify._run_graphify_process", side_effect=fail_install,
+        ), mock.patch(
+            "tmux_core.runtime.graphify._probe_tool",
+            return_value=GraphifyToolResolution(source="managed", error="broken shebang"),
+        ):
+            with self.assertRaisesRegex(GraphifyUnavailable, "uv failed"):
+                setup_managed_graphify()
+        self.assertEqual(observed_environment["UV_PROJECT_ENVIRONMENT"], str(target))
+        self.assertEqual(marker.read_text(encoding="utf-8"), "keep")
+        self.assertFalse(any(target.parent.glob(f".{GRAPHIFY_VERSION}.*.bak")))
+
     def test_off_does_not_probe_or_scan(self) -> None:
         with mock.patch("tmux_core.runtime.graphify.resolve_graphify_tool", side_effect=AssertionError("must not probe")):
             profile = resolve_graphify_turn_profile(
@@ -230,6 +312,15 @@ class GraphifyRuntimeTests(unittest.TestCase):
         self.assertEqual(first.status.state, "ready")
         self.assertIn("Graphify Code Graph Evidence", first.evidence.block_text)
         self.assertIn("alpha", first.evidence.block_text)
+        self.assertIn("FURTHER_QUERY (optional; read-only)", first.evidence.block_text)
+        self.assertIn('"$TMUX_GRAPHIFY_CMD" query "<question>"', first.evidence.block_text)
+        self.assertIn('"$TMUX_GRAPHIFY_CMD" affected "<file-or-symbol>"', first.evidence.block_text)
+        self.assertIn('"$TMUX_GRAPHIFY_CMD" path "<source>" "<target>"', first.evidence.block_text)
+        self.assertIn('"$TMUX_GRAPHIFY_CMD" explain "<symbol>"', first.evidence.block_text)
+        self.assertIn('"$TMUX_GRAPHIFY_CMD" god-nodes', first.evidence.block_text)
+        self.assertIn("do not query on every turn", first.evidence.block_text)
+        self.assertIn("verify them in AGENTS.md (when present), source, tests, and config", first.evidence.block_text)
+        self.assertIn("The wrapper is read-only", first.evidence.block_text)
         self.assertNotIn(str(self.cache_home), first.evidence.block_text)
         self.assertTrue(Path(first.evidence.report_path).is_file())
         calls_after_first = self.log_path.read_text(encoding="utf-8").splitlines()
@@ -270,27 +361,7 @@ class GraphifyRuntimeTests(unittest.TestCase):
             target.write_text(f"def {target.stem}(): return True\n", encoding="utf-8")
         docs = self.project / "docs"
         docs.mkdir()
-        (docs / "repo_map.json").write_text(
-            json.dumps(
-                {
-                    "modules": [
-                        {
-                            "id": "M_EXACT_ROUTED",
-                            "owned_paths": [
-                                {"type": "literal", "match": "exact", "path": "src/a_routed.py"}
-                            ],
-                        },
-                        {
-                            "id": "M_SOURCE_TREE",
-                            "owned_paths": [
-                                {"type": "subtree", "match": "subtree", "path": "src"}
-                            ],
-                        },
-                    ]
-                }
-            ),
-            encoding="utf-8",
-        )
+        (docs / "repo_map.json").write_text("not runtime input", encoding="utf-8")
 
         baseline = self._profile(prompt="generic request")
         for relative in target_paths:
@@ -318,14 +389,8 @@ class GraphifyRuntimeTests(unittest.TestCase):
         for relative in target_paths:
             self.assertIn(relative, seeded.evidence.related_paths)
         self.assertNotEqual(baseline.evidence.evidence_id, seeded.evidence.evidence_id)
-        self.assertIn(
-            "M_EXACT_ROUTED <- src/a_routed.py [needs_code_confirmation]",
-            seeded.evidence.routed_module_candidates,
-        )
-        self.assertTrue(
-            any(candidate.startswith("M_SOURCE_TREE <- ") for candidate in seeded.evidence.routed_module_candidates)
-        )
-        self.assertIn("ROUTED_MODULE_CANDIDATES (needs_code_confirmation", seeded.evidence.block_text)
+        self.assertEqual(seeded.evidence.routed_module_candidates, ())
+        self.assertNotIn("ROUTED_MODULE_CANDIDATES", seeded.evidence.block_text)
         self.assertIn("AI Hermes routing remains authoritative", seeded.evidence.block_text)
         self.assertNotIn(str(outside), seeded.evidence.block_text)
 
@@ -518,12 +583,36 @@ class GraphifyRuntimeTests(unittest.TestCase):
         with self.assertRaises(GraphifyUnavailable):
             run_readonly_query(self.project, "extract", ["."])
 
+    def test_readonly_query_rejects_option_injection_and_invalid_arity(self) -> None:
+        self._write_sources()
+        self._profile()
+        invalid = (
+            ("query", ["--"]),
+            ("affected", ["--save-result"]),
+            ("explain", ["--reflect"]),
+            ("path", ["alpha", "--graph"]),
+            ("query", []),
+            ("path", ["alpha"]),
+            ("god-nodes", ["--graph", "1"]),
+            ("god-nodes", ["--top", "0"]),
+        )
+        for command, values in invalid:
+            with self.subTest(command=command, values=values):
+                with self.assertRaises(GraphifyUnavailable):
+                    execute_readonly_query(self.project, command, values)
+        self.assertTrue(execute_readonly_query(self.project, "god-nodes", ["--top", "3"]).ok)
+
     def test_readonly_query_runs_from_cache_not_target_project(self) -> None:
         self._write_sources()
         profile = self._profile()
         completed = subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
-        with mock.patch("tmux_core.runtime.graphify._run_graphify_process", return_value=completed) as runner:
-            self.assertEqual(run_readonly_query(self.project, "query", ["alpha"]), "ok")
+        with mock.patch(
+            "tmux_core.runtime.graphify._run_bounded_graphify_query",
+            return_value=(completed, False),
+        ) as runner:
+            output = run_readonly_query(self.project, "query", ["alpha"])
+        self.assertIn("[TMUX_GRAPHIFY_QUERY]", output)
+        self.assertIn("\n[RESULT]\nok\n[END_TMUX_GRAPHIFY_QUERY]", output)
         expected = (
             project_cache_dir(self.project)
             / "graphs"
@@ -570,6 +659,342 @@ class GraphifyRuntimeTests(unittest.TestCase):
         self.assertTrue(profile.enabled)
         self.assertEqual(after, before)
 
+    def test_turn_context_generates_bounded_deterministic_query_suggestions(self) -> None:
+        self._write_sources()
+        context = GraphifyTurnContext(
+            stage_key="A07",
+            phase="development_review",
+            role="reviewer",
+            intent=GraphifyQueryIntent.CHANGE_REVIEW,
+            requirement_name="Safe review",
+            task_name="M1-T1",
+            routed_paths=("src/alpha.py",),
+            changed_files=("src/beta.py", "src/alpha.py"),
+            symbols=("alpha",),
+        )
+        profile = resolve_graphify_turn_profile(
+            project_dir=self.project,
+            mode="required",
+            prompt="review the change",
+            runtime_dir=self.project / ".development_runtime" / "context",
+            turn_context=context,
+        )
+        self.assertEqual(profile.turn_context, context)
+        self.assertGreaterEqual(len(profile.suggestions), 1)
+        self.assertLessEqual(len(profile.suggestions), 3)
+        self.assertEqual(profile.suggestions[0].command, "affected")
+        self.assertEqual(profile.suggestions[0].values, ("src/alpha.py",))
+        self.assertIn('"$TMUX_GRAPHIFY_CMD" affected src/alpha.py', profile.evidence.block_text)
+        self.assertIn("src/alpha.py:L10", profile.evidence.block_text)
+        self.assertIn("[EXTRACTED] edge:", profile.evidence.block_text)
+        self.assertLessEqual(len(profile.evidence.block_text), GRAPHIFY_EVIDENCE_MAX_CHARS)
+        self.assertTrue(profile.evidence.block_text.endswith("[End Graphify Code Graph Evidence]"))
+        full = build_graphify_evidence_block(profile, "business", include_full_guide=True)
+        compact = build_graphify_evidence_block(profile, "business", include_full_guide=False)
+        self.assertIn(GRAPHIFY_FULL_GUIDE_MARKER, full)
+        self.assertNotIn(GRAPHIFY_FULL_GUIDE_MARKER, compact)
+        self.assertIn("RECOMMENDED_QUERIES", compact)
+
+    def test_deleted_path_uses_previous_generation_as_ambiguous_navigation_only(self) -> None:
+        self._write_sources()
+        first = self._profile(prompt="alpha calls beta")
+        (self.project / "src" / "beta.py").unlink()
+        context = GraphifyTurnContext(
+            stage_key="A07",
+            phase="a07_developer_to_reviewer_checkpoint",
+            role="development_reviewer",
+            intent=GraphifyQueryIntent.CHANGE_REVIEW,
+            requirement_name="Delete beta",
+            task_name="M1-T1",
+            changed_files=("src/beta.py",),
+            deleted_files=("src/beta.py",),
+        )
+        refreshed = resolve_graphify_turn_profile(
+            project_dir=self.project,
+            mode="required",
+            prompt="review deleted beta callers",
+            runtime_dir=self.project / ".development_runtime" / "deleted",
+            turn_context=context,
+        )
+
+        self.assertNotEqual(first.evidence.graph_fingerprint, refreshed.evidence.graph_fingerprint)
+        self.assertEqual(refreshed.deleted_files, ("src/beta.py",))
+        self.assertTrue(refreshed.evidence.old_generation_candidates)
+        self.assertEqual(
+            refreshed.evidence.old_generation_fingerprint,
+            first.evidence.graph_fingerprint,
+        )
+        old_candidate = refreshed.evidence.old_generation_candidates[0]
+        self.assertIn("[OLD_GENERATION][AMBIGUOUS]", old_candidate)
+        self.assertIn("alpha", old_candidate)
+        self.assertIn("beta", old_candidate)
+        self.assertIn("OLD_GENERATION_CANDIDATES", refreshed.evidence.block_text)
+        self.assertNotIn(str(project_cache_dir(self.project)), refreshed.evidence.block_text)
+        self.assertEqual(refreshed.suggestions[0].generation_scope, "previous")
+        self.assertEqual(
+            refreshed.suggestions[0].shell_command,
+            '"$TMUX_GRAPHIFY_CMD" affected src/beta.py --previous',
+        )
+
+        previous_result = execute_readonly_query(
+            self.project,
+            "affected",
+            ["src/beta.py"],
+            generation_scope="previous",
+        )
+        self.assertTrue(previous_result.ok)
+        self.assertEqual(previous_result.graph_fingerprint, first.evidence.graph_fingerprint)
+        self.assertEqual(previous_result.freshness, "stale")
+        self.assertEqual(previous_result.generation_scope, "previous")
+        self.assertIn("OLD_GENERATION", previous_result.warnings[0])
+        self.assertEqual(previous_result.to_public_dict()["graph"]["generation_scope"], "previous")
+        self.assertEqual(read_graphify_project_status(self.project)["state"], "ready")
+        upstream_call = self.log_path.read_text(encoding="utf-8").splitlines()[-1]
+        self.assertTrue(upstream_call.startswith("affected src/beta.py "))
+        self.assertNotIn("--previous", upstream_call)
+
+        with self.assertRaisesRegex(GraphifyUnavailable, "仍存在"):
+            execute_readonly_query(
+                self.project,
+                "affected",
+                ["src/alpha.py"],
+                generation_scope="previous",
+            )
+        with self.assertRaisesRegex(GraphifyUnavailable, "相对路径"):
+            execute_readonly_query(
+                self.project,
+                "affected",
+                [str(self.project / "src" / "beta.py")],
+                generation_scope="previous",
+            )
+        with self.assertRaisesRegex(GraphifyUnavailable, "manifest 删除校验"):
+            execute_readonly_query(
+                self.project,
+                "affected",
+                ["src/never-existed.py"],
+                generation_scope="previous",
+            )
+        with self.assertRaisesRegex(GraphifyUnavailable, "仅支持 affected"):
+            execute_readonly_query(
+                self.project,
+                "query",
+                ["beta"],
+                generation_scope="previous",
+            )
+        with mock.patch("builtins.print"):
+            self.assertEqual(
+                cli_main([
+                    "affected",
+                    "src/beta.py",
+                    "--previous",
+                    "--project",
+                    str(self.project),
+                    "--format",
+                    "json",
+                ]),
+                0,
+            )
+
+    def test_evidence_truncation_preserves_authority_limit_verification_and_end(self) -> None:
+        source_dir = self.project / "src"
+        source_dir.mkdir()
+        for index in range(24):
+            name = f"symbol_{index:02d}_" + ("x" * 180) + ".py"
+            (source_dir / name).write_text(f"VALUE_{index} = {index}\n", encoding="utf-8")
+        profile = self._profile(prompt="unmatched broad request")
+        block = profile.evidence.block_text
+        self.assertLessEqual(len(block), GRAPHIFY_EVIDENCE_MAX_CHARS)
+        self.assertIn("authority: navigation evidence only", block)
+        self.assertIn("limitation: static extraction cannot prove", block)
+        self.assertIn("VERIFY_BEFORE_ACTING:", block)
+        self.assertIn("verify them in AGENTS.md", block)
+        self.assertTrue(block.endswith("[End Graphify Code Graph Evidence]"))
+        self.assertIn("[truncated within evidence budget]", block)
+
+    def test_query_suggestion_shell_command_quotes_shell_expansion(self) -> None:
+        suggestion = GraphifyQuerySuggestion(
+            command="query",
+            values=('$(touch /tmp/should-not-run) `id` "quoted"',),
+            purpose="test",
+        )
+        rendered = suggestion.shell_command
+        self.assertTrue(rendered.startswith('"$TMUX_GRAPHIFY_CMD" query '))
+        self.assertIn("'$(touch /tmp/should-not-run) `id` \"quoted\"'", rendered)
+
+    def test_freshness_guard_allows_old_graph_with_explicit_warning(self) -> None:
+        self._write_sources()
+        profile = self._profile()
+        fresh = assess_graphify_freshness(self.project)
+        self.assertEqual(fresh.state, "fresh")
+        (self.project / "src" / "beta.py").write_text("def beta(): return 99\n", encoding="utf-8")
+        stale = execute_readonly_query(self.project, "affected", ["beta"])
+        self.assertTrue(stale.ok)
+        self.assertEqual(stale.freshness, "stale")
+        self.assertIn("src/beta.py", stale.warnings[0])
+        current = json.loads(
+            (project_cache_dir(self.project) / "current.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(current["fingerprint"], profile.evidence.graph_fingerprint)
+        self.assertEqual(current["freshness"], "stale")
+        status = read_graphify_project_status(self.project)
+        self.assertEqual(status["state"], "stale")
+        self.assertEqual(status["query_count_stage"], 1)
+        (self.project / "src" / "beta.py").write_text("def beta(): return 1\n", encoding="utf-8")
+        restored = execute_readonly_query(self.project, "affected", ["beta"])
+        self.assertEqual(restored.freshness, "fresh")
+        self.assertEqual(read_graphify_project_status(self.project)["query_count_stage"], 2)
+        self._profile(prompt="checkpoint")
+        self.assertEqual(read_graphify_project_status(self.project)["query_count_stage"], 2)
+
+    def test_clean_git_change_manifest_uses_blob_ids_without_reading_source(self) -> None:
+        self._write_sources()
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        subprocess.run(["git", "-C", str(self.project), "add", "src"], check=True)
+        with mock.patch(
+            "tmux_core.runtime.graphify._read_snapshot_source",
+            side_effect=AssertionError("clean Git source must not be read"),
+        ):
+            manifest = capture_graphify_source_manifest(self.project)
+        self.assertEqual(set(manifest), {"src/alpha.py", "src/beta.py"})
+        self.assertTrue(all(value.startswith("git:") for value in manifest.values()))
+
+    def test_validation_stamp_makes_warm_query_skip_full_graph_validation(self) -> None:
+        self._write_sources()
+        profile = self._profile()
+        validation = (
+            project_cache_dir(self.project)
+            / "graphs"
+            / profile.evidence.graph_fingerprint
+            / "validation.json"
+        )
+        self.assertTrue(validation.is_file())
+        with mock.patch(
+            "tmux_core.runtime.graphify._load_and_validate_graph",
+            side_effect=AssertionError("warm query must use validation stamp"),
+        ), mock.patch(
+            "tmux_core.runtime.graphify._hash_file",
+            side_effect=AssertionError("warm query must not hash cached metadata"),
+        ):
+            result = execute_readonly_query(self.project, "query", ["alpha"])
+        self.assertTrue(result.ok)
+
+    def test_query_output_is_bounded_sanitized_and_audited_without_payload(self) -> None:
+        self._write_sources()
+        self._profile()
+        publish_graphify_pending_status(
+            self.project,
+            "auto",
+            runner_id="runner-current",
+            stage_key="A05",
+            session_generation="session-current",
+        )
+        raw = (
+            "\x1b[31m/private/secret.py C:\\secret\\file.py "
+            "file:///private/uri-secret.py "
+            "vscode://file/Users/name/vscode-secret.py "
+            "\\\\server\\share\\unc-secret.py "
+            "//server/share/forward-secret.py "
+            "https://example.com/a\n"
+            + ("x" * 7000)
+        )
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_GRAPHIFY_QUERY_OUTPUT": raw,
+                "TMUX_GRAPHIFY_RUNNER_ID": "stale-child-runner",
+                "TMUX_GRAPHIFY_SESSION_GENERATION": "session-current",
+            },
+            clear=False,
+        ):
+            result = execute_readonly_query(self.project, "query", ["sensitive question"])
+        self.assertTrue(result.ok)
+        self.assertTrue(result.truncated)
+        self.assertLessEqual(len(result.result_text), GRAPHIFY_QUERY_MAX_CHARS)
+        self.assertNotIn("/private/secret.py", result.result_text)
+        self.assertNotIn("C:\\secret", result.result_text)
+        self.assertNotIn("uri-secret.py", result.result_text)
+        self.assertNotIn("vscode-secret.py", result.result_text)
+        self.assertNotIn("unc-secret.py", result.result_text)
+        self.assertNotIn("forward-secret.py", result.result_text)
+        self.assertNotIn("\x1b", result.result_text)
+        self.assertIn("https://example.com/a", result.result_text)
+        control_output = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="ok\x00control", stderr="",
+        )
+        with mock.patch(
+            "tmux_core.runtime.graphify._run_bounded_graphify_query",
+            return_value=(control_output, False),
+        ):
+            control_result = execute_readonly_query(self.project, "query", ["control"])
+        self.assertNotIn("\x00", control_result.result_text)
+        audit_path = project_cache_dir(self.project) / "query-audit.jsonl"
+        audit_text = audit_path.read_text(encoding="utf-8")
+        self.assertNotIn("sensitive question", audit_text)
+        self.assertNotIn("secret.py", audit_text)
+        self.assertNotIn("result_text", audit_text)
+        audit_payload = json.loads(audit_text.splitlines()[0])
+        self.assertEqual(audit_payload["runner_id"], "runner-current")
+        self.assertEqual(audit_payload["stage_key"], "A05")
+        self.assertTrue(audit_payload["scope_match"])
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_GRAPHIFY_QUERY_OUTPUT": "file:///private/json-secret.py",
+                "TMUX_GRAPHIFY_SESSION_GENERATION": "session-current",
+            },
+            clear=False,
+        ):
+            json_payload = json.loads(
+                run_readonly_query(
+                    self.project,
+                    "query",
+                    ["json output"],
+                    output_format="json",
+                )
+            )
+        self.assertNotIn("json-secret.py", json_payload["result_text"])
+
+    def test_failed_stderr_truncation_and_json_envelope(self) -> None:
+        self._write_sources()
+        self._profile()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_GRAPHIFY_QUERY_OUTPUT": "failure " + ("z" * 7000),
+                "FAKE_GRAPHIFY_QUERY_STDERR": "1",
+            },
+            clear=False,
+        ):
+            result = execute_readonly_query(self.project, "explain", ["alpha"])
+        self.assertFalse(result.ok)
+        self.assertTrue(result.truncated)
+        payload = json.loads(run_readonly_query(self.project, "query", ["alpha"], output_format="json"))
+        self.assertEqual(payload["schema"], "tmux-graphify-query-result/1")
+        self.assertIn("graph", payload)
+
+    def test_readonly_cli_locks_project_and_returns_query_exit_status(self) -> None:
+        self._write_sources()
+        self._profile()
+        outside = self.root / "outside-project"
+        outside.mkdir()
+        with mock.patch.dict(
+            os.environ,
+            {
+                "TMUX_GRAPHIFY_READ_ONLY": "1",
+                "TMUX_GRAPHIFY_PROJECT_DIR": str(self.project),
+                "TMUX_GRAPHIFY_MODE": "required",
+            },
+            clear=False,
+        ):
+            self.assertEqual(
+                cli_main(["query", "alpha", "--project", str(outside), "--format", "json"]),
+                1,
+            )
+            self.assertEqual(
+                cli_main(["query", "alpha", "--project", str(self.project), "--format", "json"]),
+                0,
+            )
+
     @unittest.skipUnless(REAL_GRAPHIFY_EXECUTABLE, "set REAL_GRAPHIFY_EXECUTABLE for the managed canary")
     def test_real_graphify_code_only_incremental_and_readonly_queries(self) -> None:
         self._write_sources()
@@ -611,6 +1036,9 @@ class GraphifyRuntimeTests(unittest.TestCase):
             (self.project / "src" / "alpha.py").write_text("def alpha(): return 42\n", encoding="utf-8")
             (self.project / "src" / "added.py").write_text("def added(): return 2\n", encoding="utf-8")
             (self.project / "src" / "beta.py").unlink()
+            stale = execute_readonly_query(self.project, "affected", ["alpha"])
+            self.assertTrue(stale.ok)
+            self.assertEqual(stale.freshness, "stale")
             status_before_refresh = subprocess.run(
                 ["git", "-C", str(self.project), "status", "--porcelain"],
                 capture_output=True,
@@ -622,6 +1050,20 @@ class GraphifyRuntimeTests(unittest.TestCase):
                 mode="required",
                 prompt="alpha added",
                 runtime_dir=self.project / ".development_runtime" / "real-canary",
+                turn_context=GraphifyTurnContext(
+                    stage_key="A07",
+                    phase="a07_developer_to_reviewer_checkpoint",
+                    role="development_reviewer",
+                    intent=GraphifyQueryIntent.CHANGE_REVIEW,
+                    changed_files=("src/alpha.py", "src/added.py", "src/beta.py"),
+                    deleted_files=("src/beta.py",),
+                ),
+            )
+            previous_deleted = execute_readonly_query(
+                self.project,
+                "affected",
+                ["src/beta.py"],
+                generation_scope="previous",
             )
             status_after_refresh = subprocess.run(
                 ["git", "-C", str(self.project), "status", "--porcelain"],
@@ -631,6 +1073,12 @@ class GraphifyRuntimeTests(unittest.TestCase):
             ).stdout
         self.assertTrue(refreshed.enabled)
         self.assertNotEqual(first.evidence.graph_fingerprint, refreshed.evidence.graph_fingerprint)
+        self.assertEqual(refreshed.status.freshness, "fresh")
+        self.assertTrue(refreshed.evidence.old_generation_candidates)
+        self.assertEqual(previous_deleted.graph_fingerprint, first.evidence.graph_fingerprint)
+        self.assertEqual(previous_deleted.generation_scope, "previous")
+        self.assertEqual(previous_deleted.freshness, "stale")
+        self.assertIn("OLD_GENERATION", previous_deleted.warnings[0])
         self.assertEqual(status_after_refresh, status_before_refresh)
 
 

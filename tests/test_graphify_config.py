@@ -12,16 +12,33 @@ import A01_Routing_LayerPlanning as routing
 import A02_RequirementIntake as intake
 import A03_RequirementsClarification as clarification
 from T03_agent_init_workflow import RunManifest, RunStore
+from tmux_core.runtime import graphify as graphify_runtime
+from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
 from tmux_core.runtime.graphify import (
+    GRAPHIFY_FULL_GUIDE_MARKER,
+    GRAPHIFY_GUIDE_VERSION,
+    GraphifyEvidence,
     GraphifyMode,
+    GraphifyQueryIntent,
+    GraphifyQueryResult,
+    GraphifyState,
+    GraphifyStatus,
+    GraphifyTurnContext,
     GraphifyTurnProfile,
     GraphifyUnavailable,
     graphify_required_recovery_decision,
+    publish_graphify_pending_status,
+    read_graphify_project_status,
     set_graphify_required_recovery_decision,
 )
 from tmux_core.runtime.grill import BEGIN_MARKER as GRILL_BEGIN_MARKER, GrillTurnProfile
 from tmux_core.runtime.ponytail import BEGIN_MARKER as PONYTAIL_BEGIN_MARKER
-from tmux_core.runtime.tmux_runtime import AgentRunConfig, TmuxBatchWorker
+from tmux_core.runtime.tmux_runtime import (
+    AgentRunConfig,
+    AgentRuntimeState,
+    TmuxBatchWorker,
+    WorkerStatus,
+)
 from tmux_core.stage_kernel import detailed_design, development, overall_review, requirements_review, task_split
 from tmux_core.stage_kernel.shared_review import (
     ReviewAgentSelection,
@@ -70,6 +87,10 @@ def _prompt_worker() -> TmuxBatchWorker:
     worker.grill_delivered_mode = ""
     worker.grill_question_seq = 0
     worker.graphify_mode = "auto"
+    worker.graphify_session_generation = "graphify-session"
+    worker.graphify_orientation_delivered = False
+    worker.graphify_delivered_mode = ""
+    worker.graphify_delivered_guide_version = ""
     worker.session_name = "test-session"
     return worker
 
@@ -206,7 +227,7 @@ def test_prompt_order_is_ponytail_grill_graphify_business_protocol() -> None:
         ),
         mock.patch(
             "tmux_core.runtime.tmux_runtime.build_graphify_evidence_block",
-            side_effect=lambda _profile, prompt: f"[[GRAPHIFY EVIDENCE]]\n{prompt}",
+            side_effect=lambda _profile, prompt, **_kwargs: f"[[GRAPHIFY EVIDENCE]]\n{prompt}",
         ),
     ):
         prompt = worker._build_turn_prompt(  # noqa: SLF001
@@ -222,6 +243,377 @@ def test_prompt_order_is_ponytail_grill_graphify_business_protocol() -> None:
     assert prompt.index(GRILL_BEGIN_MARKER) < prompt.index("[[GRAPHIFY EVIDENCE]]")
     assert prompt.index("[[GRAPHIFY EVIDENCE]]") < prompt.index("Do the task")
     assert prompt.index("Do the task") < prompt.index("Turn completion protocol")
+
+
+def test_graphify_orientation_is_full_once_then_compact_for_same_session() -> None:
+    worker = _prompt_worker()
+    profile = GraphifyTurnProfile(mode=GraphifyMode.AUTO.value)
+    guide_flags: list[bool] = []
+
+    def render(_profile, prompt, *, include_full_guide=True):  # noqa: ANN001
+        guide_flags.append(bool(include_full_guide))
+        return f"[[GRAPHIFY {'FULL' if include_full_guide else 'REMINDER'}]]\n{prompt}"
+    with (
+        mock.patch.object(
+            worker,
+            "_normalize_graphify_profile_for_turn",
+            return_value=SimpleNamespace(enabled=True, mode="auto"),
+        ),
+        mock.patch(
+            "tmux_core.runtime.tmux_runtime.build_graphify_evidence_block",
+            side_effect=render,
+        ),
+    ):
+        first = worker._build_turn_prompt(  # noqa: SLF001
+            "First",
+            "[[DONE]]",
+            (),
+            task_status_path=Path("status.json"),
+            include_turn_protocol=False,
+            graphify_profile=profile,
+        )
+        worker.graphify_orientation_delivered = True
+        worker.graphify_delivered_mode = "auto"
+        worker.graphify_delivered_guide_version = GRAPHIFY_GUIDE_VERSION
+        second = worker._build_turn_prompt(  # noqa: SLF001
+            "Second",
+            "[[DONE]]",
+            (),
+            task_status_path=Path("status.json"),
+            include_turn_protocol=False,
+            graphify_profile=profile,
+        )
+
+    assert guide_flags == [True, False]
+    assert "[[GRAPHIFY FULL]]" in first
+    assert "[[GRAPHIFY REMINDER]]" in second
+
+
+def test_graphify_orientation_latches_only_a_confirmed_full_guide() -> None:
+    worker = _prompt_worker()
+    managed_evidence = (
+        f"{GRAPHIFY_FULL_GUIDE_MARKER}\n"
+        "managed evidence\n"
+        "[END_GRAPHIFY_EVIDENCE]"
+    )
+    profile = GraphifyTurnProfile(
+        mode=GraphifyMode.AUTO.value,
+        evidence=GraphifyEvidence(
+            evidence_id="evidence-1",
+            graph_fingerprint="f" * 64,
+            freshness="fresh",
+            block_text=managed_evidence,
+            compact_block_text="compact evidence",
+        ),
+    )
+    worker._persist_graphify_policy_fast = mock.Mock()  # type: ignore[method-assign]
+
+    worker._confirm_graphify_orientation_delivery("ordinary prompt", profile)  # noqa: SLF001
+    assert worker.graphify_orientation_delivered is False
+
+    worker._confirm_graphify_orientation_delivery(  # noqa: SLF001
+        f"business prompt quoted {GRAPHIFY_FULL_GUIDE_MARKER}",
+        profile,
+    )
+    assert worker.graphify_orientation_delivered is False
+
+    worker._confirm_graphify_orientation_delivery(  # noqa: SLF001
+        f"{managed_evidence}\n\nbusiness prompt",
+        profile,
+    )
+    assert worker.graphify_orientation_delivered is True
+    assert worker.graphify_delivered_mode == "auto"
+    assert worker.graphify_delivered_guide_version == GRAPHIFY_GUIDE_VERSION
+    worker._persist_graphify_policy_fast.assert_called_once()
+
+
+def test_resumed_contract_latches_persisted_full_graphify_delivery() -> None:
+    worker = _prompt_worker()
+    profile = GraphifyTurnProfile(
+        mode=GraphifyMode.AUTO.value,
+        evidence=GraphifyEvidence(
+            evidence_id="evidence-1",
+            graph_fingerprint="f" * 64,
+            freshness="fresh",
+            block_text=f"{GRAPHIFY_FULL_GUIDE_MARKER}\nmanaged evidence",
+        ),
+    )
+    persisted_state = {
+        "current_graphify_prompt_kind": "full",
+        "current_graphify_guide_version": GRAPHIFY_GUIDE_VERSION,
+        "started_at": "2026-07-27T00:00:00+00:00",
+    }
+    worker.read_state = mock.Mock(return_value=persisted_state)  # type: ignore[method-assign]
+    worker._persist_graphify_policy_fast = mock.Mock()  # type: ignore[method-assign]
+    worker._confirm_grill_profile_delivery = mock.Mock()  # type: ignore[method-assign]
+    worker._record_result = mock.Mock()  # type: ignore[method-assign]
+    worker._log_event = mock.Mock()  # type: ignore[method-assign]
+    contract = TurnFileContract(
+        turn_id="turn-1",
+        phase="requirements_clarification",
+        status_path=Path("/tmp/graphify-resume-status.json"),
+        validator=mock.Mock(),
+    )
+    file_result = TurnFileResult(
+        status_path=str(contract.status_path),
+        payload={"status": "completed"},
+        artifact_paths={},
+        artifact_hashes={},
+        validated_at="2026-07-27T00:00:01+00:00",
+    )
+
+    worker._record_resumed_completion_turn(  # noqa: SLF001
+        label="resume",
+        contract=contract,
+        file_result=file_result,
+        task_status_path=None,
+        grill_profile=None,
+        graphify_profile=profile,
+    )
+
+    assert worker.graphify_orientation_delivered is True
+    assert worker.graphify_delivered_mode == GraphifyMode.AUTO.value
+    assert worker.graphify_delivered_guide_version == GRAPHIFY_GUIDE_VERSION
+    worker._persist_graphify_policy_fast.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "vendor",
+    ("codex", "claude", "gemini", "opencode", "mimo", "agy", "deveco"),
+)
+def test_all_vendor_launches_receive_real_graphify_runner_id(
+    tmp_path: Path,
+    vendor: str,
+) -> None:
+    worker = object.__new__(TmuxBatchWorker)
+    worker.config = _config(vendor, graphify_mode="auto")
+    worker.work_dir = tmp_path
+    worker.stage_runner_id = "runner-123"
+    worker.graphify_session_generation = "session-123"
+
+    command = worker._build_agent_launch_command()  # noqa: SLF001
+
+    assert command.startswith("env TMUX_GRAPHIFY_RUNNER_ID=runner-123 ")
+    assert command.count("TMUX_GRAPHIFY_RUNNER_ID=") == 1
+    assert "TMUX_GRAPHIFY_SESSION_GENERATION=session-123" in command
+
+    worker.stage_runner_id = ""
+    assert "TMUX_GRAPHIFY_RUNNER_ID=" not in worker._build_agent_launch_command()  # noqa: SLF001
+    assert "TMUX_GRAPHIFY_SESSION_GENERATION=session-123" in worker._build_agent_launch_command()  # noqa: SLF001
+
+
+def test_new_session_generation_clears_old_graphify_evidence_identity(
+    tmp_path: Path,
+) -> None:
+    backend = mock.Mock()
+    backend.control_state.return_value = {}
+    runtime_dir = tmp_path / "runtime" / "worker-existing"
+    runtime_dir.mkdir(parents=True)
+    state_path = runtime_dir / "worker.state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "session_name": "old-session",
+                "config": {
+                    "vendor": "codex",
+                    "model": "model",
+                    "graphify_mode": "auto",
+                    "graphify_config": {},
+                },
+                "graphify_evidence_id": "old-evidence",
+                "graphify_fingerprint": "f" * 64,
+                "graphify_freshness": "fresh",
+                "graphify_policy": {
+                    "session_generation": "old-generation",
+                    "guide_version": GRAPHIFY_GUIDE_VERSION,
+                    "orientation_delivered": True,
+                    "delivered_mode": "auto",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with mock.patch(
+        "tmux_core.runtime.tmux_runtime.publish_graphify_pending_status"
+    ):
+        worker = TmuxBatchWorker(
+            worker_id="worker",
+            work_dir=tmp_path,
+            config=_config(graphify_mode="auto"),
+            runtime_root=tmp_path / "runtime",
+            existing_runtime_dir=runtime_dir,
+            existing_session_name="old-session",
+            backend=backend,
+        )
+    old_generation = worker.graphify_session_generation
+
+    worker._reset_graphify_delivery_generation()  # noqa: SLF001
+    worker._write_session_created_state_fast()  # noqa: SLF001
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert persisted["graphify_evidence_id"] == ""
+    assert persisted["graphify_fingerprint"] == ""
+    assert persisted["graphify_freshness"] == ""
+    assert persisted["graphify_policy"]["orientation_delivered"] is False
+    assert persisted["graphify_policy"]["session_generation"] != old_generation
+
+
+def test_graphify_pending_and_query_aggregate_are_runner_generation_scoped(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    with mock.patch.dict("os.environ", {"XDG_CACHE_HOME": str(tmp_path / "cache")}, clear=False):
+        assert publish_graphify_pending_status(
+            project,
+            "auto",
+            runner_id="root-runner",
+            stage_key="A07",
+            session_generation="session-reused",
+        )
+        graphify_runtime._write_status(  # noqa: SLF001
+            project,
+            GraphifyStatus(
+                mode="auto",
+                state=GraphifyState.READY.value,
+                version="0.9.27",
+                freshness="fresh",
+                query_count_stage=4,
+                last_query_command="affected",
+            ),
+        )
+
+        # Another worker in the same runner must not flash Ready back to
+        # Building or clear the already observed query count.
+        assert publish_graphify_pending_status(
+            project,
+            "auto",
+            runner_id="root-runner",
+            stage_key="A07",
+            session_generation="session-old-peer",
+        )
+        same_runner = read_graphify_project_status(project)
+        assert same_runner is not None
+        assert same_runner["state"] == GraphifyState.READY.value
+        assert same_runner["query_count_stage"] == 4
+
+        # A00 reuses one root runner, so the stage key must reset the aggregate.
+        assert publish_graphify_pending_status(
+            project,
+            "auto",
+            runner_id="root-runner",
+            stage_key="A08",
+            session_generation="session-reused",
+        )
+        new_runner = read_graphify_project_status(project)
+        assert new_runner is not None
+        assert new_runner["state"] == GraphifyState.BUILDING.value
+        assert new_runner["query_count_stage"] == 0
+
+        query_result = GraphifyQueryResult(
+            ok=True,
+            query_id="query-1",
+            command="affected",
+            graph_fingerprint="f" * 64,
+            freshness="fresh",
+            warnings=(),
+            truncated=False,
+            duration_ms=1,
+            result_text="result",
+        )
+        # A late query from an A07-only session cannot contaminate A08 even
+        # though both stages share one root runner.
+        with mock.patch.dict(
+            "os.environ",
+            {
+                "TMUX_GRAPHIFY_RUNNER_ID": "root-runner",
+                "TMUX_GRAPHIFY_SESSION_GENERATION": "session-old-peer",
+                "TMUX_GRAPHIFY_MODE": "auto",
+            },
+            clear=False,
+        ):
+            graphify_runtime._publish_query_result(project, query_result)  # noqa: SLF001
+        after_late_query = read_graphify_project_status(project)
+        assert after_late_query is not None
+        assert after_late_query["query_count_stage"] == 0
+
+        with mock.patch.dict(
+            "os.environ",
+            {
+                # A reused session can retain the A07 runner env. The trusted
+                # ledger and stable session generation own A08 attribution.
+                "TMUX_GRAPHIFY_RUNNER_ID": "stale-a07-env",
+                "TMUX_GRAPHIFY_SESSION_GENERATION": "session-reused",
+                "TMUX_GRAPHIFY_MODE": "auto",
+            },
+            clear=False,
+        ):
+            graphify_runtime._publish_query_result(project, query_result)  # noqa: SLF001
+            query_scope = graphify_runtime._resolve_query_scope(project)  # noqa: SLF001
+        after_current_query = read_graphify_project_status(project)
+        assert after_current_query is not None
+        assert after_current_query["query_count_stage"] == 1
+        assert query_scope.runner_id == "root-runner"
+        assert query_scope.stage_key == "A08"
+        assert query_scope.accepted is True
+
+
+def test_graphify_identity_and_orientation_survive_intermediate_state_writes(
+    tmp_path: Path,
+) -> None:
+    backend = mock.Mock()
+    backend.control_state.return_value = {}
+    runtime_dir = tmp_path / "runtime" / "worker-existing"
+    runtime_dir.mkdir(parents=True)
+    state_path = runtime_dir / "worker.state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "session_name": "same-session",
+                "config": {
+                    "vendor": "codex",
+                    "model": "model",
+                    "graphify_mode": "auto",
+                    "graphify_config": {},
+                },
+                "graphify_evidence_id": "evidence-1",
+                "graphify_fingerprint": "f" * 64,
+                "graphify_freshness": "fresh",
+                "graphify_generation_refreshed": True,
+                "graphify_policy": {
+                    "session_generation": "generation-1",
+                    "guide_version": GRAPHIFY_GUIDE_VERSION,
+                    "orientation_delivered": True,
+                    "delivered_mode": "auto",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    with mock.patch(
+        "tmux_core.runtime.tmux_runtime.publish_graphify_pending_status"
+    ):
+        worker = TmuxBatchWorker(
+            worker_id="worker",
+            work_dir=tmp_path,
+            config=_config(graphify_mode="auto"),
+            runtime_root=tmp_path / "runtime",
+            existing_runtime_dir=runtime_dir,
+            existing_session_name="same-session",
+            backend=backend,
+        )
+    worker.is_agent_alive = mock.Mock(return_value=True)  # type: ignore[method-assign]
+    worker.get_agent_state = mock.Mock(return_value=AgentRuntimeState.READY)  # type: ignore[method-assign]
+
+    worker._write_state(WorkerStatus.RUNNING, note="health_refresh")  # noqa: SLF001
+    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+
+    assert persisted["graphify_evidence_id"] == "evidence-1"
+    assert persisted["graphify_fingerprint"] == "f" * 64
+    assert persisted["graphify_freshness"] == "fresh"
+    assert persisted["graphify_generation_refreshed"] is True
+    assert persisted["graphify_policy"]["orientation_delivered"] is True
+    assert worker.graphify_session_generation == "generation-1"
 
 
 def test_run_turn_resolves_graphify_once_before_internal_retry_loop() -> None:
@@ -402,12 +794,25 @@ def test_graphify_checkpoint_refreshes_one_worker_and_marks_peers() -> None:
         refresh_graphify_generation=mock.Mock(),
         mark_graphify_generation_current=mock.Mock(),
     )
+    context = GraphifyTurnContext(
+        stage_key="A08",
+        phase="a08_checkpoint",
+        role="reviewer",
+        intent=GraphifyQueryIntent.WHOLE_CHANGE_REVIEW,
+    )
     assert shared_review.refresh_graphify_workers_for_checkpoint(
-        [leader, peer, off], prompt="A08 checkpoint"
+        [leader, peer, off],
+        prompt="A08 checkpoint",
+        turn_context=context,
     ) == "profile"
-    leader.refresh_graphify_generation.assert_called_once_with("A08 checkpoint")
+    leader.refresh_graphify_generation.assert_called_once_with(
+        "A08 checkpoint",
+        turn_context=context,
+    )
     peer.refresh_graphify_generation.assert_not_called()
-    peer.mark_graphify_generation_current.assert_called_once_with()
+    peer.mark_graphify_generation_current.assert_called_once_with(
+        turn_context=context,
+    )
     off.refresh_graphify_generation.assert_not_called()
 
 

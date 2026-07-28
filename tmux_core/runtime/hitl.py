@@ -1978,6 +1978,7 @@ def run_hitl_agent_loop(
     grill_domain_draft_path: str | Path | None = None,
     grill_project_dir: str | Path | None = None,
     grill_turn_profile_factory: Callable[[int], object] | None = None,
+    graphify_context_factory: Callable[[HitlPromptContext], object] | None = None,
     grill_confirmation_provider: Callable[..., GrillControlDecision | str] = collect_grill_final_confirmation,
     grill_budget_provider: Callable[..., GrillControlDecision | str] = collect_grill_budget_decision,
     grill_context_target_provider: Callable[[Sequence[Path]], str] = collect_grill_context_target,
@@ -2855,6 +2856,28 @@ def run_hitl_agent_loop(
                 prompt_kind = grill_state.turn_prompt_kind or prompt_kind
             elif not resuming_grill_turn or grill_state.turn_submission_cursor == "not_started":
                 _persist_grill_turn_prompt(prompt, prompt_kind=prompt_kind)
+        # Freeze one Graphify profile for the whole logical HITL turn. Any
+        # contract-repair prompt below must reuse the same graph generation and
+        # evidence instead of silently widening its source facts.
+        graphify_profile: object | None = None
+        if graphify_context_factory is not None:
+            prepare_graphify = getattr(worker, "prepare_graphify_turn_profile", None)
+            if callable(prepare_graphify):
+                graphify_context = graphify_context_factory(context)
+                try:
+                    parameters = inspect.signature(prepare_graphify).parameters.values()
+                except (TypeError, ValueError):
+                    parameters = ()
+                if any(
+                    parameter.name == "turn_context" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                ):
+                    graphify_profile = prepare_graphify(
+                        prompt,
+                        turn_context=graphify_context,
+                    )
+                else:
+                    graphify_profile = prepare_graphify(prompt)
         effective_fresh_completion_paths = list(
             tuple(fresh_completion_paths) if hitl_round >= fresh_start_round else ()
         )
@@ -2949,6 +2972,16 @@ def run_hitl_agent_loop(
                     )
                     if supports_grill_profile:
                         turn_kwargs["grill_profile"] = grill_profile
+                if graphify_profile is not None:
+                    try:
+                        parameters = inspect.signature(turn_worker.run_turn).parameters.values()
+                    except (TypeError, ValueError):
+                        parameters = ()
+                    if any(
+                        parameter.name == "graphify_profile" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in parameters
+                    ):
+                        turn_kwargs["graphify_profile"] = graphify_profile
                 if resume_this_submission:
                     if grill_legacy_unbound_turn:
                         raise GrillSessionError(
@@ -2970,6 +3003,7 @@ def run_hitl_agent_loop(
                         ),
                         stage_status_path=status_file,
                         grill_profile=grill_profile,
+                        graphify_profile=graphify_profile,
                         runtime_intervention_handler=startup_intervention_handler,
                     )
                     resume_this_submission = False

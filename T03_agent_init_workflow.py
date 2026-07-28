@@ -42,7 +42,12 @@ from T02_tmux_agents import (
     worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.agent_intervention import run_worker_turn_with_startup_recovery
-from tmux_core.runtime.graphify import GraphifyMode, GraphifyTurnProfile
+from tmux_core.runtime.graphify import (
+    GraphifyMode,
+    GraphifyQueryIntent,
+    GraphifyTurnContext,
+    GraphifyTurnProfile,
+)
 
 
 ROUTING_LAYER_REQUIRED_FILES = (
@@ -1913,13 +1918,38 @@ def run_directory_initialization_with_worker(
         reset_turn_runtime_dir(worker.runtime_dir, current_turn_id)
         current_turn_status_path = str(contract.status_path)
         sync_state("create_running", note="create_routing_layer")
+        create_prompt = build_create_prompt()
+        graphify_profile: object | None = None
+        prepare_graphify = getattr(worker, "prepare_graphify_turn_profile", None)
+        if callable(prepare_graphify):
+            turn_context = GraphifyTurnContext(
+                stage_key="A01",
+                phase=PHASE_ROUTING_LAYER_CREATE,
+                role="routing_agent",
+                intent=GraphifyQueryIntent.ROUTING_DISCOVERY,
+                query_seeds=("project entry points", "module boundaries", "related tests"),
+            )
+            try:
+                parameters = inspect.signature(prepare_graphify).parameters.values()
+            except (TypeError, ValueError):
+                parameters = ()
+            if any(
+                parameter.name == "turn_context" or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters
+            ):
+                graphify_profile = prepare_graphify(create_prompt, turn_context=turn_context)
+            else:
+                graphify_profile = prepare_graphify(create_prompt)
+        create_turn_kwargs: dict[str, object] = {
+            "label": "create_routing_layer",
+            "prompt": create_prompt,
+            "completion_contract": contract,
+        }
+        if graphify_profile is not None:
+            create_turn_kwargs["graphify_profile"] = graphify_profile
         create_result = run_routing_turn_with_startup_recovery(
             workflow_stage="create_running",
-            run_turn_kwargs={
-                "label": "create_routing_layer",
-                "prompt": build_create_prompt(),
-                "completion_contract": contract,
-            },
+            run_turn_kwargs=create_turn_kwargs,
         )
         if run_store is not None:
             run_store.update_worker_state_from_file(

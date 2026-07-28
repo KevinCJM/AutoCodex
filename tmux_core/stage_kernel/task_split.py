@@ -40,6 +40,7 @@ from tmux_core.runtime.contracts import (
     normalize_review_status_payload,
 )
 from tmux_core.runtime.hitl import build_prefixed_sha256
+from tmux_core.runtime.graphify import GraphifyQueryIntent
 from tmux_core.runtime.tmux_runtime import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
     TmuxBatchWorker,
@@ -73,6 +74,11 @@ from tmux_core.stage_kernel.death_orchestration import (
     run_reviewer_phase_with_death_handling,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from tmux_core.stage_kernel.graphify_route_context import (
+    build_stage_graphify_turn_context,
+    worker_graphify_route_hints_enabled,
+    worker_graphify_scope,
+)
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
     StageAuditRunContext,
@@ -155,6 +161,46 @@ TASK_SPLIT_RUNTIME_ROOT_NAME = ".task_split_runtime"
 MAX_TASK_SPLIT_REVIEW_ROUNDS = 5
 MAX_TASK_SPLIT_HITL_ROUNDS = 8
 MAX_TASK_SPLIT_JSON_REPAIR_ATTEMPTS = 2
+
+
+def _task_split_graphify_context(
+    worker: object,
+    *,
+    phase: str,
+    role: str,
+):
+    project_root, requirement_name = worker_graphify_scope(worker)
+    paths = build_task_split_paths(project_root, requirement_name) if requirement_name else {}
+    return build_stage_graphify_turn_context(
+        project_root,
+        stage_key="A06",
+        phase=phase,
+        role=role,
+        intent=GraphifyQueryIntent.TASK_DEPENDENCY,
+        requirement_name=requirement_name,
+        task_name=TASK_SPLIT_TASK_NAME,
+        query_seeds=(
+            requirement_name,
+            "task dependencies",
+            "shared files and regression tests",
+        ),
+        business_artifact_paths=tuple(
+            paths[key]
+            for key in (
+                "original_requirement_path",
+                "requirements_clear_path",
+                "detailed_design_path",
+                "task_md_path",
+                "task_json_path",
+                "merged_review_path",
+                "ba_feedback_path",
+            )
+            if key in paths
+        ),
+        resolve_route_hints=worker_graphify_route_hints_enabled(worker),
+    )
+
+
 PLACEHOLDER_NEXT_STEP = "下一步进入任务开发阶段（待接入）"
 TASK_SPLIT_BA_ROLE_DESC = "你是任务拆分阶段的需求分析师，负责将详细设计转换为可执行任务单，并在评审后对任务单做最小化修订。"
 
@@ -945,6 +991,11 @@ def _run_ba_turn(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         stage_label=TASK_SPLIT_TASK_NAME,
         role_label=str(getattr(handoff.worker, "session_name", "") or "需求分析师"),
+        graphify_context=_task_split_graphify_context(
+            handoff.worker,
+            phase=result_contract.phase,
+            role="task_analyst",
+        ),
     )
 
 
@@ -1485,6 +1536,14 @@ def _run_reviewer_result_turn(
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
                 stage_label=TASK_SPLIT_TASK_NAME,
                 role_label=_reviewer_artifact_agent_name(current_reviewer),
+                graphify_context=_task_split_graphify_context(
+                    current_reviewer.worker,
+                    phase=str(
+                        getattr(result_contract, "phase", "")
+                        or getattr(result_contract, "mode", "a06_reviewer_init")
+                    ),
+                    role="task_reviewer",
+                ),
             )
             return current_reviewer
         except Exception as error:  # noqa: BLE001
@@ -1603,6 +1662,11 @@ def _run_reviewer_turn_with_resume(
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
                 stage_label=TASK_SPLIT_TASK_NAME,
                 role_label=_reviewer_artifact_agent_name(current_reviewer),
+                graphify_context=_task_split_graphify_context(
+                    current_reviewer.worker,
+                    phase=current_reviewer.contract.phase,
+                    role="task_reviewer",
+                ),
             )
             return current_reviewer
         except Exception as error:  # noqa: BLE001

@@ -30,6 +30,11 @@ from tmux_core.runtime.contracts import (
     finalize_task_result,
     write_task_status,
 )
+from tmux_core.runtime.graphify import (
+    GraphifyMode,
+    GraphifyQueryIntent,
+    GraphifyTurnContext,
+)
 from tmux_core.runtime.tmux_runtime import (
     AgentRuntimeState,
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -44,6 +49,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     load_worker_from_state_path,
+    get_current_stage_runner_id,
     normalize_graphify_config,
     try_resume_worker,
 )
@@ -80,6 +86,13 @@ from tmux_core.stage_kernel.reviewer_orchestration import (
     shutdown_stage_workers,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from tmux_core.stage_kernel.graphify_change_ledger import (
+    ensure_graphify_task_baseline,
+    graphify_change_ledger_path,
+    load_graphify_cumulative_changes,
+    mark_graphify_change_scope_unknown,
+    record_graphify_task_changes,
+)
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
     StageAuditRunContext,
@@ -146,6 +159,34 @@ OVERALL_REVIEW_TASK_NAME = "全面复核"
 PLACEHOLDER_NEXT_STEP = "下一步进入测试阶段（功能测试 + 全面回归，待接入）"
 MAX_OVERALL_REVIEW_ROUNDS = 5
 MAX_OVERALL_REVIEW_HITL_ROUNDS = 8
+OVERALL_REVIEW_GRAPHIFY_TASK = "__A08_overall_review__"
+
+
+def _overall_review_graphify_context(
+    *,
+    project_dir: str | Path,
+    requirement_name: str,
+    phase: str,
+    role: str,
+) -> GraphifyTurnContext:
+    changes = load_graphify_cumulative_changes(
+        graphify_change_ledger_path(
+            build_development_runtime_root(project_dir, requirement_name)
+        )
+    )
+    return GraphifyTurnContext(
+        stage_key="A08",
+        phase=phase,
+        role=role,
+        intent=GraphifyQueryIntent.WHOLE_CHANGE_REVIEW,
+        requirement_name=requirement_name,
+        task_name=OVERALL_REVIEW_TASK_NAME,
+        changed_files=changes.cumulative_changed_files,
+        deleted_files=changes.cumulative_deleted_files,
+        query_seeds=tuple(
+            item for item in (requirement_name, "whole change impact", changes.reason) if item
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -1618,6 +1659,12 @@ def _run_overall_review_developer_turn(
                 role_label=str(current_developer.worker.session_name or "开发工程师").strip() or "开发工程师",
                 task_name=OVERALL_REVIEW_TASK_NAME,
                 requirement_name=requirement_name,
+                graphify_context=_overall_review_graphify_context(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    phase=result_contract.phase,
+                    role="overall_review_developer",
+                ),
             )
             return current_developer
         except Exception as error:  # noqa: BLE001
@@ -1882,6 +1929,12 @@ def _run_single_overall_review_reviewer_init(
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
                 task_name=OVERALL_REVIEW_TASK_NAME,
                 requirement_name=requirement_name,
+                graphify_context=_overall_review_graphify_context(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    phase=init_contract.phase,
+                    role="overall_reviewer",
+                ),
             )
             return current_reviewer
         except Exception as error:  # noqa: BLE001
@@ -2035,6 +2088,12 @@ def run_overall_review_turn_with_recreation(
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
                 task_name=OVERALL_REVIEW_TASK_NAME,
                 requirement_name=requirement_name,
+                graphify_context=_overall_review_graphify_context(
+                    project_dir=project_dir,
+                    requirement_name=requirement_name,
+                    phase="a08_reviewer_round",
+                    role="overall_reviewer",
+                ),
             )
             return current_reviewer
         except Exception as error:  # noqa: BLE001
@@ -2352,7 +2411,25 @@ def run_overall_review_stage(
                 "args": vars(args),
             },
         )
+        graphify_stage_runner_id = (
+            get_current_stage_runner_id()
+            or f"stage-audit:A08:{audit_context.stage_run_index}"
+        )
         paths = ensure_overall_review_inputs(project_dir=project_dir, requirement_name=requirement_name)
+        graphify_enabled = bool(
+            main_graphify_mode != GraphifyMode.OFF.value
+            or any(
+                selection.graphify_mode != GraphifyMode.OFF.value
+                for selection in (agent_config.reviewers or {}).values()
+            )
+        )
+        overall_change_ledger = (
+            graphify_change_ledger_path(
+                build_development_runtime_root(project_dir, requirement_name)
+            )
+            if graphify_enabled
+            else None
+        )
         active_code_context = _build_overall_review_active_code_context(project_dir)
         def developer_mode_matches(item: DevelopmentAgentHandoff | None) -> bool:
             return bool(
@@ -2502,6 +2579,22 @@ def run_overall_review_stage(
             ))
             cleanup_paths.extend(cleanup_stale_overall_review_runtime_state(project_dir, requirement_name))
         cleanup_paths.extend(cleanup_existing_overall_review_artifacts(paths, requirement_name, audit_context))
+        if overall_change_ledger is not None:
+            if not overall_change_ledger.exists():
+                mark_graphify_change_scope_unknown(
+                    overall_change_ledger,
+                    project_dir=project_dir,
+                    scope_name="__legacy_A07_scope__",
+                    reason="a07_change_ledger_missing",
+                )
+            ensure_graphify_task_baseline(
+                overall_change_ledger,
+                project_dir=project_dir,
+                task_name=OVERALL_REVIEW_GRAPHIFY_TASK,
+                graphify_config=agent_config.graphify_config,
+                stage_key="A08",
+                runner_id=graphify_stage_runner_id,
+            )
         _write_overall_review_state(paths["state_path"], passed=False)
         append_stage_audit_record(
             audit_context,
@@ -2527,6 +2620,12 @@ def run_overall_review_stage(
                 "A08 overall-review checkpoint; refresh the graph from all current "
                 "changed files before initialization and impact analysis"
             ),
+            turn_context=_overall_review_graphify_context(
+                project_dir=project_dir,
+                requirement_name=requirement_name,
+                phase="a08_initial_checkpoint",
+                role="overall_reviewer",
+            ),
         )
         reviewers = initialize_overall_review_reviewers(
             reviewers,
@@ -2543,6 +2642,31 @@ def run_overall_review_stage(
         previous_review_msg = ""
         code_change_msg = ""
         while True:
+            if round_index > 1 and overall_change_ledger is not None:
+                record_graphify_task_changes(
+                    overall_change_ledger,
+                    project_dir=project_dir,
+                    task_name=OVERALL_REVIEW_GRAPHIFY_TASK,
+                    graphify_config=agent_config.graphify_config,
+                    stage_key="A08",
+                    runner_id=graphify_stage_runner_id,
+                )
+                refresh_graphify_workers_for_checkpoint(
+                    [
+                        *([developer.worker] if developer is not None else []),
+                        *(reviewer.worker for reviewer in reviewers),
+                    ],
+                    prompt=(
+                        "A08 post-fix checkpoint; refresh the graph from the cumulative "
+                        "development change ledger before the next whole-change review"
+                    ),
+                    turn_context=_overall_review_graphify_context(
+                        project_dir=project_dir,
+                        requirement_name=requirement_name,
+                        phase="a08_post_fix_checkpoint",
+                        role="overall_reviewer",
+                    ),
+                )
             prepare_review_round_artifacts(
                 paths,
                 reviewers,

@@ -337,6 +337,58 @@ class WebBackendTests(unittest.TestCase):
         self.assertEqual(preview['payload']['path'], str(Path(failure_path).resolve()))
         self.assertIn('task split failed', preview['payload']['text'])
 
+    def test_web_backend_graphify_preview_requires_matching_stage_worker_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            evidence_id = 'evidence-123'
+            runtime_dir = project_dir / '.development_runtime' / 'worker-a'
+            runtime_dir.mkdir(parents=True)
+            state_path = runtime_dir / 'worker.state.json'
+            state_path.write_text('{}\n', encoding='utf-8')
+            report_path = runtime_dir / f'graphify_evidence_{evidence_id}.md'
+            report_path.write_text('# trusted evidence\n', encoding='utf-8')
+            unrelated_path = project_dir / f'graphify_evidence_{evidence_id}.md'
+            unrelated_path.write_text('# unrelated project file\n', encoding='utf-8')
+            stages = {
+                'development': {
+                    'workers': [
+                        {
+                            'state_path': str(state_path),
+                            'graphify_evidence_id': evidence_id,
+                        }
+                    ]
+                }
+            }
+            graphify_status = {
+                'mode': 'auto',
+                'state': 'ready',
+                'evidence_id': evidence_id,
+                'report_path': str(report_path),
+            }
+            server, thread = self._start_server()
+            try:
+                server._set_context(project_dir=str(project_dir))  # noqa: SLF001
+                with patch.object(server, '_build_stage_snapshots', return_value=stages), patch(
+                    'tmux_core.runtime.graphify.read_graphify_project_status',
+                    side_effect=lambda _project_dir: dict(graphify_status),
+                ):
+                    preview = self._get_json(
+                        server,
+                        '/api/file-preview?path=' + urllib.parse.quote(str(report_path)),
+                    )
+                    graphify_status['report_path'] = str(unrelated_path)
+                    with self.assertRaises(urllib.error.HTTPError) as unauthorized:
+                        self._get_json(
+                            server,
+                            '/api/file-preview?path=' + urllib.parse.quote(str(unrelated_path)),
+                        )
+            finally:
+                self._stop_server(server, thread)
+
+        self.assertTrue(preview['ok'])
+        self.assertEqual(preview['payload']['path'], str(report_path))
+        self.assertEqual(unauthorized.exception.code, 403)
+
     def test_web_backend_request_returns_immediate_ack_for_background_stage(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)

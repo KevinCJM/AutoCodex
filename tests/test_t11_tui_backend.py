@@ -1025,9 +1025,23 @@ class T11TuiBackendTests(unittest.TestCase):
     def test_app_snapshot_exposes_only_safe_project_level_graphify_status(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir).resolve()
-            report_path = project_dir / ".tmux_workflow" / "evidence.md"
-            report_path.parent.mkdir(parents=True)
+            evidence_id = "evidence-123"
+            runtime_dir = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / "worker-a"
+            runtime_dir.mkdir(parents=True)
+            state_path = runtime_dir / "worker.state.json"
+            state_path.write_text("{}\n", encoding="utf-8")
+            report_path = runtime_dir / f"graphify_evidence_{evidence_id}.md"
             report_path.write_text("# Graphify evidence\n", encoding="utf-8")
+            stages = {
+                "development": {
+                    "workers": [
+                        {
+                            "state_path": str(state_path),
+                            "graphify_evidence_id": evidence_id,
+                        }
+                    ]
+                }
+            }
             fake_graphify = SimpleNamespace(
                 read_graphify_project_status=lambda _project_dir: {
                     "mode": "auto",
@@ -1036,7 +1050,16 @@ class T11TuiBackendTests(unittest.TestCase):
                     "freshness": "fresh",
                     "node_count": 5098,
                     "edge_count": 22091,
+                    "evidence_id": evidence_id,
                     "report_path": str(report_path),
+                    "query_count_stage": 4,
+                    "last_query_command": "affected",
+                    "last_query_at": "2026-07-27T10:11:12+08:00",
+                    "last_query_status": "ok",
+                    "last_query_freshness": "fresh",
+                    "last_query_truncated": False,
+                    "query_text": "show me /Users/example/private.py",
+                    "query_result": "secret result",
                     "last_error": "cache /Users/example/.cache/graphify failed",
                     "executable_path": "/Users/example/.local/bin/graphify",
                     "cache_dir": "/Users/example/.cache/graphify",
@@ -1045,9 +1068,9 @@ class T11TuiBackendTests(unittest.TestCase):
             with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
                 server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
                 server._set_context(project_dir=str(project_dir))  # noqa: SLF001
-                snapshot = server._build_app_snapshot()  # noqa: SLF001
+                snapshot = server._build_app_snapshot(stage_snapshots=stages)  # noqa: SLF001
                 allowed = server._allowed_file_preview_paths(  # noqa: SLF001
-                    stages={},
+                    stages=stages,
                     control={"workers": []},
                     hitl={},
                     artifacts={"items": []},
@@ -1056,10 +1079,56 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["graphify"]["state"], "ready")
         self.assertEqual(snapshot["graphify"]["node_count"], 5098)
         self.assertEqual(snapshot["graphify"]["report_path"], str(report_path))
+        self.assertEqual(snapshot["graphify"]["query_count_stage"], 4)
+        self.assertEqual(snapshot["graphify"]["last_query_command"], "affected")
+        self.assertEqual(snapshot["graphify"]["last_query_freshness"], "fresh")
+        self.assertFalse(snapshot["graphify"]["last_query_truncated"])
         self.assertIn("<redacted-path>", snapshot["graphify"]["last_error"])
         self.assertNotIn("executable_path", snapshot["graphify"])
         self.assertNotIn("cache_dir", snapshot["graphify"])
+        self.assertNotIn("query_text", snapshot["graphify"])
+        self.assertNotIn("query_result", snapshot["graphify"])
         self.assertIn(str(report_path), allowed)
+
+    def test_graphify_report_requires_matching_known_stage_worker_runtime(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            runtime_dir = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / "worker-a"
+            runtime_dir.mkdir(parents=True)
+            state_path = runtime_dir / "worker.state.json"
+            state_path.write_text("{}\n", encoding="utf-8")
+            evidence_id = "evidence-123"
+            report_path = runtime_dir / f"graphify_evidence_{evidence_id}.md"
+            report_path.write_text("# Graphify evidence\n", encoding="utf-8")
+            fake_graphify = SimpleNamespace(
+                read_graphify_project_status=lambda _project_dir: {
+                    "mode": "auto",
+                    "state": "ready",
+                    "evidence_id": evidence_id,
+                    "report_path": str(report_path),
+                }
+            )
+            mismatches = (
+                {},
+                {"development": {"workers": [{"state_path": str(state_path), "graphify_evidence_id": "other"}]}},
+                {
+                    "development": {
+                        "workers": [
+                            {
+                                "state_path": str(project_dir / "worker.state.json"),
+                                "graphify_evidence_id": evidence_id,
+                            }
+                        ]
+                    }
+                },
+            )
+            with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
+                for stage_snapshots in mismatches:
+                    status = _read_graphify_app_status(
+                        str(project_dir),
+                        stage_snapshots=stage_snapshots,
+                    )
+                    self.assertNotIn("report_path", status)
 
     def test_graphify_report_outside_project_is_not_exposed(self):
         with tempfile.TemporaryDirectory() as tmpdir, tempfile.NamedTemporaryFile() as outside:
@@ -1068,13 +1137,25 @@ class T11TuiBackendTests(unittest.TestCase):
                     "mode": "auto",
                     "state": "ready",
                     "report_path": outside.name,
+                    "query_count_stage": -1,
+                    "last_query_command": "/Users/example/private.py",
+                    "last_query_at": "private question",
+                    "last_query_status": "private result",
+                    "last_query_freshness": "secret",
+                    "last_query_truncated": "true",
                 }
             )
             with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
                 status = _read_graphify_app_status(tmpdir)
 
         self.assertEqual(status["state"], "ready")
+        self.assertEqual(status["query_count_stage"], 0)
         self.assertNotIn("report_path", status)
+        self.assertNotIn("last_query_command", status)
+        self.assertNotIn("last_query_at", status)
+        self.assertNotIn("last_query_status", status)
+        self.assertNotIn("last_query_freshness", status)
+        self.assertNotIn("last_query_truncated", status)
 
     def test_worker_snapshot_exposes_only_safe_graphify_turn_identity(self):
         flattened = _flatten_graphify_worker_fields(

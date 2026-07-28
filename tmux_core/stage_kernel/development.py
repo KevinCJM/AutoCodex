@@ -48,6 +48,11 @@ from tmux_core.runtime.contracts import (
     write_task_status,
 )
 from tmux_core.runtime.hitl import build_prefixed_sha256
+from tmux_core.runtime.graphify import (
+    GraphifyMode,
+    GraphifyQueryIntent,
+    GraphifyTurnContext,
+)
 from tmux_core.runtime.tmux_runtime import (
     AgentRuntimeState,
     CommandResult,
@@ -69,6 +74,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_provider_runtime_error,
     load_worker_from_state_path,
     list_registered_tmux_workers,
+    get_current_stage_runner_id,
     normalize_graphify_config,
     try_resume_worker,
 )
@@ -92,6 +98,11 @@ from tmux_core.stage_kernel.agent_intervention import (
     request_worker_manual_intervention,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
+from tmux_core.stage_kernel.graphify_change_ledger import (
+    ensure_graphify_task_baseline,
+    graphify_change_ledger_path,
+    record_graphify_task_changes,
+)
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
     StageAuditRunContext,
@@ -1790,6 +1801,14 @@ def _run_developer_result_turn(
                 stage_label="任务开发",
                 role_label=str(current_developer.worker.session_name or "开发工程师").strip() or "开发工程师",
                 task_name=task_name,
+                graphify_context=GraphifyTurnContext(
+                    stage_key="A07",
+                    phase=result_contract.phase,
+                    role="developer",
+                    intent=GraphifyQueryIntent.IMPLEMENTATION,
+                    task_name=task_name,
+                    query_seeds=tuple(item for item in (task_name, "implementation call path") if item),
+                ),
             )
             if turn_policy is not None:
                 turn_policy.record_turn()
@@ -2530,6 +2549,15 @@ def _run_single_reviewer_initialization(
                 pre_submit_observation_tail_bytes=A07_PRE_SUBMIT_OBSERVATION_TAIL_BYTES,
                 stage_label="任务开发",
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
+                graphify_context=GraphifyTurnContext(
+                    stage_key="A07",
+                    phase=init_contract.phase,
+                    role="development_reviewer",
+                    intent=GraphifyQueryIntent.CHANGE_REVIEW,
+                    requirement_name=requirement_name,
+                    task_name="reviewer_initialization",
+                    query_seeds=(requirement_name, "review boundaries"),
+                ),
                 propagate_file_intervention_action=True,
             )
             return current_reviewer
@@ -3038,6 +3066,14 @@ def _run_reviewer_turn_with_resume(
                 stage_label="任务开发",
                 role_label=str(reviewer.worker.session_name or reviewer.reviewer_name).strip() or reviewer.reviewer_name,
                 task_name=task_name,
+                graphify_context=GraphifyTurnContext(
+                    stage_key="A07",
+                    phase="a07_reviewer_resume",
+                    role="development_reviewer",
+                    intent=GraphifyQueryIntent.CHANGE_REVIEW,
+                    task_name=task_name,
+                    query_seeds=tuple(item for item in (task_name, "affected tests") if item),
+                ),
             )
             return reviewer
         except Exception as error:  # noqa: BLE001
@@ -3427,6 +3463,8 @@ def run_reviewer_turn_with_recreation(
     can_skip_ready_timeout: bool = True,
     ready_timeout_skip_budget: _ReadyTimeoutSkipBudget | None = None,
     allow_existing_outputs: bool = True,
+    changed_files: Sequence[str] = (),
+    deleted_files: Sequence[str] = (),
 ) -> ReviewerRuntime | None:
     current_reviewer = reviewer
     while True:
@@ -3454,6 +3492,17 @@ def run_reviewer_turn_with_recreation(
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
                 task_name=task_name,
                 requirement_name=requirement_name,
+                graphify_context=GraphifyTurnContext(
+                    stage_key="A07",
+                    phase="a07_reviewer_round",
+                    role="development_reviewer",
+                    intent=GraphifyQueryIntent.CHANGE_REVIEW,
+                    requirement_name=requirement_name,
+                    task_name=task_name,
+                    changed_files=tuple(changed_files),
+                    deleted_files=tuple(deleted_files),
+                    query_seeds=tuple(item for item in (task_name, "affected tests") if item),
+                ),
                 propagate_file_intervention_action=True,
             )
             return current_reviewer
@@ -3779,15 +3828,48 @@ def _run_parallel_reviewers(
     label_prefix: str,
     progress: ReviewStageProgress | None = None,
     allow_existing_outputs: bool = True,
+    change_ledger_path: str | Path | None = None,
+    graphify_config: dict[str, object] | None = None,
+    stage_runner_id: str = "",
 ) -> list[ReviewerRuntime]:
     if progress is not None:
         progress.set_phase(f"任务开发 / {task_name} 评审第 {round_index} 轮")
     reviewer_list = list(reviewers)
+    changed_files: tuple[str, ...] = ()
+    deleted_files: tuple[str, ...] = ()
+    change_scope_reason = ""
+    if change_ledger_path is not None:
+        change_set = record_graphify_task_changes(
+            change_ledger_path,
+            project_dir=project_dir,
+            task_name=task_name,
+            graphify_config=graphify_config,
+            stage_key="A07",
+            runner_id=stage_runner_id,
+        )
+        changed_files = change_set.changed_files
+        deleted_files = change_set.deleted
+        change_scope_reason = change_set.reason
     refresh_graphify_workers_for_checkpoint(
         [reviewer.worker for reviewer in reviewer_list],
         prompt=(
             f"A07 developer-to-reviewer checkpoint for task {task_name}; "
             "refresh changed source files and affected test candidates"
+        ),
+        turn_context=GraphifyTurnContext(
+            stage_key="A07",
+            phase="a07_developer_to_reviewer_checkpoint",
+            role="development_reviewer",
+            intent=GraphifyQueryIntent.CHANGE_REVIEW,
+            requirement_name=requirement_name,
+            task_name=task_name,
+            changed_files=changed_files,
+            deleted_files=deleted_files,
+            query_seeds=tuple(
+                item
+                for item in (task_name, "affected tests", change_scope_reason)
+                if item
+            ),
         ),
     )
     skip_budget = _ReadyTimeoutSkipBudget(len(reviewer_list))
@@ -3807,6 +3889,8 @@ def _run_parallel_reviewers(
             can_skip_ready_timeout=True,
             ready_timeout_skip_budget=skip_budget,
             allow_existing_outputs=allow_existing_outputs,
+            changed_files=changed_files,
+            deleted_files=deleted_files,
         )
 
     return run_parallel_reviewer_round(
@@ -4660,6 +4744,10 @@ def run_development_stage(
                 "args": vars(args),
             },
         )
+        graphify_stage_runner_id = (
+            get_current_stage_runner_id()
+            or f"stage-audit:A07:{audit_context.stage_run_index}"
+        )
         paths = ensure_development_inputs(args, project_dir=project_dir, requirement_name=requirement_name)
         initial_next_task = get_first_false_task(paths["task_json_path"])
         recovered_developer_output = _recover_valid_developer_output_for_next_task(paths, initial_next_task)
@@ -4745,6 +4833,13 @@ def run_development_stage(
                     raise
                 continue
         agent_config = resolve_stage_agent_config(args, stage_key="development")
+        change_ledger = (
+            graphify_change_ledger_path(
+                build_development_runtime_root(project_dir, requirement_name)
+            )
+            if agent_config.graphify_mode != GraphifyMode.OFF.value
+            else None
+        )
         reviewer_selection_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
             stdin_is_interactive() and not bool(agent_config.reviewers) and bool(reviewer_specs),
@@ -4926,6 +5021,16 @@ def run_development_stage(
                 if recovered_developer_output is not None and recovered_developer_output.task_name == current_task_name
                 else ""
             )
+            if change_ledger is not None:
+                ensure_graphify_task_baseline(
+                    change_ledger,
+                    project_dir=project_dir,
+                    task_name=current_task_name,
+                    graphify_config=agent_config.graphify_config,
+                    legacy_output_present=bool(recovered_code_change),
+                    stage_key="A07",
+                    runner_id=graphify_stage_runner_id,
+                )
             if not reviewers_built:
                 reviewer_workers = build_reviewer_workers(
                     args,
@@ -5074,6 +5179,9 @@ def run_development_stage(
                             ),
                             label_prefix=f"development_review_init_{sanitize_requirement_name(next_task)}",
                             progress=progress,
+                            change_ledger_path=change_ledger,
+                            graphify_config=agent_config.graphify_config,
+                            stage_runner_id=graphify_stage_runner_id,
                         ),
                         replace_dead_main_owner=replace_dead_developer_owner,
                         replace_dead_reviewer=replace_dead_reviewer,
@@ -5149,6 +5257,9 @@ def run_development_stage(
                             label_prefix=f"development_review_again_{sanitize_requirement_name(next_task)}",
                             progress=progress,
                             allow_existing_outputs=False,
+                            change_ledger_path=change_ledger,
+                            graphify_config=agent_config.graphify_config,
+                            stage_runner_id=graphify_stage_runner_id,
                         ),
                         replace_dead_main_owner=replace_dead_developer_owner,
                         replace_dead_reviewer=replace_dead_reviewer,

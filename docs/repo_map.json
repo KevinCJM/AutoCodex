@@ -2502,7 +2502,7 @@
       "name": "project_graph_service",
       "path": "tmux_core/runtime/graphify.py",
       "kind": "isolated_external_tool_adapter",
-      "purpose": "resolve pinned Graphify tooling, build safe code-only project snapshots and immutable graph generations, and provide bounded read-only evidence",
+      "purpose": "resolve pinned Graphify tooling, build safe code-only project snapshots and immutable graph generations, combine stage-resolved AI Hermes routes with bounded evidence, audit stage/runner/session-scoped read-only queries, and track A07/A08 source changes including deleted-path impact from the previous graph generation",
       "task_keywords": [
         "graphify",
         "graphifyy",
@@ -2514,7 +2514,17 @@
         "graph_cache",
         "affected",
         "god_nodes",
-        "tmux_graphify"
+        "tmux_graphify",
+        "graphify_turn_context",
+        "query_intent",
+        "freshness",
+        "change_ledger",
+        "graphify_route_context",
+        "previous_generation",
+        "session_generation",
+        "query_scope",
+        "validation_stamp",
+        "query_audit"
       ],
       "owned_paths": [
         {
@@ -2534,6 +2544,18 @@
           "path": "tools/graphify",
           "match": "subtree",
           "role": "isolated_tool_manifest"
+        },
+        {
+          "type": "literal",
+          "path": "tmux_core/stage_kernel/graphify_change_ledger.py",
+          "match": "exact",
+          "role": "runner_scoped_change_ledger"
+        },
+        {
+          "type": "literal",
+          "path": "tmux_core/stage_kernel/graphify_route_context.py",
+          "match": "exact",
+          "role": "stage_resolved_ai_hermes_graph_context"
         }
       ],
       "entry_selectors": [
@@ -2553,10 +2575,22 @@
         "GraphifyToolResolution",
         "GraphifyProjectSnapshot",
         "GraphifyEvidence",
+        "GraphifyTurnContext",
+        "GraphifyQueryIntent",
+        "GraphifyQueryResult",
+        "GraphifyFreshnessAssessment",
+        "StageGraphifyRouteHints",
         "TurnContextBlock",
         "resolve_graphify_turn_profile",
         "build_graphify_evidence_block",
-        "read_graphify_project_status"
+        "execute_readonly_query",
+        "assess_graphify_freshness",
+        "capture_graphify_source_manifest",
+        "read_graphify_project_status",
+        "build_stage_graphify_turn_context",
+        "resolve_stage_graphify_route_hints",
+        "ensure_graphify_task_baseline",
+        "record_graphify_task_changes"
       ],
       "first_read_selectors": [
         {
@@ -2584,12 +2618,32 @@
         {
           "type": "literal",
           "path": "tests/test_graphify_runtime.py"
+        },
+        {
+          "type": "literal",
+          "path": "tmux_core/stage_kernel/graphify_change_ledger.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_change_ledger.py"
+        },
+        {
+          "type": "literal",
+          "path": "tmux_core/stage_kernel/graphify_route_context.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_stage_route_context.py"
         }
       ],
       "relations": [
         {
           "type": "used_by",
           "target": "M01_workflow_entry"
+        },
+        {
+          "type": "used_by",
+          "target": "M03_stage_family"
         },
         {
           "type": "used_by",
@@ -2625,6 +2679,22 @@
         {
           "type": "literal",
           "path": "tests/test_t11_tui_backend.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_t11_web_backend.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_change_ledger.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_stage_route_context.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_stage_kernel_turn_output_goals.py"
         },
         {
           "type": "literal",
@@ -2671,6 +2741,22 @@
         },
         {
           "type": "literal",
+          "path": "tests/test_t11_web_backend.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_change_ledger.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_graphify_stage_route_context.py"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_stage_kernel_turn_output_goals.py"
+        },
+        {
+          "type": "literal",
           "path": "packages/tui/src/graphifyStatus.test.ts"
         },
         {
@@ -2708,6 +2794,8 @@
         "fact_status": "grounded",
         "evidence": [
           "tmux_core/runtime/graphify.py",
+          "tmux_core/stage_kernel/graphify_change_ledger.py",
+          "tmux_core/stage_kernel/graphify_route_context.py",
           "scripts/tmux-graphify",
           "tools/graphify/pyproject.toml",
           "tools/graphify/uv.lock",
@@ -2716,7 +2804,11 @@
           "tmux_core/bridge/backend.py",
           "tests/test_graphify_runtime.py",
           "tests/test_graphify_config.py",
+          "tests/test_graphify_change_ledger.py",
+          "tests/test_graphify_stage_route_context.py",
+          "tests/test_stage_kernel_turn_output_goals.py",
           "tests/test_t11_tui_backend.py",
+          "tests/test_t11_web_backend.py",
           "packages/tui/src/graphifyStatus.ts",
           "packages/tui/src/graphifyStatus.test.ts",
           "packages/web/src/domain/graphifyStatus.ts",

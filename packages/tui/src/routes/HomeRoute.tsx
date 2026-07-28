@@ -1,5 +1,5 @@
 import { For, Show, createMemo, createSignal, onCleanup } from 'solid-js'
-import { graphifyStatusColor, graphifyStatusLabel } from '../graphifyStatus'
+import { graphifyStatusColor, graphifyStatusSummary } from '../graphifyStatus'
 import type { AppSnapshot, GraphifyStatus, HitlSnapshot, HomeAgentItem, StageFailureSnapshot } from '../types'
 
 type Props = {
@@ -55,7 +55,7 @@ export function HomeRoute(props: Props) {
         {(graphify: GraphifyStatus) => (
           <box flexDirection="column">
             <text fg={graphifyStatusColor(graphify)}>
-              {`代码图谱: ${graphifyStatusLabel(graphify)}${graphify.version ? ` · v${graphify.version}` : ''}`}
+              {`代码图谱：${graphifyStatusSummary(graphify)}`}
             </text>
             <Show when={graphify.nodeCount > 0 || graphify.edgeCount > 0}>
               <text fg="#888888">{`${graphify.nodeCount} nodes / ${graphify.edgeCount} edges`}</text>

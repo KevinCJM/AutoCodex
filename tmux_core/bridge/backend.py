@@ -956,6 +956,12 @@ _GRAPHIFY_PUBLIC_COUNT_KEYS = (
     "direct_count",
     "inferred_count",
 )
+_GRAPHIFY_PUBLIC_QUERY_COMMANDS = {"query", "affected", "path", "explain", "god-nodes"}
+_GRAPHIFY_PUBLIC_QUERY_STATUSES = {"ok", "error", "failed", "timeout", "unavailable"}
+_GRAPHIFY_PUBLIC_FRESHNESS = {"fresh", "stale", "unknown", "cache_fallback", "degraded"}
+_GRAPHIFY_PUBLIC_TIMESTAMP_RE = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?"
+)
 
 
 def _graphify_public_text(value: object) -> str:
@@ -973,7 +979,60 @@ def _redact_graphify_error(value: object) -> str:
     return re.sub(r"(?<![A-Za-z0-9_.])(?:~|/)[^\s,;]+", "<redacted-path>", text)
 
 
-def _read_graphify_app_status(project_dir: str) -> dict[str, Any]:
+def _trusted_graphify_report_path(
+    *,
+    project_dir: str,
+    payload: Mapping[str, Any],
+    stage_snapshots: Mapping[str, Mapping[str, Any]] | None,
+) -> str:
+    """Accept only the evidence report owned by a known stage worker runtime."""
+
+    report_text = _graphify_public_text(payload.get("report_path", ""))
+    evidence_id = _graphify_public_text(payload.get("evidence_id", ""))
+    if not report_text or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", evidence_id):
+        return ""
+    try:
+        project_root = Path(project_dir).expanduser().resolve()
+        report_path = Path(report_text).expanduser().resolve()
+        report_path.relative_to(project_root)
+    except (OSError, ValueError):
+        return ""
+    expected_name = f"graphify_evidence_{evidence_id}.md"
+    if report_path.name != expected_name or not report_path.is_file():
+        return ""
+
+    for stage_snapshot in (stage_snapshots or {}).values():
+        if not isinstance(stage_snapshot, Mapping):
+            continue
+        workers = stage_snapshot.get("workers", [])
+        if not isinstance(workers, Sequence) or isinstance(workers, (str, bytes)):
+            continue
+        for worker in workers:
+            if not isinstance(worker, Mapping):
+                continue
+            if _graphify_public_text(worker.get("graphify_evidence_id", "")) != evidence_id:
+                continue
+            state_text = _graphify_public_text(worker.get("state_path", ""))
+            if not state_text:
+                continue
+            try:
+                state_path = Path(state_text).expanduser().resolve()
+                state_path.relative_to(project_root)
+                if state_path.name != "worker.state.json" or not state_path.is_file():
+                    continue
+                expected_report = (state_path.parent / expected_name).resolve()
+            except (OSError, ValueError):
+                continue
+            if report_path == expected_report:
+                return str(report_path)
+    return ""
+
+
+def _read_graphify_app_status(
+    project_dir: str,
+    *,
+    stage_snapshots: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
     project_text = str(project_dir or "").strip()
     if not project_text:
         return {}
@@ -1025,16 +1084,33 @@ def _read_graphify_app_status(project_dir: str) -> dict[str, Any]:
         except (TypeError, ValueError):
             public[key] = 0
 
-    report_text = _graphify_public_text(payload.get("report_path", ""))
-    if report_text:
+    if "query_count_stage" in payload:
         try:
-            project_root = Path(project_text).expanduser().resolve()
-            report_path = Path(report_text).expanduser().resolve()
-            report_path.relative_to(project_root)
-            if report_path.is_file():
-                public["report_path"] = str(report_path)
-        except (OSError, ValueError):
-            pass
+            public["query_count_stage"] = max(0, int(payload.get("query_count_stage", 0) or 0))
+        except (TypeError, ValueError):
+            public["query_count_stage"] = 0
+    query_command = _graphify_public_text(payload.get("last_query_command", "")).lower()
+    if query_command in _GRAPHIFY_PUBLIC_QUERY_COMMANDS:
+        public["last_query_command"] = query_command
+    query_status = _graphify_public_text(payload.get("last_query_status", "")).lower()
+    if query_status in _GRAPHIFY_PUBLIC_QUERY_STATUSES:
+        public["last_query_status"] = query_status
+    query_freshness = _graphify_public_text(payload.get("last_query_freshness", "")).lower()
+    if query_freshness in _GRAPHIFY_PUBLIC_FRESHNESS:
+        public["last_query_freshness"] = query_freshness
+    query_at = _graphify_public_text(payload.get("last_query_at", ""))
+    if _GRAPHIFY_PUBLIC_TIMESTAMP_RE.fullmatch(query_at):
+        public["last_query_at"] = query_at
+    if isinstance(payload.get("last_query_truncated"), bool):
+        public["last_query_truncated"] = bool(payload["last_query_truncated"])
+
+    report_path = _trusted_graphify_report_path(
+        project_dir=project_text,
+        payload=payload,
+        stage_snapshots=stage_snapshots,
+    )
+    if report_path:
+        public["report_path"] = report_path
     public["last_error"] = _redact_graphify_error(payload.get("last_error", ""))
     return public
 
@@ -4943,7 +5019,10 @@ class BridgeCore:
                 "collapsible_logs": True,
             },
         }
-        graphify_status = _read_graphify_app_status(project_dir)
+        graphify_status = _read_graphify_app_status(
+            project_dir,
+            stage_snapshots=stage_snapshots,
+        )
         if graphify_status:
             snapshot["graphify"] = graphify_status
         return snapshot
@@ -8373,7 +8452,10 @@ class BridgeCore:
             and str(persisted_state.get("source", "") or "").strip() == "runner_failure"
         ):
             self._add_preview_path(allowed, persisted_state.get("failure_path", ""))
-        graphify_status = _read_graphify_app_status(self._resolve_project_dir())
+        graphify_status = _read_graphify_app_status(
+            self._resolve_project_dir(),
+            stage_snapshots=stage_snapshots,
+        )
         self._add_preview_path(allowed, graphify_status.get("report_path", ""))
         return allowed
 
@@ -8400,6 +8482,7 @@ class BridgeCore:
             hitl=hitl,
             attention=attention,
             artifacts=artifacts,
+            stage_snapshots=stages,
         )
         return {
             "app": app,

@@ -132,6 +132,37 @@ class TurnOutputGoalsTests(unittest.TestCase):
             self.assertNotIn("task_runtime", worker.prompts[1])
             self.assertNotIn(".development_runtime", worker.prompts[1])
 
+    def test_task_repair_freezes_graphify_profile_with_turn_context(self):
+        contract = TaskResultContract(
+            turn_id="context-turn",
+            phase="a07_developer_task_complete",
+            task_kind="development",
+            mode="a07_developer_task_complete",
+            expected_statuses=("completed",),
+        )
+        worker = _FakeTaskWorker(
+            [lambda **_kwargs: SimpleNamespace(ok=True, clean_output=json.dumps({"status": "completed"}))]
+        )
+        graphify_profile = object()
+        graphify_context = object()
+        prepared: list[tuple[str, object]] = []
+
+        def prepare(prompt: str, *, turn_context=None):  # noqa: ANN001
+            prepared.append((prompt, turn_context))
+            return graphify_profile
+
+        worker.prepare_graphify_turn_profile = prepare  # type: ignore[attr-defined]
+        run_task_result_turn_with_repair(
+            worker=worker,
+            label="context-turn",
+            prompt="task prompt",
+            result_contract=contract,
+            parse_result_payload=json.loads,
+            graphify_context=graphify_context,
+        )
+        self.assertEqual(prepared, [("task prompt", graphify_context)])
+        self.assertIs(worker.run_turn_kwargs[0]["graphify_profile"], graphify_profile)
+
     def test_run_task_result_turn_with_repair_forwards_pre_submit_observation_budget(self):
         contract = TaskResultContract(
             turn_id="turn-pre-submit",

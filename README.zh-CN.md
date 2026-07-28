@@ -360,7 +360,11 @@ scripts/tmux-graphify prune
 
 构图固定使用 `--code-only`、`--no-cluster` 和受控源码快照：不跟随符号链接，排除凭据类文件、运行时目录、构建目录和 vendor 目录；文件大小、文件数和总输入上限超出时明确失败，不静默截断。Graphify 子进程固定使用 `GRAPHIFY_QUERY_LOG_DISABLE=1`，并移除模型厂商凭据。不可变 generation 存放在用户缓存 `$XDG_CACHE_HOME/tmux_coding_team/graphify/`（未设置时为 `~/.cache/...`）；失败的 staging 永远不会替换上一份有效图。TUI/Web 不暴露 raw graph、缓存路径或可执行文件路径。
 
-Codex、Claude、Gemini、OpenCode、MiMo、AGY、DevEco 都通过普通提示词链获得同一份有边界的 Graphify 证据，并获得同一套只读命令环境；无需安装 Graphify Skill、MCP、Hook 或插件。系统默认只注入受限的 `EXTRACTED` 关系，最多附带少量明确标注的 `INFERRED` 候选；重试复用同一份证据，不重复构图或重发业务任务。
+Codex、Claude、Gemini、OpenCode、MiMo、AGY、DevEco 都通过普通提示词链获得同一份有边界的 Graphify 证据，并获得同一套只读命令环境；无需安装 Graphify Skill、MCP、Hook 或插件。证据块会明确说明如何通过 `$TMUX_GRAPHIFY_CMD` 按需执行 `query`、`affected`、`path`、`explain` 和 `god-nodes`，但不会要求每轮查询；查询结果仍须回到 `AGENTS.md`（存在时）、源码、测试和配置核实。系统默认只注入受限的 `EXTRACTED` 关系，最多附带少量明确标注的 `INFERRED` 候选；重试复用同一份证据，不重复构图或重发业务任务。
+
+证据会结合当前阶段、角色、任务、由阶段层按 AI Hermes 合同解析的路由路径、明确符号和 A07 实际改动，生成最多三条可直接执行的推荐查询。每个 tmux 会话首次确认提交的 Graphify turn 会收到完整使用指南，后续只保留自包含提醒和本轮建议；未确认或结果不确定的提交不会锁存指南。A07 使用任务开始前后的受控源码 manifest 记录真实改动，A08 使用累计账本，并在每次开发修复后刷新图谱，避免把项目启动前已有的 dirty 文件误算为本需求修改。对于 manifest 已确认删除的源码路径，证据和可选命令 `affected <路径> --previous` 会使用上一份不可变 generation，并将结果明确标记为 `OLD_GENERATION/AMBIGUOUS`，不会冒充当前代码事实。
+
+五类智能体查询都会先轻量核对图谱与当前源码。图谱过期或新鲜度未知时仍可查询不可变 generation，但结果会明确标记 `stale/unknown`，要求回到当前源码核验，且不会由智能体命令自动触发构图。查询默认返回带 BEGIN/END marker 的有界文本，也支持 `--format json` 的 `tmux-graphify-query-result/1` 结果；绝对路径、本地文件/编辑器 URI、UNC 路径、ANSI 和控制字符都会被脱敏，保存的输出限制为 6,000 字符。查询统计按阶段、runner 和 tmux 会话 generation 隔离：复用会话会计入当前阶段，旧会话不能污染新阶段。TUI/Web 只展示该阶段查询次数与最近一次命令/新鲜度，不保存问题或结果正文。
 
 事实优先级不变：当前代码、测试、配置是实现事实；`AGENTS.md`、`repo_map.json`、`task_routes.json`、`pitfalls.json`仍是机器路由权威；Graphify 只提供静态导航和影响面候选。A01 create 可以消费这些证据，A01 audit/refine 则会明确关闭 Graphify，并保持只审核或修改四个路由文件。动态 import、反射、代码生成、运行时配置与跨服务行为必须重新核查代码或运行证据。
 
