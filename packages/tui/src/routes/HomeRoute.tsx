@@ -121,6 +121,9 @@ export function HomeRoute(props: Props) {
                   <text>{agentSummary(agent)}</text>
                 </box>
                 <text fg="#888888">{agent.attachCommand}</text>
+                <Show when={agent.graphifyUsageLabel}>
+                  <text fg="#888888">{agent.graphifyUsageLabel}</text>
+                </Show>
               </box>
             )}
           </For>

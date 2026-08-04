@@ -21,6 +21,7 @@ from typing import Callable, Mapping, Sequence
 from tmux_core.runtime.contracts import TurnFileContract, TurnFileResult
 from tmux_core.runtime.tmux_runtime import (
     AgentInterventionRequired,
+    AgentRuntimeInterventionRequired,
     AgentStartupInterventionRequired,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     is_turn_artifact_contract_error,
@@ -2424,7 +2425,12 @@ def run_hitl_agent_loop(
         if resume_publishing:
             _validate_persisted_final_confirmation()
         else:
-            control = _call_confirmation_provider()
+            owner_metadata = _await_worker_ready_for_human_input(
+                turn_id=candidate.turn_id,
+                reason="Grill 最终确认",
+            )
+            with prompt_metadata(**owner_metadata):
+                control = _call_confirmation_provider()
             if control.action == "abort":
                 grill_state.state = "aborted"
                 save_grill_session_state(session_file, grill_state)
@@ -2524,24 +2530,34 @@ def run_hitl_agent_loop(
         assert grill_state is not None and session_file is not None
         question = validate_grill_question_file(decision.question_path)
         grill_state.question_seq += 1
-        grill_state.state = "awaiting_answer"
+        # The question contract is durable before the terminal necessarily
+        # returns to an input-ready surface.  Keep this intermediate state
+        # non-interactive so a restart cannot expose a premature HITL prompt.
+        grill_state.state = "question_ready"
         grill_state.pending_question_path = str(Path(decision.question_path).expanduser().resolve())
         grill_state.pending_question_hash = build_prefixed_sha256(decision.question_path)
         grill_state.pending_answer = ""
         save_grill_session_state(session_file, grill_state)
-        if human_input_provider is collect_terminal_hitl_response:
-            answer = collect_grill_hitl_response(
-                decision.question_path,
-                hitl_round=decision.hitl_round,
-                question_index=grill_state.question_seq,
-            )
-        else:
-            try:
-                answer = human_input_provider(decision.question_path, hitl_round=decision.hitl_round)
-            except TypeError as error:
-                if "unexpected keyword argument" not in str(error):
-                    raise
-                answer = human_input_provider(decision.question_path, decision.hitl_round)
+        owner_metadata = _await_worker_ready_for_human_input(
+            turn_id=decision.turn_id,
+            reason=f"Grill 第 {grill_state.question_seq} 题",
+        )
+        grill_state.state = "awaiting_answer"
+        save_grill_session_state(session_file, grill_state)
+        with prompt_metadata(**owner_metadata):
+            if human_input_provider is collect_terminal_hitl_response:
+                answer = collect_grill_hitl_response(
+                    decision.question_path,
+                    hitl_round=decision.hitl_round,
+                    question_index=grill_state.question_seq,
+                )
+            else:
+                try:
+                    answer = human_input_provider(decision.question_path, hitl_round=decision.hitl_round)
+                except TypeError as error:
+                    if "unexpected keyword argument" not in str(error):
+                        raise
+                    answer = human_input_provider(decision.question_path, decision.hitl_round)
         answer = str(answer or "").strip()
         if not answer:
             raise GrillSessionError("Grill 人类回复不能为空")
@@ -2624,6 +2640,73 @@ def run_hitl_agent_loop(
                 on_worker_started(worker)
         return worker
 
+    def _await_worker_ready_for_human_input(*, turn_id: str, reason: str) -> dict[str, object]:
+        """Open a business HITL boundary only after its owning pane is READY."""
+
+        nonlocal worker
+        normalized_turn_id = str(turn_id or "").strip()
+        while True:
+            cursor = _read_worker_cursor(worker)
+            agent_state = str(cursor.get("agent_state", "") or "").strip().upper()
+            current_turn_id = str(cursor.get("current_turn_id", "") or "").strip()
+            cursor_is_ready = agent_state == "READY"
+            # Old worker snapshots did not persist ``agent_state``.  They
+            # cannot participate in the new READY-generation handshake, so
+            # retain their previous prompt behavior instead of trapping an
+            # already completed recovered turn behind an unverifiable gate.
+            legacy_terminal_cursor = not agent_state
+            turn_matches = not current_turn_id or not normalized_turn_id or current_turn_id == normalized_turn_id
+            if turn_matches and (cursor_is_ready or legacy_terminal_cursor):
+                break
+            if cursor_is_ready and not turn_matches:
+                raise GrillSessionError(
+                    "人工输入门禁的 Worker turn 与问题合同不一致: "
+                    f"worker={current_turn_id!r}, expected={normalized_turn_id!r}"
+                )
+            try:
+                worker.ensure_agent_ready(timeout_sec=min(timeout_sec, 60.0))
+            except AgentInterventionRequired as error:
+                if startup_intervention_handler is None:
+                    raise
+                startup_intervention_handler(worker, error)
+                continue
+            except Exception as error:  # noqa: BLE001
+                if replace_dead_worker is not None and is_worker_death_error(error):
+                    worker = _replace_worker(worker, error)
+                    continue
+                if isinstance(error, TimeoutError) and startup_intervention_handler is not None:
+                    intervention = AgentRuntimeInterventionRequired(
+                        blocker_kind="human_prompt_owner_busy",
+                        session_name=str(getattr(worker, "session_name", "") or ""),
+                        state_path=str(getattr(worker, "state_path", "") or ""),
+                        message=(
+                            f"{reason} 已生成，但所属智能体持续处于 BUSY，系统尚未开放业务问题。\n"
+                            f"请进入会话确认智能体是否仍在工作: tmux attach -t "
+                            f"{str(getattr(worker, 'session_name', '') or '')}"
+                        ),
+                    )
+                    startup_intervention_handler(worker, intervention)
+                    continue
+                raise
+            notify_runtime_state_changed()
+            _sync_grill_turn_cursor(worker)
+
+        notify_runtime_state_changed()
+        _sync_grill_turn_cursor(worker)
+        ready_cursor = _read_worker_cursor(worker)
+        try:
+            revision = max(int(ready_cursor.get("state_revision", 0) or 0), 0)
+        except (TypeError, ValueError):
+            revision = 0
+        return {
+            "ready_for_human": True,
+            "owner_session_name": str(
+                ready_cursor.get("session_name", getattr(worker, "session_name", "")) or ""
+            ).strip(),
+            "owner_turn_id": normalized_turn_id,
+            "owner_state_revision": revision,
+        }
+
     # A recovered question is shown again from the persisted file without invoking the agent.
     recovered_human_message = ""
     if grill_state is not None:
@@ -2649,7 +2732,7 @@ def run_hitl_agent_loop(
             )
             if recovered_result is not None:
                 return recovered_result
-        elif grill_state.state == "awaiting_answer" and grill_state.pending_question_path:
+        elif grill_state.state in {"question_ready", "awaiting_answer"} and grill_state.pending_question_path:
             recovered_decision = validate_hitl_status_file(
                 status_file,
                 expected_stage=stage_name,
@@ -2661,25 +2744,32 @@ def run_hitl_agent_loop(
             )
             # Do not increment question_seq for a question already counted before shutdown.
             question = validate_grill_question_file(recovered_decision.question_path)
-            if human_input_provider is collect_terminal_hitl_response:
-                recovered_human_message = collect_grill_hitl_response(
-                    recovered_decision.question_path,
-                    hitl_round=recovered_decision.hitl_round,
-                    question_index=grill_state.question_seq,
-                )
-            else:
-                try:
-                    recovered_human_message = human_input_provider(
+            owner_metadata = _await_worker_ready_for_human_input(
+                turn_id=recovered_decision.turn_id,
+                reason=f"Grill 第 {grill_state.question_seq} 题恢复",
+            )
+            grill_state.state = "awaiting_answer"
+            save_grill_session_state(session_file, grill_state)
+            with prompt_metadata(**owner_metadata):
+                if human_input_provider is collect_terminal_hitl_response:
+                    recovered_human_message = collect_grill_hitl_response(
                         recovered_decision.question_path,
                         hitl_round=recovered_decision.hitl_round,
+                        question_index=grill_state.question_seq,
                     )
-                except TypeError as error:
-                    if "unexpected keyword argument" not in str(error):
-                        raise
-                    recovered_human_message = human_input_provider(
-                        recovered_decision.question_path,
-                        recovered_decision.hitl_round,
-                    )
+                else:
+                    try:
+                        recovered_human_message = human_input_provider(
+                            recovered_decision.question_path,
+                            hitl_round=recovered_decision.hitl_round,
+                        )
+                    except TypeError as error:
+                        if "unexpected keyword argument" not in str(error):
+                            raise
+                        recovered_human_message = human_input_provider(
+                            recovered_decision.question_path,
+                            recovered_decision.hitl_round,
+                        )
             recovered_human_message = str(recovered_human_message or "").strip()
             if not recovered_human_message:
                 raise GrillSessionError("Grill 人类回复不能为空")
@@ -3205,12 +3295,17 @@ def run_hitl_agent_loop(
             grill_state.candidate_round = hitl_round
             human_message = _persist_question_and_collect_answer(decision)
         else:
-            try:
-                human_message = human_input_provider(decision.question_path, hitl_round=hitl_round)
-            except TypeError as error:
-                if "unexpected keyword argument" not in str(error):
-                    raise
-                human_message = human_input_provider(decision.question_path, hitl_round)
+            owner_metadata = _await_worker_ready_for_human_input(
+                turn_id=turn_id,
+                reason=f"HITL 第 {hitl_round} 轮",
+            )
+            with prompt_metadata(**owner_metadata):
+                try:
+                    human_message = human_input_provider(decision.question_path, hitl_round=hitl_round)
+                except TypeError as error:
+                    if "unexpected keyword argument" not in str(error):
+                        raise
+                    human_message = human_input_provider(decision.question_path, hitl_round)
         human_history_path = turns_dir / turn_id / f"human_response_round_{hitl_round}.md"
         human_history_path.write_text(human_message.strip() + "\n", encoding="utf-8")
         _invoke_optional_hitl_callback(

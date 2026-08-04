@@ -353,7 +353,7 @@
       "name": "stage_family",
       "path": "A02_RequirementIntake.py",
       "kind": "python_stage_family",
-      "purpose": "stage entry family and shared stage implementation surface, including the persisted A03 Grill interview lifecycle",
+      "purpose": "stage entry family and shared stage implementation surface, including persisted A03 Grill interviews and live analyst handoff through A04/A05",
       "task_keywords": [
         "requirement",
         "clarification",
@@ -363,6 +363,7 @@
         "development",
         "overall_review",
         "requirements_mode",
+        "requirements_behavior",
         "grill",
         "grill_with_docs",
         "domain_context",
@@ -450,6 +451,8 @@
         "main",
         "run_requirements_clarification",
         "build_requirements_grill_paths",
+        "RequirementsAnalystHandoff",
+        "RequirementsClarificationReturnRequested",
         "resolve_workflow_requirements_mode",
         "needs_code_confirmation"
       ],
@@ -894,6 +897,8 @@
         "grill_me",
         "grill_with_docs",
         "requirements_mode",
+        "requirements_behavior",
+        "grill_transition",
         "grill_session",
         "domain_modeling",
         "graphify",
@@ -991,10 +996,12 @@
         "build_ponytail_bootstrap",
         "build_ponytail_reminder",
         "RequirementsMode",
+        "RequirementsBehavior",
         "GrillTurnProfile",
         "render_grill_rules",
         "build_grill_bootstrap",
         "build_grill_reminder",
+        "build_grill_completion_transition",
         "GraphifyMode",
         "GraphifyTurnProfile",
         "build_graphify_evidence_block",
@@ -1299,6 +1306,7 @@
         "ponytail_bundle_version",
         "ponytail_delivery",
         "requirements_mode",
+        "requirements_behavior",
         "grill_bundle_commit",
         "grill_delivery",
         "grill_question_seq",
@@ -1553,6 +1561,7 @@
         "behavior_profile_label",
         "agent_config_label",
         "requirements_mode",
+        "requirements_behavior",
         "grill",
         "grill_prompt",
         "recommendation",
@@ -2502,7 +2511,7 @@
       "name": "project_graph_service",
       "path": "tmux_core/runtime/graphify.py",
       "kind": "isolated_external_tool_adapter",
-      "purpose": "resolve pinned Graphify tooling, build safe code-only project snapshots and immutable graph generations, combine stage-resolved AI Hermes routes with bounded evidence, audit stage/runner/session-scoped read-only queries, and track A07/A08 source changes including deleted-path impact from the previous graph generation",
+      "purpose": "resolve pinned Graphify tooling, build safe code-only project snapshots and immutable graph generations, combine stage-resolved AI Hermes routes with bounded evidence, derive per-turn evidence/query usage policy, audit exact runner/session/turn/evidence/fingerprint/invocation-scoped read-only queries, enforce Auto degradation or Required HITL after one repair, and track A07/A08 source changes including deleted-path impact from the previous graph generation",
       "task_keywords": [
         "graphify",
         "graphifyy",
@@ -2524,7 +2533,12 @@
         "session_generation",
         "query_scope",
         "validation_stamp",
-        "query_audit"
+        "query_audit",
+        "usage_policy",
+        "usage_receipt",
+        "query_required",
+        "invocation_digest",
+        "graphify_usage_intervention"
       ],
       "owned_paths": [
         {
@@ -2579,12 +2593,17 @@
         "GraphifyQueryIntent",
         "GraphifyQueryResult",
         "GraphifyFreshnessAssessment",
+        "GraphifyUsagePolicy",
+        "GraphifyUsageAssessment",
+        "GraphifyUsageContractError",
         "StageGraphifyRouteHints",
         "TurnContextBlock",
         "resolve_graphify_turn_profile",
         "build_graphify_evidence_block",
         "execute_readonly_query",
         "assess_graphify_freshness",
+        "assess_graphify_turn_usage",
+        "register_graphify_turn_usage",
         "capture_graphify_source_manifest",
         "read_graphify_project_status",
         "build_stage_graphify_turn_context",
@@ -2655,6 +2674,10 @@
         },
         {
           "type": "used_by",
+          "target": "M07_frontend_packages"
+        },
+        {
+          "type": "used_by",
           "target": "M09_routing_init_layer"
         },
         {
@@ -2703,6 +2726,22 @@
         {
           "type": "literal",
           "path": "packages/web/src/domain/graphifyStatus.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/homeAgents.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/web/src/domain/agents.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/web/src/graphifyUi.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_role_orchestration.py"
         }
       ],
       "related_config_selectors": [
@@ -2762,6 +2801,18 @@
         {
           "type": "literal",
           "path": "packages/web/src/domain/graphifyStatus.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/tui/src/homeAgents.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "packages/web/src/domain/agents.test.ts"
+        },
+        {
+          "type": "literal",
+          "path": "tests/test_role_orchestration.py"
         }
       ],
       "read_before_edit_selectors": [
@@ -2801,6 +2852,7 @@
           "tools/graphify/uv.lock",
           "tools/graphify/UPSTREAM.json",
           "tmux_core/runtime/tmux_runtime.py",
+          "tmux_core/stage_kernel/agent_intervention.py",
           "tmux_core/bridge/backend.py",
           "tests/test_graphify_runtime.py",
           "tests/test_graphify_config.py",
@@ -2809,10 +2861,15 @@
           "tests/test_stage_kernel_turn_output_goals.py",
           "tests/test_t11_tui_backend.py",
           "tests/test_t11_web_backend.py",
+          "tests/test_role_orchestration.py",
           "packages/tui/src/graphifyStatus.ts",
           "packages/tui/src/graphifyStatus.test.ts",
+          "packages/tui/src/homeAgents.ts",
+          "packages/tui/src/homeAgents.test.ts",
           "packages/web/src/domain/graphifyStatus.ts",
-          "packages/web/src/domain/graphifyStatus.test.ts"
+          "packages/web/src/domain/graphifyStatus.test.ts",
+          "packages/web/src/domain/agents.ts",
+          "packages/web/src/domain/agents.test.ts"
         ],
         "unsampled_paths": []
       }

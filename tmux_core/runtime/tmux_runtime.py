@@ -50,12 +50,17 @@ from tmux_core.runtime.grill import (
     BUNDLE_COMMIT as GRILL_BUNDLE_COMMIT,
     BUNDLE_DELIVERY as GRILL_BUNDLE_DELIVERY,
     BEGIN_MARKER as GRILL_BEGIN_MARKER,
+    TRANSITION_BEGIN_MARKER as GRILL_TRANSITION_BEGIN_MARKER,
+    TRANSITION_END_MARKER as GRILL_TRANSITION_END_MARKER,
     GrillBundleError,
     GrillTurnProfile,
+    RequirementsBehavior,
     RequirementsMode,
     build_grill_bootstrap,
+    build_grill_completion_transition,
     build_grill_reminder,
     normalize_grill_turn_profile,
+    normalize_requirements_behavior,
     normalize_requirements_mode,
     validate_grill_bundle,
 )
@@ -67,6 +72,10 @@ from tmux_core.runtime.graphify import (
     GraphifyMode,
     GraphifyTurnContext,
     GraphifyTurnProfile,
+    GraphifyUsageAssessment,
+    GraphifyUsageContractError,
+    GraphifyUsagePolicy,
+    assess_graphify_turn_usage,
     build_graphify_evidence_block,
     graphify_interactive_recovery_enabled,
     graphify_required_recovery_decision,
@@ -74,6 +83,7 @@ from tmux_core.runtime.graphify import (
     normalize_graphify_mode,
     publish_graphify_off_status,
     publish_graphify_pending_status,
+    register_graphify_turn_usage,
     resolve_graphify_tool,
     resolve_graphify_turn_profile,
     set_graphify_required_recovery_decision,
@@ -150,6 +160,7 @@ TASK_RESULT_READY_MISSING_GRACE_SEC = 2.0
 STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX = "stale_busy_without_contract"
 LONG_RUNNING_TASK_RESULT_REASON_PREFIX = "long_running_task_result"
 LONG_RUNNING_TASK_RESULT_BLOCKER = "long_running_task_result"
+GRAPHIFY_USAGE_BLOCKER = "graphify_usage_required"
 TASK_CONTRACT_STALL_IDLE_SEC = 45.0
 CODEX_TRANSIENT_SHELL_START_GRACE_SEC = 15.0
 TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS = _positive_int_env("TMUX_TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 30)
@@ -4235,6 +4246,14 @@ class TmuxBatchWorker:
         ).value
         if self.requirements_mode != RequirementsMode.STANDARD.value:
             validate_grill_bundle()
+        self.requirements_behavior = (
+            RequirementsBehavior.INTERVIEW.value
+            if self.requirements_mode != RequirementsMode.STANDARD.value
+            else RequirementsBehavior.STANDARD.value
+        )
+        self.requirements_grill_session_id = ""
+        self.requirements_transition_pending = False
+        self.requirements_transition_delivered = False
         self.graphify_mode = normalize_graphify_mode(
             getattr(self.config, "graphify_mode", GraphifyMode.OFF.value),
             default=GraphifyMode.OFF,
@@ -4244,6 +4263,13 @@ class TmuxBatchWorker:
         self.graphify_orientation_delivered = False
         self.graphify_delivered_mode = ""
         self.graphify_delivered_guide_version = ""
+        self.graphify_usage_turn_id = ""
+        self.graphify_usage_policy = GraphifyUsagePolicy()
+        self.graphify_usage_delivery = ""
+        self.graphify_query_status = ""
+        self.graphify_usage_receipt = ""
+        self.graphify_usage_manual_override = False
+        self._graphify_usage_repair_active = False
         self.backend = backend or TmuxBackend()
         self.detector = build_output_detector(self.config.vendor)
         self.runtime_root = Path(runtime_root or DEFAULT_RUNTIME_ROOT).expanduser().resolve()
@@ -4451,6 +4477,33 @@ class TmuxBatchWorker:
                 self.grill_delivered_mode = delivered_mode if self.grill_full_delivered else ""
                 with contextlib.suppress(TypeError, ValueError):
                     self.grill_question_seq = max(int(grill_policy.get("question_seq", 0) or 0), 0)
+            requirements_policy = existing_state.get("requirements_policy", {})
+            if isinstance(requirements_policy, Mapping):
+                policy_generation = str(
+                    requirements_policy.get("session_generation", "") or ""
+                ).strip()
+                configured_mode = normalize_requirements_mode(
+                    requirements_policy.get("configured_mode", self.requirements_mode),
+                    default=self.requirements_mode,
+                ).value
+                if (
+                    configured_mode == self.requirements_mode
+                    and (not policy_generation or policy_generation == self.grill_session_generation)
+                ):
+                    self.requirements_behavior = normalize_requirements_behavior(
+                        requirements_policy.get("active_behavior", self.requirements_behavior),
+                        default=self.requirements_behavior,
+                    ).value
+                    self.requirements_grill_session_id = str(
+                        requirements_policy.get("grill_session_id", "") or ""
+                    ).strip()
+                    self.requirements_transition_delivered = bool(
+                        requirements_policy.get("transition_delivered", False)
+                    )
+                    self.requirements_transition_pending = bool(
+                        requirements_policy.get("transition_pending", False)
+                        and not self.requirements_transition_delivered
+                    )
             graphify_policy = existing_state.get("graphify_policy", {})
             if isinstance(graphify_policy, Mapping):
                 existing_generation = str(graphify_policy.get("session_generation", "") or "").strip()
@@ -4468,6 +4521,43 @@ class TmuxBatchWorker:
                 if self.graphify_orientation_delivered:
                     self.graphify_delivered_mode = delivered_mode
                     self.graphify_delivered_guide_version = delivered_guide_version
+            self.graphify_usage_turn_id = str(
+                existing_state.get("current_graphify_usage_turn_id", "") or ""
+            ).strip()
+            self.graphify_usage_delivery = str(
+                existing_state.get("graphify_evidence_delivery", "") or ""
+            ).strip()
+            self.graphify_query_status = str(
+                existing_state.get("graphify_query_status", "") or ""
+            ).strip()
+            existing_usage_receipt = str(
+                existing_state.get("graphify_usage_receipt", "") or ""
+            ).strip()
+            self.graphify_usage_receipt = (
+                str(self._task_runtime_dir() / existing_usage_receipt)
+                if existing_usage_receipt and Path(existing_usage_receipt).name == existing_usage_receipt
+                else ""
+            )
+            existing_evidence_id = str(
+                existing_state.get("graphify_evidence_id", "") or ""
+            ).strip()
+            existing_query_requirement = str(
+                existing_state.get("graphify_query_requirement", "not_applicable")
+                or "not_applicable"
+            ).strip().lower()
+            if existing_query_requirement not in {"required", "optional", "not_applicable"}:
+                existing_query_requirement = "not_applicable"
+            self.graphify_usage_policy = GraphifyUsagePolicy(
+                evidence_required=bool(existing_evidence_id),
+                query_requirement=existing_query_requirement,
+                evidence_id=existing_evidence_id,
+                graph_fingerprint=str(
+                    existing_state.get("graphify_fingerprint", "") or ""
+                ).strip(),
+                freshness=str(
+                    existing_state.get("graphify_freshness", "") or ""
+                ).strip(),
+            )
             existing_runner_id = str(existing_state.get("stage_runner_id", "") or "").strip()
             if (
                     metadata_owns_runner_id
@@ -4712,6 +4802,17 @@ class TmuxBatchWorker:
             default=RequirementsMode.STANDARD,
         ).value
 
+    def _configured_requirements_behavior(self) -> str:
+        default_behavior = (
+            RequirementsBehavior.INTERVIEW
+            if self._configured_requirements_mode() != RequirementsMode.STANDARD.value
+            else RequirementsBehavior.STANDARD
+        )
+        return normalize_requirements_behavior(
+            getattr(self, "requirements_behavior", default_behavior.value),
+            default=default_behavior,
+        ).value
+
     def _configured_graphify_mode(self) -> str:
         config = getattr(self, "config", None)
         return normalize_graphify_mode(
@@ -4723,9 +4824,16 @@ class TmuxBatchWorker:
             default=GraphifyMode.OFF,
         ).value
 
+    def _graphify_runner_scope_id(self) -> str:
+        authoritative = str(getattr(self, "stage_runner_id", "") or "").strip()
+        if authoritative:
+            return authoritative
+        runtime_worker_id = str(getattr(self, "runtime_worker_id", "") or "").strip()
+        return f"worker-{runtime_worker_id}" if runtime_worker_id else ""
+
     def _build_agent_launch_command(self) -> str:
         command = self.config.build_launch_command(self.work_dir)
-        runner_id = str(getattr(self, "stage_runner_id", "") or "").strip()
+        runner_id = self._graphify_runner_scope_id()
         graphify_session_generation = ""
         if self._configured_graphify_mode() != GraphifyMode.OFF.value:
             graphify_session_generation = str(
@@ -4770,12 +4878,139 @@ class TmuxBatchWorker:
         return publish_graphify_pending_status(
             self.work_dir,
             self._configured_graphify_mode(),
-            runner_id=str(getattr(self, "stage_runner_id", "") or "").strip(),
+            runner_id=self._graphify_runner_scope_id(),
             stage_key=self._graphify_stage_scope_key(turn_context),
             session_generation=str(
                 getattr(self, "graphify_session_generation", "") or ""
             ).strip(),
         )
+
+    @staticmethod
+    def _graphify_usage_command_name(policy: GraphifyUsagePolicy) -> str:
+        match = re.search(
+            r'\$TMUX_GRAPHIFY_CMD"?\s+(query|affected|path|explain|god-nodes)\b',
+            str(policy.recommended_command or ""),
+        )
+        return match.group(1) if match else ""
+
+    def _graphify_usage_receipt_path(self, label: str, turn_id: str) -> Path:
+        basename = _slugify(f"{label}-{turn_id[:12]}-graphify-usage", max_len=128)
+        return self._task_runtime_dir() / f"{basename}.json"
+
+    def _persist_graphify_usage_state_fast(
+            self,
+            *,
+            last_writer: str = "TmuxBatchWorker.graphify_usage",
+    ) -> None:
+        policy = self.graphify_usage_policy
+        with self.state_lock:
+            payload = self.read_state()
+            payload.update(
+                {
+                    "current_graphify_usage_turn_id": self.graphify_usage_turn_id,
+                    "graphify_usage_policy": f"query_{policy.query_requirement}",
+                    "graphify_evidence_delivery": self.graphify_usage_delivery,
+                    "graphify_query_requirement": policy.query_requirement,
+                    "graphify_query_status": self.graphify_query_status,
+                    "graphify_query_command": self._graphify_usage_command_name(policy),
+                    "graphify_usage_receipt": Path(self.graphify_usage_receipt).name
+                    if self.graphify_usage_receipt else "",
+                    "updated_at": _now_iso(),
+                    "state_revision": int(payload.get("state_revision", 0) or 0) + 1,
+                    "last_writer": last_writer,
+                }
+            )
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def _begin_graphify_turn_usage(
+            self,
+            *,
+            label: str,
+            profile: GraphifyTurnProfile,
+    ) -> None:
+        if not profile.enabled:
+            return
+        self.graphify_usage_turn_id = uuid.uuid4().hex
+        self.graphify_usage_policy = profile.usage_policy
+        self.graphify_usage_delivery = "pending"
+        self.graphify_query_status = (
+            "pending" if profile.usage_policy.query_requirement == "required" else "optional"
+        )
+        self.graphify_usage_receipt = str(
+            self._graphify_usage_receipt_path(label, self.graphify_usage_turn_id)
+        )
+        self.graphify_usage_manual_override = False
+        register_graphify_turn_usage(
+            self.work_dir,
+            self._configured_graphify_mode(),
+            runner_id=self._graphify_runner_scope_id(),
+            stage_key=self._graphify_stage_scope_key(profile.turn_context),
+            session_generation=self.graphify_session_generation,
+            turn_id=self.graphify_usage_turn_id,
+            policy=self.graphify_usage_policy,
+            delivery_confirmed=False,
+        )
+
+    def _confirm_graphify_turn_delivery(self, profile: GraphifyTurnProfile) -> None:
+        if (
+            not profile.enabled
+            or not str(getattr(self, "graphify_usage_turn_id", "") or "")
+            or profile.usage_policy.evidence_id
+            != getattr(self, "graphify_usage_policy", GraphifyUsagePolicy()).evidence_id
+        ):
+            return
+        if self.graphify_usage_delivery == "confirmed":
+            return
+        registered = register_graphify_turn_usage(
+            self.work_dir,
+            self._configured_graphify_mode(),
+            runner_id=self._graphify_runner_scope_id(),
+            stage_key=self._graphify_stage_scope_key(profile.turn_context),
+            session_generation=self.graphify_session_generation,
+            turn_id=self.graphify_usage_turn_id,
+            policy=self.graphify_usage_policy,
+            delivery_confirmed=True,
+        )
+        if not registered:
+            return
+        self.graphify_usage_delivery = "confirmed"
+        self._persist_graphify_usage_state_fast(
+            last_writer="TmuxBatchWorker.graphify_usage_delivery"
+        )
+
+    def _assess_graphify_usage(
+            self,
+            *,
+            degraded: bool = False,
+            manual_override: bool = False,
+    ) -> GraphifyUsageAssessment:
+        assessment = assess_graphify_turn_usage(
+            self.work_dir,
+            self.graphify_usage_policy,
+            session_generation=self.graphify_session_generation,
+            turn_id=self.graphify_usage_turn_id,
+            delivery_confirmed=self.graphify_usage_delivery == "confirmed",
+            receipt_path=self.graphify_usage_receipt or None,
+            manual_override=manual_override,
+            degraded=degraded,
+        )
+        self.graphify_query_status = assessment.query_status
+        self.graphify_usage_manual_override = assessment.query_status == "manual_override"
+        self._persist_graphify_usage_state_fast()
+        return assessment
+
+    def override_graphify_usage_requirement(self) -> None:
+        """Record an explicit human override for the current Required-mode turn."""
+
+        self._assess_graphify_usage(manual_override=True)
+
+    def _graphify_required_query_is_satisfied(self) -> bool:
+        if not self.graphify_usage_turn_id:
+            return True
+        return self._assess_graphify_usage(
+            manual_override=self.graphify_usage_manual_override,
+        ).satisfied
 
     def _graphify_policy_payload(self) -> dict[str, object]:
         return {
@@ -4836,11 +5071,31 @@ class TmuxBatchWorker:
         self.graphify_orientation_delivered = False
         self.graphify_delivered_mode = ""
         self.graphify_delivered_guide_version = ""
+        self.graphify_usage_turn_id = ""
+        self.graphify_usage_policy = GraphifyUsagePolicy()
+        self.graphify_usage_delivery = ""
+        self.graphify_query_status = ""
+        self.graphify_usage_receipt = ""
+        self.graphify_usage_manual_override = False
         if not self.state_path.exists():
             return
         with self.state_lock:
             payload = self.read_state()
             payload["graphify_policy"] = self._graphify_policy_payload()
+            payload.update(
+                {
+                    "graphify_evidence_id": "",
+                    "graphify_fingerprint": "",
+                    "graphify_freshness": "",
+                    "current_graphify_usage_turn_id": "",
+                    "graphify_usage_policy": "",
+                    "graphify_evidence_delivery": "",
+                    "graphify_query_requirement": "not_applicable",
+                    "graphify_query_status": "",
+                    "graphify_query_command": "",
+                    "graphify_usage_receipt": "",
+                }
+            )
             payload["updated_at"] = _now_iso()
             payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
             payload["last_writer"] = "TmuxBatchWorker.graphify_generation"
@@ -4872,6 +5127,7 @@ class TmuxBatchWorker:
         normalized = self._normalize_graphify_profile_for_turn(profile)
         if not normalized.enabled:
             return
+        self._confirm_graphify_turn_delivery(normalized)
         if str(delivery_guide_version or "").strip() != GRAPHIFY_GUIDE_VERSION:
             return
         managed_prompt_kind = str(prompt_kind or "").strip().lower()
@@ -4949,6 +5205,7 @@ class TmuxBatchWorker:
             config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
             refresh=refresh,
             turn_context=turn_context,
+            usage_session_generation=self.graphify_session_generation,
         )
         if self._configured_graphify_mode() != GraphifyMode.OFF.value:
             self.graphify_generation_refreshed = True
@@ -4986,6 +5243,7 @@ class TmuxBatchWorker:
             config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
             refresh=True,
             turn_context=turn_context,
+            usage_session_generation=self.graphify_session_generation,
         )
         self.graphify_generation_refreshed = True
         return profile
@@ -5010,16 +5268,114 @@ class TmuxBatchWorker:
             "delivery": GRILL_BUNDLE_DELIVERY,
         }
 
+    def _requirements_policy_payload(self) -> dict[str, object]:
+        return {
+            "configured_mode": self._configured_requirements_mode(),
+            "active_behavior": self._configured_requirements_behavior(),
+            "grill_session_id": str(
+                getattr(self, "requirements_grill_session_id", "") or ""
+            ),
+            "transition_pending": bool(
+                getattr(self, "requirements_transition_pending", False)
+            ),
+            "transition_delivered": bool(
+                getattr(self, "requirements_transition_delivered", False)
+            ),
+            "session_generation": str(
+                getattr(self, "grill_session_generation", "") or ""
+            ),
+        }
+
+    def _persist_requirements_policy_fast(self, *, writer: str) -> None:
+        if not self.state_path.exists():
+            return
+        with self.state_lock:
+            payload = self.read_state()
+            payload["requirements_policy"] = self._requirements_policy_payload()
+            payload["updated_at"] = _now_iso()
+            payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
+            payload["last_writer"] = writer
+            _atomic_write_json(self.state_path, payload)
+        _notify_runtime_state_changed_best_effort()
+
+    def transition_requirements_behavior(
+            self,
+            behavior: RequirementsBehavior | str,
+            *,
+            grill_session_id: str = "",
+            expected_session_generation: str = "",
+    ) -> None:
+        """Change A03 interview behavior without replacing the live agent session."""
+
+        normalized = normalize_requirements_behavior(behavior).value
+        expected_generation = str(expected_session_generation or "").strip()
+        if expected_generation and expected_generation != self.grill_session_generation:
+            raise GrillSessionModeMismatch(
+                "cannot change requirements behavior for a stale session generation: "
+                f"session={getattr(self, 'session_name', '')}, "
+                f"expected={expected_generation}, actual={self.grill_session_generation}"
+            )
+        if (
+            normalized == RequirementsBehavior.INTERVIEW.value
+            and self.requirements_mode == RequirementsMode.STANDARD.value
+        ):
+            raise GrillSessionModeMismatch("Standard requirements sessions cannot enter Grill interview behavior")
+
+        previous = (
+            self.requirements_behavior,
+            self.requirements_grill_session_id,
+            self.requirements_transition_pending,
+            self.requirements_transition_delivered,
+        )
+        next_session_id = str(grill_session_id or self.requirements_grill_session_id or "").strip()
+        if normalized == RequirementsBehavior.INTERVIEW.value:
+            self.requirements_behavior = normalized
+            self.requirements_grill_session_id = next_session_id
+            self.requirements_transition_pending = False
+            self.requirements_transition_delivered = False
+        else:
+            changed_from_interview = self.requirements_behavior == RequirementsBehavior.INTERVIEW.value
+            changed_session = bool(
+                next_session_id and next_session_id != self.requirements_grill_session_id
+            )
+            self.requirements_behavior = normalized
+            self.requirements_grill_session_id = next_session_id
+            if self.requirements_mode == RequirementsMode.STANDARD.value:
+                self.requirements_transition_pending = False
+                self.requirements_transition_delivered = False
+            elif changed_from_interview or changed_session or not self.requirements_transition_delivered:
+                self.requirements_transition_pending = True
+                self.requirements_transition_delivered = False
+        try:
+            self._persist_requirements_policy_fast(
+                writer="TmuxBatchWorker.requirements_behavior"
+            )
+        except Exception:
+            (
+                self.requirements_behavior,
+                self.requirements_grill_session_id,
+                self.requirements_transition_pending,
+                self.requirements_transition_delivered,
+            ) = previous
+            raise
+
     def _reset_grill_delivery_generation(self) -> None:
         self.grill_session_generation = uuid.uuid4().hex
         self.grill_full_delivered = False
         self.grill_delivered_mode = ""
         self.grill_question_seq = 0
+        if (
+            self.requirements_mode != RequirementsMode.STANDARD.value
+            and self.requirements_behavior == RequirementsBehavior.STANDARD.value
+        ):
+            self.requirements_transition_pending = True
+            self.requirements_transition_delivered = False
         if not self.state_path.exists():
             return
         with self.state_lock:
             payload = self.read_state()
             payload["grill_policy"] = self._grill_policy_payload()
+            payload["requirements_policy"] = self._requirements_policy_payload()
             payload["updated_at"] = _now_iso()
             payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
             payload["last_writer"] = "TmuxBatchWorker.grill_generation"
@@ -5033,6 +5389,12 @@ class TmuxBatchWorker:
         if profile is None:
             return None
         normalized = normalize_grill_turn_profile(profile)
+        if self._configured_requirements_behavior() != RequirementsBehavior.INTERVIEW.value:
+            raise GrillSessionModeMismatch(
+                "Grill turn cannot run after the interview behavior has been closed: "
+                f"session={getattr(self, 'session_name', '')}, "
+                f"behavior={self._configured_requirements_behavior()}, turn={normalized.mode}"
+            )
         configured_mode = self._configured_requirements_mode()
         if normalized.mode != configured_mode:
             raise GrillSessionModeMismatch(
@@ -5101,6 +5463,7 @@ class TmuxBatchWorker:
         with self.state_lock:
             payload = self.read_state()
             payload["grill_policy"] = self._grill_policy_payload()
+            payload["requirements_policy"] = self._requirements_policy_payload()
             payload["updated_at"] = _now_iso()
             payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
             payload["last_writer"] = "TmuxBatchWorker.grill_delivery"
@@ -5112,12 +5475,23 @@ class TmuxBatchWorker:
             self.grill_full_delivered,
             self.grill_delivered_mode,
             self.grill_question_seq,
+            bool(getattr(self, "requirements_transition_pending", False)),
+            bool(getattr(self, "requirements_transition_delivered", False)),
         )
         self._mark_grill_prompt_delivered(submitted_prompt)
+        if (
+            bool(getattr(self, "requirements_transition_pending", False))
+            and GRILL_TRANSITION_BEGIN_MARKER in str(submitted_prompt or "")
+            and GRILL_TRANSITION_END_MARKER in str(submitted_prompt or "")
+        ):
+            self.requirements_transition_pending = False
+            self.requirements_transition_delivered = True
         current = (
             self.grill_full_delivered,
             self.grill_delivered_mode,
             self.grill_question_seq,
+            bool(getattr(self, "requirements_transition_pending", False)),
+            bool(getattr(self, "requirements_transition_delivered", False)),
         )
         if current == previous:
             return
@@ -5128,6 +5502,8 @@ class TmuxBatchWorker:
                 self.grill_full_delivered,
                 self.grill_delivered_mode,
                 self.grill_question_seq,
+                self.requirements_transition_pending,
+                self.requirements_transition_delivered,
             ) = previous
             raise
 
@@ -5778,6 +6154,8 @@ class TmuxBatchWorker:
             # A human recheck grants another wait budget while the same already
             # submitted turn remains live; it must never cause prompt replay.
             return True
+        if blocker == GRAPHIFY_USAGE_BLOCKER:
+            return self._graphify_required_query_is_satisfied()
         return True
 
     def _request_runtime_intervention(
@@ -6186,10 +6564,18 @@ class TmuxBatchWorker:
             "terminal_recently_changed": False,
             "ponytail_policy": self._ponytail_policy_payload(),
             "grill_policy": self._grill_policy_payload(),
+            "requirements_policy": self._requirements_policy_payload(),
             "graphify_policy": self._graphify_policy_payload(),
             "graphify_evidence_id": "",
             "graphify_fingerprint": "",
             "graphify_freshness": "",
+            "current_graphify_usage_turn_id": "",
+            "graphify_usage_policy": "",
+            "graphify_evidence_delivery": "",
+            "graphify_query_requirement": "not_applicable",
+            "graphify_query_status": "",
+            "graphify_query_command": "",
+            "graphify_usage_receipt": "",
             "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
         }
         payload.update(self._runtime_metadata)
@@ -6239,6 +6625,14 @@ class TmuxBatchWorker:
                 "current_turn_id": str(previous.get("current_turn_id", "")),
                 "current_turn_phase": str(previous.get("current_turn_phase", "")),
                 "current_turn_status_path": str(previous.get("current_turn_status_path", "")),
+                "current_grill_bundle_commit": str(previous.get("current_grill_bundle_commit", "") or ""),
+                "current_grill_prompt_kind": str(previous.get("current_grill_prompt_kind", "") or ""),
+                "current_requirements_transition": bool(
+                    previous.get("current_requirements_transition", False)
+                ),
+                "current_requirements_session_generation": str(
+                    previous.get("current_requirements_session_generation", "") or ""
+                ),
                 "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
                 "current_task_result_path": self.current_task_result_path or str(previous.get("current_task_result_path", "")),
                 "current_task_runtime_status": self.current_task_runtime_status or str(previous.get("current_task_runtime_status", "")),
@@ -6258,6 +6652,7 @@ class TmuxBatchWorker:
                 "terminal_recently_changed": self.terminal_recently_changed,
                 "ponytail_policy": self._ponytail_policy_payload(),
                 "grill_policy": self._grill_policy_payload(),
+                "requirements_policy": self._requirements_policy_payload(),
                 "graphify_policy": self._graphify_policy_payload(),
                 # A new tmux session is a new delivery generation.  Evidence
                 # identity belongs to the prior session until a new immutable
@@ -6265,6 +6660,13 @@ class TmuxBatchWorker:
                 "graphify_evidence_id": "",
                 "graphify_fingerprint": "",
                 "graphify_freshness": "",
+                "current_graphify_usage_turn_id": "",
+                "graphify_usage_policy": "",
+                "graphify_evidence_delivery": "",
+                "graphify_query_requirement": "not_applicable",
+                "graphify_query_status": "",
+                "graphify_query_command": "",
+                "graphify_usage_receipt": "",
                 "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
             }
             payload.update(self._runtime_metadata)
@@ -6408,6 +6810,14 @@ class TmuxBatchWorker:
                 "current_turn_id": str(previous.get("current_turn_id", "")),
                 "current_turn_phase": str(previous.get("current_turn_phase", "")),
                 "current_turn_status_path": str(previous.get("current_turn_status_path", "")),
+                "current_grill_bundle_commit": str(previous.get("current_grill_bundle_commit", "") or ""),
+                "current_grill_prompt_kind": str(previous.get("current_grill_prompt_kind", "") or ""),
+                "current_requirements_transition": bool(
+                    previous.get("current_requirements_transition", False)
+                ),
+                "current_requirements_session_generation": str(
+                    previous.get("current_requirements_session_generation", "") or ""
+                ),
                 "current_task_status_path": self.current_task_status_path or str(previous.get("current_task_status_path", "")),
                 "current_task_result_path": self.current_task_result_path or str(previous.get("current_task_result_path", "")),
                 "current_task_runtime_status": current_task_runtime_status,
@@ -6427,10 +6837,39 @@ class TmuxBatchWorker:
                 "terminal_recently_changed": self.terminal_recently_changed,
                 "ponytail_policy": self._ponytail_policy_payload(),
                 "grill_policy": self._grill_policy_payload(),
+                "requirements_policy": self._requirements_policy_payload(),
                 "graphify_policy": self._graphify_policy_payload(),
                 "graphify_evidence_id": str(previous.get("graphify_evidence_id", "") or ""),
                 "graphify_fingerprint": str(previous.get("graphify_fingerprint", "") or ""),
                 "graphify_freshness": str(previous.get("graphify_freshness", "") or ""),
+                "current_graphify_usage_turn_id": self.graphify_usage_turn_id or str(
+                    previous.get("current_graphify_usage_turn_id", "") or ""
+                ),
+                "graphify_usage_policy": (
+                    f"query_{self.graphify_usage_policy.query_requirement}"
+                    if self.graphify_usage_policy.evidence_required
+                    else str(previous.get("graphify_usage_policy", "") or "")
+                ),
+                "graphify_evidence_delivery": self.graphify_usage_delivery or str(
+                    previous.get("graphify_evidence_delivery", "") or ""
+                ),
+                "graphify_query_requirement": (
+                    self.graphify_usage_policy.query_requirement
+                    if self.graphify_usage_policy.evidence_required
+                    else str(previous.get("graphify_query_requirement", "not_applicable") or "not_applicable")
+                ),
+                "graphify_query_status": self.graphify_query_status or str(
+                    previous.get("graphify_query_status", "") or ""
+                ),
+                "graphify_query_command": (
+                    self._graphify_usage_command_name(self.graphify_usage_policy)
+                    or str(previous.get("graphify_query_command", "") or "")
+                ),
+                "graphify_usage_receipt": (
+                    Path(self.graphify_usage_receipt).name
+                    if self.graphify_usage_receipt
+                    else str(previous.get("graphify_usage_receipt", "") or "")
+                ),
                 "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
             }
             for key in (
@@ -10260,7 +10699,17 @@ class TmuxBatchWorker:
         )
         normalized_grill_profile = self._normalize_grill_profile_for_turn(grill_profile)
         if normalized_grill_profile is None or not normalized_grill_profile.enabled:
-            grill_prompt = graphify_prompt
+            if (
+                self._configured_requirements_behavior() == RequirementsBehavior.STANDARD.value
+                and bool(getattr(self, "requirements_transition_pending", False))
+                and self._configured_requirements_mode() != RequirementsMode.STANDARD.value
+            ):
+                grill_prompt = build_grill_completion_transition(
+                    self._configured_requirements_mode(),
+                    graphify_prompt,
+                )
+            else:
+                grill_prompt = graphify_prompt
         elif (
                 not self.grill_full_delivered
                 or self.grill_delivered_mode != normalized_grill_profile.mode
@@ -10598,6 +11047,30 @@ class TmuxBatchWorker:
                 persisted_state.get("current_grill_bundle_commit", "") or ""
             ),
         )
+        if (
+            bool(persisted_state.get("current_requirements_transition", False))
+            and str(
+                persisted_state.get("current_requirements_session_generation", "") or ""
+            ).strip()
+            == self.grill_session_generation
+            and self.requirements_transition_pending
+        ):
+            previous_transition = (
+                self.requirements_transition_pending,
+                self.requirements_transition_delivered,
+            )
+            self.requirements_transition_pending = False
+            self.requirements_transition_delivered = True
+            try:
+                self._persist_requirements_policy_fast(
+                    writer="TmuxBatchWorker.requirements_transition_resume"
+                )
+            except Exception:
+                (
+                    self.requirements_transition_pending,
+                    self.requirements_transition_delivered,
+                ) = previous_transition
+                raise
         self._confirm_graphify_orientation_delivery(
             "",
             graphify_profile,
@@ -10773,13 +11246,24 @@ class TmuxBatchWorker:
                 raise
         finally:
             self._runtime_intervention_handler = previous_handler
-        return self._record_resumed_completion_turn(
+        result = self._record_resumed_completion_turn(
             label=label,
             contract=completion_contract,
             file_result=file_result,
             task_status_path=task_status_path,
             grill_profile=grill_profile,
             graphify_profile=graphify_profile,
+        )
+        if graphify_profile is None:
+            return result
+        normalized_graphify_profile = self._normalize_graphify_profile_for_turn(
+            graphify_profile
+        )
+        return self._enforce_graphify_usage_after_turn(
+            result=result,
+            label=label,
+            profile=normalized_graphify_profile,
+            timeout_sec=timeout_sec,
         )
 
     def run_turn(
@@ -10806,7 +11290,7 @@ class TmuxBatchWorker:
                 prompt,
                 graphify_profile,
             )
-            return self._run_turn_impl(
+            result = self._run_turn_impl(
                 label=label,
                 prompt=prompt,
                 required_tokens=required_tokens,
@@ -10820,8 +11304,153 @@ class TmuxBatchWorker:
                 grill_profile=grill_profile,
                 graphify_profile=resolved_graphify_profile,
             )
+            return self._enforce_graphify_usage_after_turn(
+                result=result,
+                label=label,
+                profile=resolved_graphify_profile,
+                timeout_sec=timeout_sec,
+            )
         finally:
             self._runtime_intervention_handler = previous_handler
+
+    def _restore_business_turn_state_after_graphify_gate(
+            self,
+            *,
+            label: str,
+            previous: Mapping[str, object],
+            degraded: bool = False,
+    ) -> None:
+        self.current_task_status_path = str(previous.get("current_task_status_path", "") or "")
+        self.current_task_result_path = str(previous.get("current_task_result_path", "") or "")
+        self.current_task_runtime_status = str(
+            previous.get("current_task_runtime_status", TASK_STATUS_DONE) or TASK_STATUS_DONE
+        )
+        self.dispatch_state = str(previous.get("dispatch_state", "") or "")
+        self.dispatch_reason = str(previous.get("dispatch_reason", "") or "")
+        self._write_state(
+            WorkerStatus.SUCCEEDED,
+            note=(f"done:{label}:graphify_degraded" if degraded else f"done:{label}:graphify_checked"),
+            extra={
+                "label": label,
+                "result_status": "succeeded",
+                "current_turn_id": str(previous.get("current_turn_id", "") or ""),
+                "current_turn_phase": str(previous.get("current_turn_phase", "") or ""),
+                "current_turn_status_path": str(previous.get("current_turn_status_path", "") or ""),
+                "current_task_status_path": self.current_task_status_path,
+                "current_task_result_path": self.current_task_result_path,
+                "current_task_runtime_status": self.current_task_runtime_status,
+                "dispatch_state": self.dispatch_state,
+                "dispatch_reason": self.dispatch_reason,
+                "turn_state": TurnState.SUCCEEDED.value,
+                "graphify_evidence_id": self.graphify_usage_policy.evidence_id,
+                "graphify_fingerprint": self.graphify_usage_policy.graph_fingerprint,
+                "graphify_freshness": self.graphify_usage_policy.freshness,
+                "current_graphify_usage_turn_id": self.graphify_usage_turn_id,
+                "graphify_usage_policy": f"query_{self.graphify_usage_policy.query_requirement}",
+                "graphify_evidence_delivery": self.graphify_usage_delivery,
+                "graphify_query_requirement": self.graphify_usage_policy.query_requirement,
+                "graphify_query_status": self.graphify_query_status,
+                "graphify_query_command": self._graphify_usage_command_name(self.graphify_usage_policy),
+                "graphify_usage_receipt": Path(self.graphify_usage_receipt).name
+                if self.graphify_usage_receipt else "",
+            },
+        )
+
+    def _enforce_graphify_usage_after_turn(
+            self,
+            *,
+            result: CommandResult,
+            label: str,
+            profile: GraphifyTurnProfile,
+            timeout_sec: float,
+    ) -> CommandResult:
+        if not profile.enabled or not result.ok:
+            return result
+        business_state = self.read_state()
+        assessment = self._assess_graphify_usage()
+        if assessment.satisfied or profile.usage_policy.query_requirement != "required":
+            self._restore_business_turn_state_after_graphify_gate(
+                label=label,
+                previous=business_state,
+            )
+            return result
+
+        repair_prompt = """Graphify usage correction — do not repeat the original business task.
+
+The original task artifacts/result contract are already valid, but this turn required one audited Graphify query.
+Execute exactly this read-only command now:
+{command}
+
+Inspect the result, then verify relevant conclusions against AGENTS.md, source, tests, and config.
+Only update the existing business artifacts if that verification changes the conclusion.
+After the query and verification, briefly report completion. Do not rebuild or modify the Graphify graph.
+""".format(command=profile.usage_policy.recommended_command)
+        repair_result: CommandResult | None = None
+        self._graphify_usage_repair_active = True
+        try:
+            repair_result = self._run_turn_impl(
+                label=f"{label}_graphify_usage_repair",
+                prompt=repair_prompt,
+                timeout_sec=min(float(timeout_sec), 180.0),
+                graphify_profile=profile,
+            )
+        finally:
+            self._graphify_usage_repair_active = False
+            if repair_result is not None and self.results and self.results[-1] is repair_result:
+                self.results.pop()
+        assessment = self._assess_graphify_usage()
+        if assessment.satisfied:
+            self._restore_business_turn_state_after_graphify_gate(
+                label=label,
+                previous=business_state,
+            )
+            return result
+        if profile.mode == GraphifyMode.AUTO.value:
+            self._assess_graphify_usage(degraded=True)
+            self._restore_business_turn_state_after_graphify_gate(
+                label=label,
+                previous=business_state,
+                degraded=True,
+            )
+            self._log_event(
+                "graphify_usage_degraded",
+                label=label,
+                evidence_id=profile.usage_policy.evidence_id,
+                query_status=assessment.query_status,
+            )
+            return result
+
+        self._restore_business_turn_state_after_graphify_gate(
+            label=label,
+            previous=business_state,
+        )
+        error = AgentRuntimeInterventionRequired(
+            blocker_kind=GRAPHIFY_USAGE_BLOCKER,
+            session_name=self.session_name,
+            state_path=str(self.state_path),
+            message=(
+                "Required 模式未取得当前 turn 的 Graphify 查询回执。\n"
+                f"请进入会话执行: {profile.usage_policy.recommended_command}\n"
+                "执行后选择重新检查，或由人类明确记录本轮源码核验 override。"
+            ),
+        )
+        self._request_runtime_intervention(
+            error,
+            context=f"graphify_usage:{label}",
+            preserve_agent_state=AgentRuntimeState.READY,
+        )
+        final_assessment = self._assess_graphify_usage(
+            manual_override=self.graphify_usage_manual_override,
+        )
+        if not final_assessment.satisfied:
+            raise GraphifyUsageContractError(
+                "Required Graphify query remains unsatisfied after manual intervention"
+            )
+        self._restore_business_turn_state_after_graphify_gate(
+            label=label,
+            previous=business_state,
+        )
+        return result
 
     def _run_turn_impl(
             self,
@@ -10863,6 +11492,16 @@ class TmuxBatchWorker:
             graphify_prompt_kind = self._graphify_prompt_kind_for_turn(
                 graphify_profile
             )
+            normalized_usage_profile = (
+                self._normalize_graphify_profile_for_turn(graphify_profile)
+                if graphify_profile is not None
+                else GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
+            )
+            if normalized_usage_profile.enabled and not self._graphify_usage_repair_active:
+                self._begin_graphify_turn_usage(
+                    label=label,
+                    profile=normalized_usage_profile,
+                )
             submitted_prompt = self._build_turn_prompt(
                 prompt,
                 turn_token,
@@ -10873,6 +11512,10 @@ class TmuxBatchWorker:
                 graphify_profile=graphify_profile,
             )
             managed_grill_prompt = self._managed_grill_profile_from_prompt(submitted_prompt)
+            managed_requirements_transition = bool(
+                GRILL_TRANSITION_BEGIN_MARKER in submitted_prompt
+                and GRILL_TRANSITION_END_MARKER in submitted_prompt
+            )
             prompt_hash = hashlib.sha1(submitted_prompt.encode("utf-8")).hexdigest()[:12]
             self._append_transcript(f"{label} / prompt", f"```text\n{submitted_prompt}\n```")
             self._write_state(
@@ -10893,6 +11536,10 @@ class TmuxBatchWorker:
                         if managed_grill_prompt is not None
                         else ""
                     ),
+                    "current_requirements_transition": managed_requirements_transition,
+                    "current_requirements_session_generation": (
+                        self.grill_session_generation if managed_requirements_transition else ""
+                    ),
                     "graphify_evidence_id": str(
                         getattr(getattr(graphify_profile, "evidence", None), "evidence_id", "") or ""
                     ),
@@ -10908,6 +11555,24 @@ class TmuxBatchWorker:
                     "current_graphify_prompt_kind": graphify_prompt_kind,
                     "current_graphify_guide_version": (
                         GRAPHIFY_GUIDE_VERSION if graphify_prompt_kind else ""
+                    ),
+                    "current_graphify_usage_turn_id": self.graphify_usage_turn_id,
+                    "graphify_usage_policy": (
+                        f"query_{self.graphify_usage_policy.query_requirement}"
+                        if normalized_usage_profile.enabled else ""
+                    ),
+                    "graphify_evidence_delivery": self.graphify_usage_delivery,
+                    "graphify_query_requirement": (
+                        self.graphify_usage_policy.query_requirement
+                        if normalized_usage_profile.enabled else "not_applicable"
+                    ),
+                    "graphify_query_status": self.graphify_query_status,
+                    "graphify_query_command": self._graphify_usage_command_name(
+                        self.graphify_usage_policy
+                    ),
+                    "graphify_usage_receipt": (
+                        Path(self.graphify_usage_receipt).name
+                        if self.graphify_usage_receipt else ""
                     ),
                     "current_turn_id": completion_contract.turn_id if completion_contract else "",
                     "current_turn_phase": completion_contract.phase if completion_contract else "",

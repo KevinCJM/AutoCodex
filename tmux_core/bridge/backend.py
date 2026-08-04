@@ -38,6 +38,7 @@ from tmux_core.runtime.hitl import (
     validate_grill_question_file,
 )
 from tmux_core.runtime.tmux_runtime import (
+    GRAPHIFY_USAGE_BLOCKER,
     RuntimeShutdownRequested,
     TMUX_IDENTITY_REQUIREMENT_NAME_OPTION,
     TMUX_IDENTITY_RUNTIME_DIR_OPTION,
@@ -2004,6 +2005,9 @@ def _flatten_grill_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     policy_payload = snapshot.get("grill_policy", {})
     if not isinstance(policy_payload, Mapping):
         policy_payload = {}
+    requirements_policy = snapshot.get("requirements_policy", {})
+    if not isinstance(requirements_policy, Mapping):
+        requirements_policy = {}
 
     mode = str(
         snapshot.get("requirements_mode")
@@ -2025,6 +2029,13 @@ def _flatten_grill_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     flattened: dict[str, Any] = {}
     if mode:
         flattened["requirements_mode"] = mode
+    behavior = str(
+        snapshot.get("requirements_behavior")
+        or requirements_policy.get("active_behavior")
+        or ""
+    ).strip()
+    if behavior:
+        flattened["requirements_behavior"] = behavior
     if commit:
         flattened["grill_bundle_commit"] = commit
     if delivery:
@@ -2048,6 +2059,12 @@ def _flatten_graphify_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, st
         "graphify_evidence_id": snapshot.get("graphify_evidence_id"),
         "graphify_fingerprint": snapshot.get("graphify_fingerprint"),
         "graphify_freshness": snapshot.get("graphify_freshness"),
+        "graphify_usage_policy": snapshot.get("graphify_usage_policy"),
+        "graphify_evidence_delivery": snapshot.get("graphify_evidence_delivery"),
+        "graphify_query_requirement": snapshot.get("graphify_query_requirement"),
+        "graphify_query_status": snapshot.get("graphify_query_status"),
+        "graphify_query_command": snapshot.get("graphify_query_command"),
+        "graphify_usage_receipt": snapshot.get("graphify_usage_receipt"),
     }
     flattened: dict[str, str] = {}
     for field_name, value in candidates.items():
@@ -2058,6 +2075,30 @@ def _flatten_graphify_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, st
             continue
         if field_name in {"graphify_evidence_id", "graphify_fingerprint"} and not re.fullmatch(
             r"[A-Za-z0-9_.:-]{1,128}", text
+        ):
+            continue
+        if field_name == "graphify_usage_policy" and text not in {
+            "query_required", "query_optional", "query_not_applicable",
+        }:
+            continue
+        if field_name == "graphify_evidence_delivery" and text not in {"pending", "confirmed"}:
+            continue
+        if field_name == "graphify_query_requirement" and text not in {
+            "required", "optional", "not_applicable",
+        }:
+            continue
+        if field_name == "graphify_query_status" and text not in {
+            "pending", "missing", "query_failed", "satisfied", "optional",
+            "degraded", "manual_override", "not_applicable",
+        }:
+            continue
+        if field_name == "graphify_query_command" and text not in {
+            "query", "affected", "path", "explain", "god-nodes",
+        }:
+            continue
+        if field_name == "graphify_usage_receipt" and (
+            Path(text).name != text
+            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,180}\.json", text)
         ):
             continue
         flattened[field_name] = text
@@ -2199,6 +2240,7 @@ def _read_worker_state_snapshot(
         "note": note,
         "transcript_path": str(state.get("transcript_path", "")).strip(),
         "turn_status_path": str(state.get("current_turn_status_path", "")).strip(),
+        "current_turn_id": str(state.get("current_turn_id", "")).strip(),
         "current_turn_phase": str(state.get("current_turn_phase", "")).strip(),
         "current_task_status_path": str(state.get("current_task_status_path", "")).strip(),
         "current_task_result_path": str(state.get("current_task_result_path", "")).strip(),
@@ -2399,12 +2441,23 @@ class BridgeCore:
 
     @staticmethod
     def _prompt_cursor_payload(prompt: PendingPromptState) -> dict[str, Any]:
-        if not _prompt_is_grill(prompt.payload):
-            return {}
-        return {
-            "owner_runner_id": str(prompt.owner_runner_id or "").strip(),
-            "question_seq": max(int(prompt.question_seq or 0), 0),
-        }
+        payload: dict[str, Any] = {}
+        if _prompt_is_grill(prompt.payload):
+            payload.update(
+                {
+                    "owner_runner_id": str(prompt.owner_runner_id or "").strip(),
+                    "question_seq": max(int(prompt.question_seq or 0), 0),
+                }
+            )
+        for key in (
+            "ready_for_human",
+            "owner_session_name",
+            "owner_turn_id",
+            "owner_state_revision",
+        ):
+            if key in prompt.payload:
+                payload[key] = prompt.payload[key]
+        return payload
 
     @staticmethod
     def _grill_question_key(payload: Mapping[str, Any], question_seq: int = 0) -> str:
@@ -2465,6 +2518,16 @@ class BridgeCore:
             ),
         )
         self._emit_hitl_prompt_log(request)
+        stage_routes = self._stage_routes_for_action(self._display_action or self._context.current_action)
+        if stage_routes:
+            # The runtime writes the owning worker's READY revision before it
+            # opens a business HITL prompt. Publish that file-backed snapshot
+            # synchronously, without any tmux probe, so clients cannot observe
+            # awaiting-input alongside an older BUSY worker row.
+            self._emit_snapshot_update(
+                stage_routes=stage_routes,
+                refresh_worker_health=False,
+            )
         prompt_display_state = self._pending_prompt_display_state
         self._pending_prompt_display_state = None
         if prompt_display_state:
@@ -2492,7 +2555,6 @@ class BridgeCore:
                 ),
             )
             self.emit_event("snapshot.hitl", hitl_snapshot)
-        stage_routes = self._stage_routes_for_action(self._display_action or self._context.current_action)
         self._schedule_flow_snapshot_update(
             sections={"app", "hitl", "prompt"},
             stage_routes=stage_routes,
@@ -4683,6 +4745,15 @@ class BridgeCore:
         runtime_snapshot = self._build_runtime_worker_hitl_snapshot(active_action)
         if runtime_snapshot.get("pending", False):
             return runtime_snapshot
+        if active_action == "stage.a03.start" and self._grill_business_prompt_is_deferred():
+            return {
+                "pending": False,
+                "question_path": "",
+                "answer_path": "",
+                "summary": "问题已生成，智能体仍在收尾，等待终端就绪。",
+                "deferred": True,
+                "deferred_reason": "owner_worker_not_ready",
+            }
         project_dir = self._resolve_project_dir()
         requirement_name = self._resolve_requirement_name()
         if not project_dir or not requirement_name:
@@ -4896,6 +4967,8 @@ class BridgeCore:
             preferred_runner_id = str(self._display_runner_id or "").strip()
             preferred_message = str(self._display_message or "").strip()
             display_failure = dict(self._display_failure)
+        if preferred_stage == "stage.a03.start" and self._grill_business_prompt_is_deferred():
+            preferred_message = "问题已生成，智能体仍在收尾，等待终端就绪。"
         runtime_status: str | None = None
         if stage_snapshots:
             active_route = STAGE_ROUTE_BY_ACTION.get(str(preferred_stage or "").strip())
@@ -6525,7 +6598,7 @@ class BridgeCore:
         stage_seq: int,
         error: BaseException,
         respond: bool,
-    ) -> None:
+    ) -> str:
         final_action, final_stage_seq = self._resolve_terminal_stage_target(
             fallback_action=action,
             fallback_stage_seq=stage_seq,
@@ -6556,10 +6629,18 @@ class BridgeCore:
         attach_command = f"tmux attach -t {session_name}" if session_name else ""
         if runtime_intervention:
             runtime_blocker_kind = str(getattr(error, "blocker_kind", "") or "").strip()
+            graphify_usage_intervention = runtime_blocker_kind == GRAPHIFY_USAGE_BLOCKER
             question_intervention = runtime_blocker_kind == "opencode_question"
             hook_trust_intervention = runtime_blocker_kind == "codex_hook_trust"
             long_running_intervention = runtime_blocker_kind == "long_running_task_result"
-            if long_running_intervention:
+            if graphify_usage_intervention:
+                recovery_kind = "graphify_usage_intervention"
+                title = "HITL: Graphify Required 查询待处理"
+                prompt_text = (
+                    "请进入原 tmux 会话执行系统给出的只读 Graphify 命令后复检；"
+                    "也可以明确按源码核验结果继续并记录人工 override。"
+                )
+            elif long_running_intervention:
                 title = "HITL: 智能体任务长时间运行"
                 prompt_text = (
                     "原任务已经提交且智能体仍存活。请进入原 tmux 会话检查；"
@@ -6612,14 +6693,33 @@ class BridgeCore:
             message=message_text,
         )
         recovered = False
+        terminated = False
         try:
-            self._prompt_broker.request(
+            graphify_options = [
+                {
+                    "value": "recheck_after_manual_intervention",
+                    "label": "进入 tmux 执行查询后复检",
+                },
+                {
+                    "value": "graphify_usage_manual_override",
+                    "label": "按源码核验结果继续并记录人工 override",
+                },
+                {
+                    "value": "graphify_usage_terminate",
+                    "label": "终止本阶段",
+                },
+            ]
+            prompt_result = self._prompt_broker.request(
                 BridgePromptRequest(
                     prompt_type="select",
                     payload={
                         "title": title,
                         "prompt_text": prompt_text,
-                        "options": [
+                        "options": graphify_options if (
+                            runtime_intervention
+                            and str(getattr(error, "blocker_kind", "") or "").strip()
+                            == GRAPHIFY_USAGE_BLOCKER
+                        ) else [
                             {
                                 "value": "recheck_after_manual_intervention",
                                 "label": "我已处理，重新检查",
@@ -6638,8 +6738,23 @@ class BridgeCore:
             )
             backend = getattr(self._tmux_runtime, "backend", None)
             recovered_worker = load_worker_from_state_path(state_path, backend=backend) if state_path else None
+            decision = str(
+                prompt_result.get("value", "")
+                if isinstance(prompt_result, Mapping)
+                else prompt_result or ""
+            ).strip()
             if recovered_worker is not None:
-                if runtime_intervention:
+                if (
+                    runtime_intervention
+                    and str(getattr(error, "blocker_kind", "") or "").strip()
+                    == GRAPHIFY_USAGE_BLOCKER
+                    and decision == "graphify_usage_manual_override"
+                ):
+                    override = getattr(recovered_worker, "override_graphify_usage_requirement", None)
+                    if callable(override):
+                        override()
+                        recovered = True
+                elif runtime_intervention:
                     checker = getattr(recovered_worker, "runtime_intervention_is_resolved", None)
                     if callable(checker):
                         recovered = bool(checker(str(getattr(error, "blocker_kind", "") or "")))
@@ -6647,6 +6762,17 @@ class BridgeCore:
                         recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
                 else:
                     recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
+            if decision == "graphify_usage_terminate":
+                terminated = True
+                runner_id = str(getattr(self._runner_local, "runner_id", "") or "").strip()
+                self._commit_runner_failure(
+                    action=final_action or action,
+                    stage_seq=final_stage_seq,
+                    runner_id=runner_id,
+                    error=RuntimeError("人类终止 Required Graphify 查询介入"),
+                    traceback_text="",
+                    failure_kind="graphify_usage_terminated",
+                )
         finally:
             self._pending_prompt_display_state = None
         if recovered:
@@ -6669,14 +6795,16 @@ class BridgeCore:
                 request_id,
                 ok=True,
                 payload={
-                    "awaiting_input": not recovered,
+                    "awaiting_input": not recovered and not terminated,
                     "recovered": recovered,
+                    "terminated": terminated,
                     "recovery_kind": recovery_kind,
                     "session_name": session_name,
                     "attach_command": attach_command,
                     "message": message_text,
                 },
             )
+        return "terminated" if terminated else "recovered" if recovered else "awaiting_input"
 
     def _manual_reconfiguration_error_pending(self, *, action: str, error: BaseException) -> bool:
         message = str(error or "").strip()
@@ -7272,14 +7400,21 @@ class BridgeCore:
                             )
                     return
                 if is_agent_runtime_intervention_error(error):
-                    self._await_agent_ready_timeout_recovery(
+                    recovery_outcome = self._await_agent_ready_timeout_recovery(
                         request_id=request_id,
                         action=final_action or action,
                         stage_seq=final_stage_seq,
                         error=error,
                         respond=respond,
                     )
-                    self._mark_runner_execution_terminal(runner_id, source="awaiting_input")
+                    self._mark_runner_execution_terminal(
+                        runner_id,
+                        source=(
+                            "runner_failure"
+                            if recovery_outcome == "terminated"
+                            else "awaiting_input"
+                        ),
+                    )
                     return
                 if is_agent_startup_intervention_error(error):
                     self._await_agent_ready_timeout_recovery(
@@ -8045,7 +8180,11 @@ class BridgeCore:
         for key in ("preview_path", "question_path", "answer_path"):
             cls._add_preview_path(allowed, prompt.payload.get(key, ""))
 
-    def _active_grill_session_record(self) -> tuple[Path, dict[str, Any]] | None:
+    def _active_grill_session_record(
+        self,
+        *,
+        allowed_states: Sequence[str] = ("awaiting_answer",),
+    ) -> tuple[Path, dict[str, Any]] | None:
         """Read the current scope's unanswered Grill question without mutating it."""
 
         if self._current_snapshot_action() != "stage.a03.start":
@@ -8071,7 +8210,12 @@ class BridgeCore:
             mode = str(payload.get("requirements_mode", "") or "").strip().lower().replace("_", "-")
             if mode not in {"grill", "grill-with-docs"}:
                 return None
-            if str(payload.get("state", "") or "").strip() != "awaiting_answer":
+            normalized_states = {
+                str(item or "").strip()
+                for item in allowed_states
+                if str(item or "").strip()
+            }
+            if str(payload.get("state", "") or "").strip() not in normalized_states:
                 return None
             # An answer already recorded in session.json has crossed the human
             # input boundary and must never be presented for a second response.
@@ -8088,6 +8232,73 @@ class BridgeCore:
         except (OSError, ValueError, TypeError, RuntimeError, json.JSONDecodeError):
             return None
         return session_path, payload
+
+    def _grill_session_owner_is_ready_for_human(self, session_payload: Mapping[str, Any]) -> bool:
+        """Treat only an explicitly live BUSY/STARTING owner as a prompt blocker."""
+
+        try:
+            expected_revision = max(
+                int(session_payload.get("turn_worker_state_revision", 0) or 0),
+                0,
+            )
+        except (TypeError, ValueError):
+            return True
+        if expected_revision <= 0:
+            return True
+        worker_state_text = str(session_payload.get("active_worker_state_path", "") or "").strip()
+        if not worker_state_text:
+            return True
+        try:
+            project_root = Path(self._resolve_project_dir()).expanduser().resolve()
+            worker_state_path = Path(worker_state_text).expanduser().resolve()
+            worker_state_path.relative_to(project_root)
+            worker_state = json.loads(worker_state_path.read_text(encoding="utf-8"))
+            if not isinstance(worker_state, Mapping):
+                return True
+            revision = max(int(worker_state.get("state_revision", 0) or 0), 0)
+            if revision < expected_revision:
+                return False
+            agent_state = str(worker_state.get("agent_state", "") or "").strip().upper()
+            if agent_state in {"BUSY", "STARTING"}:
+                return False
+            turn_state = str(worker_state.get("turn_state", "") or "").strip().lower()
+            runtime_status = str(worker_state.get("current_task_runtime_status", "") or "").strip().lower()
+            if turn_state in {
+                "preparing",
+                "submitting",
+                "submitted",
+                "waiting_result",
+                "submission_unknown",
+                "running",
+            }:
+                return False
+            if runtime_status in {
+                "preparing",
+                "submitting",
+                "submitted",
+                "waiting_result",
+                "submission_unknown",
+                "running",
+            }:
+                return False
+            return True
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            # Missing legacy state must not make a durable recovered question
+            # permanently unanswerable. Strict gating applies when a current
+            # owner state file is actually available.
+            return True
+
+    def _grill_business_prompt_is_deferred(self) -> bool:
+        session_record = self._active_grill_session_record(
+            allowed_states=("question_ready", "awaiting_answer"),
+        )
+        if session_record is None:
+            return False
+        _session_path, payload = session_record
+        state = str(payload.get("state", "") or "").strip()
+        if state == "question_ready":
+            return True
+        return not self._grill_session_owner_is_ready_for_human(payload)
 
     def _grill_session_owner_runner_id(
         self,
@@ -8184,6 +8395,14 @@ class BridgeCore:
         question_seq = max(int(session_payload.get("question_seq", 0) or 0), 0)
         question_hash = str(session_payload.get("pending_question_hash", "") or "").strip()
         session_id = str(session_payload.get("session_id", "") or "").strip()
+        owner_session_name = str(session_payload.get("active_session_name", "") or "").strip()
+        try:
+            owner_state_revision = max(
+                int(session_payload.get("turn_worker_state_revision", 0) or 0),
+                0,
+            )
+        except (TypeError, ValueError):
+            owner_state_revision = 0
         metadata: dict[str, Any] = {
             "interaction_kind": "grill",
             "question_index": question_seq,
@@ -8204,6 +8423,15 @@ class BridgeCore:
             "grill_session_id": session_id,
             "grill_question_hash": question_hash,
         }
+        if owner_session_name and owner_state_revision > 0:
+            metadata.update(
+                {
+                    "ready_for_human": True,
+                    "owner_session_name": owner_session_name,
+                    "owner_turn_id": str(session_payload.get("turn_id", "") or "").strip(),
+                    "owner_state_revision": owner_state_revision,
+                }
+            )
         if can_submit:
             metadata.update(
                 {
@@ -8262,6 +8490,16 @@ class BridgeCore:
         if session_record is None:
             return None
         _session_path, session_payload = session_record
+        if not self._grill_session_owner_is_ready_for_human(session_payload):
+            return {
+                "pending": False,
+                "prompt_id": "",
+                "prompt_type": "",
+                "payload": {},
+                "prompt_revision": self._prompt_revision,
+                "deferred": True,
+                "deferred_reason": "owner_worker_not_ready",
+            }
         project_root = Path(self._resolve_project_dir()).expanduser().resolve()
         requirement_name = self._resolve_requirement_name()
         question_path = Path(str(session_payload["pending_question_path"])).expanduser().resolve()
@@ -8619,6 +8857,9 @@ class BridgeCore:
             self._schedule_grill_recovery_refresh()
             return False
         session_path, raw_session = session_record
+        if not self._grill_session_owner_is_ready_for_human(raw_session):
+            self._schedule_grill_recovery_refresh()
+            return False
         project_root = Path(self._resolve_project_dir()).expanduser().resolve()
         requirement_name = self._resolve_requirement_name()
         session_id = str(raw_session.get("session_id", "") or "").strip()

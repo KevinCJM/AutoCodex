@@ -10,6 +10,10 @@ const PROMPT_METADATA_KEYS = [
   ['question_index', 'questionIndex'],
   ['owner_runner_id', 'ownerRunnerId'],
   ['question_seq', 'questionSeq'],
+  ['ready_for_human', 'readyForHuman'],
+  ['owner_session_name', 'ownerSessionName'],
+  ['owner_turn_id', 'ownerTurnId'],
+  ['owner_state_revision', 'ownerStateRevision'],
   ['recommendation', 'recommendation'],
   ['reason_text', 'reasonText'],
 ] as const
@@ -60,6 +64,51 @@ export const EMPTY_PROMPT_SYNC_STATE: PromptSyncState = {
   revision: null,
   liveUpdateSeen: false,
   signature: 'pending:false',
+}
+
+type PromptOwnerWorker = {
+  sessionName?: string
+  stateRevision?: number
+  agentState?: string
+  turnState?: string
+  currentTaskRuntimeStatus?: string
+  currentTurnId?: string
+}
+
+function optionalBoolean(value: unknown): boolean | null {
+  if (value === undefined || value === null || value === '') return null
+  if (typeof value === 'boolean') return value
+  const normalized = String(value).trim().toLowerCase()
+  if (normalized === 'true' || normalized === '1') return true
+  if (normalized === 'false' || normalized === '0') return false
+  return null
+}
+
+export function workerOwnedPromptIsReady(
+  prompt: BootstrapPromptState | null,
+  workers: PromptOwnerWorker[],
+): boolean {
+  if (!prompt) return true
+  const payload = prompt.payload
+  const explicitlyReady = optionalBoolean(payload.ready_for_human ?? payload.readyForHuman)
+  if (explicitlyReady === null) return true
+  if (!explicitlyReady) return false
+  const ownerSession = String(payload.owner_session_name ?? payload.ownerSessionName ?? '').trim()
+  if (!ownerSession) return true
+  const owner = workers.find((worker) => String(worker.sessionName ?? '').trim() === ownerSession)
+  if (!owner) return false
+  const ownerRevision = Number(payload.owner_state_revision ?? payload.ownerStateRevision ?? 0)
+  if (Number.isSafeInteger(ownerRevision) && ownerRevision > 0 && Number(owner.stateRevision ?? 0) < ownerRevision) {
+    return false
+  }
+  if (String(owner.agentState ?? '').trim().toUpperCase() !== 'READY') return false
+  const ownerTurnId = String(payload.owner_turn_id ?? payload.ownerTurnId ?? '').trim()
+  const workerTurnId = String(owner.currentTurnId ?? '').trim()
+  if (ownerTurnId && workerTurnId && ownerTurnId !== workerTurnId) return false
+  const active = new Set(['preparing', 'submitting', 'submitted', 'waiting_result', 'submission_unknown', 'running'])
+  if (active.has(String(owner.turnState ?? '').trim().toLowerCase())) return false
+  if (active.has(String(owner.currentTaskRuntimeStatus ?? '').trim().toLowerCase())) return false
+  return true
 }
 
 function promptSignature(prompt: BootstrapPromptState | null): string {

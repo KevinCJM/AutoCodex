@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test'
-import { buildAgentConfigLabel, buildHomeAgents, isBusyTurnWorker, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState } from './agents'
-import type { WorkerSnapshot } from './types'
+import { buildAgentConfigLabel, buildGraphifyUsageLabel, buildHomeAgents, isBusyTurnWorker, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState, workerOwnedPromptIsReady } from './agents'
+import type { PromptSnapshot, WorkerSnapshot } from './types'
 
 function worker(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
   return {
@@ -18,6 +18,34 @@ function worker(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
 test('explicit terminal state wins over turn lifecycle fields', () => {
   expect(resolveAgentState(worker({ agentState: 'BUSY', status: 'succeeded', turnState: 'succeeded' }))).toBe('BUSY')
   expect(resolveAgentState(worker({ agentState: 'READY', status: 'running', turnState: 'waiting_result' }))).toBe('READY')
+})
+
+test('worker-owned prompt requires matching READY owner revision', () => {
+  const prompt: PromptSnapshot = {
+    pending: true,
+    promptId: 'prompt-ready-gate',
+    promptType: 'multiline',
+    payload: {
+      ready_for_human: true,
+      owner_session_name: '开发工程师-天罡星',
+      owner_turn_id: 'turn-1',
+      owner_state_revision: 7,
+    },
+  }
+  expect(workerOwnedPromptIsReady(prompt, [worker({
+    stateRevision: 6,
+    agentState: 'BUSY',
+    turnState: 'succeeded',
+    currentTaskRuntimeStatus: 'done',
+    currentTurnId: 'turn-1',
+  })])).toBe(false)
+  expect(workerOwnedPromptIsReady(prompt, [worker({
+    stateRevision: 7,
+    agentState: 'READY',
+    turnState: 'succeeded',
+    currentTaskRuntimeStatus: 'done',
+    currentTurnId: 'turn-1',
+  })])).toBe(true)
 })
 
 test('home agents reject old runner and prefer the newest state revision', () => {
@@ -39,9 +67,27 @@ test('agent config label appends Ponytail mode and keeps legacy labels unchanged
   expect(buildAgentConfigLabel(worker())).toBe('DevEco Code | deveco/GLM-5.1, Max')
 })
 
+test('Graphify usage labels never claim the model read evidence', () => {
+  expect(buildGraphifyUsageLabel(worker({
+    graphifyEvidenceDelivery: 'confirmed',
+    graphifyQueryRequirement: 'optional',
+    graphifyQueryStatus: 'optional',
+  }))).toBe('图谱证据：已投递 · 查询可选')
+  expect(buildGraphifyUsageLabel(worker({
+    graphifyEvidenceDelivery: 'confirmed',
+    graphifyQueryRequirement: 'required',
+    graphifyQueryStatus: 'query_failed',
+    graphifyQueryCommand: 'path',
+  }))).toBe('图谱证据：已投递 · 必须查询 path · 执行失败')
+})
+
 test('agent config label appends Grill modes and hides Standard', () => {
   expect(buildAgentConfigLabel(worker({ requirementsMode: 'grill' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Grill Me')
   expect(buildAgentConfigLabel(worker({ requirementsMode: 'grill-with-docs' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Grill with Docs')
+  expect(buildAgentConfigLabel(worker({
+    requirementsMode: 'grill-with-docs',
+    requirementsBehavior: 'standard',
+  }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Grill with Docs · 已完成')
   expect(buildAgentConfigLabel(worker({ requirementsMode: 'standard' }))).toBe('DevEco Code | deveco/GLM-5.1, Max')
   expect(buildAgentConfigLabel(worker({ ponytailMode: 'full', requirementsMode: 'grill' }))).toBe(
     'DevEco Code | deveco/GLM-5.1, Max | Ponytail Full | Grill Me',

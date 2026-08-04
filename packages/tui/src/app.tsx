@@ -42,6 +42,7 @@ import {
   promptSyncUpdateFromSnapshot,
   reconcilePromptSyncState,
   type PromptSyncUpdate,
+  workerOwnedPromptIsReady,
 } from './promptSnapshot'
 import { resolvePromptAwareStatus, resolvePromptResponseTransition } from './promptTransition'
 import {
@@ -794,6 +795,7 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     dispatchState: String(value.dispatch_state ?? value.dispatchState ?? ''),
     dispatchReason: String(value.dispatch_reason ?? value.dispatchReason ?? ''),
     turnState: String(value.turn_state ?? value.turnState ?? ''),
+    currentTurnId: String(value.current_turn_id ?? value.currentTurnId ?? ''),
     tmuxControlStatus: String(value.tmux_control_status ?? value.tmuxControlStatus ?? ''),
     tmuxControlError: String(value.tmux_control_error ?? value.tmuxControlError ?? ''),
     tmuxUnavailableSince: String(
@@ -822,6 +824,9 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
     requirementsMode: value.requirements_mode === undefined && value.requirementsMode === undefined
       ? undefined
       : String(value.requirements_mode ?? value.requirementsMode ?? ''),
+    requirementsBehavior: value.requirements_behavior === undefined && value.requirementsBehavior === undefined
+      ? undefined
+      : String(value.requirements_behavior ?? value.requirementsBehavior ?? ''),
     grillBundleCommit: value.grill_bundle_commit === undefined && value.grillBundleCommit === undefined
       ? undefined
       : String(value.grill_bundle_commit ?? value.grillBundleCommit ?? ''),
@@ -834,6 +839,27 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
       const parsed = Number(raw)
       return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
     })(),
+    graphifyUsagePolicy: value.graphify_usage_policy === undefined && value.graphifyUsagePolicy === undefined
+      ? undefined
+      : String(value.graphify_usage_policy ?? value.graphifyUsagePolicy ?? ''),
+    graphifyFreshness: value.graphify_freshness === undefined && value.graphifyFreshness === undefined
+      ? undefined
+      : String(value.graphify_freshness ?? value.graphifyFreshness ?? ''),
+    graphifyEvidenceDelivery: value.graphify_evidence_delivery === undefined && value.graphifyEvidenceDelivery === undefined
+      ? undefined
+      : String(value.graphify_evidence_delivery ?? value.graphifyEvidenceDelivery ?? ''),
+    graphifyQueryRequirement: value.graphify_query_requirement === undefined && value.graphifyQueryRequirement === undefined
+      ? undefined
+      : String(value.graphify_query_requirement ?? value.graphifyQueryRequirement ?? ''),
+    graphifyQueryStatus: value.graphify_query_status === undefined && value.graphifyQueryStatus === undefined
+      ? undefined
+      : String(value.graphify_query_status ?? value.graphifyQueryStatus ?? ''),
+    graphifyQueryCommand: value.graphify_query_command === undefined && value.graphifyQueryCommand === undefined
+      ? undefined
+      : String(value.graphify_query_command ?? value.graphifyQueryCommand ?? ''),
+    graphifyUsageReceipt: value.graphify_usage_receipt === undefined && value.graphifyUsageReceipt === undefined
+      ? undefined
+      : String(value.graphify_usage_receipt ?? value.graphifyUsageReceipt ?? ''),
     retryCount: Number(value.retry_count ?? value.retryCount ?? 0),
     note: String(value.note ?? ''),
     transcriptPath: String(value.transcript_path ?? value.transcriptPath ?? ''),
@@ -1509,6 +1535,17 @@ export function App(props: StartupOptions) {
   }
 
   const applyBackendPromptUpdate = (update: PromptSyncUpdate, reportOpen = false): boolean => {
+    const promptWorkers = [
+      ...(controlSnapshot()?.workers ?? []),
+      ...routingSnapshot().workers,
+      ...requirementsSnapshot().workers,
+      ...reviewSnapshot().workers,
+      ...designSnapshot().workers,
+      ...taskSplitSnapshot().workers,
+      ...developmentSnapshot().workers,
+      ...overallReviewSnapshot().workers,
+    ]
+    if (update.prompt && !workerOwnedPromptIsReady(update.prompt, promptWorkers)) return false
     const transition = reconcilePromptSyncState(promptSyncState, update)
     if (!transition.accepted) return false
     const previousPromptId = promptSyncState.prompt?.id ?? ''
@@ -1526,10 +1563,6 @@ export function App(props: StartupOptions) {
 
   const applyBootstrapSnapshots = (payload: Record<string, unknown>) => {
     const snapshots = (payload.snapshots as Record<string, unknown>) ?? {}
-    const promptUpdate = promptSyncUpdateFromSnapshot(snapshots.prompt, 'bootstrap', buildPromptDraftKey)
-    if (promptUpdate) {
-      applyBackendPromptUpdate(promptUpdate)
-    }
     let bootstrapFailure: StageFailureSnapshot | null = null
     if (snapshots.app && typeof snapshots.app === 'object') {
       bootstrapFailure = applyAppStageState(normalizeAppSnapshot(snapshots.app as Record<string, unknown>), false)
@@ -1567,6 +1600,8 @@ export function App(props: StartupOptions) {
     if (snapshots.artifacts && typeof snapshots.artifacts === 'object') {
       setArtifactsSnapshot(normalizeArtifactsSnapshot(snapshots.artifacts as Record<string, unknown>))
     }
+    const promptUpdate = promptSyncUpdateFromSnapshot(snapshots.prompt, 'bootstrap', buildPromptDraftKey)
+    if (promptUpdate) applyBackendPromptUpdate(promptUpdate)
     return bootstrapFailure
   }
 

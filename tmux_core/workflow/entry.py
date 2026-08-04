@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -26,7 +27,10 @@ from tmux_core.stage_kernel.requirement_intake import run_requirement_intake_sta
 from tmux_core.stage_kernel.requirements_clarification import run_requirements_clarification_stage
 from tmux_core.stage_kernel.detailed_design import run_detailed_design_stage
 from tmux_core.stage_kernel.overall_review import run_overall_review_stage
-from tmux_core.stage_kernel.requirements_review import run_requirements_review_stage
+from tmux_core.stage_kernel.requirements_review import (
+    RequirementsClarificationReturnRequested,
+    run_requirements_review_stage,
+)
 from tmux_core.stage_kernel.routing_init import run_routing_stage as routing_stage_main
 from tmux_core.stage_kernel.development import cleanup_stale_development_runtime_state, run_development_stage
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
@@ -392,10 +396,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 try:
                     requirements_result = run_requirements_clarification_stage(
                         clarification_stage_args,
-                        # Grill mode suppresses handoff inside A03 itself.  Keep
-                        # this true so a mode chosen interactively in A03 can
-                        # still preserve a Standard analyst without A00 asking
-                        # the mode a second time.
+                        # Full A00 workflows preserve the same analyst. Grill
+                        # sessions switch to standard behavior after explicit
+                        # confirmation instead of replacing the tmux session.
                         preserve_ba_worker=True,
                     )
                 except PromptBackRequested:
@@ -449,6 +452,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                         ba_handoff=requirements_result.ba_handoff,
                         preserve_ba_worker=True,
                     )
+                except RequirementsClarificationReturnRequested as error:
+                    if requirements_result is not None and error.handoff is not None:
+                        requirements_result = replace(
+                            requirements_result,
+                            ba_handoff=error.handoff,
+                        )
+                    stage = "clarification"
+                    continue
                 except PromptBackRequested:
                     stage = "clarification"
                     continue
@@ -477,6 +488,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     graphify_mode=detailed_design_agent_config.graphify_mode,
                     agent_config=args.agent_config,
                 )
+                if review_result.ba_handoff is not None:
+                    design_stage_args.append("--reuse-review-ba")
                 message("\n===== 详细设计阶段 =====")
                 notify_stage_action_changed("stage.a05.start")
                 try:

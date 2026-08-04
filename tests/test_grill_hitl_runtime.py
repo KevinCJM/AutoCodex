@@ -140,6 +140,49 @@ class _CrashResumeWorker(_GrillWorker):
         return None
 
 
+class _BusyAfterResultWorker(_GrillWorker):
+    def __init__(self, root: Path, behavior) -> None:  # noqa: ANN001
+        super().__init__(root, behavior)
+        self.state_path = self.runtime_dir / "worker.state.json"
+        self.session_name = "requirements-agent"
+        self.ready_calls = 0
+        self.cursor: dict[str, object] = {
+            "session_name": self.session_name,
+            "agent_state": "READY",
+            "turn_state": "idle",
+            "current_task_runtime_status": "done",
+            "state_revision": 1,
+        }
+
+    def read_state(self):
+        return dict(self.cursor)
+
+    def ensure_agent_ready(self, timeout_sec=60.0):  # noqa: ANN001
+        _ = timeout_sec
+        self.ready_calls += 1
+        self.cursor.update(
+            {
+                "agent_state": "READY",
+                "turn_state": "succeeded",
+                "current_task_runtime_status": "done",
+                "state_revision": int(self.cursor.get("state_revision", 0)) + 1,
+            }
+        )
+
+    def run_turn(self, *, completion_contract, **kwargs):  # noqa: ANN003
+        result = super().run_turn(completion_contract=completion_contract, **kwargs)
+        self.cursor.update(
+            {
+                "current_turn_id": completion_contract.turn_id,
+                "agent_state": "BUSY",
+                "turn_state": "succeeded",
+                "current_task_runtime_status": "done",
+                "state_revision": int(self.cursor.get("state_revision", 0)) + 1,
+            }
+        )
+        return result
+
+
 class GrillHitlRuntimeTests(unittest.TestCase):
     def test_select_question_requires_recommendation_to_match_and_uses_it_as_default(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -246,6 +289,53 @@ class GrillHitlRuntimeTests(unittest.TestCase):
             self.assertEqual(state.pending_question_hash, "")
             self.assertEqual(worker.turn_calls, 2)
             self.assertEqual(worker.profiles, [{"question_seq": 0}, {"question_seq": 1}])
+
+    def test_business_hitl_waits_for_owner_ready_before_collecting_answer(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_path = root / "output.md"
+            question_path = root / "question.md"
+            record_path = root / "record.md"
+            session_path = root / "session.json"
+            observed_states: list[tuple[str, str]] = []
+
+            def behavior(worker, _prompt, _contract):  # noqa: ANN001
+                if worker.turn_calls == 1:
+                    question_path.write_text(_question_markdown(), encoding="utf-8")
+                    record_path.write_text("- 待确认边界\n", encoding="utf-8")
+                else:
+                    output_path.write_text("# 完成\n", encoding="utf-8")
+                    question_path.write_text("", encoding="utf-8")
+                    record_path.write_text("- 已确认\n", encoding="utf-8")
+
+            worker = _BusyAfterResultWorker(root, behavior)
+
+            def collect_answer(_path, _round):  # noqa: ANN001
+                session = load_grill_session_state(session_path, requirements_mode="grill")
+                observed_states.append((str(worker.read_state()["agent_state"]), session.state))
+                return "方案 B"
+
+            result = run_hitl_agent_loop(
+                worker=worker,
+                stage_name="requirements_clarification",
+                output_path=output_path,
+                question_path=question_path,
+                record_path=record_path,
+                stage_status_path=root / "status.json",
+                turns_root=root / "turns",
+                initial_prompt_builder=lambda _context: "initial",
+                hitl_prompt_builder=lambda answer, _context: f"answer::{answer}",
+                label_prefix="requirements_clarification",
+                turn_phase="requirements_clarification",
+                human_input_provider=collect_answer,
+                requirements_mode="grill",
+                grill_session_path=session_path,
+                grill_confirmation_provider=lambda _path, _round: "confirm",
+            )
+
+            self.assertEqual(result.decision.status, "completed")
+            self.assertEqual(observed_states, [("READY", "awaiting_answer")])
+            self.assertGreaterEqual(worker.ready_calls, 2)
 
     def test_final_confirmation_revision_is_preserved_in_session_audit(self):
         with tempfile.TemporaryDirectory() as tmpdir:

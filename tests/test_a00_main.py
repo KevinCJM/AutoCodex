@@ -243,7 +243,7 @@ class A00MainTests(unittest.TestCase):
                     ("a02", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
                     ("a03", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--requirements-mode", "standard", "--graphify-mode", "auto", "--yes"]),
                     ("a04", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
-                    ("a05", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a05", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes", "--reuse-review-ba"]),
                     ("a06", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
                     ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
                     ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
@@ -908,7 +908,7 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         self.assertIn("详细设计失败", stdout.getvalue())
 
-    def test_main_continues_to_a05_when_a04_skips_review_and_clears_ba_handoff(self):
+    def test_main_continues_to_a05_when_a04_skips_review_and_preserves_ba_handoff(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             observed: dict[str, object] = {}
 
@@ -932,7 +932,7 @@ class A00MainTests(unittest.TestCase):
                 return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
                 "A00_main_tui.run_requirements_review_stage",
-                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None),
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
             ), patch(
                 "A00_main_tui.run_detailed_design_stage",
                 side_effect=fake_a05,
@@ -951,9 +951,9 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             observed["argv"],
-            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"],
+            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes", "--reuse-review-ba"],
         )
-        self.assertIsNone(observed["ba_handoff"])
+        self.assertEqual(observed["ba_handoff"], "live-ba")
         self.assertTrue(observed["preserve_workers"])
         self.assertIsNone(observed["a06_ba_handoff"])
         self.assertIsNone(observed["a06_reviewer_handoff"])

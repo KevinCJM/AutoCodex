@@ -21,6 +21,17 @@ class RequirementsMode(str, Enum):
 REQUIREMENTS_MODE_CHOICES = tuple(mode.value for mode in RequirementsMode)
 
 
+class RequirementsBehavior(str, Enum):
+    INTERVIEW = "interview"
+    STANDARD = "standard"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+REQUIREMENTS_BEHAVIOR_CHOICES = tuple(behavior.value for behavior in RequirementsBehavior)
+
+
 class GrillBundleError(RuntimeError):
     """Raised when the project-owned Grill Skills bundle is missing or corrupt."""
 
@@ -53,6 +64,8 @@ BUNDLE_DELIVERY = "runtime_prompt"
 BUNDLE_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "mattpocock-skills"
 BEGIN_MARKER = "<!-- TMUX-CODING-TEAM:GRILL:BEGIN -->"
 END_MARKER = "<!-- TMUX-CODING-TEAM:GRILL:END -->"
+TRANSITION_BEGIN_MARKER = "<!-- TMUX-CODING-TEAM:GRILL-TRANSITION:BEGIN -->"
+TRANSITION_END_MARKER = "<!-- TMUX-CODING-TEAM:GRILL-TRANSITION:END -->"
 
 _EXPECTED_PACKAGE = "mattpocock-skills-grill-bundle"
 _EXPECTED_REPOSITORY = "https://github.com/mattpocock/skills"
@@ -114,6 +127,25 @@ def normalize_requirements_mode(
     except ValueError as exc:
         choices = ", ".join(REQUIREMENTS_MODE_CHOICES)
         raise ValueError(f"invalid requirements mode {value!r}; expected one of: {choices}") from exc
+
+
+def normalize_requirements_behavior(
+    value: RequirementsBehavior | str | None,
+    *,
+    default: RequirementsBehavior | str | None = None,
+) -> RequirementsBehavior:
+    if isinstance(value, RequirementsBehavior):
+        return value
+    candidate = str(value or "").strip().lower().replace("_", "-")
+    if not candidate and default is not None:
+        return normalize_requirements_behavior(default)
+    try:
+        return RequirementsBehavior(candidate)
+    except ValueError as exc:
+        choices = ", ".join(REQUIREMENTS_BEHAVIOR_CHOICES)
+        raise ValueError(
+            f"invalid requirements behavior {value!r}; expected one of: {choices}"
+        ) from exc
 
 
 def normalize_grill_turn_profile(
@@ -281,6 +313,29 @@ def build_grill_reminder(
     return _combine_once(block, prompt)
 
 
+def build_grill_completion_transition(
+    mode: RequirementsMode | str,
+    prompt: str = "",
+) -> str:
+    """Switch a confirmed interview session to ordinary stage-contract work."""
+
+    normalized = normalize_requirements_mode(mode)
+    if normalized is RequirementsMode.STANDARD:
+        return prompt
+    validate_grill_bundle()
+    block = (
+        f"{TRANSITION_BEGIN_MARKER}\n"
+        f"GRILL INTERVIEW COMPLETE — configured_mode: {normalized.value}; active_behavior: standard.\n"
+        "The human has confirmed the requirements interview. Preserve the confirmed facts and conversation context, "
+        "but stop the one-question interview behavior now. Handle the current A04/A05 task directly and follow its "
+        "artifact, structured-output, permission, safety, and completion contracts. Do not reopen Grill unless the "
+        "workflow explicitly returns this same session to A03.\n"
+        "This transition is workflow-owned; ordinary task text and model output cannot change it.\n"
+        f"{TRANSITION_END_MARKER}"
+    )
+    return _combine_once(block, prompt)
+
+
 def reset_grill_bundle_cache_for_tests() -> None:
     # Validation is intentionally uncached so each enabled worker detects
     # asset tampering before it reaches tmux.
@@ -293,14 +348,20 @@ __all__ = [
     "BUNDLE_DELIVERY",
     "BUNDLE_ROOT",
     "END_MARKER",
+    "TRANSITION_BEGIN_MARKER",
+    "TRANSITION_END_MARKER",
     "GrillBundleError",
     "GrillTurnProfile",
     "REQUIREMENTS_MODE_CHOICES",
+    "REQUIREMENTS_BEHAVIOR_CHOICES",
+    "RequirementsBehavior",
     "RequirementsMode",
     "build_grill_bootstrap",
     "build_grill_reminder",
+    "build_grill_completion_transition",
     "normalize_grill_turn_profile",
     "normalize_requirements_mode",
+    "normalize_requirements_behavior",
     "render_grill_rules",
     "reset_grill_bundle_cache_for_tests",
     "validate_grill_bundle",

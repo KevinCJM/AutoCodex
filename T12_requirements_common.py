@@ -50,6 +50,8 @@ class RequirementsAnalystHandoff:
     ponytail_mode: str = "off"
     graphify_mode: str = "off"
     graphify_config: dict[str, object] = field(default_factory=dict)
+    requirements_mode: str = "standard"
+    requirements_behavior: str = "standard"
 
 
 def prompt_with_default(prompt_text: str, default: str = "", allow_empty: bool = False) -> str:

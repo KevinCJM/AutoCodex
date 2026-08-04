@@ -11,6 +11,7 @@ from unittest.mock import patch
 from Prompt_04_RequirementsReview import resume_ba
 from A03_RequirementsReview import (
     REQUIREMENTS_REVIEW_TASK_NAME,
+    RequirementsClarificationReturnRequested,
     MAX_REVIEWER_REPAIR_ATTEMPTS,
     RequirementsAnalystHandoff,
     ReviewAgentSelection,
@@ -26,6 +27,7 @@ from A03_RequirementsReview import (
     cleanup_stale_review_runtime_state,
     create_reviewer_runtime,
     prepare_ba_handoff,
+    recreate_ba_handoff,
     repair_reviewer_outputs,
     run_ba_turn_with_recreation,
     run_reviewer_turn_with_recreation,
@@ -45,6 +47,7 @@ from T08_pre_development import (
 )
 from tmux_core.runtime.contracts import TASK_STATUS_DONE, TASK_STATUS_RUNNING, read_task_status, write_task_status
 from tmux_core.runtime.hitl import GrillSessionState, load_grill_session_state, save_grill_session_state
+from tmux_core.runtime.tmux_runtime import AgentRunConfig
 from tmux_core.stage_kernel.agent_intervention import AGENT_INTERVENTION_RECREATE
 
 
@@ -57,6 +60,11 @@ class _FakeWorker:
         self.prompts: list[tuple[str, str]] = []
         self.killed = False
         self.session_name = "demo-session"
+        self.pane_id = "%7"
+        self.state_path = self.runtime_dir / "worker.state.json"
+        self.state_path.write_text("{}", encoding="utf-8")
+        self.grill_session_generation = "generation-a03"
+        self.behavior_transitions: list[tuple[str, str, str]] = []
         self.metadata_updates: list[dict[str, object]] = []
         self._runtime_metadata: dict[str, object] = {}
 
@@ -77,6 +85,17 @@ class _FakeWorker:
 
     def read_state(self):
         return dict(self._runtime_metadata)
+
+    def transition_requirements_behavior(
+        self,
+        behavior,
+        *,
+        grill_session_id="",
+        expected_session_generation="",
+    ):  # noqa: ANN001
+        self.behavior_transitions.append(
+            (str(behavior), str(grill_session_id), str(expected_session_generation))
+        )
 
 
 class A03RequirementsReviewTests(unittest.TestCase):
@@ -174,10 +193,16 @@ class A03RequirementsReviewTests(unittest.TestCase):
                 ),
             )
 
+            worker = _FakeWorker(
+                runtime_root=root / ".requirements_clarification_runtime",
+                runtime_dir=root / ".requirements_clarification_runtime" / "requirements-a03",
+            )
+
             reopened = _reopen_confirmed_grill_session_for_review_ambiguity(
                 project_dir=root,
                 requirement_name=requirement_name,
                 question_path=question_path,
+                worker=worker,
             )
 
             self.assertTrue(reopened)
@@ -205,6 +230,69 @@ class A03RequirementsReviewTests(unittest.TestCase):
             self.assertIn(str(context_path.resolve()), state.context_preimage_hashes)
             self.assertFalse(state.context_map_exists)
             self.assertEqual(state.context_target_snapshot, [str(context_path.resolve())])
+            self.assertEqual(state.active_worker_state_path, str(worker.state_path.resolve()))
+            self.assertEqual(state.active_session_name, worker.session_name)
+            self.assertEqual(state.active_worker_generation, "generation-a03")
+            self.assertEqual(
+                worker.behavior_transitions,
+                [("interview", "session-a03", "generation-a03")],
+            )
+
+    def test_recreated_a04_analyst_keeps_grill_origin_but_starts_standard(self):
+        previous = RequirementsAnalystHandoff(
+            worker=_FakeWorker(),
+            vendor="codex",
+            model="gpt-5.4",
+            reasoning_effort="high",
+            proxy_url="",
+            ponytail_mode="full",
+            requirements_mode="grill-with-docs",
+            requirements_behavior="standard",
+        )
+        selection = ReviewAgentSelection(
+            "codex",
+            "gpt-5.4",
+            "high",
+            "",
+            "full",
+        )
+        base_config = AgentRunConfig(
+            vendor="codex",
+            model="gpt-5.4",
+            reasoning_effort="high",
+            ponytail_mode="full",
+            requirements_mode="standard",
+        )
+        replacement_worker = _FakeWorker()
+        captured: dict[str, object] = {}
+
+        def fake_worker_factory(**kwargs):  # noqa: ANN003
+            captured.update(kwargs)
+            return replacement_worker
+
+        with patch(
+            "A03_RequirementsReview.prompt_required_replacement_review_agent_selection",
+            return_value=selection,
+        ), patch(
+            "A03_RequirementsReview.resolve_agent_run_config_with_recovery",
+            return_value=(selection, base_config),
+        ), patch(
+            "A03_RequirementsReview.TmuxBatchWorker",
+            side_effect=fake_worker_factory,
+        ):
+            recreated = recreate_ba_handoff(
+                project_dir="/tmp/project",
+                previous_handoff=previous,
+            )
+
+        self.assertIsNotNone(recreated)
+        self.assertEqual(captured["config"].requirements_mode, "grill-with-docs")
+        self.assertEqual(recreated.requirements_mode, "grill-with-docs")
+        self.assertEqual(recreated.requirements_behavior, "standard")
+        self.assertEqual(
+            replacement_worker.behavior_transitions,
+            [("standard", "", "generation-a03")],
+        )
 
     def test_a04_ambiguity_keeps_standard_flow_without_confirmed_grill_session(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -2037,13 +2125,60 @@ class A03RequirementsReviewTests(unittest.TestCase):
             pre_dev_payload = json.loads(pre_dev_path.read_text(encoding="utf-8"))
             self.assertFalse(result.passed)
             self.assertEqual(result.rounds_used, 0)
-            self.assertIsNone(result.ba_handoff)
+            self.assertIs(result.ba_handoff, live_ba)
             self.assertEqual(result.cleanup_paths, ("artifact-cleanup", "worker-cleanup"))
             self.assertIs(observed["ba_handoff"], live_ba)
             self.assertEqual(observed["reviewers"], [])
             self.assertTrue(observed["cleanup_runtime"])
-            self.assertFalse(observed["preserve_ba_worker"])
+            self.assertTrue(observed["preserve_ba_worker"])
             self.assertFalse(pre_dev_payload["需求评审"]["需求评审"])
+
+    def test_a04_return_to_a03_exception_carries_entry_handoff(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "需求A_原始需求.md").write_text("原始需求正文\n", encoding="utf-8")
+            (root / "需求A_需求澄清.md").write_text("需求澄清正文\n", encoding="utf-8")
+            ensure_pre_development_task_record(root, "需求A")
+            live_ba = RequirementsAnalystHandoff(
+                worker=_FakeWorker(
+                    runtime_root=root / ".requirements_clarification_runtime",
+                    runtime_dir=root / ".requirements_clarification_runtime" / "ba",
+                ),
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+                requirements_mode="grill",
+                requirements_behavior="standard",
+            )
+            observed: dict[str, object] = {}
+
+            def fake_shutdown(ba_handoff, reviewers, *, cleanup_runtime, preserve_ba_worker=False):  # noqa: ANN001
+                observed["ba_handoff"] = ba_handoff
+                observed["reviewers"] = list(reviewers)
+                observed["cleanup_runtime"] = cleanup_runtime
+                observed["preserve_ba_worker"] = preserve_ba_worker
+                return ()
+
+            with patch(
+                "A03_RequirementsReview.run_human_check_loop",
+                side_effect=PromptBackRequested(),
+            ), patch(
+                "A03_RequirementsReview._shutdown_workers",
+                side_effect=fake_shutdown,
+            ):
+                with self.assertRaises(RequirementsClarificationReturnRequested) as raised:
+                    run_requirements_review_stage(
+                        ["--project-dir", tmpdir, "--requirement-name", "需求A"],
+                        ba_handoff=live_ba,
+                        preserve_ba_worker=True,
+                    )
+
+            self.assertIs(raised.exception.handoff, live_ba)
+            self.assertIs(observed["ba_handoff"], live_ba)
+            self.assertEqual(observed["reviewers"], [])
+            self.assertTrue(observed["cleanup_runtime"])
+            self.assertTrue(observed["preserve_ba_worker"])
 
     def test_cleanup_existing_review_artifacts_removes_stale_files_for_same_requirement(self):
         with tempfile.TemporaryDirectory() as tmpdir:

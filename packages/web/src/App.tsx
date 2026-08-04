@@ -11,7 +11,7 @@ import {
   submitPromptResponse,
 } from './api/client'
 import { appendLog, classifyLog } from './domain/logs'
-import { buildAgentConfigLabel, buildHomeAgents, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState } from './domain/agents'
+import { buildAgentConfigLabel, buildHomeAgents, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState, workerOwnedPromptIsReady } from './domain/agents'
 import { graphifyStatusSummary, graphifyStatusTone } from './domain/graphifyStatus'
 import {
   EMPTY_APP,
@@ -423,6 +423,7 @@ function AgentOverview(props: { agents: HomeAgentItem[] }) {
                   <Copy size={14} /><span>{agent.sessionName}</span>
                 </button>
                 <Show when={agent.agentConfigLabel}><p>{agent.agentConfigLabel}</p></Show>
+                <Show when={agent.graphifyUsageLabel}><p>{agent.graphifyUsageLabel}</p></Show>
               </div>
               <div class="status-pills">
                 <span class={`pill ${statusClass(agent.agentState)}`}>{agent.agentState}</span>
@@ -954,11 +955,19 @@ export function App() {
       ...payload.control,
       workers: reconcileWorkerSnapshots(previous.control.workers, payload.control.workers),
     }
+    const promptWorkers = [
+      ...control.workers,
+      ...STAGE_ROUTES.flatMap((route) => stages[route].workers),
+    ]
+    const prompt = workerOwnedPromptIsReady(payload.prompt, promptWorkers)
+      ? payload.prompt
+      : EMPTY_PROMPT
     const reconciled = {
       ...payload,
       stages,
       control,
-      app: reconcileAppSnapshot(payload.app, previous.app, payload.prompt.pending),
+      prompt,
+      app: reconcileAppSnapshot(payload.app, previous.app, prompt.pending),
     }
     setSnapshots(reconciled)
     setSelectedControlIndex((prev) => Math.min(prev, Math.max(control.workers.length - 1, 0)))
@@ -1016,19 +1025,27 @@ export function App() {
     }
     if (event.type === 'prompt.request') {
       promptRevision += 1
-      setSnapshots((prev) => ({
-        ...prev,
-        app: {
-          ...prev.app,
-          activeStageStatus: resolvePromptAwareStatus(prev.app.activeStageStatus, true),
-        },
-        prompt: normalizePromptSnapshot({
+      setSnapshots((prev) => {
+        const candidate = normalizePromptSnapshot({
           pending: true,
           prompt_id: event.payload.id,
           prompt_type: event.payload.prompt_type,
           payload: event.payload,
-        }),
-      }))
+        })
+        const workers = [
+          ...prev.control.workers,
+          ...STAGE_ROUTES.flatMap((route) => prev.stages[route].workers),
+        ]
+        if (!workerOwnedPromptIsReady(candidate, workers)) return prev
+        return {
+          ...prev,
+          app: {
+            ...prev.app,
+            activeStageStatus: resolvePromptAwareStatus(prev.app.activeStageStatus, true),
+          },
+          prompt: candidate,
+        }
+      })
       setActiveTab('home')
       queueRefreshSnapshots(150)
       return

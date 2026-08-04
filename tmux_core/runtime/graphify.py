@@ -39,6 +39,7 @@ GRAPHIFY_QUERY_MAX_CHARS = 6_000
 GRAPHIFY_GUIDE_VERSION = "2"
 GRAPHIFY_FULL_GUIDE_MARKER = f"[Graphify Full Usage Guide v{GRAPHIFY_GUIDE_VERSION}]"
 GRAPHIFY_QUERY_RESULT_SCHEMA = "tmux-graphify-query-result/1"
+GRAPHIFY_USAGE_RECEIPT_SCHEMA = "tmux-graphify-usage/1"
 GRAPHIFY_QUERY_AUDIT_MAX_BYTES = 1024 * 1024
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -88,6 +89,10 @@ class GraphifySchemaError(GraphifyError):
 
 class GraphifySnapshotError(GraphifyError):
     pass
+
+
+class GraphifyUsageContractError(GraphifyError):
+    """A required Graphify query was not proven for the current logical turn."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -185,6 +190,51 @@ class GraphifyQuerySuggestion:
 
 
 @dataclasses.dataclass(frozen=True)
+class GraphifyUsagePolicy:
+    evidence_required: bool = False
+    query_requirement: str = "not_applicable"
+    requirement_reason: str = ""
+    recommended_command: str = ""
+    evidence_id: str = ""
+    graph_fingerprint: str = ""
+    freshness: str = ""
+
+    def __post_init__(self) -> None:
+        requirement = str(self.query_requirement or "not_applicable").strip().lower()
+        if requirement not in {"required", "optional", "not_applicable"}:
+            raise ValueError(f"非法 Graphify query requirement: {requirement!r}")
+        object.__setattr__(self, "query_requirement", requirement)
+        for field_name in (
+            "requirement_reason",
+            "recommended_command",
+            "evidence_id",
+            "graph_fingerprint",
+            "freshness",
+        ):
+            object.__setattr__(self, field_name, str(getattr(self, field_name) or "").strip())
+
+
+@dataclasses.dataclass(frozen=True)
+class GraphifyUsageAssessment:
+    evidence_id: str
+    turn_id: str
+    policy: str
+    delivery: str
+    query_status: str
+    query_ids: tuple[str, ...] = ()
+    commands: tuple[str, ...] = ()
+    freshness: str = ""
+    checked_at: str = ""
+    receipt_path: str = ""
+
+    @property
+    def satisfied(self) -> bool:
+        return self.query_status in {
+            "not_applicable", "optional", "satisfied", "manual_override", "degraded",
+        }
+
+
+@dataclasses.dataclass(frozen=True)
 class GraphifyFreshnessAssessment:
     state: str
     graph_fingerprint: str
@@ -206,6 +256,7 @@ class GraphifyQueryResult:
     result_text: str
     error_kind: str = ""
     generation_scope: str = "current"
+    invocation_digest: str = ""
 
     def to_public_dict(self) -> dict[str, Any]:
         return {
@@ -256,6 +307,13 @@ class _GraphifyQueryScope:
     runner_id: str = ""
     stage_key: str = ""
     scope_key: str = ""
+    session_generation: str = ""
+    turn_id: str = ""
+    evidence_id: str = ""
+    graph_fingerprint: str = ""
+    delivery_confirmed: bool = False
+    expected_query_command: str = ""
+    expected_invocation_digest: str = ""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -275,6 +333,7 @@ class GraphifyEvidence:
     block_text: str = ""
     compact_block_text: str = ""
     suggestions: tuple[GraphifyQuerySuggestion, ...] = ()
+    usage_policy: GraphifyUsagePolicy = dataclasses.field(default_factory=GraphifyUsagePolicy)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -323,6 +382,7 @@ class GraphifyTurnProfile:
     prompt_file_references: tuple[str, ...] = ()
     turn_context: GraphifyTurnContext | None = None
     suggestions: tuple[GraphifyQuerySuggestion, ...] = ()
+    usage_policy: GraphifyUsagePolicy = dataclasses.field(default_factory=GraphifyUsagePolicy)
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -737,6 +797,130 @@ def publish_graphify_pending_status(
                     },
                 )
     except (GraphifyError, OSError):
+        return False
+    return True
+
+
+def _graphify_query_invocation_digest(
+    command: str,
+    values: Sequence[str],
+    generation_scope: str,
+) -> str:
+    material = json.dumps(
+        [
+            str(command or "").strip().lower(),
+            str(generation_scope or "current").strip().lower(),
+            *[str(value) for value in values],
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _expected_query_from_policy(policy: GraphifyUsagePolicy) -> tuple[str, str]:
+    try:
+        tokens = shlex.split(str(policy.recommended_command or ""))
+    except ValueError:
+        return "", ""
+    if len(tokens) < 2 or tokens[0] != "$TMUX_GRAPHIFY_CMD":
+        return "", ""
+    command = str(tokens[1] or "").strip().lower()
+    values = list(tokens[2:])
+    generation_scope = "current"
+    if values and values[-1] == "--previous":
+        generation_scope = "previous"
+        values.pop()
+    if command not in _QUERY_COMMANDS:
+        return "", ""
+    try:
+        normalized_values = _validated_readonly_query_values(command, values)
+    except GraphifyUnavailable:
+        return "", ""
+    return command, _graphify_query_invocation_digest(
+        command,
+        normalized_values,
+        generation_scope,
+    )
+
+
+def register_graphify_turn_usage(
+    project_dir: str | Path,
+    mode: GraphifyMode | str,
+    *,
+    runner_id: str,
+    stage_key: str,
+    session_generation: str,
+    turn_id: str,
+    policy: GraphifyUsagePolicy,
+    delivery_confirmed: bool,
+) -> bool:
+    """Bind one live worker session to an exact Graphify evidence/turn cursor."""
+
+    normalized_mode = normalize_graphify_mode(mode, default=GraphifyMode.AUTO)
+    normalized_runner = _normalize_query_scope_component(runner_id)
+    normalized_stage = _normalize_graphify_stage_key(stage_key)
+    normalized_generation = _normalize_query_scope_component(session_generation, max_length=64)
+    normalized_turn = _normalize_query_scope_component(turn_id, max_length=128)
+    if (
+        normalized_mode == GraphifyMode.OFF
+        or not normalized_runner
+        or not normalized_stage
+        or not normalized_generation
+        or not normalized_turn
+        or not policy.evidence_id
+    ):
+        return False
+    project = _project_root(project_dir)
+    cache_dir = project_cache_dir(project)
+    expected_scope_key = _runner_query_scope_key(normalized_runner, normalized_mode, normalized_stage)
+    try:
+        with _metadata_lock(cache_dir):
+            payload = _read_runner_query_scope(project)
+            generations = {
+                _normalize_query_scope_component(value, max_length=64)
+                for value in payload.get("session_generations", ())
+                if _normalize_query_scope_component(value, max_length=64)
+            }
+            if (
+                str(payload.get("scope_key", "") or "") != expected_scope_key
+                or normalized_generation not in generations
+            ):
+                return False
+            turns = payload.get("turns", {})
+            if not isinstance(turns, dict):
+                turns = {}
+            turns = {
+                str(key): value
+                for key, value in turns.items()
+                if isinstance(value, dict) and str(key) in generations
+            }
+            previous = turns.get(normalized_generation, {})
+            expected_query_command, expected_invocation_digest = _expected_query_from_policy(policy)
+            confirmed = bool(delivery_confirmed) or (
+                str(previous.get("turn_id", "") or "") == normalized_turn
+                and bool(previous.get("delivery_confirmed", False))
+            )
+            turns[normalized_generation] = {
+                "turn_id": normalized_turn,
+                "evidence_id": _normalize_query_scope_component(policy.evidence_id),
+                "graph_fingerprint": _normalize_query_scope_component(policy.graph_fingerprint),
+                "query_requirement": policy.query_requirement,
+                "expected_query_command": expected_query_command,
+                "expected_invocation_digest": expected_invocation_digest,
+                "delivery_confirmed": confirmed,
+                "updated_at": _now_iso(),
+            }
+            _atomic_write_json(
+                _runner_query_scope_path(project),
+                {
+                    **payload,
+                    "schema": "tmux-graphify-query-scope/3",
+                    "turns": turns,
+                    "updated_at": _now_iso(),
+                },
+            )
+    except (GraphifyError, OSError, ValueError):
         return False
     return True
 
@@ -2553,12 +2737,142 @@ def _query_suggestions(
     if broad:
         add("query", (broad,), "补充当前需求或任务的相关代码候选")
     if intent in {GraphifyQueryIntent.ROUTING_DISCOVERY, GraphifyQueryIntent.ARCHITECTURE_BOUNDARY}:
-        add("god-nodes", (), "发现高连接节点，仅作为扩大代码阅读范围的候选")
+        add("god-nodes", ("--top", "10"), "发现高连接节点，仅作为扩大代码阅读范围的候选")
     if not candidates and paths:
         add("affected", (paths[0],), "检查目标路径的静态影响候选")
     if not candidates and symbol_values:
         add("explain", (symbol_values[0],), "查看目标符号的静态关系")
     return tuple(candidates[:3])
+
+
+def _graphify_seed_is_covered(seed: str, evidence_text: str) -> bool:
+    normalized = str(seed or "").strip().lower().strip("/")
+    if not normalized:
+        return True
+    candidates = {normalized, Path(normalized).name, Path(normalized).stem}
+    return any(candidate and candidate in evidence_text for candidate in candidates)
+
+
+def _build_graphify_usage_policy(
+    *,
+    evidence_id: str,
+    graph_fingerprint: str,
+    freshness: str,
+    context: GraphifyTurnContext | None,
+    routed_paths: Sequence[str],
+    changed_files: Sequence[str],
+    deleted_files: Sequence[str],
+    symbols: Sequence[str],
+    query_seeds: Sequence[str],
+    prompt_file_references: Sequence[str],
+    extracted_nodes: Sequence[str],
+    extracted_edges: Sequence[str],
+    ambiguous: Sequence[str],
+    inferred: Sequence[str],
+    suggestions: Sequence[GraphifyQuerySuggestion],
+    routing_query_already_satisfied: bool = False,
+) -> GraphifyUsagePolicy:
+    """Choose a deterministic read/query policy without asking the model to self-grade."""
+
+    intent = context.intent if context is not None else GraphifyQueryIntent.CODE_FACT_DISCOVERY
+    evidence_text = "\n".join((*extracted_nodes, *extracted_edges)).lower()
+    explicit_seeds = tuple(dict.fromkeys((
+        *changed_files,
+        *deleted_files,
+        *symbols,
+        *routed_paths,
+        *prompt_file_references,
+    )))
+    missing_seeds = tuple(
+        seed for seed in explicit_seeds if not _graphify_seed_is_covered(seed, evidence_text)
+    )
+    module_path_buckets = {
+        "/".join(Path(path).parts[:2])
+        for path in (*routed_paths, *prompt_file_references)
+        if Path(path).parts
+    }
+    requirement = "optional"
+    reason = "当前精简证据包含可用的 EXTRACTED 导航信息；仅在不足时查询"
+
+    if intent == GraphifyQueryIntent.ROUTING_DISCOVERY and routing_query_already_satisfied:
+        requirement = "optional"
+        reason = "当前 session 已对同一 graph fingerprint 完成首轮 routing query；本轮按证据充分度查询"
+    elif intent == GraphifyQueryIntent.ROUTING_DISCOVERY:
+        requirement = "required"
+        reason = "A01 Create 必须为当前 session/graph fingerprint 主动核对一次项目高连接节点或路由候选"
+    elif intent in {GraphifyQueryIntent.CHANGE_REVIEW, GraphifyQueryIntent.WHOLE_CHANGE_REVIEW} and (
+        changed_files or deleted_files
+    ):
+        requirement = "required"
+        reason = "评审存在 change ledger 确认的真实改动，必须主动检查 affected 影响候选"
+    elif intent == GraphifyQueryIntent.CODE_FACT_DISCOVERY and (
+        routed_paths or symbols or query_seeds or prompt_file_references
+    ) and missing_seeds:
+        requirement = "required"
+        reason = "需求澄清包含明确代码事实种子，但注入的 EXTRACTED 证据未完整覆盖"
+    elif intent in {
+        GraphifyQueryIntent.REQUIREMENT_IMPACT,
+        GraphifyQueryIntent.ARCHITECTURE_BOUNDARY,
+        GraphifyQueryIntent.TASK_DEPENDENCY,
+    } and (
+        (len(module_path_buckets) >= 2 and not extracted_edges)
+        or (not extracted_edges and bool(ambiguous or inferred))
+    ):
+        requirement = "required"
+        reason = "跨模块/边界分析缺少 EXTRACTED 关系边，或当前只有候选关系"
+    elif intent == GraphifyQueryIntent.IMPLEMENTATION and missing_seeds:
+        requirement = "required"
+        reason = "当前实现任务引用的路径或符号未被注入的 EXTRACTED 证据完整覆盖"
+    elif not extracted_nodes and not extracted_edges and explicit_seeds:
+        requirement = "required"
+        reason = "当前任务有明确代码种子，但精简图谱证据为空"
+
+    recommended = suggestions[0] if suggestions else None
+    if requirement == "required" and recommended is None:
+        broad = " ".join(
+            value for value in (
+                context.requirement_name if context is not None else "",
+                context.task_name if context is not None else "",
+                *query_seeds,
+            ) if str(value or "").strip()
+        ).strip()
+        recommended = (
+            GraphifyQuerySuggestion("query", (_safe_query_value(broad),), "补充当前任务的相关代码候选")
+            if broad
+            else GraphifyQuerySuggestion("god-nodes", ("--top", "10"), "发现高连接代码节点")
+        )
+    return GraphifyUsagePolicy(
+        evidence_required=True,
+        query_requirement=requirement,
+        requirement_reason=reason,
+        recommended_command=recommended.shell_command if recommended is not None else "",
+        evidence_id=evidence_id,
+        graph_fingerprint=graph_fingerprint,
+        freshness=freshness,
+    )
+
+
+def _routing_query_was_satisfied_for_session(
+    project: Path,
+    *,
+    session_generation: str,
+    graph_fingerprint: str,
+) -> bool:
+    normalized_generation = _normalize_query_scope_component(
+        session_generation,
+        max_length=64,
+    )
+    if not normalized_generation or not graph_fingerprint:
+        return False
+    return any(
+        bool(entry.get("scope_match", False))
+        and bool(entry.get("delivery_confirmed", False))
+        and bool(entry.get("ok", False))
+        and str(entry.get("session_generation", "") or "") == normalized_generation
+        and str(entry.get("registered_fingerprint", "") or "") == graph_fingerprint
+        and str(entry.get("command", "") or "") in {"query", "god-nodes"}
+        for entry in _read_graphify_query_audit(project)
+    )
 
 
 def _render_bounded_evidence(
@@ -2603,6 +2917,7 @@ def _build_evidence(
     query_seeds: Sequence[str] = (),
     prompt_file_references: Sequence[str] = (),
     turn_context: GraphifyTurnContext | None = None,
+    usage_session_generation: str = "",
 ) -> GraphifyEvidence:
     payload, _, _ = _load_and_validate_graph(generation.graph_path)
     raw_nodes, raw_edges = _graph_lists(payload)
@@ -2769,6 +3084,28 @@ def _build_evidence(
     evidence_id = hashlib.sha256(
         f"{generation.fingerprint}\0{previous_fingerprint}\0{evidence_seed_payload}".encode("utf-8")
     ).hexdigest()[:20]
+    usage_policy = _build_graphify_usage_policy(
+        evidence_id=evidence_id,
+        graph_fingerprint=generation.fingerprint,
+        freshness=generation.freshness,
+        context=turn_context,
+        routed_paths=routed_paths,
+        changed_files=changed_files,
+        deleted_files=deleted_files,
+        symbols=symbols,
+        query_seeds=query_seeds,
+        prompt_file_references=prompt_file_references,
+        extracted_nodes=extracted_nodes,
+        extracted_edges=extracted_edges,
+        ambiguous=ambiguous,
+        inferred=inferred,
+        suggestions=suggestions,
+        routing_query_already_satisfied=_routing_query_was_satisfied_for_session(
+            project,
+            session_generation=usage_session_generation,
+            graph_fingerprint=generation.fingerprint,
+        ),
+    )
     intent_text = turn_context.intent.value if turn_context is not None else "code_fact_discovery"
     header = [
         f"- evidence_id: {evidence_id}",
@@ -2780,20 +3117,38 @@ def _build_evidence(
     ]
     guide = [
         GRAPHIFY_FULL_GUIDE_MARKER,
-        "- Query only when the injected evidence is insufficient; do not query on every turn.",
+        "- Read the injected Graphify Evidence before acting; this is mandatory whenever this block is present.",
+        "- Execute the concrete REQUIRED_QUERY when query_requirement is required; otherwise query only when the evidence is insufficient.",
         '- `"$TMUX_GRAPHIFY_CMD" query "<question>"`',
         '- `"$TMUX_GRAPHIFY_CMD" affected "<file-or-symbol>"`',
         '- For a ledger-confirmed deleted path only: `"$TMUX_GRAPHIFY_CMD" affected "<deleted-file>" --previous`',
         '- `"$TMUX_GRAPHIFY_CMD" path "<source>" "<target>"`',
         '- `"$TMUX_GRAPHIFY_CMD" explain "<symbol>"`',
-        '- `"$TMUX_GRAPHIFY_CMD" god-nodes`',
+        '- `"$TMUX_GRAPHIFY_CMD" god-nodes --top 10`',
         "- Query output reports fresh/stale/unknown; stale or unknown results are old navigation evidence and require source verification.",
         "- The wrapper is read-only and rejects setup, build, update, prune, install, hooks, watch, serve, global, and write operations.",
     ]
+    policy_lines = [
+        "- evidence_reading: required",
+        f"- query_requirement: {usage_policy.query_requirement}",
+        f"- requirement_reason: {usage_policy.requirement_reason}",
+    ]
+    if usage_policy.query_requirement == "required":
+        policy_lines.append(f"- required_command: `{usage_policy.recommended_command}`")
     recommendation_lines = [
         f"- `{suggestion.shell_command}` — {suggestion.purpose}"
         for suggestion in suggestions
     ] or ["- No concrete query is recommended for this turn."]
+    query_heading = (
+        "REQUIRED_QUERY (execute before completing this turn):"
+        if usage_policy.query_requirement == "required"
+        else "RECOMMENDED_QUERIES (optional; max 3):"
+    )
+    query_lines = (
+        [f"- `{usage_policy.recommended_command}` — {usage_policy.requirement_reason}"]
+        if usage_policy.query_requirement == "required"
+        else recommendation_lines
+    )
     old_generation_sections: list[tuple[str, Sequence[str]]] = []
     if old_generation_candidates:
         old_generation_sections.append((
@@ -2805,8 +3160,9 @@ def _build_evidence(
         ))
     full_sections: list[tuple[str, Sequence[str]]] = [
         ("[Graphify Code Graph Evidence]", header),
-        ("FURTHER_QUERY (optional; read-only):", guide),
-        ("RECOMMENDED_QUERIES (optional; max 3):", recommendation_lines),
+        ("GRAPHIFY_USAGE_POLICY:", policy_lines),
+        ("GRAPHIFY_USAGE_GUIDE (read-only):", guide),
+        (query_heading, query_lines),
         *old_generation_sections,
         ("EXTRACTED:", [
             *[f"- [EXTRACTED] node: {item}" for item in extracted_nodes],
@@ -2815,11 +3171,13 @@ def _build_evidence(
     ]
     compact_sections: list[tuple[str, Sequence[str]]] = [
         ("[Graphify Code Graph Evidence]", header),
+        ("GRAPHIFY_USAGE_POLICY:", policy_lines),
         ("GRAPHIFY_REMINDER:", [
-            "- Optional read-only wrapper is available; query only when current evidence is insufficient.",
+            "- You must read this evidence block before acting.",
+            "- Execute REQUIRED_QUERY when query_requirement is required; otherwise query only when current evidence is insufficient.",
             "- Verify every graph result against AGENTS.md, source, tests, and config.",
         ]),
-        ("RECOMMENDED_QUERIES (optional; max 3):", recommendation_lines),
+        (query_heading, query_lines),
         *old_generation_sections,
         ("EXTRACTED:", [
             *[f"- [EXTRACTED] node: {item}" for item in extracted_nodes],
@@ -2878,6 +3236,7 @@ def _build_evidence(
         block_text=block_text,
         compact_block_text=compact_block_text,
         suggestions=suggestions,
+        usage_policy=usage_policy,
     )
 
 
@@ -2895,6 +3254,7 @@ def resolve_graphify_turn_profile(
     symbols: Sequence[str] | None = None,
     query_seeds: Sequence[str] | None = None,
     turn_context: GraphifyTurnContext | None = None,
+    usage_session_generation: str = "",
 ) -> GraphifyTurnProfile:
     normalized_mode = normalize_graphify_mode(mode)
     project = _project_root(project_dir)
@@ -3030,6 +3390,7 @@ def resolve_graphify_turn_profile(
             query_seeds=normalized_query_seeds,
             prompt_file_references=prompt_references,
             turn_context=turn_context,
+            usage_session_generation=usage_session_generation,
         )
     except GraphifyError as exc:
         if normalized_mode == GraphifyMode.REQUIRED:
@@ -3071,6 +3432,7 @@ def resolve_graphify_turn_profile(
         evidence=evidence,
         status=status,
         suggestions=evidence.suggestions,
+        usage_policy=evidence.usage_policy,
         **profile_seed_fields,
     )
 
@@ -3265,6 +3627,12 @@ def _resolve_query_scope(project: Path) -> _GraphifyQueryScope:
             for value in scope_payload.get("session_generations", ())
             if _normalize_query_scope_component(value, max_length=64)
         }
+        turns = scope_payload.get("turns", {})
+        if not isinstance(turns, dict):
+            turns = {}
+        turn_payload = turns.get(generation, {})
+        if not isinstance(turn_payload, dict):
+            turn_payload = {}
         return _GraphifyQueryScope(
             active=True,
             accepted=bool(
@@ -3275,6 +3643,17 @@ def _resolve_query_scope(project: Path) -> _GraphifyQueryScope:
             runner_id=runner_id,
             stage_key=stage_key,
             scope_key=scope_key,
+            session_generation=generation,
+            turn_id=_normalize_query_scope_component(turn_payload.get("turn_id", ""), max_length=128),
+            evidence_id=_normalize_query_scope_component(turn_payload.get("evidence_id", "")),
+            graph_fingerprint=_normalize_query_scope_component(turn_payload.get("graph_fingerprint", "")),
+            delivery_confirmed=bool(turn_payload.get("delivery_confirmed", False)),
+            expected_query_command=str(
+                turn_payload.get("expected_query_command", "") or ""
+            ).strip(),
+            expected_invocation_digest=str(
+                turn_payload.get("expected_invocation_digest", "") or ""
+            ).strip(),
         )
     # Compatibility for manual/legacy queries created before scope v2. They
     # remain queryable, but cannot impersonate a stage key.
@@ -3305,10 +3684,21 @@ def _rotate_and_append_query_audit(
             "query_id": result.query_id,
             "runner_id": query_scope.runner_id,
             "stage_key": query_scope.stage_key,
+            "session_generation": query_scope.session_generation,
+            "turn_id": query_scope.turn_id,
+            "evidence_id": query_scope.evidence_id,
             "scope_match": query_scope.accepted,
             "command": result.command,
             "generation_scope": result.generation_scope,
             "fingerprint": result.graph_fingerprint,
+            "registered_fingerprint": query_scope.graph_fingerprint,
+            "delivery_confirmed": query_scope.delivery_confirmed,
+            "required_query_match": bool(
+                query_scope.expected_query_command
+                and result.command == query_scope.expected_query_command
+                and query_scope.expected_invocation_digest
+                and result.invocation_digest == query_scope.expected_invocation_digest
+            ),
             "freshness": result.freshness,
             "duration_ms": result.duration_ms,
             "ok": result.ok,
@@ -3323,6 +3713,109 @@ def _rotate_and_append_query_audit(
             with contextlib.suppress(OSError):
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+def _read_graphify_query_audit(project: Path) -> tuple[dict[str, Any], ...]:
+    cache_dir = project_cache_dir(project)
+    entries: list[dict[str, Any]] = []
+    for path in (cache_dir / "query-audit.jsonl.1", cache_dir / "query-audit.jsonl"):
+        if not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, dict):
+                entries.append(payload)
+    return tuple(entries)
+
+
+def assess_graphify_turn_usage(
+    project_dir: str | Path,
+    policy: GraphifyUsagePolicy,
+    *,
+    session_generation: str,
+    turn_id: str,
+    delivery_confirmed: bool,
+    receipt_path: str | Path | None = None,
+    manual_override: bool = False,
+    degraded: bool = False,
+) -> GraphifyUsageAssessment:
+    """Assess a turn from system-owned delivery state and exact wrapper audit rows."""
+
+    project = _project_root(project_dir)
+    normalized_generation = _normalize_query_scope_component(session_generation, max_length=64)
+    normalized_turn = _normalize_query_scope_component(turn_id, max_length=128)
+    scoped_matching = tuple(
+        entry
+        for entry in _read_graphify_query_audit(project)
+        if bool(entry.get("scope_match", False))
+        and str(entry.get("session_generation", "") or "") == normalized_generation
+        and str(entry.get("turn_id", "") or "") == normalized_turn
+        and str(entry.get("evidence_id", "") or "") == policy.evidence_id
+        and str(entry.get("registered_fingerprint", "") or "") == policy.graph_fingerprint
+    )
+    matching = tuple(
+        entry
+        for entry in scoped_matching
+        if policy.query_requirement != "required"
+        or bool(entry.get("required_query_match", False))
+    )
+    query_ids = tuple(
+        dict.fromkeys(str(entry.get("query_id", "") or "") for entry in matching if entry.get("query_id"))
+    )
+    commands = tuple(
+        dict.fromkeys(str(entry.get("command", "") or "") for entry in matching if entry.get("command"))
+    )
+    if policy.query_requirement == "not_applicable":
+        query_status = "not_applicable"
+    elif not delivery_confirmed:
+        query_status = "pending"
+    elif manual_override:
+        query_status = "manual_override"
+    elif any(bool(entry.get("ok", False)) for entry in matching):
+        query_status = "satisfied"
+    elif matching:
+        query_status = "query_failed"
+    elif policy.query_requirement == "required":
+        query_status = "degraded" if degraded else "missing"
+    else:
+        query_status = "optional"
+    checked_at = _now_iso()
+    payload = {
+        "schema": GRAPHIFY_USAGE_RECEIPT_SCHEMA,
+        "evidence_id": policy.evidence_id,
+        "turn_id": normalized_turn,
+        "policy": f"query_{policy.query_requirement}",
+        "delivery": "confirmed" if delivery_confirmed else "pending",
+        "query_status": query_status,
+        "query_ids": list(query_ids),
+        "commands": list(commands),
+        "freshness": policy.freshness,
+        "checked_at": checked_at,
+    }
+    resolved_receipt = ""
+    if receipt_path is not None:
+        target = Path(receipt_path).expanduser().resolve()
+        _atomic_write_json(target, payload)
+        resolved_receipt = str(target)
+    return GraphifyUsageAssessment(
+        evidence_id=policy.evidence_id,
+        turn_id=normalized_turn,
+        policy=f"query_{policy.query_requirement}",
+        delivery=payload["delivery"],
+        query_status=query_status,
+        query_ids=query_ids,
+        commands=commands,
+        freshness=policy.freshness,
+        checked_at=checked_at,
+        receipt_path=resolved_receipt,
+    )
 
 
 def _publish_query_result(
@@ -3524,6 +4017,11 @@ def execute_readonly_query(
             result_text=sanitized,
             error_kind=error_kind,
             generation_scope=normalized_generation_scope,
+            invocation_digest=_graphify_query_invocation_digest(
+                command_text,
+                query_values,
+                normalized_generation_scope,
+            ),
         )
         with contextlib.suppress(OSError):
             _rotate_and_append_query_audit(project, result, query_scope)
@@ -3723,6 +4221,7 @@ __all__ = [
     "GRAPHIFY_GUIDE_VERSION",
     "GRAPHIFY_PACKAGE",
     "GRAPHIFY_QUERY_RESULT_SCHEMA",
+    "GRAPHIFY_USAGE_RECEIPT_SCHEMA",
     "GRAPHIFY_VERSION",
     "GraphifyFreshnessAssessment",
     "GraphifyBuildConfig",
@@ -3740,8 +4239,12 @@ __all__ = [
     "GraphifyTurnProfile",
     "GraphifyTurnContext",
     "GraphifyUnavailable",
+    "GraphifyUsageAssessment",
+    "GraphifyUsageContractError",
+    "GraphifyUsagePolicy",
     "TurnContextBlock",
     "assess_graphify_freshness",
+    "assess_graphify_turn_usage",
     "build_graphify_evidence_block",
     "cancel_graphify_processes",
     "capture_graphify_source_manifest",
@@ -3757,6 +4260,7 @@ __all__ = [
     "project_cache_key",
     "prune_graphify_cache",
     "read_graphify_project_status",
+    "register_graphify_turn_usage",
     "resolve_graphify_tool",
     "resolve_graphify_turn_profile",
     "run_readonly_query",

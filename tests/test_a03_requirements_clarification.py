@@ -197,6 +197,102 @@ class PreserveFailedWorkerTests(unittest.TestCase):
             self.assertIs(created_workers[1].config, created_workers[0].config)
             self.assertEqual(created_workers[1].config.requirements_mode, "grill")
 
+    def test_confirmed_grill_preserves_same_worker_and_switches_to_standard_behavior(self):
+        with TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            requirement_name = "需求A"
+            (project_dir / f"{requirement_name}_原始需求.md").write_text(
+                "原始需求\n", encoding="utf-8"
+            )
+            requirements_clear_path = project_dir / f"{requirement_name}_需求澄清.md"
+            _, session_path, _ = build_requirements_grill_paths(
+                project_dir,
+                requirement_name,
+            )
+            created_workers: list[object] = []
+
+            class FakeWorker:
+                def __init__(self, **kwargs):  # noqa: ANN003
+                    self.config = kwargs["config"]
+                    self.runtime_root = Path(kwargs["runtime_root"])
+                    self.runtime_dir = self.runtime_root / "requirements-live"
+                    self.runtime_dir.mkdir(parents=True)
+                    self.state_path = self.runtime_dir / "worker.state.json"
+                    self.session_name = "需求分析师-天哭星"
+                    self.pane_id = "%1"
+                    self.grill_session_generation = "generation-a03"
+                    self.transition_calls: list[tuple[str, str, str]] = []
+                    self.killed = False
+                    created_workers.append(self)
+
+                def set_runtime_metadata(self, **_metadata):  # noqa: ANN003
+                    return None
+
+                def transition_requirements_behavior(
+                    self,
+                    behavior,
+                    *,
+                    grill_session_id="",
+                    expected_session_generation="",
+                ):
+                    self.transition_calls.append(
+                        (behavior, grill_session_id, expected_session_generation)
+                    )
+
+                def request_kill(self):
+                    self.killed = True
+
+            def complete_grill(**_kwargs):  # noqa: ANN003
+                requirements_clear_path.write_text("已确认需求\n", encoding="utf-8")
+                save_grill_session_state(
+                    session_path,
+                    GrillSessionState(
+                        session_id="grill-session-a03",
+                        requirements_mode="grill",
+                        state="confirmed",
+                    ),
+                )
+                return SimpleNamespace(
+                    decision=SimpleNamespace(payload={"status": "completed"}, summary=""),
+                )
+
+            with patch(
+                "A03_RequirementsClarification.TmuxBatchWorker",
+                FakeWorker,
+            ), patch(
+                "A03_RequirementsClarification.AgentRunConfig",
+                side_effect=lambda **kwargs: SimpleNamespace(
+                    vendor=SimpleNamespace(value=str(kwargs["vendor"])),
+                    model=str(kwargs["model"]),
+                    reasoning_effort=str(kwargs["reasoning_effort"]),
+                    proxy_url=str(kwargs.get("proxy_url", "")),
+                    ponytail_mode=str(kwargs.get("ponytail_mode", "off")),
+                    requirements_mode=str(kwargs.get("requirements_mode", "standard")),
+                    graphify_mode=str(kwargs.get("graphify_mode", "off")),
+                    graphify_config=dict(kwargs.get("graphify_config", {})),
+                ),
+            ), patch(
+                "A03_RequirementsClarification.run_hitl_agent_loop",
+                side_effect=complete_grill,
+            ):
+                result = run_requirements_clarification(
+                    project_dir,
+                    requirement_name,
+                    requirements_mode="grill",
+                    preserve_ba_worker=True,
+                )
+
+            self.assertEqual(len(created_workers), 1)
+            worker = created_workers[0]
+            self.assertIs(result.ba_handoff.worker, worker)
+            self.assertEqual(result.ba_handoff.requirements_mode, "grill")
+            self.assertEqual(result.ba_handoff.requirements_behavior, "standard")
+            self.assertEqual(
+                worker.transition_calls,
+                [("standard", "grill-session-a03", "generation-a03")],
+            )
+            self.assertFalse(worker.killed)
+
     def test_stage_cleanup_never_removes_other_requirement_runtime(self):
         with TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir)
@@ -557,6 +653,105 @@ class RequirementsClarificationAgentSelectionTests(unittest.TestCase):
 
             self.assertEqual(captured["requirements_mode"], "grill-with-docs")
             self.assertTrue(captured["resume_existing"])
+
+    def test_confirmed_grill_reuse_recovers_live_worker_for_a00_handoff(self):
+        with TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir).resolve()
+            requirement_name = "需求A"
+            (project_dir / f"{requirement_name}_原始需求.md").write_text(
+                "原始需求\n", encoding="utf-8"
+            )
+            (project_dir / f"{requirement_name}_需求澄清.md").write_text(
+                "已确认需求\n", encoding="utf-8"
+            )
+            worker_runtime_dir = project_dir / ".requirements_clarification_runtime" / "live"
+            worker_runtime_dir.mkdir(parents=True)
+            worker_state_path = worker_runtime_dir / "worker.state.json"
+            worker_state_path.write_text("{}", encoding="utf-8")
+            _, session_path, _ = build_requirements_grill_paths(
+                project_dir,
+                requirement_name,
+            )
+            save_grill_session_state(
+                session_path,
+                GrillSessionState(
+                    session_id="confirmed-session",
+                    requirements_mode="grill",
+                    state="confirmed",
+                    active_worker_state_path=str(worker_state_path),
+                    active_runtime_dir=str(worker_runtime_dir),
+                    active_session_name="需求分析师-天哭星",
+                    active_pane_id="%1",
+                    active_worker_generation="generation-a03",
+                ),
+            )
+
+            class LiveWorker:
+                state_path = worker_state_path
+                runtime_dir = worker_runtime_dir
+                runtime_root = worker_runtime_dir.parent
+                session_name = "需求分析师-天哭星"
+                grill_session_generation = "generation-a03"
+                config = SimpleNamespace(
+                    vendor=SimpleNamespace(value="codex"),
+                    model="gpt-5.4",
+                    reasoning_effort="high",
+                    proxy_url="",
+                    ponytail_mode="full",
+                    graphify_mode="auto",
+                    graphify_config={},
+                    requirements_mode="grill",
+                )
+
+                def __init__(self):
+                    self.transitions: list[tuple[str, str, str]] = []
+
+                def transition_requirements_behavior(
+                    self,
+                    behavior,
+                    *,
+                    grill_session_id="",
+                    expected_session_generation="",
+                ):
+                    self.transitions.append(
+                        (behavior, grill_session_id, expected_session_generation)
+                    )
+
+            worker = LiveWorker()
+            with patch(
+                "A03_RequirementsClarification.stdin_is_interactive",
+                return_value=True,
+            ), patch(
+                "A03_RequirementsClarification.resolve_workflow_requirements_mode",
+                return_value="grill",
+            ), patch(
+                "A03_RequirementsClarification.should_reuse_existing_requirements_clarification",
+                return_value=True,
+            ), patch(
+                "A03_RequirementsClarification.restore_live_requirements_grill_worker",
+                return_value=worker,
+            ), patch(
+                "A03_RequirementsClarification.collect_requirements_clarification_agent_selection",
+                side_effect=AssertionError("恢复存活 worker 时不应重新选择模型"),
+            ):
+                result = run_requirements_clarification_stage(
+                    [
+                        "--project-dir",
+                        str(project_dir),
+                        "--requirement-name",
+                        requirement_name,
+                        "--requirements-mode",
+                        "grill",
+                    ],
+                    preserve_ba_worker=True,
+                )
+
+            self.assertIs(result.ba_handoff.worker, worker)
+            self.assertEqual(result.ba_handoff.requirements_behavior, "standard")
+            self.assertEqual(
+                worker.transitions,
+                [("standard", "confirmed-session", "generation-a03")],
+            )
 
 
 if __name__ == "__main__":

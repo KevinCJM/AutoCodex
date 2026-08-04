@@ -909,7 +909,13 @@
         "session_generation",
         "query_scope",
         "validation.json",
-        "query_audit"
+        "query_audit",
+        "graphify_usage_policy",
+        "graphify_usage_receipt",
+        "query_required",
+        "no_query_receipt",
+        "graphify_usage_intervention",
+        "invocation_digest"
       ],
       "negative_keywords": [
         "vendor_catalog",

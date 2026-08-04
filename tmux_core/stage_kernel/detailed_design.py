@@ -1041,6 +1041,10 @@ def create_design_ba_handoff(
         ponytail_mode=selection.ponytail_mode,
         graphify_mode=selection.graphify_mode,
         graphify_config=selection.graphify_config,
+        requirements_mode=str(
+            getattr(config, "requirements_mode", "standard") or "standard"
+        ),
+        requirements_behavior="standard",
     )
 
 

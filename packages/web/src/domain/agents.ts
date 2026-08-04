@@ -1,5 +1,5 @@
 import { stageBusyLabel, stageRouteForAction } from './stages'
-import type { HomeAgentItem, WorkerSnapshot } from './types'
+import type { HomeAgentItem, PromptSnapshot, WorkerSnapshot } from './types'
 
 const LIVE_HEALTH = new Set(['alive', 'observe_error', 'provider_auth_error'])
 const RUNNING = new Set(['running', 'busy', 'submitted', 'submitting'])
@@ -31,6 +31,38 @@ const VENDOR_LABELS: Record<string, string> = {
   mimo: 'MiMo Code',
   agy: 'AGY',
   deveco: 'DevEco Code',
+}
+
+function optionalBoolean(value: unknown): boolean | null {
+  if (value === undefined || value === null || value === '') return null
+  if (typeof value === 'boolean') return value
+  const normalized = String(value).trim().toLowerCase()
+  if (normalized === 'true' || normalized === '1') return true
+  if (normalized === 'false' || normalized === '0') return false
+  return null
+}
+
+export function workerOwnedPromptIsReady(prompt: PromptSnapshot, workers: WorkerSnapshot[]): boolean {
+  if (!prompt.pending) return true
+  const payload = prompt.payload
+  const explicitlyReady = optionalBoolean(payload.ready_for_human ?? payload.readyForHuman)
+  if (explicitlyReady === null) return true
+  if (!explicitlyReady) return false
+  const ownerSession = String(payload.owner_session_name ?? payload.ownerSessionName ?? '').trim()
+  if (!ownerSession) return true
+  const owner = workers.find((worker) => worker.sessionName.trim() === ownerSession)
+  if (!owner) return false
+  const ownerRevision = Number(payload.owner_state_revision ?? payload.ownerStateRevision ?? 0)
+  if (Number.isSafeInteger(ownerRevision) && ownerRevision > 0 && Number(owner.stateRevision ?? 0) < ownerRevision) {
+    return false
+  }
+  if (owner.agentState.trim().toUpperCase() !== 'READY') return false
+  const ownerTurnId = String(payload.owner_turn_id ?? payload.ownerTurnId ?? '').trim()
+  const workerTurnId = String(owner.currentTurnId ?? '').trim()
+  if (ownerTurnId && workerTurnId && ownerTurnId !== workerTurnId) return false
+  if (ACTIVE_TURN.has(normalized(owner.turnState))) return false
+  if (ACTIVE_TURN.has(normalized(owner.currentTaskRuntimeStatus))) return false
+  return true
 }
 const EFFORT_LABELS: Record<string, string> = {
   high: 'High',
@@ -171,10 +203,35 @@ export function buildAgentConfigLabel(worker: WorkerSnapshot): string {
     ? `Ponytail ${PONYTAIL_MODE_LABELS[ponytailMode] || titleCase(ponytailMode)}`
     : ''
   const requirementsMode = normalized(worker.requirementsMode).replaceAll('_', '-')
-  const requirements = requirementsMode && requirementsMode !== 'standard'
+  const requirementsBehavior = normalized(worker.requirementsBehavior)
+  const requirementsLabel = requirementsMode && requirementsMode !== 'standard'
     ? REQUIREMENTS_MODE_LABELS[requirementsMode] || `Requirements ${titleCase(requirementsMode)}`
     : ''
+  const requirements = requirementsLabel && requirementsBehavior === 'standard'
+    ? `${requirementsLabel} · 已完成`
+    : requirementsLabel
   return [vendor, modelAndEffort, ponytail, requirements].filter(Boolean).join(' | ')
+}
+
+export function buildGraphifyUsageLabel(worker: WorkerSnapshot): string {
+  const delivery = normalized(worker.graphifyEvidenceDelivery)
+  const requirement = normalized(worker.graphifyQueryRequirement)
+  const status = normalized(worker.graphifyQueryStatus)
+  const command = String(worker.graphifyQueryCommand || '').trim()
+  const freshness = String(worker.graphifyFreshness || '').trim()
+  if (!delivery && !requirement && !status) return ''
+  if (delivery !== 'confirmed') return '图谱证据：投递确认中'
+  if (status === 'degraded') return '图谱证据：Auto 降级 · 未执行必需查询'
+  if (status === 'manual_override') return '图谱证据：已投递 · 人工确认按源码核验结果继续'
+  if (status === 'satisfied') {
+    return `图谱证据：已投递 · ${command || '查询'} 已完成${freshness ? `/${freshness}` : ''}`
+  }
+  if (requirement === 'required') {
+    const suffix = status === 'query_failed' ? '执行失败' : '待执行'
+    return `图谱证据：已投递 · 必须查询 ${command || 'Graphify'} · ${suffix}`
+  }
+  if (requirement === 'optional' || status === 'optional') return '图谱证据：已投递 · 查询可选'
+  return ''
 }
 
 function effectiveSource(
@@ -289,6 +346,7 @@ export function buildHomeAgents(
       agentState: resolveAgentState(worker),
       turnState: String(worker.turnState || worker.currentTaskRuntimeStatus || '').trim(),
       agentConfigLabel: buildAgentConfigLabel(worker),
+      graphifyUsageLabel: buildGraphifyUsageLabel(worker),
       attachCommand: `tmux attach -t ${worker.sessionName}`,
       workDir: worker.workDir,
     }))

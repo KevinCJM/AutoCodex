@@ -26,6 +26,8 @@ from tmux_core.runtime.graphify import (
     GraphifyTurnContext,
     GraphifyTurnProfile,
     GraphifyUnavailable,
+    GraphifyUsageAssessment,
+    GraphifyUsagePolicy,
     graphify_required_recovery_decision,
     publish_graphify_pending_status,
     read_graphify_project_status,
@@ -36,6 +38,7 @@ from tmux_core.runtime.ponytail import BEGIN_MARKER as PONYTAIL_BEGIN_MARKER
 from tmux_core.runtime.tmux_runtime import (
     AgentRunConfig,
     AgentRuntimeState,
+    CommandResult,
     TmuxBatchWorker,
     WorkerStatus,
 )
@@ -423,6 +426,13 @@ def test_new_session_generation_clears_old_graphify_evidence_identity(
                 "graphify_evidence_id": "old-evidence",
                 "graphify_fingerprint": "f" * 64,
                 "graphify_freshness": "fresh",
+                "current_graphify_usage_turn_id": "turn-1",
+                "graphify_usage_policy": "query_required",
+                "graphify_evidence_delivery": "confirmed",
+                "graphify_query_requirement": "required",
+                "graphify_query_status": "missing",
+                "graphify_query_command": "affected",
+                "graphify_usage_receipt": "usage.json",
                 "graphify_policy": {
                     "session_generation": "old-generation",
                     "guide_version": GRAPHIFY_GUIDE_VERSION,
@@ -454,6 +464,13 @@ def test_new_session_generation_clears_old_graphify_evidence_identity(
     assert persisted["graphify_evidence_id"] == ""
     assert persisted["graphify_fingerprint"] == ""
     assert persisted["graphify_freshness"] == ""
+    assert persisted["current_graphify_usage_turn_id"] == ""
+    assert persisted["graphify_usage_policy"] == ""
+    assert persisted["graphify_evidence_delivery"] == ""
+    assert persisted["graphify_query_requirement"] == "not_applicable"
+    assert persisted["graphify_query_status"] == ""
+    assert persisted["graphify_query_command"] == ""
+    assert persisted["graphify_usage_receipt"] == ""
     assert persisted["graphify_policy"]["orientation_delivered"] is False
     assert persisted["graphify_policy"]["session_generation"] != old_generation
 
@@ -579,6 +596,13 @@ def test_graphify_identity_and_orientation_survive_intermediate_state_writes(
                 "graphify_evidence_id": "evidence-1",
                 "graphify_fingerprint": "f" * 64,
                 "graphify_freshness": "fresh",
+                "current_graphify_usage_turn_id": "turn-1",
+                "graphify_usage_policy": "query_required",
+                "graphify_evidence_delivery": "confirmed",
+                "graphify_query_requirement": "required",
+                "graphify_query_status": "missing",
+                "graphify_query_command": "affected",
+                "graphify_usage_receipt": "usage.json",
                 "graphify_generation_refreshed": True,
                 "graphify_policy": {
                     "session_generation": "generation-1",
@@ -611,6 +635,13 @@ def test_graphify_identity_and_orientation_survive_intermediate_state_writes(
     assert persisted["graphify_evidence_id"] == "evidence-1"
     assert persisted["graphify_fingerprint"] == "f" * 64
     assert persisted["graphify_freshness"] == "fresh"
+    assert persisted["current_graphify_usage_turn_id"] == "turn-1"
+    assert persisted["graphify_usage_policy"] == "query_required"
+    assert persisted["graphify_evidence_delivery"] == "confirmed"
+    assert persisted["graphify_query_requirement"] == "required"
+    assert persisted["graphify_query_status"] == "missing"
+    assert persisted["graphify_query_command"] == "affected"
+    assert persisted["graphify_usage_receipt"] == "usage.json"
     assert persisted["graphify_generation_refreshed"] is True
     assert persisted["graphify_policy"]["orientation_delivered"] is True
     assert worker.graphify_session_generation == "generation-1"
@@ -626,6 +657,118 @@ def test_run_turn_resolves_graphify_once_before_internal_retry_loop() -> None:
     assert worker.run_turn(label="task", prompt="Do the task") == "result"
     worker._resolve_graphify_profile_for_turn.assert_called_once_with("Do the task", None)  # type: ignore[attr-defined]  # noqa: SLF001
     assert worker._run_turn_impl.call_args.kwargs["graphify_profile"] is profile  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+def _usage_assessment(status: str) -> GraphifyUsageAssessment:
+    return GraphifyUsageAssessment(
+        evidence_id="evidence-1",
+        turn_id="turn-1",
+        policy="query_required",
+        delivery="confirmed",
+        query_status=status,
+    )
+
+
+def _usage_profile(mode: str) -> GraphifyTurnProfile:
+    policy = GraphifyUsagePolicy(
+        evidence_required=True,
+        query_requirement="required",
+        requirement_reason="review changed file",
+        recommended_command='"$TMUX_GRAPHIFY_CMD" affected src/alpha.py',
+        evidence_id="evidence-1",
+        graph_fingerprint="f" * 64,
+        freshness="fresh",
+    )
+    evidence = GraphifyEvidence(
+        evidence_id="evidence-1",
+        graph_fingerprint="f" * 64,
+        freshness="fresh",
+        block_text="managed evidence",
+        compact_block_text="managed reminder",
+        usage_policy=policy,
+    )
+    return GraphifyTurnProfile(mode=mode, evidence=evidence, usage_policy=policy)
+
+
+def _command_result(label: str = "task") -> CommandResult:
+    return CommandResult(
+        label=label,
+        command="prompt",
+        exit_code=0,
+        raw_output="ok",
+        clean_output="ok",
+        started_at="2026-08-04T00:00:00+00:00",
+        finished_at="2026-08-04T00:00:01+00:00",
+    )
+
+
+def test_auto_usage_gate_repairs_once_then_degrades_without_overwriting_result() -> None:
+    worker = object.__new__(TmuxBatchWorker)
+    original = _command_result()
+    repair = _command_result("repair")
+    worker.results = [original]
+    worker._graphify_usage_repair_active = False  # noqa: SLF001
+    worker._assess_graphify_usage = mock.Mock(  # type: ignore[method-assign]  # noqa: SLF001
+        side_effect=[_usage_assessment("missing"), _usage_assessment("missing"), _usage_assessment("degraded")]
+    )
+    worker._run_turn_impl = mock.Mock(return_value=repair)  # type: ignore[method-assign]  # noqa: SLF001
+    worker._restore_business_turn_state_after_graphify_gate = mock.Mock()  # type: ignore[method-assign]  # noqa: SLF001
+    worker._log_event = mock.Mock()  # type: ignore[method-assign]
+    worker.read_state = mock.Mock(return_value={})  # type: ignore[method-assign]
+
+    returned = worker._enforce_graphify_usage_after_turn(  # noqa: SLF001
+        result=original,
+        label="task",
+        profile=_usage_profile("auto"),
+        timeout_sec=300,
+    )
+
+    assert returned is original
+    assert worker._run_turn_impl.call_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
+    assert worker._run_turn_impl.call_args.kwargs["label"] == "task_graphify_usage_repair"  # type: ignore[attr-defined]  # noqa: SLF001
+    assert worker.results == [original]
+    assert worker._assess_graphify_usage.call_args_list[-1] == mock.call(degraded=True)  # type: ignore[attr-defined]  # noqa: SLF001
+
+
+def test_required_usage_gate_accepts_only_explicit_manual_override_after_one_repair() -> None:
+    worker = object.__new__(TmuxBatchWorker)
+    original = _command_result()
+    repair = _command_result("repair")
+    worker.results = [original]
+    worker.session_name = "reviewer-session"
+    worker.state_path = Path("/tmp/reviewer.state.json")
+    worker.graphify_usage_manual_override = False
+    worker._graphify_usage_repair_active = False  # noqa: SLF001
+    worker._assess_graphify_usage = mock.Mock(  # type: ignore[method-assign]  # noqa: SLF001
+        side_effect=[
+            _usage_assessment("missing"),
+            _usage_assessment("missing"),
+            _usage_assessment("manual_override"),
+        ]
+    )
+    worker._run_turn_impl = mock.Mock(return_value=repair)  # type: ignore[method-assign]  # noqa: SLF001
+    worker._restore_business_turn_state_after_graphify_gate = mock.Mock()  # type: ignore[method-assign]  # noqa: SLF001
+    worker.read_state = mock.Mock(return_value={})  # type: ignore[method-assign]
+
+    def override(_error, **_kwargs):
+        worker.graphify_usage_manual_override = True
+
+    worker._request_runtime_intervention = mock.Mock(side_effect=override)  # type: ignore[method-assign]  # noqa: SLF001
+
+    returned = worker._enforce_graphify_usage_after_turn(  # noqa: SLF001
+        result=original,
+        label="task",
+        profile=_usage_profile("required"),
+        timeout_sec=300,
+    )
+
+    assert returned is original
+    worker._request_runtime_intervention.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+    assert (
+        worker._request_runtime_intervention.call_args.kwargs["preserve_agent_state"]  # type: ignore[attr-defined]  # noqa: SLF001
+        == AgentRuntimeState.READY
+    )
+    assert worker._assess_graphify_usage.call_args_list[-1] == mock.call(manual_override=True)  # type: ignore[attr-defined]  # noqa: SLF001
 
 
 def test_off_profile_is_hard_noop_without_cache_or_tool_probe() -> None:

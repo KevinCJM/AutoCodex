@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from T09_terminal_ops import message, prompt_select_option, terminal_ui_is_interactive
 from tmux_core.runtime.tmux_runtime import (
+    GRAPHIFY_USAGE_BLOCKER,
     AgentInterventionRequired,
     AgentRuntimeInterventionRequired,
     AgentStartupInterventionRequired,
@@ -16,6 +17,8 @@ from tmux_core.runtime.tmux_runtime import (
 AGENT_INTERVENTION_RECHECK = "recheck_after_manual_intervention"
 AGENT_INTERVENTION_RECREATE = "recreate_after_manual_intervention"
 AGENT_INTERVENTION_WORKER_DEAD = "worker_dead_after_manual_intervention"
+GRAPHIFY_USAGE_OVERRIDE = "graphify_usage_manual_override"
+GRAPHIFY_USAGE_TERMINATE = "graphify_usage_terminate"
 
 
 class AgentInterventionActionSelected(RuntimeError):
@@ -244,6 +247,14 @@ def wait_for_worker_runtime_intervention(
     stage_label: str,
     role_label: str,
 ) -> None:
+    if error.blocker_kind == GRAPHIFY_USAGE_BLOCKER:
+        _wait_for_graphify_usage_intervention(
+            worker,
+            error=error,
+            stage_label=stage_label,
+            role_label=role_label,
+        )
+        return
     current_reason = str(error)
     while True:
         decision = request_worker_manual_intervention(
@@ -266,6 +277,67 @@ def wait_for_worker_runtime_intervention(
         current_reason = (
             "人工处理后智能体的交互页面仍然可见；"
             "请继续在原 tmux 会话完成回答、授权或拒绝。"
+        )
+
+
+def _wait_for_graphify_usage_intervention(
+    worker: object,
+    *,
+    error: AgentRuntimeInterventionRequired,
+    stage_label: str,
+    role_label: str,
+) -> None:
+    """Offer one Required-mode Graphify decision without declaring the agent dead."""
+
+    stage_text = str(stage_label or "智能体运行").strip()
+    role_text = str(role_label or _session_name(worker) or "智能体").strip()
+    current_reason = str(error).strip()
+    while True:
+        summary = render_worker_intervention_summary(
+            stage_label=stage_text,
+            role_label=role_text,
+            worker=worker,
+            reason_text=current_reason,
+        )
+        message(summary)
+        if not terminal_ui_is_interactive():
+            raise RuntimeError(f"Required Graphify 查询需要人工介入，但当前环境不可交互:\n{summary}")
+        decision = prompt_select_option(
+            title=f"HITL: {role_text} 缺少 Graphify 查询回执",
+            options=(
+                (AGENT_INTERVENTION_RECHECK, "进入 tmux 执行查询后复检"),
+                (GRAPHIFY_USAGE_OVERRIDE, "按源码核验结果继续并记录人工 override"),
+                (GRAPHIFY_USAGE_TERMINATE, "终止本阶段"),
+            ),
+            default_value=AGENT_INTERVENTION_RECHECK,
+            prompt_text="请选择 Graphify Required 恢复方式",
+            is_hitl=True,
+            extra_payload={
+                "recovery_kind": "graphify_usage_intervention",
+                "stage_label": stage_text,
+                "role_label": role_text,
+                "session_name": _session_name(worker),
+                "worker_state": _worker_state(worker),
+                "attach_command": _attach_command(worker),
+                "reason_text": current_reason,
+            },
+        )
+        if decision == GRAPHIFY_USAGE_TERMINATE:
+            raise RuntimeError(f"人类终止 Required Graphify 查询介入: {current_reason}")
+        if decision == GRAPHIFY_USAGE_OVERRIDE:
+            override = getattr(worker, "override_graphify_usage_requirement", None)
+            if not callable(override):
+                raise RuntimeError("当前 worker 不支持 Graphify usage override")
+            override()
+            return
+        if decision != AGENT_INTERVENTION_RECHECK:
+            continue
+        resolved = getattr(worker, "runtime_intervention_is_resolved", None)
+        if callable(resolved) and bool(resolved(error.blocker_kind)):
+            return
+        current_reason = (
+            "当前 Turn 仍没有匹配 runner、session、turn、evidence 和 graph fingerprint 的查询回执。"
+            "请在原 tmux 会话执行界面给出的只读命令后再次复检。"
         )
 
 

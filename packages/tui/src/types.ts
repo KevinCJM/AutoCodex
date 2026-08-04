@@ -23,6 +23,7 @@ export type WorkerSnapshot = {
   dispatchState?: string
   dispatchReason?: string
   turnState?: string
+  currentTurnId?: string
   tmuxControlStatus?: string
   tmuxControlError?: string
   tmuxUnavailableSince?: string
@@ -37,9 +38,17 @@ export type WorkerSnapshot = {
   ponytailBundleVersion?: string
   ponytailDelivery?: string
   requirementsMode?: string
+  requirementsBehavior?: string
   grillBundleCommit?: string
   grillDelivery?: string
   grillQuestionSeq?: number
+  graphifyFreshness?: string
+  graphifyUsagePolicy?: string
+  graphifyEvidenceDelivery?: string
+  graphifyQueryRequirement?: string
+  graphifyQueryStatus?: string
+  graphifyQueryCommand?: string
+  graphifyUsageReceipt?: string
   retryCount: number
   note: string
   transcriptPath: string
@@ -160,6 +169,7 @@ export type HomeAgentItem = {
   healthStatus: string
   agentState: string
   agentConfigLabel: string
+  graphifyUsageLabel?: string
   attachCommand: string
   workDir: string
 }

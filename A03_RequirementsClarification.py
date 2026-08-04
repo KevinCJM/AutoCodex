@@ -11,7 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import uuid
 from typing import Callable, Sequence
@@ -52,6 +52,7 @@ from T02_tmux_agents import (
 from T05_hitl_runtime import (
     GrillSessionError,
     HitlPromptContext,
+    load_grill_session_state,
     read_grill_session_header,
     run_hitl_agent_loop,
 )
@@ -864,6 +865,30 @@ def run_requirements_clarification(
                         requirement_name=requirement_name,
                         workflow_action="stage.a03.start",
                     )
+                current_grill_header = read_grill_session_header(grill_session_path)
+                if (
+                    current_requirements_mode != RequirementsMode.STANDARD.value
+                    and current_grill_header is not None
+                    and current_grill_header.state not in {"confirmed", "aborted"}
+                ):
+                    current_grill_state = load_grill_session_state(
+                        grill_session_path,
+                        requirements_mode=current_requirements_mode,
+                        domain_draft_path=grill_domain_draft_path,
+                    )
+                    transition_behavior = getattr(
+                        worker,
+                        "transition_requirements_behavior",
+                        None,
+                    )
+                    if callable(transition_behavior):
+                        transition_behavior(
+                            "interview",
+                            grill_session_id=current_grill_state.session_id,
+                            expected_session_generation=str(
+                                getattr(worker, "grill_session_generation", "") or ""
+                            ),
+                        )
             except Exception as error:  # noqa: BLE001
                 stop_progress()
                 stop_boot_progress()
@@ -1125,7 +1150,31 @@ def run_requirements_clarification(
                     raise RuntimeError("需求澄清文档为空")
                 handoff = None
                 cleanup_paths: tuple[str, ...] = (str(ask_human_path.resolve()),)
-                if preserve_ba_worker and current_requirements_mode == RequirementsMode.STANDARD.value:
+                requirements_behavior = "standard"
+                if preserve_ba_worker:
+                    if current_requirements_mode != RequirementsMode.STANDARD.value:
+                        confirmed_grill_state = load_grill_session_state(
+                            grill_session_path,
+                            requirements_mode=current_requirements_mode,
+                            domain_draft_path=grill_domain_draft_path,
+                        )
+                        if confirmed_grill_state.state != "confirmed":
+                            raise GrillSessionError(
+                                "Grill 需求澄清尚未最终确认，不能交接到需求评审阶段"
+                            )
+                        transition_behavior = getattr(
+                            worker,
+                            "transition_requirements_behavior",
+                            None,
+                        )
+                        if callable(transition_behavior):
+                            transition_behavior(
+                                requirements_behavior,
+                                grill_session_id=confirmed_grill_state.session_id,
+                                expected_session_generation=str(
+                                    getattr(worker, "grill_session_generation", "") or ""
+                                ),
+                            )
                     keep_worker_alive = True
                     handoff = RequirementsAnalystHandoff(
                         worker=worker,
@@ -1136,6 +1185,8 @@ def run_requirements_clarification(
                         ponytail_mode=worker.config.ponytail_mode,
                         graphify_mode=worker.config.graphify_mode,
                         graphify_config=dict(worker.config.graphify_config),
+                        requirements_mode=current_requirements_mode,
+                        requirements_behavior=requirements_behavior,
                     )
                 else:
                     cleanup_paths = (
@@ -1293,7 +1344,10 @@ def run_requirements_clarification_stage(
     parser = build_parser()
     args = parser.parse_args(argv)
     project_dir, requirement_name = collect_request(args)
-    _, grill_session_path, _ = build_requirements_grill_paths(project_dir, requirement_name)
+    _, grill_session_path, grill_domain_draft_path = build_requirements_grill_paths(
+        project_dir,
+        requirement_name,
+    )
     grill_session_header = read_grill_session_header(grill_session_path)
     active_grill_session = (
         grill_session_header
@@ -1406,6 +1460,61 @@ def run_requirements_clarification_stage(
                     requirement_name,
                     requirements_mode=requirements_mode,
                 )
+                if (
+                    preserve_ba_worker
+                    and requirements_mode != RequirementsMode.STANDARD.value
+                    and grill_session_header is not None
+                    and grill_session_header.state == "confirmed"
+                    and grill_session_header.active_worker_state_path
+                ):
+                    restored_worker = restore_live_requirements_grill_worker(
+                        project_dir=project_dir,
+                        runtime_root=Path(project_dir).expanduser().resolve()
+                        / REQUIREMENTS_RUNTIME_ROOT_NAME,
+                        state_path=grill_session_header.active_worker_state_path,
+                        requirements_mode=requirements_mode,
+                    )
+                    confirmed_grill_state = load_grill_session_state(
+                        grill_session_path,
+                        requirements_mode=requirements_mode,
+                        domain_draft_path=grill_domain_draft_path,
+                    )
+                    expected_generation = str(
+                        confirmed_grill_state.active_worker_generation or ""
+                    ).strip()
+                    actual_generation = str(
+                        getattr(restored_worker, "grill_session_generation", "") or ""
+                    ).strip()
+                    if (
+                        restored_worker is not None
+                        and (not expected_generation or expected_generation == actual_generation)
+                    ):
+                        transition_behavior = getattr(
+                            restored_worker,
+                            "transition_requirements_behavior",
+                            None,
+                        )
+                        if callable(transition_behavior):
+                            transition_behavior(
+                                "standard",
+                                grill_session_id=confirmed_grill_state.session_id,
+                                expected_session_generation=actual_generation,
+                            )
+                        result = replace(
+                            result,
+                            ba_handoff=RequirementsAnalystHandoff(
+                                worker=restored_worker,
+                                vendor=restored_worker.config.vendor.value,
+                                model=restored_worker.config.model,
+                                reasoning_effort=restored_worker.config.reasoning_effort,
+                                proxy_url=restored_worker.config.proxy_url,
+                                ponytail_mode=restored_worker.config.ponytail_mode,
+                                graphify_mode=restored_worker.config.graphify_mode,
+                                graphify_config=dict(restored_worker.config.graphify_config),
+                                requirements_mode=requirements_mode,
+                                requirements_behavior="standard",
+                            ),
+                        )
                 append_stage_audit_record(
                     audit_context,
                     event_type="clarification_updated",

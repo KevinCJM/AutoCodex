@@ -360,7 +360,7 @@ scripts/tmux-graphify prune
 
 构图固定使用 `--code-only`、`--no-cluster` 和受控源码快照：不跟随符号链接，排除凭据类文件、运行时目录、构建目录和 vendor 目录；文件大小、文件数和总输入上限超出时明确失败，不静默截断。Graphify 子进程固定使用 `GRAPHIFY_QUERY_LOG_DISABLE=1`，并移除模型厂商凭据。不可变 generation 存放在用户缓存 `$XDG_CACHE_HOME/tmux_coding_team/graphify/`（未设置时为 `~/.cache/...`）；失败的 staging 永远不会替换上一份有效图。TUI/Web 不暴露 raw graph、缓存路径或可执行文件路径。
 
-Codex、Claude、Gemini、OpenCode、MiMo、AGY、DevEco 都通过普通提示词链获得同一份有边界的 Graphify 证据，并获得同一套只读命令环境；无需安装 Graphify Skill、MCP、Hook 或插件。证据块会明确说明如何通过 `$TMUX_GRAPHIFY_CMD` 按需执行 `query`、`affected`、`path`、`explain` 和 `god-nodes`，但不会要求每轮查询；查询结果仍须回到 `AGENTS.md`（存在时）、源码、测试和配置核实。系统默认只注入受限的 `EXTRACTED` 关系，最多附带少量明确标注的 `INFERRED` 候选；重试复用同一份证据，不重复构图或重发业务任务。
+Codex、Claude、Gemini、OpenCode、MiMo、AGY、DevEco 都通过普通提示词链获得同一份有边界的 Graphify 证据，并获得同一套只读命令环境；无需安装 Graphify Skill、MCP、Hook 或插件。只要本轮存在证据，提示词就会明确要求智能体先阅读。查询采用条件强制：`EXTRACTED` 证据充分时可不查；路由首次发现、代码事实或关系边缺失、实现种子未覆盖、真实改动评审等场景会给出一条无占位符的 `query`、`affected`、`path`、`explain` 或 `god-nodes --top 10` 必查命令。只读包装器用 runner、session、turn、evidence、graph fingerprint 和调用摘要核验真实执行，不保存查询参数或结果。Auto 模式漏查时提醒一次后记录降级并继续；Required 模式保留智能体现场，要求人工复检、明确按源码核验结果 override，或终止阶段。Graphify 始终只作导航，结论仍须回到 `AGENTS.md`（存在时）、源码、测试和配置核实。
 
 证据会结合当前阶段、角色、任务、由阶段层按 AI Hermes 合同解析的路由路径、明确符号和 A07 实际改动，生成最多三条可直接执行的推荐查询。每个 tmux 会话首次确认提交的 Graphify turn 会收到完整使用指南，后续只保留自包含提醒和本轮建议；未确认或结果不确定的提交不会锁存指南。A07 使用任务开始前后的受控源码 manifest 记录真实改动，A08 使用累计账本，并在每次开发修复后刷新图谱，避免把项目启动前已有的 dirty 文件误算为本需求修改。对于 manifest 已确认删除的源码路径，证据和可选命令 `affected <路径> --previous` 会使用上一份不可变 generation，并将结果明确标记为 `OLD_GENERATION/AMBIGUOUS`，不会冒充当前代码事实。
 

@@ -53,6 +53,7 @@ from tmux_core.runtime.hitl import (
 )
 from tmux_core.runtime.graphify import GraphifyQueryIntent
 from tmux_core.runtime.tmux_runtime import (
+    AgentRunConfig,
     CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
     TmuxBatchWorker,
@@ -227,6 +228,50 @@ class _SkipToDetailedDesign(RuntimeError):
         self.handoff = handoff
 
 
+class RequirementsClarificationReturnRequested(PromptBackRequested):
+    def __init__(
+        self,
+        handoff: RequirementsAnalystHandoff | None,
+        *,
+        reason: str = "requirements_review_back",
+    ) -> None:
+        super().__init__()
+        self.handoff = handoff
+        self.reason = str(reason or "requirements_review_back").strip()
+
+
+def _inherit_replacement_requirements_config(
+        config: object,
+        previous_handoff: RequirementsAnalystHandoff,
+) -> object:
+    """Keep the A03 mode as session origin while A04 behavior stays standard."""
+
+    configured_mode = str(previous_handoff.requirements_mode or "standard").strip()
+    if (
+        isinstance(config, AgentRunConfig)
+        and configured_mode
+        and configured_mode != str(config.requirements_mode or "standard").strip()
+    ):
+        return replace(config, requirements_mode=configured_mode)
+    return config
+
+
+def _activate_replacement_standard_behavior(
+        worker: object,
+        previous_handoff: RequirementsAnalystHandoff,
+) -> None:
+    if str(previous_handoff.requirements_mode or "standard").strip() == "standard":
+        return
+    transition_behavior = getattr(worker, "transition_requirements_behavior", None)
+    if callable(transition_behavior):
+        transition_behavior(
+            "standard",
+            expected_session_generation=str(
+                getattr(worker, "grill_session_generation", "") or ""
+            ),
+        )
+
+
 def _requirements_grill_paths(project_dir: str | Path, requirement_name: str) -> tuple[Path, Path]:
     project_root = Path(project_dir).expanduser().resolve()
     grill_root = (
@@ -243,6 +288,7 @@ def _reopen_confirmed_grill_session_for_review_ambiguity(
     project_dir: str | Path,
     requirement_name: str,
     question_path: str | Path,
+    worker: object | None = None,
 ) -> bool:
     """Return an A04 ambiguity to the authoritative A03 Grill session.
 
@@ -282,14 +328,20 @@ def _reopen_confirmed_grill_session_for_review_ambiguity(
     state.force_finalize = False
     state.published_paths = []
     state.publish_intent = {}
-    # A03 deliberately closes its Grill worker after confirmation.  Reopening
-    # from A04 is a new launch generation and must receive the full rule block,
-    # never try to reuse the completed interview's process or turn cursor.
-    state.active_worker_state_path = ""
-    state.active_runtime_dir = ""
-    state.active_session_name = ""
-    state.active_pane_id = ""
-    state.active_worker_generation = ""
+    if worker is not None:
+        worker_state_path = str(getattr(worker, "state_path", "") or "").strip()
+        worker_runtime_dir = str(getattr(worker, "runtime_dir", "") or "").strip()
+        state.active_worker_state_path = (
+            str(Path(worker_state_path).expanduser().resolve()) if worker_state_path else ""
+        )
+        state.active_runtime_dir = (
+            str(Path(worker_runtime_dir).expanduser().resolve()) if worker_runtime_dir else ""
+        )
+        state.active_session_name = str(getattr(worker, "session_name", "") or "").strip()
+        state.active_pane_id = str(getattr(worker, "pane_id", "") or "").strip()
+        state.active_worker_generation = str(
+            getattr(worker, "grill_session_generation", "") or ""
+        ).strip()
     state.turn_id = ""
     state.turn_label = ""
     state.turn_status_path = ""
@@ -315,6 +367,16 @@ def _reopen_confirmed_grill_session_for_review_ambiguity(
         apply_grill_context_snapshot(state, project_dir)
         state.selected_context_target = ""
     save_grill_session_state(session_path, state)
+    if worker is not None:
+        transition_behavior = getattr(worker, "transition_requirements_behavior", None)
+        if callable(transition_behavior):
+            transition_behavior(
+                "interview",
+                grill_session_id=state.session_id,
+                expected_session_generation=str(
+                    getattr(worker, "grill_session_generation", "") or ""
+                ),
+            )
     message("A04 检测到新的业务歧义，已恢复原 Grill 会话并返回 A03 逐问澄清。")
     return True
 
@@ -1242,18 +1304,27 @@ def run_ba_turn_with_recreation(
                     role_label=ba_display_name,
                     progress=progress,
                 )
+                config = _inherit_replacement_requirements_config(
+                    config,
+                    current_handoff,
+                )
+                replacement_worker = TmuxBatchWorker(
+                    worker_id="requirements-review-analyst",
+                    work_dir=Path(project_dir).expanduser().resolve(),
+                    config=config,
+                    runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+                    runtime_metadata={
+                        "project_dir": str(Path(project_dir).expanduser().resolve()),
+                        "requirement_name": effective_requirement_name,
+                        "workflow_action": "stage.a04.start",
+                    },
+                )
+                _activate_replacement_standard_behavior(
+                    replacement_worker,
+                    current_handoff,
+                )
                 current_handoff = RequirementsAnalystHandoff(
-                    worker=TmuxBatchWorker(
-                        worker_id="requirements-review-analyst",
-                        work_dir=Path(project_dir).expanduser().resolve(),
-                        config=config,
-                        runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
-                        runtime_metadata={
-                            "project_dir": str(Path(project_dir).expanduser().resolve()),
-                            "requirement_name": effective_requirement_name,
-                            "workflow_action": "stage.a04.start",
-                        },
-                    ),
+                    worker=replacement_worker,
                     vendor=selection.vendor,
                     model=selection.model,
                     reasoning_effort=selection.reasoning_effort,
@@ -1261,6 +1332,8 @@ def run_ba_turn_with_recreation(
                     ponytail_mode=selection.ponytail_mode,
                     graphify_mode=selection.graphify_mode,
                     graphify_config=selection.graphify_config,
+                    requirements_mode=current_handoff.requirements_mode,
+                    requirements_behavior="standard",
                 )
                 message(render_tmux_start_summary(str(current_handoff.worker.session_name).strip() or ba_display_name, current_handoff.worker))
                 continue
@@ -1287,18 +1360,27 @@ def run_ba_turn_with_recreation(
                     role_label=ba_display_name,
                     progress=progress,
                 )
+                config = _inherit_replacement_requirements_config(
+                    config,
+                    current_handoff,
+                )
+                replacement_worker = TmuxBatchWorker(
+                    worker_id="requirements-review-analyst",
+                    work_dir=Path(project_dir).expanduser().resolve(),
+                    config=config,
+                    runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
+                    runtime_metadata={
+                        "project_dir": str(Path(project_dir).expanduser().resolve()),
+                        "requirement_name": effective_requirement_name,
+                        "workflow_action": "stage.a04.start",
+                    },
+                )
+                _activate_replacement_standard_behavior(
+                    replacement_worker,
+                    current_handoff,
+                )
                 current_handoff = RequirementsAnalystHandoff(
-                    worker=TmuxBatchWorker(
-                        worker_id="requirements-review-analyst",
-                        work_dir=Path(project_dir).expanduser().resolve(),
-                        config=config,
-                        runtime_root=Path(project_dir).expanduser().resolve() / REQUIREMENTS_REVIEW_RUNTIME_ROOT_NAME,
-                        runtime_metadata={
-                            "project_dir": str(Path(project_dir).expanduser().resolve()),
-                            "requirement_name": effective_requirement_name,
-                            "workflow_action": "stage.a04.start",
-                        },
-                    ),
+                    worker=replacement_worker,
                     vendor=selection.vendor,
                     model=selection.model,
                     reasoning_effort=selection.reasoning_effort,
@@ -1306,6 +1388,8 @@ def run_ba_turn_with_recreation(
                     ponytail_mode=selection.ponytail_mode,
                     graphify_mode=selection.graphify_mode,
                     graphify_config=selection.graphify_config,
+                    requirements_mode=current_handoff.requirements_mode,
+                    requirements_behavior="standard",
                 )
                 message(render_tmux_start_summary(str(current_handoff.worker.session_name).strip() or ba_display_name, current_handoff.worker))
                 continue
@@ -1575,6 +1659,10 @@ def _create_review_ba_handoff(
         ponytail_mode=selection.ponytail_mode,
         graphify_mode=selection.graphify_mode,
         graphify_config=selection.graphify_config,
+        requirements_mode=str(
+            getattr(config, "requirements_mode", "standard") or "standard"
+        ),
+        requirements_behavior="standard",
     )
 
 
@@ -1626,6 +1714,7 @@ def recreate_ba_handoff(
         role_label=ba_display_name,
         progress=progress,
     )
+    config = _inherit_replacement_requirements_config(config, previous_handoff)
     worker = TmuxBatchWorker(
         worker_id="requirements-review-analyst",
         work_dir=Path(project_dir).expanduser().resolve(),
@@ -1637,6 +1726,7 @@ def recreate_ba_handoff(
             "workflow_action": "stage.a04.start",
         },
     )
+    _activate_replacement_standard_behavior(worker, previous_handoff)
     message(render_tmux_start_summary(str(worker.session_name).strip() or ba_display_name, worker))
     return RequirementsAnalystHandoff(
         worker=worker,
@@ -1647,6 +1737,8 @@ def recreate_ba_handoff(
         ponytail_mode=selection.ponytail_mode,
         graphify_mode=selection.graphify_mode,
         graphify_config=selection.graphify_config,
+        requirements_mode=previous_handoff.requirements_mode,
+        requirements_behavior="standard",
     )
 
 
@@ -1940,6 +2032,7 @@ def _run_review_clarification_continuation(
                 project_dir=paths["project_root"],
                 requirement_name=requirement_name,
                 question_path=question_path,
+                worker=current_handoff.worker,
             )
         ):
             raise PromptBackRequested()
@@ -2569,11 +2662,14 @@ def run_requirements_review_stage(
             )
             allow_previous_stage_back = False
         except _SkipToDetailedDesign as skip_to_design:
+            result_ba_handoff = (
+                skip_to_design.handoff if preserve_ba_worker else None
+            )
             cleanup_paths = cleanup_existing_review_artifacts(paths, requirement_name, audit_context) + _shutdown_workers(
                 skip_to_design.handoff,
                 (),
                 cleanup_runtime=True,
-                preserve_ba_worker=False,
+                preserve_ba_worker=preserve_ba_worker,
             )
             return RequirementsReviewStageResult(
                 project_dir=project_dir,
@@ -2582,7 +2678,7 @@ def run_requirements_review_stage(
                 rounds_used=0,
                 passed=False,
                 cleanup_paths=cleanup_paths,
-                ba_handoff=None,
+                ba_handoff=result_ba_handoff,
             )
         review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
             allow_previous_stage_back,
@@ -2766,7 +2862,8 @@ def run_requirements_review_stage(
                 )
                 review_round_policy.reset_after_hitl()
             round_index += 1
-    except PromptBackRequested:
+    except PromptBackRequested as error:
+        return_handoff = active_ba_handoff or ba_handoff
         append_stage_audit_record(
             audit_context,
             event_type="stage_returned_to_clarification",
@@ -2777,12 +2874,19 @@ def run_requirements_review_stage(
             metadata={"reason": "grill_business_ambiguity"},
         )
         _shutdown_workers(
-            active_ba_handoff,
+            return_handoff,
             reviewer_workers,
             cleanup_runtime=True,
-            preserve_ba_worker=False,
+            preserve_ba_worker=return_handoff is not None,
         )
-        raise
+        raise RequirementsClarificationReturnRequested(
+            return_handoff,
+            reason=(
+                "grill_business_ambiguity"
+                if str(getattr(error, "reason", "") or "") != "requirements_review_back"
+                else "requirements_review_back"
+            ),
+        ) from error
     except Exception as error:
         append_stage_audit_record(
             audit_context,

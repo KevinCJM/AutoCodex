@@ -25,7 +25,9 @@ from tmux_core.runtime.graphify import (
     GraphifyTurnContext,
     GraphifyToolResolution,
     GraphifyUnavailable,
+    GraphifyUsagePolicy,
     assess_graphify_freshness,
+    assess_graphify_turn_usage,
     build_graphify_evidence_block,
     capture_graphify_source_manifest,
     cli_main,
@@ -36,6 +38,7 @@ from tmux_core.runtime.graphify import (
     project_cache_dir,
     publish_graphify_pending_status,
     read_graphify_project_status,
+    register_graphify_turn_usage,
     resolve_graphify_tool,
     resolve_graphify_turn_profile,
     run_readonly_query,
@@ -95,6 +98,8 @@ if command in {"extract", "update"}:
     edge_mode = os.environ.get("FAKE_GRAPHIFY_EDGE_MODE", "")
     if edge_mode == "non_object":
         edges = ["broken-edge"]
+    elif edge_mode == "no_edges":
+        edges = []
     elif edge_mode == "missing_target":
         edges = [{"source": nodes[0]["id"]}]
     elif edge_mode == "unknown_target":
@@ -312,13 +317,15 @@ class GraphifyRuntimeTests(unittest.TestCase):
         self.assertEqual(first.status.state, "ready")
         self.assertIn("Graphify Code Graph Evidence", first.evidence.block_text)
         self.assertIn("alpha", first.evidence.block_text)
-        self.assertIn("FURTHER_QUERY (optional; read-only)", first.evidence.block_text)
+        self.assertIn("GRAPHIFY_USAGE_POLICY", first.evidence.block_text)
+        self.assertIn("evidence_reading: required", first.evidence.block_text)
+        self.assertIn("query_requirement: optional", first.evidence.block_text)
         self.assertIn('"$TMUX_GRAPHIFY_CMD" query "<question>"', first.evidence.block_text)
         self.assertIn('"$TMUX_GRAPHIFY_CMD" affected "<file-or-symbol>"', first.evidence.block_text)
         self.assertIn('"$TMUX_GRAPHIFY_CMD" path "<source>" "<target>"', first.evidence.block_text)
         self.assertIn('"$TMUX_GRAPHIFY_CMD" explain "<symbol>"', first.evidence.block_text)
         self.assertIn('"$TMUX_GRAPHIFY_CMD" god-nodes', first.evidence.block_text)
-        self.assertIn("do not query on every turn", first.evidence.block_text)
+        self.assertIn("otherwise query only when the evidence is insufficient", first.evidence.block_text)
         self.assertIn("verify them in AGENTS.md (when present), source, tests, and config", first.evidence.block_text)
         self.assertIn("The wrapper is read-only", first.evidence.block_text)
         self.assertNotIn(str(self.cache_home), first.evidence.block_text)
@@ -693,7 +700,220 @@ class GraphifyRuntimeTests(unittest.TestCase):
         compact = build_graphify_evidence_block(profile, "business", include_full_guide=False)
         self.assertIn(GRAPHIFY_FULL_GUIDE_MARKER, full)
         self.assertNotIn(GRAPHIFY_FULL_GUIDE_MARKER, compact)
-        self.assertIn("RECOMMENDED_QUERIES", compact)
+        self.assertIn("REQUIRED_QUERY", compact)
+
+    def test_usage_policy_requires_concrete_queries_only_for_matching_conditions(self) -> None:
+        self._write_sources()
+        routing_profile = resolve_graphify_turn_profile(
+            project_dir=self.project,
+            mode="required",
+            prompt="create routing",
+            runtime_dir=self.project / ".routing_init_runtime" / "usage",
+            turn_context=GraphifyTurnContext(
+                stage_key="A01",
+                phase="routing_create",
+                role="routing-initializer",
+                intent=GraphifyQueryIntent.ROUTING_DISCOVERY,
+            ),
+        )
+        self.assertEqual(routing_profile.usage_policy.query_requirement, "required")
+        self.assertEqual(
+            routing_profile.usage_policy.recommended_command,
+            '"$TMUX_GRAPHIFY_CMD" god-nodes --top 10',
+        )
+        self.assertTrue(publish_graphify_pending_status(
+            self.project,
+            "required",
+            runner_id="routing-runner",
+            stage_key="A01",
+            session_generation="routing-session",
+        ))
+        self.assertTrue(register_graphify_turn_usage(
+            self.project,
+            "required",
+            runner_id="routing-runner",
+            stage_key="A01",
+            session_generation="routing-session",
+            turn_id="routing-turn-1",
+            policy=routing_profile.usage_policy,
+            delivery_confirmed=True,
+        ))
+        with mock.patch.dict(
+            os.environ,
+            {"TMUX_GRAPHIFY_SESSION_GENERATION": "routing-session"},
+            clear=False,
+        ):
+            self.assertTrue(execute_readonly_query(
+                self.project,
+                "god-nodes",
+                ["--top", "10"],
+            ).ok)
+        later_routing_profile = resolve_graphify_turn_profile(
+            project_dir=self.project,
+            mode="required",
+            prompt="continue routing",
+            runtime_dir=self.project / ".routing_init_runtime" / "usage-later",
+            refresh=False,
+            turn_context=GraphifyTurnContext(
+                stage_key="A01",
+                phase="routing_create",
+                role="routing-initializer",
+                intent=GraphifyQueryIntent.ROUTING_DISCOVERY,
+            ),
+            usage_session_generation="routing-session",
+        )
+        self.assertEqual(later_routing_profile.usage_policy.query_requirement, "optional")
+        clarification_profile = resolve_graphify_turn_profile(
+            project_dir=self.project,
+            mode="required",
+            prompt="clarify a missing symbol",
+            runtime_dir=self.project / ".requirement_clarification_runtime" / "usage",
+            refresh=False,
+            turn_context=GraphifyTurnContext(
+                stage_key="A03",
+                phase="requirements_clarification",
+                role="requirements-analyst",
+                intent=GraphifyQueryIntent.CODE_FACT_DISCOVERY,
+                symbols=("missing_symbol",),
+            ),
+        )
+        self.assertEqual(clarification_profile.usage_policy.query_requirement, "required")
+        self.assertIn("explain missing_symbol", clarification_profile.usage_policy.recommended_command)
+        implementation_profile = resolve_graphify_turn_profile(
+            project_dir=self.project,
+            mode="required",
+            prompt="implement alpha",
+            runtime_dir=self.project / ".development_runtime" / "usage",
+            refresh=False,
+            turn_context=GraphifyTurnContext(
+                stage_key="A07",
+                phase="development",
+                role="developer",
+                intent=GraphifyQueryIntent.IMPLEMENTATION,
+                routed_paths=("src/alpha.py",),
+                symbols=("alpha",),
+            ),
+        )
+        self.assertEqual(implementation_profile.usage_policy.query_requirement, "optional")
+        for profile in (routing_profile, clarification_profile, implementation_profile):
+            self.assertIn("evidence_reading: required", profile.evidence.block_text)
+
+    def test_usage_receipt_requires_exact_session_turn_evidence_and_fingerprint(self) -> None:
+        self._write_sources()
+        profile = resolve_graphify_turn_profile(
+            project_dir=self.project,
+            mode="required",
+            prompt="review alpha",
+            runtime_dir=self.project / ".development_runtime" / "receipt",
+            turn_context=GraphifyTurnContext(
+                stage_key="A07",
+                phase="development_review",
+                role="reviewer",
+                intent=GraphifyQueryIntent.CHANGE_REVIEW,
+                changed_files=("src/alpha.py",),
+            ),
+        )
+        policy = profile.usage_policy
+        self.assertTrue(publish_graphify_pending_status(
+            self.project,
+            "required",
+            runner_id="runner-current",
+            stage_key="A07",
+            session_generation="session-current",
+        ))
+        self.assertTrue(register_graphify_turn_usage(
+            self.project,
+            "required",
+            runner_id="runner-current",
+            stage_key="A07",
+            session_generation="session-current",
+            turn_id="turn-current",
+            policy=policy,
+            delivery_confirmed=True,
+        ))
+        with mock.patch.dict(
+            os.environ,
+            {"TMUX_GRAPHIFY_SESSION_GENERATION": "session-current"},
+            clear=False,
+        ):
+            result = execute_readonly_query(self.project, "affected", ["src/alpha.py"])
+        self.assertTrue(result.ok)
+        receipt_path = self.project / ".development_runtime" / "receipt" / "usage.json"
+        current = assess_graphify_turn_usage(
+            self.project,
+            policy,
+            session_generation="session-current",
+            turn_id="turn-current",
+            delivery_confirmed=True,
+            receipt_path=receipt_path,
+        )
+        self.assertEqual(current.query_status, "satisfied")
+        self.assertEqual(json.loads(receipt_path.read_text(encoding="utf-8"))["schema"], "tmux-graphify-usage/1")
+        self.assertTrue(register_graphify_turn_usage(
+            self.project,
+            "required",
+            runner_id="runner-current",
+            stage_key="A07",
+            session_generation="session-current",
+            turn_id="turn-wrong-command",
+            policy=policy,
+            delivery_confirmed=True,
+        ))
+        with mock.patch.dict(
+            os.environ,
+            {"TMUX_GRAPHIFY_SESSION_GENERATION": "session-current"},
+            clear=False,
+        ):
+            self.assertTrue(execute_readonly_query(self.project, "explain", ["alpha"]).ok)
+        wrong_command = assess_graphify_turn_usage(
+            self.project,
+            policy,
+            session_generation="session-current",
+            turn_id="turn-wrong-command",
+            delivery_confirmed=True,
+        )
+        self.assertEqual(wrong_command.query_status, "missing")
+        old_turn = assess_graphify_turn_usage(
+            self.project,
+            policy,
+            session_generation="session-current",
+            turn_id="turn-old",
+            delivery_confirmed=True,
+        )
+        self.assertEqual(old_turn.query_status, "missing")
+        old_graph = assess_graphify_turn_usage(
+            self.project,
+            GraphifyUsagePolicy(
+                evidence_required=True,
+                query_requirement="required",
+                evidence_id=policy.evidence_id,
+                graph_fingerprint="0" * 64,
+                freshness="fresh",
+            ),
+            session_generation="session-current",
+            turn_id="turn-current",
+            delivery_confirmed=True,
+        )
+        self.assertEqual(old_graph.query_status, "missing")
+
+    def test_cross_module_design_without_extracted_edge_requires_query(self) -> None:
+        self._write_sources()
+        with mock.patch.dict(os.environ, {"FAKE_GRAPHIFY_EDGE_MODE": "no_edges"}, clear=False):
+            profile = resolve_graphify_turn_profile(
+                project_dir=self.project,
+                mode="required",
+                prompt="design alpha and beta",
+                runtime_dir=self.project / ".detailed_design_runtime" / "usage",
+                turn_context=GraphifyTurnContext(
+                    stage_key="A05",
+                    phase="detailed_design",
+                    role="requirements-analyst",
+                    intent=GraphifyQueryIntent.ARCHITECTURE_BOUNDARY,
+                    routed_paths=("src/alpha.py", "src/beta.py"),
+                ),
+            )
+        self.assertEqual(profile.usage_policy.query_requirement, "required")
+        self.assertIn("缺少 EXTRACTED", profile.usage_policy.requirement_reason)
 
     def test_deleted_path_uses_previous_generation_as_ambiguous_navigation_only(self) -> None:
         self._write_sources()

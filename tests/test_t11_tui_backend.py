@@ -44,6 +44,7 @@ from T10_tui_protocol import build_request
 from T09_terminal_ops import BridgePromptRequest
 from tmux_core.bridge.backend import _flatten_graphify_worker_fields
 from tmux_core.runtime.tmux_runtime import (
+    GRAPHIFY_USAGE_BLOCKER,
     AgentRuntimeInterventionRequired,
     AgentStartupInterventionRequired,
     clear_runtime_shutdown_request,
@@ -99,6 +100,9 @@ def _write_grill_recovery_session(
     state: str = "awaiting_answer",
     pending_answer: str = "",
     active_worker_state_path: str = "",
+    turn_worker_state_revision: int = 0,
+    active_session_name: str = "分析师-天异星",
+    turn_id: str = "requirements_clarification_3",
     question_hash: str | None = None,
 ) -> tuple[Path, Path]:
     question_path = project_dir / ".requirements_runtime" / "grill-question.md"
@@ -139,6 +143,9 @@ select
                 "pending_question_hash": question_hash or build_prefixed_sha256(question_path),
                 "pending_answer": pending_answer,
                 "active_worker_state_path": active_worker_state_path,
+                "turn_worker_state_revision": turn_worker_state_revision,
+                "active_session_name": active_session_name,
+                "turn_id": turn_id,
                 "updated_at": "2026-07-24T12:00:00+00:00",
             },
             ensure_ascii=False,
@@ -1167,6 +1174,12 @@ class T11TuiBackendTests(unittest.TestCase):
                 "graphify_evidence_id": "evidence-123",
                 "graphify_fingerprint": "a" * 64,
                 "graphify_freshness": "fresh",
+                "graphify_usage_policy": "query_required",
+                "graphify_evidence_delivery": "confirmed",
+                "graphify_query_requirement": "required",
+                "graphify_query_status": "missing",
+                "graphify_query_command": "affected",
+                "graphify_usage_receipt": "usage.json",
                 "graphify_cache_dir": "/Users/example/.cache/private",
             }
         )
@@ -1174,6 +1187,12 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(flattened["graphify_evidence_id"], "evidence-123")
         self.assertEqual(flattened["graphify_fingerprint"], "a" * 64)
         self.assertEqual(flattened["graphify_freshness"], "fresh")
+        self.assertEqual(flattened["graphify_usage_policy"], "query_required")
+        self.assertEqual(flattened["graphify_evidence_delivery"], "confirmed")
+        self.assertEqual(flattened["graphify_query_requirement"], "required")
+        self.assertEqual(flattened["graphify_query_status"], "missing")
+        self.assertEqual(flattened["graphify_query_command"], "affected")
+        self.assertEqual(flattened["graphify_usage_receipt"], "usage.json")
         self.assertNotIn("graphify_config", flattened)
         self.assertNotIn("graphify_cache_dir", flattened)
 
@@ -5286,6 +5305,115 @@ class T11TuiBackendTests(unittest.TestCase):
             self.assertEqual(duplicate, {"accepted": False})
             self.assertEqual(server.build_prompt_snapshot()["prompt_revision"], accepted_revision)
 
+    def test_grill_business_prompt_stays_deferred_while_owner_worker_is_busy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp).resolve()
+            requirement_name = "需求A"
+            worker_state_path = project_dir / ".requirements_runtime" / "worker.state.json"
+            worker_state_path.parent.mkdir(parents=True, exist_ok=True)
+            worker_state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "分析师-忙碌",
+                        "state_revision": 8,
+                        "agent_state": "BUSY",
+                        "turn_state": "succeeded",
+                        "current_task_runtime_status": "done",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            _write_grill_recovery_session(
+                project_dir,
+                requirement_name,
+                active_worker_state_path=str(worker_state_path),
+                turn_worker_state_revision=8,
+                active_session_name="分析师-忙碌",
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                action="stage.a03.start",
+            )
+            server._display_action = "stage.a03.start"  # noqa: SLF001
+
+            prompt_snapshot = server.build_prompt_snapshot()
+            hitl_snapshot = server._build_hitl_snapshot()  # noqa: SLF001
+
+            self.assertFalse(prompt_snapshot["pending"])
+            self.assertTrue(prompt_snapshot["deferred"])
+            self.assertFalse(hitl_snapshot["pending"])
+            self.assertTrue(hitl_snapshot["deferred"])
+
+            worker_state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "分析师-忙碌",
+                        "state_revision": 9,
+                        "agent_state": "READY",
+                        "turn_state": "succeeded",
+                        "current_task_runtime_status": "done",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            ready_snapshot = server.build_prompt_snapshot()
+            self.assertTrue(ready_snapshot["pending"])
+            self.assertTrue(ready_snapshot["payload"]["ready_for_human"])
+            self.assertEqual(ready_snapshot["payload"]["owner_session_name"], "分析师-忙碌")
+            self.assertEqual(
+                ready_snapshot["payload"]["owner_turn_id"],
+                "requirements_clarification_3",
+            )
+            self.assertEqual(ready_snapshot["payload"]["owner_state_revision"], 8)
+
+            worker_state_path.write_text(
+                json.dumps(
+                    {
+                        "session_name": "分析师-忙碌",
+                        "state_revision": 10,
+                        "agent_state": "BUSY",
+                        "turn_state": "running",
+                        "current_task_runtime_status": "running",
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            response = server.resolve_prompt(
+                ready_snapshot["prompt_id"],
+                {
+                    "prompt_id": ready_snapshot["prompt_id"],
+                    "value": "方案 B",
+                    "runner_id": ready_snapshot["owner_runner_id"],
+                    "question_seq": ready_snapshot["question_seq"],
+                    "grill_session_id": ready_snapshot["grill_session_id"],
+                    "grill_question_hash": ready_snapshot["grill_question_hash"],
+                },
+            )
+            self.assertEqual(response, {"accepted": False})
+
+    def test_grill_question_ready_is_not_reported_as_pending_hitl(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp).resolve()
+            requirement_name = "需求A"
+            _write_grill_recovery_session(project_dir, requirement_name, state="question_ready")
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(  # noqa: SLF001
+                project_dir=str(project_dir),
+                requirement_name=requirement_name,
+                action="stage.a03.start",
+            )
+            server._display_action = "stage.a03.start"  # noqa: SLF001
+
+            self.assertFalse(server.build_prompt_snapshot()["pending"])
+            hitl_snapshot = server._build_hitl_snapshot()  # noqa: SLF001
+            self.assertFalse(hitl_snapshot["pending"])
+            self.assertEqual(hitl_snapshot["deferred_reason"], "owner_worker_not_ready")
+
     def test_grill_recovery_does_not_reopen_consumed_or_invalid_question(self):
         cases = (
             {"state": "turn_in_progress"},
@@ -5554,20 +5682,25 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl", "prompt"})
         self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
 
-    def test_prompt_open_schedules_lightweight_snapshot_without_sync_emit(self):
+    def test_prompt_open_emits_current_stage_snapshot_before_awaiting_input(self):
         server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+        server._set_context(action="stage.a03.start")  # noqa: SLF001
+        server._display_action = "stage.a03.start"  # noqa: SLF001
         request = BridgePromptRequest(
             prompt_type="select",
             payload={"title": "HITL: 架构师 需要人工介入", "is_hitl": True},
         )
 
-        with patch.object(server, "_emit_snapshot_update", side_effect=AssertionError("sync snapshot should not run")) as emit_snapshot, patch.object(
+        with patch.object(server, "_emit_snapshot_update") as emit_snapshot, patch.object(
             server,
             "_schedule_snapshot_update",
         ) as schedule_snapshot:
             server._handle_prompt_open("prompt_1", request)  # noqa: SLF001
 
-        emit_snapshot.assert_not_called()
+        emit_snapshot.assert_called_once_with(
+            stage_routes=("requirements",),
+            refresh_worker_health=False,
+        )
         schedule_snapshot.assert_called_once()
         self.assertEqual(schedule_snapshot.call_args.kwargs["sections"], {"app", "hitl", "prompt"})
         self.assertFalse(schedule_snapshot.call_args.kwargs["refresh_worker_health"])
@@ -6162,6 +6295,63 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertIn("运行期权限确认", prompt.payload["prompt_text"])
         self.assertEqual(checked_blockers, ["codex_approval"])
         resume_worker.assert_not_called()
+
+    def test_graphify_required_intervention_exposes_recheck_override_and_terminate(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str((Path(tmpdir) / "runtime-worker.state.json").resolve())
+            error = AgentRuntimeInterventionRequired(
+                blocker_kind=GRAPHIFY_USAGE_BLOCKER,
+                session_name="审核员-图谱",
+                state_path=state_path,
+                message="Required Graphify query receipt missing",
+            )
+            overrides: list[str] = []
+            recovered_worker = SimpleNamespace(
+                override_graphify_usage_requirement=lambda: overrides.append("override"),
+                runtime_intervention_is_resolved=lambda _blocker_kind: False,
+            )
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+
+            with patch.object(
+                server,
+                "_current_stage_workers_without_runtime_io",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_current_stage_workers",
+                return_value=[],
+            ), patch.object(
+                server,
+                "_persist_runner_awaiting_input",
+                return_value=True,
+            ), patch.object(
+                server._prompt_broker,
+                "request",
+                return_value={"value": "graphify_usage_manual_override"},
+            ) as request_prompt, patch(
+                "T11_tui_backend.load_worker_from_state_path",
+                return_value=recovered_worker,
+            ):
+                outcome = server._await_agent_ready_timeout_recovery(  # noqa: SLF001
+                    request_id="",
+                    action="stage.a07.start",
+                    stage_seq=7,
+                    error=error,
+                    respond=False,
+                )
+
+        prompt = request_prompt.call_args.args[0]
+        self.assertEqual(prompt.payload["recovery_kind"], "graphify_usage_intervention")
+        self.assertEqual(
+            [item["value"] for item in prompt.payload["options"]],
+            [
+                "recheck_after_manual_intervention",
+                "graphify_usage_manual_override",
+                "graphify_usage_terminate",
+            ],
+        )
+        self.assertEqual(overrides, ["override"])
+        self.assertEqual(outcome, "recovered")
 
     def test_opencode_question_intervention_prompts_human_to_answer_in_tmux(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -9299,6 +9489,11 @@ class T11TuiBackendTests(unittest.TestCase):
                             "delivery": "runtime_prompt",
                             "question_seq": 4,
                         },
+                        "requirements_policy": {
+                            "configured_mode": "grill-with-docs",
+                            "active_behavior": "standard",
+                            "transition_delivered": True,
+                        },
                     },
                     ensure_ascii=False,
                 ),
@@ -9309,10 +9504,12 @@ class T11TuiBackendTests(unittest.TestCase):
             legacy_snapshot = _read_worker_state_snapshot(state_path)
 
         self.assertEqual(grill_snapshot["requirements_mode"], "grill-with-docs")
+        self.assertEqual(grill_snapshot["requirements_behavior"], "standard")
         self.assertEqual(grill_snapshot["grill_bundle_commit"], "ed37663cc5fbef691ddfecd080dff42f7e7e350d")
         self.assertEqual(grill_snapshot["grill_delivery"], "runtime_prompt")
         self.assertEqual(grill_snapshot["grill_question_seq"], 4)
         self.assertNotIn("requirements_mode", legacy_snapshot)
+        self.assertNotIn("requirements_behavior", legacy_snapshot)
         self.assertNotIn("grill_bundle_commit", legacy_snapshot)
         self.assertNotIn("grill_delivery", legacy_snapshot)
         self.assertNotIn("grill_question_seq", legacy_snapshot)

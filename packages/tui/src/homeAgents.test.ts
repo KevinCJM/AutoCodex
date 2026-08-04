@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { buildAgentConfigLabel, buildHomeAgents, isBusyWorker, isRunningWorker, resolveHomeAgentState } from './homeAgents'
+import { buildAgentConfigLabel, buildGraphifyUsageLabel, buildHomeAgents, isBusyWorker, isRunningWorker, resolveHomeAgentState } from './homeAgents'
 import type { WorkerSnapshot } from './types'
 
 function worker(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
@@ -27,6 +27,28 @@ test('isRunningWorker keeps live health evidence when sessionExists is false', (
   expect(isRunningWorker(worker({ sessionExists: false, healthStatus: 'alive' }))).toBe(true)
   expect(isRunningWorker(worker({ sessionExists: false, healthStatus: 'observe_error' }))).toBe(true)
   expect(isRunningWorker(worker({ sessionExists: false, healthStatus: 'provider_auth_error' }))).toBe(true)
+})
+
+test('Graphify usage labels report only provable delivery and query state', () => {
+  expect(buildGraphifyUsageLabel(worker({
+    graphifyEvidenceDelivery: 'confirmed',
+    graphifyQueryRequirement: 'required',
+    graphifyQueryStatus: 'missing',
+    graphifyQueryCommand: 'affected',
+  }))).toBe('图谱证据：已投递 · 必须查询 affected · 待执行')
+  expect(buildGraphifyUsageLabel(worker({
+    graphifyEvidenceDelivery: 'confirmed',
+    graphifyQueryRequirement: 'required',
+    graphifyQueryStatus: 'satisfied',
+    graphifyQueryCommand: 'affected',
+    graphifyFreshness: 'fresh',
+  }))).toBe('图谱证据：已投递 · affected 已完成/fresh')
+  expect(buildGraphifyUsageLabel(worker({
+    graphifyEvidenceDelivery: 'confirmed',
+    graphifyQueryRequirement: 'required',
+    graphifyQueryStatus: 'degraded',
+  }))).toBe('图谱证据：Auto 降级 · 未执行必需查询')
+  expect(buildGraphifyUsageLabel(worker({ graphifyEvidenceDelivery: 'pending' }))).toBe('图谱证据：投递确认中')
 })
 
 test('isRunningWorker hides stale missing-session alive snapshots without active turn evidence', () => {
@@ -290,6 +312,10 @@ test('buildAgentConfigLabel shows Grill modes but hides Standard and legacy abse
     requirementsMode: 'grill-with-docs',
   }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Grill with Docs')
   expect(buildAgentConfigLabel(worker({ requirementsMode: 'grill' }))).toBe('Grill Me')
+  expect(buildAgentConfigLabel(worker({
+    requirementsMode: 'grill-with-docs',
+    requirementsBehavior: 'standard',
+  }))).toBe('Grill with Docs · 已完成')
   expect(buildAgentConfigLabel(worker({ requirementsMode: 'standard' }))).toBe('')
   expect(buildAgentConfigLabel(worker())).toBe('')
 })

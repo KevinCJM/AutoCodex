@@ -7,12 +7,38 @@ import {
   promptSyncUpdateFromRequest,
   promptSyncUpdateFromSnapshot,
   reconcilePromptSyncState,
+  workerOwnedPromptIsReady,
 } from './promptSnapshot'
 
 const buildDraftKey = (promptType: string, payload: Record<string, unknown>) =>
   `${promptType}:${String(payload.title ?? '')}`
 
 describe('promptStateFromSnapshot', () => {
+  it('keeps worker-owned HITL hidden until the owning READY revision is visible', () => {
+    const prompt = promptStateFromSnapshot(
+      {
+        pending: true,
+        prompt_id: 'prompt_ready_gate',
+        prompt_type: 'multiline',
+        payload: {
+          ready_for_human: true,
+          owner_session_name: '分析师-天异星',
+          owner_turn_id: 'requirements_clarification_1',
+          owner_state_revision: 9,
+        },
+      },
+      buildDraftKey,
+    )
+    expect(workerOwnedPromptIsReady(prompt, [{
+      sessionName: '分析师-天异星', stateRevision: 8, agentState: 'BUSY', turnState: 'succeeded',
+      currentTaskRuntimeStatus: 'done', currentTurnId: 'requirements_clarification_1',
+    }])).toBe(false)
+    expect(workerOwnedPromptIsReady(prompt, [{
+      sessionName: '分析师-天异星', stateRevision: 9, agentState: 'READY', turnState: 'succeeded',
+      currentTaskRuntimeStatus: 'done', currentTurnId: 'requirements_clarification_1',
+    }])).toBe(true)
+  })
+
   it('restores a pending bootstrap prompt', () => {
     const restored = promptStateFromSnapshot(
       {

@@ -21,13 +21,16 @@ test('route files exist with expected exports', () => {
   }
 })
 
-test('home app snapshot renders optional project-level Graphify status without changing agent labels', () => {
+test('home renders project Graphify status plus provable per-turn usage without changing config labels', () => {
   const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
   const homeContent = readFileSync(join(import.meta.dir, 'routes/HomeRoute.tsx'), 'utf8')
   const agentContent = readFileSync(join(import.meta.dir, 'homeAgents.ts'), 'utf8')
   expect(appContent.includes('graphify: normalizeGraphifyStatus(payload.graphify)')).toBe(true)
   expect(homeContent.includes('代码图谱：${graphifyStatusSummary(graphify)}')).toBe(true)
-  expect(agentContent.includes('graphify')).toBe(false)
+  const configLabelBody = agentContent.split('export function buildAgentConfigLabel', 2)[1]?.split('export function buildGraphifyUsageLabel', 1)[0] ?? ''
+  expect(configLabelBody.toLowerCase().includes('graphify')).toBe(false)
+  expect(agentContent.includes('export function buildGraphifyUsageLabel')).toBe(true)
+  expect(homeContent.includes('agent.graphifyUsageLabel')).toBe(true)
 })
 
 test('stage snapshots cannot replace project Graphify status', () => {
@@ -392,6 +395,7 @@ test('app aggregates running workers for home overview and HomeRoute uses the ne
   expect(content.includes('ponytailBundleVersion: value.ponytail_bundle_version === undefined && value.ponytailBundleVersion === undefined')).toBe(true)
   expect(content.includes('ponytailDelivery: value.ponytail_delivery === undefined && value.ponytailDelivery === undefined')).toBe(true)
   expect(content.includes('requirementsMode: value.requirements_mode === undefined && value.requirementsMode === undefined')).toBe(true)
+  expect(content.includes('requirementsBehavior: value.requirements_behavior === undefined && value.requirementsBehavior === undefined')).toBe(true)
   expect(content.includes('grillBundleCommit: value.grill_bundle_commit === undefined && value.grillBundleCommit === undefined')).toBe(true)
   expect(content.includes('grillDelivery: value.grill_delivery === undefined && value.grillDelivery === undefined')).toBe(true)
   expect(content.includes('value.grill_question_seq ?? value.grillQuestionSeq')).toBe(true)

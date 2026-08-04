@@ -202,6 +202,7 @@ export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
     dispatchState: str(item.dispatch_state ?? item.dispatchState),
     dispatchReason: str(item.dispatch_reason ?? item.dispatchReason),
     turnState: str(item.turn_state ?? item.turnState),
+    currentTurnId: str(item.current_turn_id ?? item.currentTurnId),
     tmuxControlStatus: str(item.tmux_control_status ?? item.tmuxControlStatus),
     tmuxControlError: str(item.tmux_control_error ?? item.tmuxControlError),
     tmuxUnavailableSince: str(
@@ -229,6 +230,9 @@ export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
     requirementsMode: item.requirements_mode === undefined && item.requirementsMode === undefined
       ? undefined
       : str(item.requirements_mode ?? item.requirementsMode),
+    requirementsBehavior: item.requirements_behavior === undefined && item.requirementsBehavior === undefined
+      ? undefined
+      : str(item.requirements_behavior ?? item.requirementsBehavior),
     grillBundleCommit: item.grill_bundle_commit === undefined && item.grillBundleCommit === undefined
       ? undefined
       : str(item.grill_bundle_commit ?? item.grillBundleCommit),
@@ -241,6 +245,27 @@ export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
       const parsed = Number(raw)
       return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
     })(),
+    graphifyUsagePolicy: item.graphify_usage_policy === undefined && item.graphifyUsagePolicy === undefined
+      ? undefined
+      : str(item.graphify_usage_policy ?? item.graphifyUsagePolicy),
+    graphifyFreshness: item.graphify_freshness === undefined && item.graphifyFreshness === undefined
+      ? undefined
+      : str(item.graphify_freshness ?? item.graphifyFreshness),
+    graphifyEvidenceDelivery: item.graphify_evidence_delivery === undefined && item.graphifyEvidenceDelivery === undefined
+      ? undefined
+      : str(item.graphify_evidence_delivery ?? item.graphifyEvidenceDelivery),
+    graphifyQueryRequirement: item.graphify_query_requirement === undefined && item.graphifyQueryRequirement === undefined
+      ? undefined
+      : str(item.graphify_query_requirement ?? item.graphifyQueryRequirement),
+    graphifyQueryStatus: item.graphify_query_status === undefined && item.graphifyQueryStatus === undefined
+      ? undefined
+      : str(item.graphify_query_status ?? item.graphifyQueryStatus),
+    graphifyQueryCommand: item.graphify_query_command === undefined && item.graphifyQueryCommand === undefined
+      ? undefined
+      : str(item.graphify_query_command ?? item.graphifyQueryCommand),
+    graphifyUsageReceipt: item.graphify_usage_receipt === undefined && item.graphifyUsageReceipt === undefined
+      ? undefined
+      : str(item.graphify_usage_receipt ?? item.graphifyUsageReceipt),
     retryCount: num(item.retry_count ?? item.retryCount),
     note: str(item.note),
     transcriptPath: str(item.transcript_path ?? item.transcriptPath),

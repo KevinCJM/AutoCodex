@@ -9,6 +9,7 @@ import pytest
 from tmux_core.runtime.grill import (
     BUNDLE_COMMIT as GRILL_BUNDLE_COMMIT,
     BEGIN_MARKER as GRILL_BEGIN_MARKER,
+    TRANSITION_BEGIN_MARKER as GRILL_TRANSITION_BEGIN_MARKER,
     GrillBundleError,
     GrillTurnProfile,
     build_grill_bootstrap,
@@ -61,6 +62,10 @@ def _prompt_worker(mode: str, *, ponytail_mode: str = "off") -> TmuxBatchWorker:
     worker = object.__new__(TmuxBatchWorker)
     worker.config = SimpleNamespace(requirements_mode=mode, ponytail_mode=ponytail_mode)
     worker.requirements_mode = mode
+    worker.requirements_behavior = "interview" if mode != "standard" else "standard"
+    worker.requirements_grill_session_id = ""
+    worker.requirements_transition_pending = False
+    worker.requirements_transition_delivered = False
     worker.ponytail_mode = ponytail_mode
     worker.ponytail_full_delivered = False
     worker.ponytail_delivered_mode = ""
@@ -135,6 +140,45 @@ def test_grill_is_never_injected_without_an_explicit_turn_profile() -> None:
     prompt = _build_prompt(worker, profile=None)
     assert GRILL_BEGIN_MARKER not in prompt
     assert prompt.startswith("Do the task")
+
+
+def test_confirmed_grill_session_sends_one_standard_transition_then_stops() -> None:
+    worker = _prompt_worker("grill-with-docs")
+    worker.requirements_behavior = "standard"
+    worker.requirements_grill_session_id = "session-a03"
+    worker.requirements_transition_pending = True
+    worker._persist_grill_policy_fast = mock.Mock()  # type: ignore[method-assign]
+
+    first = _build_prompt(worker, profile=None)
+    assert first.startswith(GRILL_TRANSITION_BEGIN_MARKER)
+    assert "stop the one-question interview behavior" in first
+    assert worker.requirements_transition_pending is True
+    assert worker.requirements_transition_delivered is False
+
+    worker._confirm_grill_prompt_delivery(first)  # noqa: SLF001
+    assert worker.requirements_transition_pending is False
+    assert worker.requirements_transition_delivered is True
+    second = _build_prompt(worker, profile=None, prompt="NEXT")
+    assert GRILL_TRANSITION_BEGIN_MARKER not in second
+    assert second.startswith("NEXT")
+
+
+def test_reopened_same_session_returns_to_interview_without_replaying_full_rules() -> None:
+    worker = _prompt_worker("grill")
+    worker.grill_full_delivered = True
+    worker.grill_delivered_mode = "grill"
+    worker.requirements_behavior = "standard"
+    worker.requirements_transition_delivered = True
+    worker._persist_requirements_policy_fast = mock.Mock()  # type: ignore[method-assign]
+
+    worker.transition_requirements_behavior(
+        "interview",
+        grill_session_id="session-a03",
+        expected_session_generation="generation",
+    )
+    prompt = _build_prompt(worker, profile=GrillTurnProfile("grill", 4))
+    assert "GRILL PROFILE REMINDER" in prompt
+    assert "GRILL REQUIREMENTS MODE ACTIVE" not in prompt
 
 
 def test_turn_profile_must_match_worker_mode() -> None:
