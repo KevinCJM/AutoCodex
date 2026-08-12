@@ -28,7 +28,7 @@
       "name": "workflow_entry",
       "path": "A00_main_tui.py",
       "kind": "python_entry_orchestrator",
-      "purpose": "launch and chain A01-A08 workflow, including shared behavior-profile, requirements-interview, and project Graphify policy propagation",
+      "purpose": "launch and chain A01-A08 workflow, including shared behavior-profile, requirements-interview, and project CodeGraph policy propagation",
       "task_keywords": [
         "main",
         "workflow",
@@ -42,7 +42,7 @@
         "requirements_mode",
         "grill",
         "grill_with_docs",
-        "graphify_mode",
+        "codegraph_mode",
         "project_graph"
       ],
       "owned_paths": [
@@ -86,7 +86,7 @@
         "build_parser",
         "resolve_workflow_ponytail_mode",
         "resolve_workflow_requirements_mode",
-        "resolve_workflow_graphify_mode",
+        "resolve_workflow_codegraph_mode",
         "configured_workflow_requirements_mode"
       ],
       "first_read_selectors": [
@@ -868,7 +868,7 @@
       "name": "tmux_runtime_hitl",
       "path": "T02_tmux_agents.py",
       "kind": "runtime_and_terminal_protocol",
-      "purpose": "tmux worker control, HITL files, terminal I/O, provider runtime, behavior profiles, Grill interviews, and vendor-neutral Graphify evidence delivery",
+      "purpose": "tmux worker control, HITL files, terminal I/O, provider runtime, behavior profiles, Grill interviews, and vendor-neutral CodeGraph navigation hints",
       "task_keywords": [
         "tmux",
         "worker",
@@ -901,11 +901,11 @@
         "grill_transition",
         "grill_session",
         "domain_modeling",
-        "graphify",
-        "graphify_mode",
-        "graphify_evidence",
+        "codegraph",
+        "codegraph_mode",
+        "codegraph_hint",
         "code_graph",
-        "tmux_graphify_cmd"
+        "tmux_codegraph_cmd"
       ],
       "owned_paths": [
         {
@@ -1002,11 +1002,11 @@
         "build_grill_bootstrap",
         "build_grill_reminder",
         "build_grill_completion_transition",
-        "GraphifyMode",
-        "GraphifyTurnProfile",
-        "build_graphify_evidence_block",
-        "resolve_graphify_turn_profile",
-        "GraphifySessionModeMismatch",
+        "CodeGraphMode",
+        "CodeGraphTurnProfile",
+        "build_codegraph_hint_block",
+        "resolve_codegraph_turn_profile",
+        "CodeGraphSessionModeMismatch",
         "run_hitl_agent_loop",
         "GrillSessionState"
       ],
@@ -1141,7 +1141,7 @@
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_runtime.py"
+          "path": "tests/test_codegraph_runtime.py"
         }
       ],
       "related_config_selectors": [
@@ -1217,7 +1217,7 @@
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_runtime.py"
+          "path": "tests/test_codegraph_runtime.py"
         }
       ],
       "read_before_edit_selectors": [
@@ -1248,7 +1248,7 @@
           "tmux_core/runtime/tmux_runtime.py",
           "tmux_core/runtime/ponytail.py",
           "tmux_core/runtime/grill.py",
-          "tmux_core/runtime/graphify.py",
+          "tmux_core/runtime/codegraph.py",
           "tmux_core/runtime/vendor_catalog.py",
           "tmux_core/runtime/hitl.py",
           "third_party/ponytail/LICENSE",
@@ -1282,7 +1282,7 @@
           "tests/test_grill_runtime.py",
           "tests/test_grill_config.py",
           "tests/test_grill_hitl_runtime.py",
-          "tests/test_graphify_runtime.py"
+          "tests/test_codegraph_runtime.py"
         ],
         "unsampled_paths": []
       }
@@ -1292,7 +1292,7 @@
       "name": "bridge_protocol_backends",
       "path": "T10_tui_protocol.py",
       "kind": "python_bridge_protocol",
-      "purpose": "NDJSON protocol and Python backends for TUI/Web clients, including recoverable Grill prompts and safe project-level Graphify status",
+      "purpose": "NDJSON protocol and Python backends for TUI/Web clients, including recoverable Grill prompts and safe project-level CodeGraph status",
       "task_keywords": [
         "protocol",
         "backend",
@@ -1314,9 +1314,9 @@
         "recommendation",
         "reason_text",
         "prompt_response_cursor",
-        "graphify_status",
-        "snapshot_app_graphify",
-        "graphify_report_preview"
+        "codegraph_status",
+        "snapshot_app_codegraph",
+        "codegraph_index_state"
       ],
       "owned_paths": [
         {
@@ -1371,7 +1371,7 @@
         "decode_message",
         "_flatten_ponytail_worker_fields",
         "_flatten_grill_worker_fields",
-        "_read_graphify_app_status",
+        "_read_codegraph_app_status",
         "PromptBroker",
         "PendingPromptState"
       ],
@@ -1452,7 +1452,7 @@
         },
         {
           "type": "literal",
-          "path": "packages/tui/src/graphifyStatus.test.ts"
+          "path": "packages/tui/src/codegraphStatus.test.ts"
         },
         {
           "type": "literal",
@@ -1528,7 +1528,7 @@
         "evidence": [
           "tmux_core/bridge/backend.py",
           "tmux_core/bridge/web_backend.py",
-          "tmux_core/runtime/graphify.py",
+          "tmux_core/runtime/codegraph.py",
           "tests/test_t11_tui_backend.py",
           "tests/test_t11_web_backend.py",
           "tests/test_tui_web_protocol_no_audit.py",
@@ -1543,7 +1543,7 @@
       "name": "frontend_packages",
       "path": "packages",
       "kind": "bun_solid_frontend_family",
-      "purpose": "OpenTUI terminal UI and Solid Web console, including Grill prompts, recovery metadata, worker labels, and project Graphify status",
+      "purpose": "OpenTUI terminal UI and Solid Web console, including Grill prompts, recovery metadata, worker labels, and project CodeGraph status",
       "task_keywords": [
         "frontend",
         "opentui",
@@ -1567,9 +1567,9 @@
         "recommendation",
         "reason_text",
         "prompt_cursor",
-        "graphify_status",
+        "codegraph_status",
         "code_graph_status",
-        "graphify_report"
+        "codegraph_index_state"
       ],
       "owned_paths": [
         {
@@ -1663,8 +1663,8 @@
         "buildAgentConfigLabel",
         "resolvePromptMetadata",
         "grillPromptKicker",
-        "normalizeGraphifyStatus",
-        "graphifyStatusLabel"
+        "normalizeCodeGraphStatus",
+        "codegraphStatusLabel"
       ],
       "first_read_selectors": [
         {
@@ -1796,7 +1796,7 @@
       },
       {
         "type": "literal",
-        "path": "packages/web/src/domain/graphifyStatus.test.ts"
+        "path": "packages/web/src/domain/codegraphStatus.test.ts"
       },
     {
       "type": "literal",
@@ -1868,7 +1868,7 @@
         },
         {
           "type": "literal",
-          "path": "packages/tui/src/graphifyStatus.test.ts"
+          "path": "packages/tui/src/codegraphStatus.test.ts"
         },
         {
           "type": "literal",
@@ -1904,7 +1904,7 @@
     },
     {
       "type": "literal",
-      "path": "packages/web/src/domain/graphifyStatus.test.ts"
+      "path": "packages/web/src/domain/codegraphStatus.test.ts"
     },
     {
       "type": "literal",
@@ -1946,8 +1946,8 @@
           "packages/tui/src/promptSnapshot.ts",
           "packages/tui/src/promptMetadata.ts",
           "packages/tui/src/promptMetadata.test.ts",
-          "packages/tui/src/graphifyStatus.ts",
-          "packages/tui/src/graphifyStatus.test.ts",
+          "packages/tui/src/codegraphStatus.ts",
+          "packages/tui/src/codegraphStatus.test.ts",
           "packages/tui/src/homeAgents.ts",
           "packages/tui/src/homeAgents.test.ts",
           "packages/tui/src/routes/HomeRoute.tsx",
@@ -1968,8 +1968,8 @@
           "packages/web/src/domain/agents.test.ts",
           "packages/web/src/domain/promptMetadata.ts",
           "packages/web/src/domain/promptMetadata.test.ts",
-          "packages/web/src/domain/graphifyStatus.ts",
-          "packages/web/src/domain/graphifyStatus.test.ts",
+          "packages/web/src/domain/codegraphStatus.ts",
+          "packages/web/src/domain/codegraphStatus.test.ts",
       "packages/web/src",
       "packages/web/src/styles/app.css",
       "packages/web/tests",
@@ -2149,7 +2149,7 @@
       "name": "routing_init_layer",
       "path": "docs/repo_map.json",
       "kind": "machine_routing_layer_and_initializer",
-      "purpose": "create, validate, audit, and store routing artifacts while treating Graphify only as optional static input for route creation",
+      "purpose": "create, validate, audit, and store routing artifacts while treating CodeGraph only as optional static navigation during route creation",
       "task_keywords": [
         "agents_md",
         "repo_map",
@@ -2158,8 +2158,8 @@
         "routing_layer",
         "audit",
         "machine_first",
-        "graphify",
-        "graphify_evidence",
+        "codegraph",
+        "codegraph_navigation",
         "code_graph_candidate"
       ],
       "owned_paths": [
@@ -2413,7 +2413,7 @@
           "skills/ai-hermes-routing-init/scripts/route_task.py",
           "A01_Routing_LayerPlanning.py",
           "T03_agent_init_workflow.py",
-          "tmux_core/runtime/graphify.py",
+          "tmux_core/runtime/codegraph.py",
           "tests/test_a01_routing_layer_planning.py",
           "tests/test_t03_agent_init_workflow.py",
           "tests/test_ai_hermes_route_task.py"
@@ -2509,65 +2509,56 @@
     {
       "id": "M12_project_graph_service",
       "name": "project_graph_service",
-      "path": "tmux_core/runtime/graphify.py",
+      "path": "tmux_core/runtime/codegraph.py",
       "kind": "isolated_external_tool_adapter",
-      "purpose": "resolve pinned Graphify tooling, build safe code-only project snapshots and immutable graph generations, combine stage-resolved AI Hermes routes with bounded evidence, derive per-turn evidence/query usage policy, audit exact runner/session/turn/evidence/fingerprint/invocation-scoped read-only queries, enforce Auto degradation or Required HITL after one repair, and track A07/A08 source changes including deleted-path impact from the previous graph generation",
+      "purpose": "resolve pinned CodeGraph 1.5.0 tooling, audit and synchronize project-local indexes at explicit checkpoints, provide bounded read-only explore/status access to all vendors, inject only optional navigation hints, and track A07/A08 source changes without adding model turns or completion gates",
       "task_keywords": [
-        "graphify",
-        "graphifyy",
-        "graphify_mode",
+        "codegraph",
+        "codegraph_mode",
         "project_graph",
         "code_graph",
-        "code_only",
-        "source_snapshot",
-        "graph_cache",
-        "affected",
-        "god_nodes",
-        "tmux_graphify",
-        "graphify_turn_context",
+        "tmux_codegraph",
+        "codegraph_explore",
+        "codegraph_turn_context",
         "query_intent",
         "freshness",
         "change_ledger",
-        "graphify_route_context",
-        "previous_generation",
-        "session_generation",
-        "query_scope",
-        "validation_stamp",
-        "query_audit",
-        "usage_policy",
-        "usage_receipt",
-        "query_required",
-        "invocation_digest",
-        "graphify_usage_intervention"
+        "codegraph_route_context",
+        "source_change_ledger",
+        "project_index",
+        "project_local_index",
+        "index_sync",
+        "managed_binary",
+        "read_only_wrapper"
       ],
       "owned_paths": [
         {
           "type": "literal",
-          "path": "tmux_core/runtime/graphify.py",
+          "path": "tmux_core/runtime/codegraph.py",
           "match": "exact",
           "role": "project_graph_adapter"
         },
         {
           "type": "literal",
-          "path": "scripts/tmux-graphify",
+          "path": "scripts/tmux-codegraph",
           "match": "exact",
           "role": "managed_tool_cli"
         },
         {
           "type": "subtree",
-          "path": "tools/graphify",
+          "path": "tools/codegraph",
           "match": "subtree",
           "role": "isolated_tool_manifest"
         },
         {
           "type": "literal",
-          "path": "tmux_core/stage_kernel/graphify_change_ledger.py",
+          "path": "tmux_core/stage_kernel/source_change_ledger.py",
           "match": "exact",
           "role": "runner_scoped_change_ledger"
         },
         {
           "type": "literal",
-          "path": "tmux_core/stage_kernel/graphify_route_context.py",
+          "path": "tmux_core/stage_kernel/codegraph_route_context.py",
           "match": "exact",
           "role": "stage_resolved_ai_hermes_graph_context"
         }
@@ -2575,84 +2566,78 @@
       "entry_selectors": [
         {
           "type": "literal",
-          "path": "tmux_core/runtime/graphify.py"
+          "path": "tmux_core/runtime/codegraph.py"
         },
         {
           "type": "literal",
-          "path": "scripts/tmux-graphify"
+          "path": "scripts/tmux-codegraph"
         }
       ],
       "key_symbols": [
-        "GraphifyMode",
-        "GraphifyStatus",
-        "GraphifyTurnProfile",
-        "GraphifyToolResolution",
-        "GraphifyProjectSnapshot",
-        "GraphifyEvidence",
-        "GraphifyTurnContext",
-        "GraphifyQueryIntent",
-        "GraphifyQueryResult",
-        "GraphifyFreshnessAssessment",
-        "GraphifyUsagePolicy",
-        "GraphifyUsageAssessment",
-        "GraphifyUsageContractError",
-        "StageGraphifyRouteHints",
-        "TurnContextBlock",
-        "resolve_graphify_turn_profile",
-        "build_graphify_evidence_block",
+        "CodeGraphMode",
+        "CodeGraphState",
+        "CodeGraphToolResolution",
+        "CodeGraphProjectStatus",
+        "CodeGraphTurnContext",
+        "CodeGraphTurnHint",
+        "CodeGraphQueryIntent",
+        "CodeGraphQueryResult",
+        "StageCodeGraphRouteHints",
+        "resolve_codegraph_tool",
+        "inspect_codegraph_project",
+        "initialize_codegraph_project",
+        "sync_codegraph_project",
+        "resolve_codegraph_turn_profile",
+        "build_codegraph_hint_block",
         "execute_readonly_query",
-        "assess_graphify_freshness",
-        "assess_graphify_turn_usage",
-        "register_graphify_turn_usage",
-        "capture_graphify_source_manifest",
-        "read_graphify_project_status",
-        "build_stage_graphify_turn_context",
-        "resolve_stage_graphify_route_hints",
-        "ensure_graphify_task_baseline",
-        "record_graphify_task_changes"
+        "read_codegraph_project_status",
+        "build_stage_codegraph_turn_context",
+        "resolve_stage_codegraph_route_hints",
+        "ensure_source_task_baseline",
+        "record_source_task_changes"
       ],
       "first_read_selectors": [
         {
           "type": "literal",
-          "path": "tmux_core/runtime/graphify.py"
+          "path": "tmux_core/runtime/codegraph.py"
         },
         {
           "type": "literal",
-          "path": "scripts/tmux-graphify"
+          "path": "scripts/tmux-codegraph"
         }
       ],
       "then_check_selectors": [
         {
           "type": "literal",
-          "path": "tools/graphify/pyproject.toml"
+          "path": "tools/codegraph/UPSTREAM.json"
         },
         {
           "type": "literal",
-          "path": "tools/graphify/uv.lock"
+          "path": "tools/codegraph/checksums.json"
         },
         {
           "type": "literal",
-          "path": "tools/graphify/UPSTREAM.json"
+          "path": "tools/codegraph/LICENSE"
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_runtime.py"
+          "path": "tests/test_codegraph_runtime.py"
         },
         {
           "type": "literal",
-          "path": "tmux_core/stage_kernel/graphify_change_ledger.py"
+          "path": "tmux_core/stage_kernel/source_change_ledger.py"
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_change_ledger.py"
+          "path": "tests/test_source_change_ledger.py"
         },
         {
           "type": "literal",
-          "path": "tmux_core/stage_kernel/graphify_route_context.py"
+          "path": "tmux_core/stage_kernel/codegraph_route_context.py"
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_stage_route_context.py"
+          "path": "tests/test_codegraph_stage_route_context.py"
         }
       ],
       "relations": [
@@ -2686,18 +2671,18 @@
         }
       ],
       "out_of_scope_dependencies": [
-        "graphify_external_binary",
-        "uv_registry_and_network",
+        "codegraph_external_binary",
+        "release_download_network",
         "target_project_dynamic_runtime_behavior"
       ],
       "related_test_selectors": [
         {
           "type": "literal",
-          "path": "tests/test_graphify_runtime.py"
+          "path": "tests/test_codegraph_runtime.py"
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_config.py"
+          "path": "tests/test_codegraph_config.py"
         },
         {
           "type": "literal",
@@ -2709,11 +2694,11 @@
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_change_ledger.py"
+          "path": "tests/test_source_change_ledger.py"
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_stage_route_context.py"
+          "path": "tests/test_codegraph_stage_route_context.py"
         },
         {
           "type": "literal",
@@ -2721,11 +2706,11 @@
         },
         {
           "type": "literal",
-          "path": "packages/tui/src/graphifyStatus.test.ts"
+          "path": "packages/tui/src/codegraphStatus.test.ts"
         },
         {
           "type": "literal",
-          "path": "packages/web/src/domain/graphifyStatus.test.ts"
+          "path": "packages/web/src/domain/codegraphStatus.test.ts"
         },
         {
           "type": "literal",
@@ -2737,7 +2722,7 @@
         },
         {
           "type": "literal",
-          "path": "packages/web/src/graphifyUi.test.ts"
+          "path": "packages/web/src/codegraphUi.test.ts"
         },
         {
           "type": "literal",
@@ -2747,19 +2732,19 @@
       "related_config_selectors": [
         {
           "type": "literal",
-          "path": "tools/graphify/pyproject.toml"
+          "path": "tools/codegraph/UPSTREAM.json"
         },
         {
           "type": "literal",
-          "path": "tools/graphify/uv.lock"
+          "path": "tools/codegraph/checksums.json"
         },
         {
           "type": "literal",
-          "path": "tools/graphify/UPSTREAM.json"
+          "path": "tools/codegraph/LICENSE"
         }
       ],
       "edit_risk": "high",
-      "blast_radius": "project_source_scanning_and_all_agent_turn_context",
+      "blast_radius": "project_index_lifecycle_and_all_agent_turn_context",
       "pitfall_ids": [
         "P06",
         "P07",
@@ -2768,11 +2753,11 @@
       "minimum_regression_selectors": [
         {
           "type": "literal",
-          "path": "tests/test_graphify_runtime.py"
+          "path": "tests/test_codegraph_runtime.py"
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_config.py"
+          "path": "tests/test_codegraph_config.py"
         },
         {
           "type": "literal",
@@ -2784,11 +2769,11 @@
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_change_ledger.py"
+          "path": "tests/test_source_change_ledger.py"
         },
         {
           "type": "literal",
-          "path": "tests/test_graphify_stage_route_context.py"
+          "path": "tests/test_codegraph_stage_route_context.py"
         },
         {
           "type": "literal",
@@ -2796,11 +2781,11 @@
         },
         {
           "type": "literal",
-          "path": "packages/tui/src/graphifyStatus.test.ts"
+          "path": "packages/tui/src/codegraphStatus.test.ts"
         },
         {
           "type": "literal",
-          "path": "packages/web/src/domain/graphifyStatus.test.ts"
+          "path": "packages/web/src/domain/codegraphStatus.test.ts"
         },
         {
           "type": "literal",
@@ -2844,30 +2829,29 @@
       "grounding": {
         "fact_status": "grounded",
         "evidence": [
-          "tmux_core/runtime/graphify.py",
-          "tmux_core/stage_kernel/graphify_change_ledger.py",
-          "tmux_core/stage_kernel/graphify_route_context.py",
-          "scripts/tmux-graphify",
-          "tools/graphify/pyproject.toml",
-          "tools/graphify/uv.lock",
-          "tools/graphify/UPSTREAM.json",
+          "tmux_core/runtime/codegraph.py",
+          "tmux_core/stage_kernel/source_change_ledger.py",
+          "tmux_core/stage_kernel/codegraph_route_context.py",
+          "scripts/tmux-codegraph",
+          "tools/codegraph/UPSTREAM.json",
+          "tools/codegraph/checksums.json",
+          "tools/codegraph/LICENSE",
           "tmux_core/runtime/tmux_runtime.py",
-          "tmux_core/stage_kernel/agent_intervention.py",
           "tmux_core/bridge/backend.py",
-          "tests/test_graphify_runtime.py",
-          "tests/test_graphify_config.py",
-          "tests/test_graphify_change_ledger.py",
-          "tests/test_graphify_stage_route_context.py",
+          "tests/test_codegraph_runtime.py",
+          "tests/test_codegraph_config.py",
+          "tests/test_source_change_ledger.py",
+          "tests/test_codegraph_stage_route_context.py",
           "tests/test_stage_kernel_turn_output_goals.py",
           "tests/test_t11_tui_backend.py",
           "tests/test_t11_web_backend.py",
           "tests/test_role_orchestration.py",
-          "packages/tui/src/graphifyStatus.ts",
-          "packages/tui/src/graphifyStatus.test.ts",
+          "packages/tui/src/codegraphStatus.ts",
+          "packages/tui/src/codegraphStatus.test.ts",
           "packages/tui/src/homeAgents.ts",
           "packages/tui/src/homeAgents.test.ts",
-          "packages/web/src/domain/graphifyStatus.ts",
-          "packages/web/src/domain/graphifyStatus.test.ts",
+          "packages/web/src/domain/codegraphStatus.ts",
+          "packages/web/src/domain/codegraphStatus.test.ts",
           "packages/web/src/domain/agents.ts",
           "packages/web/src/domain/agents.test.ts"
         ],
@@ -2879,7 +2863,7 @@
       "name": "tests",
       "path": "tests",
       "kind": "pytest_regression_suite",
-      "purpose": "visible Python regression and boundary tests, including the isolated Graphify service and frontend status contract",
+      "purpose": "visible Python regression and boundary tests, including the isolated CodeGraph service and frontend status contract",
       "task_keywords": [
         "test",
         "pytest",
@@ -2887,9 +2871,9 @@
         "boundary",
         "failing_test",
         "coverage",
-        "graphify",
+        "codegraph",
         "code_graph",
-        "graph_cache"
+        "project_index"
       ],
       "owned_paths": [
         {
@@ -3003,10 +2987,10 @@
       "grounding": {
         "fact_status": "mixed",
         "evidence": [
-          "tests/test_graphify_runtime.py",
+          "tests/test_codegraph_runtime.py",
           "tests/test_t11_tui_backend.py",
-          "packages/tui/src/graphifyStatus.test.ts",
-          "packages/web/src/domain/graphifyStatus.test.ts"
+          "packages/tui/src/codegraphStatus.test.ts",
+          "packages/web/src/domain/codegraphStatus.test.ts"
         ],
         "unsampled_paths": []
       }

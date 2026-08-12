@@ -26,7 +26,7 @@ from tmux_core.runtime.vendor_catalog import (
     get_vendor_inventory,
 )
 from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
-from tmux_core.runtime.graphify import GraphifyMode, normalize_graphify_mode
+from tmux_core.runtime.codegraph import CodeGraphMode, normalize_codegraph_mode
 from T02_tmux_agents import (
     AgentRunConfig,
     Vendor,
@@ -56,6 +56,7 @@ from T09_terminal_ops import (
     PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
+    cleanup_codegraph_processes_on_exit,
     message,
     maybe_launch_tui,
     prompt_metadata,
@@ -92,7 +93,7 @@ DEFAULT_MODEL_BY_VENDOR = dict(LEGACY_DEFAULT_MODEL_BY_VENDOR)
 EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 PROXY_PRESET_CHOICES = ("", "10900", "7890")
 PONYTAIL_MODE_CHOICES = tuple(mode.value for mode in PonytailMode)
-GRAPHIFY_MODE_CHOICES = tuple(mode.value for mode in GraphifyMode)
+CODEGRAPH_MODE_CHOICES = tuple(mode.value for mode in CodeGraphMode)
 RUN_INIT_CHOICES = ("yes", "no")
 EMPTY_PROJECT_ROUTING_SKIP_MESSAGE = "当前项目未检测到业务文件，跳过路由层初始化。"
 
@@ -109,8 +110,8 @@ class CliRequest:
     max_refine_rounds: int
     auto_confirm: bool
     ponytail_mode: str = PonytailMode.OFF.value
-    graphify_mode: str = GraphifyMode.OFF.value
-    graphify_config: dict[str, object] = field(default_factory=dict)
+    codegraph_mode: str = CodeGraphMode.OFF.value
+    codegraph_config: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -137,7 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effort", help="推理强度")
     parser.add_argument("--proxy-port", default="", help="代理端口或完整代理 URL")
     parser.add_argument("--ponytail-mode", choices=PONYTAIL_MODE_CHOICES, default="", help="Ponytail 模式: off|lite|full|ultra")
-    parser.add_argument("--graphify-mode", choices=GRAPHIFY_MODE_CHOICES, default="", help="Graphify 模式: off|auto|required")
+    parser.add_argument("--codegraph-mode", choices=CODEGRAPH_MODE_CHOICES, default="", help="CodeGraph 模式: off|auto|required")
+    parser.add_argument("--graphify-mode", choices=CODEGRAPH_MODE_CHOICES, default="", help=argparse.SUPPRESS)
     parser.add_argument("--main-ponytail-mode", choices=PONYTAIL_MODE_CHOICES, default="", help=argparse.SUPPRESS)
     parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--run-init", choices=RUN_INIT_CHOICES, help="是否执行 AGENT初始化: yes|no")
@@ -460,41 +462,46 @@ def resolve_cli_ponytail_mode(
         return prompt_ponytail_mode(PonytailMode.FULL.value)
 
 
-def resolve_cli_graphify_mode(
+def resolve_cli_codegraph_mode(
         args: argparse.Namespace,
         *,
         initial_mode: str = "",
         project_dir: str = "",
 ) -> str:
-    explicit = str(getattr(args, "graphify_mode", "") or "").strip()
-    if explicit or str(getattr(args, "agent_config", "") or "").strip():
+    explicit = str(getattr(args, "codegraph_mode", "") or "").strip()
+    legacy_explicit = str(getattr(args, "graphify_mode", "") or "").strip()
+    if explicit or legacy_explicit or str(getattr(args, "agent_config", "") or "").strip():
         # 延迟导入避免 shared_review 在加载 A01 选择器时形成循环依赖。
-        from tmux_core.stage_kernel.shared_review import resolve_workflow_graphify_mode
+        from tmux_core.stage_kernel.shared_review import resolve_workflow_codegraph_mode
 
-        mode = resolve_workflow_graphify_mode(args, stage_key="routing")
+        mode = resolve_workflow_codegraph_mode(args, stage_key="routing")
     elif str(initial_mode or "").strip():
-        mode = normalize_graphify_mode(initial_mode).value
+        mode = normalize_codegraph_mode(initial_mode).value
     else:
-        mode = GraphifyMode.AUTO.value
+        from tmux_core.runtime.codegraph import read_codegraph_project_preference
+
+        target_project = str(project_dir or getattr(args, "project_dir", "") or "").strip()
+        mode = read_codegraph_project_preference(target_project) if target_project else ""
+        mode = mode or CodeGraphMode.AUTO.value
     if not bool(getattr(args, "yes", False)) and terminal_ui_is_interactive():
-        from tmux_core.runtime.graphify import enable_graphify_interactive_recovery
+        from tmux_core.runtime.codegraph import enable_codegraph_interactive_recovery
 
         if str(project_dir or getattr(args, "project_dir", "") or "").strip():
-            enable_graphify_interactive_recovery(
+            enable_codegraph_interactive_recovery(
                 str(project_dir or getattr(args, "project_dir", "") or "").strip()
             )
     return mode
 
 
-def resolve_cli_graphify_config(
+def resolve_cli_codegraph_config(
     args: argparse.Namespace,
     *,
     initial_config: dict[str, object] | None = None,
 ) -> dict[str, object]:
     if str(getattr(args, "agent_config", "") or "").strip():
-        from tmux_core.stage_kernel.shared_review import resolve_workflow_graphify_config
+        from tmux_core.stage_kernel.shared_review import resolve_workflow_codegraph_config
 
-        return resolve_workflow_graphify_config(args)
+        return resolve_workflow_codegraph_config(args)
     return dict(initial_config or {})
 
 
@@ -649,14 +656,14 @@ def _collect_interactive_cli_request(
             initial_mode=initial_request.ponytail_mode if initial_request else "",
             interactive=run_init and terminal_ui_is_interactive(),
         ),
-        graphify_mode=resolve_cli_graphify_mode(
+        codegraph_mode=resolve_cli_codegraph_mode(
             args,
-            initial_mode=initial_request.graphify_mode if initial_request else "",
+            initial_mode=initial_request.codegraph_mode if initial_request else "",
             project_dir=project_dir,
         ),
-        graphify_config=resolve_cli_graphify_config(
+        codegraph_config=resolve_cli_codegraph_config(
             args,
-            initial_config=initial_request.graphify_config if initial_request else None,
+            initial_config=initial_request.codegraph_config if initial_request else None,
         ),
     )
 
@@ -761,14 +768,14 @@ def collect_cli_request(
             initial_mode=initial_request.ponytail_mode if initial_request else "",
             interactive=run_init and terminal_ui_is_interactive(),
         ),
-        graphify_mode=resolve_cli_graphify_mode(
+        codegraph_mode=resolve_cli_codegraph_mode(
             args,
-            initial_mode=initial_request.graphify_mode if initial_request else "",
+            initial_mode=initial_request.codegraph_mode if initial_request else "",
             project_dir=project_dir,
         ),
-        graphify_config=resolve_cli_graphify_config(
+        codegraph_config=resolve_cli_codegraph_config(
             args,
-            initial_config=initial_request.graphify_config if initial_request else None,
+            initial_config=initial_request.codegraph_config if initial_request else None,
         ),
     )
 
@@ -788,8 +795,8 @@ def prepare_agent_run_config(request: CliRequest) -> AgentRunConfig:
         reasoning_effort=request.reasoning_effort,
         proxy_url=request.proxy_port,
         ponytail_mode=request.ponytail_mode,
-        graphify_mode=request.graphify_mode,
-        graphify_config=request.graphify_config,
+        codegraph_mode=request.codegraph_mode,
+        codegraph_config=request.codegraph_config,
     )
 
 
@@ -1223,6 +1230,7 @@ def run_routing_stage(argv: Sequence[str] | None = None) -> RoutingStageResult:
     )
 
 
+@cleanup_codegraph_processes_on_exit
 def main(argv: Sequence[str] | None = None) -> int:
     redirected, launch = maybe_launch_tui(argv, route="routing", action="stage.a01.start")
     if redirected:

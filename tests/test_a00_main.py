@@ -239,14 +239,14 @@ class A00MainTests(unittest.TestCase):
             self.assertEqual(
                 calls,
                 [
-                    ("a01", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
-                    ("a02", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
-                    ("a03", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--requirements-mode", "standard", "--graphify-mode", "auto", "--yes"]),
-                    ("a04", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
-                    ("a05", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes", "--reuse-review-ba"]),
-                    ("a06", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
-                    ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
-                    ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                    ("a01", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
+                    ("a02", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
+                    ("a03", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--requirements-mode", "standard", "--codegraph-mode", "auto", "--yes"]),
+                    ("a04", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
+                    ("a05", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes", "--reuse-review-ba"]),
+                    ("a06", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
+                    ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
+                    ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
                 ],
             )
             self.assertEqual(lifecycle, ["a01", "flush", "a02", "flush", "a03", "flush", "a04", "flush", "a05", "flush", "a06", "flush", "a07", "flush", "a08"])
@@ -951,7 +951,7 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             observed["argv"],
-            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes", "--reuse-review-ba"],
+            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes", "--reuse-review-ba"],
         )
         self.assertEqual(observed["ba_handoff"], "live-ba")
         self.assertTrue(observed["preserve_workers"])
@@ -995,7 +995,7 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(
             observed["argv"],
-            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"],
+            ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"],
         )
         self.assertIsNone(observed["ba_handoff"])
         self.assertEqual(observed["reviewer_handoff"], ())
@@ -1055,8 +1055,8 @@ class A00MainTests(unittest.TestCase):
         self.assertEqual(
             calls,
             [
-                ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
-                ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--graphify-mode", "auto", "--yes"]),
+                ("a07", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
+                ("a08", ["--project-dir", tmpdir, "--requirement-name", "需求A", "--allow-previous-stage-back", "--ponytail-mode", "full", "--codegraph-mode", "auto", "--yes"]),
             ],
         )
         self.assertLess(
@@ -1202,9 +1202,69 @@ class A00MainTests(unittest.TestCase):
         ):
             exit_code = main([])
         self.assertEqual(exit_code, 0)
-        routing_stage.assert_called_once_with(["--ponytail-mode", "full", "--graphify-mode", "auto"])
+        routing_stage.assert_called_once_with(["--ponytail-mode", "full"])
         self.assertIn("--project-dir", intake_stage.call_args.args[0])
         self.assertIn("/tmp/project", intake_stage.call_args.args[0])
+
+    def test_main_finally_cancels_codegraph_processes_on_stage_failure(self):
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "A00_main_tui.routing_stage_main",
+            side_effect=RuntimeError("routing failed"),
+        ), patch("A00_main_tui.cancel_codegraph_processes") as cancel:
+            with self.assertRaisesRegex(RuntimeError, "routing failed"):
+                main(["--project-dir", tmpdir, "--yes"])
+
+        cancel.assert_called_once_with()
+
+    def test_project_selected_by_a01_rebinds_codegraph_preference_for_later_stages(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            preference = Path(tmpdir) / ".tmux_workflow" / "codegraph.preference.json"
+            preference.parent.mkdir(parents=True)
+            preference.write_text(
+                '{"schema":"tmux-codegraph-preference/1","mode":"off"}\n',
+                encoding="utf-8",
+            )
+            with patch(
+                "A00_main_tui.routing_stage_main",
+                return_value=SimpleNamespace(project_dir=tmpdir, exit_code=0),
+            ) as routing_stage, patch(
+                "A00_main_tui.run_requirement_intake_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ) as intake_stage, patch(
+                "A00_main_tui.run_requirements_clarification_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="live-ba"),
+            ) as clarification_stage, patch(
+                "A00_main_tui.run_requirements_review_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff="review-ba"),
+            ) as review_stage, patch(
+                "A00_main_tui.run_detailed_design_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", ba_handoff=None, reviewer_handoff=None),
+            ) as design_stage, patch(
+                "A00_main_tui.run_task_split_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ) as task_split_stage, patch(
+                "A00_main_tui.run_development_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A", developer_handoff=None, reviewer_handoff=()),
+            ) as development_stage, patch(
+                "A00_main_tui.run_overall_review_stage",
+                return_value=_RequirementsStageResult(requirement_name="需求A"),
+            ) as overall_stage:
+                exit_code = main(["--yes"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertNotIn("--codegraph-mode", routing_stage.call_args.args[0])
+        for stage_call in (
+            intake_stage,
+            clarification_stage,
+            review_stage,
+            design_stage,
+            task_split_stage,
+            development_stage,
+            overall_stage,
+        ):
+            argv = stage_call.call_args.args[0]
+            mode_index = argv.index("--codegraph-mode")
+            self.assertEqual(argv[mode_index + 1], "off")
 
     def test_parser_accepts_project_dir_and_yes(self):
         parser = build_parser()

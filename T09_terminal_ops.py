@@ -18,6 +18,7 @@ import sys
 import threading
 import uuid
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Mapping, Protocol, Sequence, TextIO
 
@@ -37,6 +38,25 @@ class PromptBackRequested(Exception):
 
 _EXTERNAL_PROCESS_SIGINT_WAIT_SEC = 30.0
 _EXTERNAL_PROCESS_SIGTERM_WAIT_SEC = 10.0
+
+
+def cleanup_codegraph_processes_on_exit(function: Callable[..., Any]) -> Callable[..., Any]:
+    """Ensure every standalone stage CLI reaps system-owned CodeGraph jobs."""
+
+    @wraps(function)
+    def wrapped(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return function(*args, **kwargs)
+        finally:
+            # Lazy import avoids making the generic terminal facade part of
+            # CodeGraph's import graph while still covering returns and all
+            # BaseException paths, including KeyboardInterrupt.
+            from tmux_core.runtime.codegraph import cancel_codegraph_processes
+
+            with contextlib.suppress(Exception):
+                cancel_codegraph_processes()
+
+    return wrapped
 
 
 def _current_prompt_metadata() -> dict[str, Any]:

@@ -12,7 +12,7 @@ import {
 } from './api/client'
 import { appendLog, classifyLog } from './domain/logs'
 import { buildAgentConfigLabel, buildHomeAgents, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState, workerOwnedPromptIsReady } from './domain/agents'
-import { graphifyStatusSummary, graphifyStatusTone } from './domain/graphifyStatus'
+import { codegraphStatusSummary, codegraphStatusTone } from './domain/codegraphStatus'
 import {
   EMPTY_APP,
   EMPTY_CONTROL,
@@ -360,24 +360,18 @@ function CurrentCard(props: {
       <div class="summary-strip">
         <StatLine label="智能体" value={props.agentCount} tone={props.agentCount > 0 ? 'active' : 'muted'} />
         <StatLine label="文件" value={props.artifacts.items.length} />
-        <Show when={props.app.graphify} keyed>
-          {(graphify) => (
+        <Show when={props.app.codegraph} keyed>
+          {(codegraph) => (
             <StatLine
               label="代码图谱"
-              value={graphifyStatusSummary(graphify)}
-              tone={graphifyStatusTone(graphify)}
+              value={codegraphStatusSummary(codegraph)}
+              tone={codegraphStatusTone(codegraph)}
             />
           )}
         </Show>
       </div>
-      <Show when={props.app.graphify?.nodeCount || props.app.graphify?.edgeCount}>
-        <p class="hero-copy">{`${props.app.graphify?.nodeCount ?? 0} nodes / ${props.app.graphify?.edgeCount ?? 0} edges`}</p>
-      </Show>
-      <Show when={props.app.graphify?.lastError}>
-        <p class="form-error">{props.app.graphify?.lastError}</p>
-      </Show>
-      <Show when={props.app.graphify?.reportPath}>
-        <PathButton path={props.app.graphify?.reportPath ?? ''} label="Graphify evidence report" onPreview={props.onPreview} />
+      <Show when={props.app.codegraph?.lastError}>
+        <p class="form-error">{props.app.codegraph?.lastError}</p>
       </Show>
     </section>
   )
@@ -423,7 +417,6 @@ function AgentOverview(props: { agents: HomeAgentItem[] }) {
                   <Copy size={14} /><span>{agent.sessionName}</span>
                 </button>
                 <Show when={agent.agentConfigLabel}><p>{agent.agentConfigLabel}</p></Show>
-                <Show when={agent.graphifyUsageLabel}><p>{agent.graphifyUsageLabel}</p></Show>
               </div>
               <div class="status-pills">
                 <span class={`pill ${statusClass(agent.agentState)}`}>{agent.agentState}</span>

@@ -24,14 +24,17 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
         orphaned_workers: [{ session_name: 'dev-1' }],
       },
       pending_hitl: true,
-      graphify: {
+      codegraph: {
         mode: 'auto',
         state: 'ready',
-        version: '0.9.27',
+        version: '1.5.0',
+        initialized: true,
         freshness: 'fresh',
+        file_count: 1200,
         node_count: 5098,
         edge_count: 22091,
-        report_path: '/tmp/project/.tmux_workflow/evidence.md',
+        pending_changes: { added: 0, modified: 0, removed: 0 },
+        index_state: 'complete',
       },
       available_runs: [{ run_id: 'run_1', worker_count: 2, failed_count: 1 }],
     },
@@ -62,13 +65,9 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
           grill_bundle_commit: 'ed37663c',
           grill_delivery: 'full',
           grill_question_seq: 3,
-          graphify_freshness: 'fresh',
-          graphify_usage_policy: 'query_required',
-          graphify_evidence_delivery: 'confirmed',
-          graphify_query_requirement: 'required',
-          graphify_query_status: 'satisfied',
-          graphify_query_command: 'affected',
-          graphify_usage_receipt: 'usage.json',
+          codegraph_mode: 'auto',
+          codegraph_available: true,
+          codegraph_hint_delivery: 'confirmed',
           tmux_control_unavailable_since: '2026-07-14T10:00:00+08:00',
           artifact_paths: ['/tmp/out.md'],
         }],
@@ -98,13 +97,14 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
   expect(snapshots.app.activeStageMessage).toBe('M1-T1 评审第 1 轮')
   expect(snapshots.app.activeStageFailure?.message).toBe('failed safely')
   expect(snapshots.app.activeStageFailure?.orphanedWorkers[0]?.attachCommand).toBe('tmux attach -t dev-1')
-  expect(snapshots.app.graphify).toMatchObject({
+  expect(snapshots.app.codegraph).toMatchObject({
     mode: 'auto',
     state: 'ready',
-    version: '0.9.27',
+    version: '1.5.0',
+    initialized: true,
+    fileCount: 1200,
     nodeCount: 5098,
     edgeCount: 22091,
-    reportPath: '/tmp/project/.tmux_workflow/evidence.md',
   })
   expect(snapshots.stages.development.workers[0]?.sessionName).toBe('dev-1')
   expect(snapshots.stages.development.workers[0]?.turnState).toBe('orphaned')
@@ -127,13 +127,9 @@ test('normalizeSnapshotsPayload maps bridge snapshots into web state', () => {
     grillBundleCommit: 'ed37663c',
     grillDelivery: 'full',
     grillQuestionSeq: 3,
-    graphifyFreshness: 'fresh',
-    graphifyUsagePolicy: 'query_required',
-    graphifyEvidenceDelivery: 'confirmed',
-    graphifyQueryRequirement: 'required',
-    graphifyQueryStatus: 'satisfied',
-    graphifyQueryCommand: 'affected',
-    graphifyUsageReceipt: 'usage.json',
+    codegraphMode: 'auto',
+    codegraphAvailable: true,
+    codegraphHintDelivery: 'confirmed',
   })
   expect(snapshots.stages.development.workers[0]?.tmuxUnavailableSince).toBe('2026-07-14T10:00:00+08:00')
   expect(snapshots.stages.development.milestones[0]?.tasks[0]?.completed).toBe(true)

@@ -14,11 +14,12 @@ from pathlib import Path
 from typing import Sequence
 
 from tmux_core.runtime.tmux_runtime import cleanup_registered_tmux_workers
-from tmux_core.runtime.graphify import GraphifyMode, cancel_graphify_processes, normalize_graphify_mode
+from tmux_core.runtime.codegraph import CodeGraphMode, cancel_codegraph_processes, normalize_codegraph_mode
 from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
 from tmux_core.stage_kernel.shared_review import (
     ReviewAgentSelection,
     StageAgentConfig,
+    configured_workflow_codegraph_mode,
     configured_workflow_requirements_mode,
     resolve_stage_agent_config,
     resolve_workflow_ponytail_mode,
@@ -85,10 +86,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent-config", default="", help="模型配置 JSON；命令行 --main-agent/--reviewer-agent 优先")
     parser.add_argument("--ponytail-mode", choices=tuple(mode.value for mode in PonytailMode), default="", help="Ponytail 模式: off|lite|full|ultra")
     parser.add_argument(
-        "--graphify-mode",
-        choices=tuple(mode.value for mode in GraphifyMode),
+        "--codegraph-mode",
+        choices=tuple(mode.value for mode in CodeGraphMode),
         default="",
-        help="Graphify 模式: off|auto|required",
+        help="CodeGraph 模式: off|auto|required",
+    )
+    parser.add_argument(
+        "--graphify-mode",
+        choices=tuple(mode.value for mode in CodeGraphMode),
+        default="",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--requirements-mode",
@@ -120,7 +127,7 @@ def build_stage_args(
         legacy_cli: bool = False,
         ponytail_mode: str = "",
         requirements_mode: str = "",
-        graphify_mode: str = "",
+        codegraph_mode: str = "",
         agent_config: str = "",
 ) -> list[str]:
     args: list[str] = []
@@ -140,10 +147,10 @@ def build_stage_args(
         args.extend(["--ponytail-mode", inherited_ponytail_mode])
     if str(requirements_mode or "").strip():
         args.extend(["--requirements-mode", str(requirements_mode).strip()])
-    if str(graphify_mode or "").strip():
+    if str(codegraph_mode or "").strip():
         args.extend([
-            "--graphify-mode",
-            normalize_graphify_mode(graphify_mode, default=GraphifyMode.AUTO).value,
+            "--codegraph-mode",
+            normalize_codegraph_mode(codegraph_mode, default=CodeGraphMode.AUTO).value,
         ])
     if str(agent_config or "").strip():
         args.extend(["--agent-config", str(agent_config).strip()])
@@ -290,7 +297,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=routing_agent_config.graphify_mode,
+                    codegraph_mode=(
+                        routing_agent_config.codegraph_mode
+                        if project_dir or configured_workflow_codegraph_mode(args, stage_key="routing")
+                        else ""
+                    ),
                     agent_config=args.agent_config,
                 )
                 if routing_allow_project_dir_back:
@@ -302,6 +313,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if routing_exit_code != 0:
                     return routing_exit_code
                 project_dir = str(getattr(routing_result, "project_dir", "") or project_dir).strip()
+                # Stage configs were initially resolved before an interactive
+                # A01 knew the project. Rebind the namespace and invalidate only
+                # the project-dependent CodeGraph cache so A02-A08 honor the
+                # selected checkout's persisted preference.
+                args.project_dir = project_dir
+                args._resolved_codegraph_modes = {}
+                intake_agent_config = _workflow_stage_agent_config(args, "requirement_intake")
+                clarification_agent_config = _workflow_stage_agent_config(args, "requirements_clarification")
+                requirements_review_agent_config = _workflow_stage_agent_config(args, "requirements_review")
+                detailed_design_agent_config = _workflow_stage_agent_config(args, "detailed_design")
+                task_split_agent_config = _workflow_stage_agent_config(args, "task_split")
+                development_agent_config = _workflow_stage_agent_config(args, "development")
+                overall_review_agent_config = _workflow_stage_agent_config(args, "overall_review")
                 try:
                     if requirement_name:
                         ensure_pre_development_task_record(project_dir, requirement_name=requirement_name)
@@ -330,7 +354,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=intake_agent_config.graphify_mode,
+                    codegraph_mode=intake_agent_config.codegraph_mode,
                     agent_config=args.agent_config,
                     main_ponytail_mode=(
                         intake_agent_config.main.ponytail_mode
@@ -388,7 +412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
                     requirements_mode=requirements_mode,
-                    graphify_mode=clarification_agent_config.graphify_mode,
+                    codegraph_mode=clarification_agent_config.codegraph_mode,
                     agent_config=args.agent_config,
                 )
                 message("\n===== 需求澄清阶段 =====")
@@ -441,7 +465,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=requirements_review_agent_config.graphify_mode,
+                    codegraph_mode=requirements_review_agent_config.codegraph_mode,
                     agent_config=args.agent_config,
                 )
                 message("\n===== 需求评审阶段 =====")
@@ -485,7 +509,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=detailed_design_agent_config.graphify_mode,
+                    codegraph_mode=detailed_design_agent_config.codegraph_mode,
                     agent_config=args.agent_config,
                 )
                 if review_result.ba_handoff is not None:
@@ -523,7 +547,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=task_split_agent_config.graphify_mode,
+                    codegraph_mode=task_split_agent_config.codegraph_mode,
                     agent_config=args.agent_config,
                 )
                 message("\n===== 任务拆分阶段 =====")
@@ -559,7 +583,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=development_agent_config.graphify_mode,
+                    codegraph_mode=development_agent_config.codegraph_mode,
                     agent_config=args.agent_config,
                 )
                 message("\n===== 任务开发阶段 =====")
@@ -605,7 +629,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     no_tui=bool(args.no_tui),
                     legacy_cli=bool(args.legacy_cli),
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=overall_review_agent_config.graphify_mode,
+                    codegraph_mode=overall_review_agent_config.codegraph_mode,
                     agent_config=args.agent_config,
                 )
                 message("\n===== 复核阶段 =====")
@@ -628,14 +652,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 message(render_remaining_stage_placeholders())
                 return 0
     finally:
-        _release_workflow_lock(workflow_lock_context)
+        try:
+            try:
+                cancel_codegraph_processes()
+            except Exception:  # noqa: BLE001 - cleanup cannot replace the stage result.
+                pass
+        finally:
+            _release_workflow_lock(workflow_lock_context)
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except KeyboardInterrupt:
-        cancel_graphify_processes()
+        cancel_codegraph_processes()
         cleaned_sessions = cleanup_registered_tmux_workers(reason="keyboard_interrupt")
         if cleaned_sessions:
             message(f"\n已清理 tmux 会话: {', '.join(cleaned_sessions)}")

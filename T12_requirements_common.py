@@ -48,8 +48,8 @@ class RequirementsAnalystHandoff:
     reasoning_effort: str
     proxy_url: str
     ponytail_mode: str = "off"
-    graphify_mode: str = "off"
-    graphify_config: dict[str, object] = field(default_factory=dict)
+    codegraph_mode: str = "off"
+    codegraph_config: dict[str, object] = field(default_factory=dict)
     requirements_mode: str = "standard"
     requirements_behavior: str = "standard"
 

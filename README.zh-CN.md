@@ -21,7 +21,7 @@ TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具�
 - 并行启动多个评审 agent，对需求澄清、详细设计、任务单、代码修改和整体代码进行评审。
 - 将详细设计拆成可跟踪的任务单 Markdown 和 JSON 进度文件。
 - 用 tmux 长会话驱动开发 agent 执行任务，并在任务级别做评审、修复和状态更新。
-- 构建项目级、仅代码的 Graphify 关系图，并向所有已支持厂商提供有边界的静态证据。
+- 可选维护项目级 CodeGraph 索引，并为所有已支持厂商提供同一套有界、只读的源码导航命令。
 - 支持阶段回退、运行时恢复、worker 重建、模型/厂商选择、代理配置和评审轮次限制。
 - 提供 OpenTUI 终端 UI、Web 控制台、legacy Python CLI 三种使用形态。
 
@@ -61,8 +61,8 @@ TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具�
 ├── docs/                        # 机器优先路由层事实源
 ├── scripts/
 │   ├── tmux-tui                 # OpenTUI 启动脚本
-│   └── tmux-graphify            # Graphify 只读安装/构建/查询包装器
-├── tools/graphify/              # 固定版本、隔离的 Graphify 工具清单与锁文件
+│   └── tmux-codegraph            # 托管安装及智能体安全的 explore/status 包装器
+├── tools/codegraph/              # CodeGraph 固定版本、许可证与校验清单
 └── tests/                       # Python 回归测试
 ```
 
@@ -77,7 +77,7 @@ TmuxCodingTeam 是一个本地运行的多智能体自动化开发编排工具�
 - 至少一个可用的 agent CLI：`codex`、`claude`、`gemini`、`opencode`、`mimo`、`agy` 或 `deveco`（DevEco Code）。
 - 对应 agent CLI 的登录状态、API 认证和网络代理。
 - 可选：Node.js。部分厂商模型探测会读取 Node 包元数据。
-- 可选：`uv`，用于安装隔离的项目托管 Graphify 0.9.27 环境；主流程不会替换用户全局安装的 Graphify。
+- 可选：CodeGraph 1.5.0；包装器可在用户明确确认后安装固定官方二进制，不覆盖用户已有安装。
 - Ponytail 无需另外安装插件、Node.js 进程、MCP 服务或联网；经审计的 Skill 已内置于 `third_party/ponytail`。
 
 ## 安装命令
@@ -161,7 +161,7 @@ python3 A00_main_tui.py \
   --requirement-name 新需求 \
   --ponytail-mode full \
   --requirements-mode standard \
-  --graphify-mode auto \
+  --codegraph-mode auto \
   --main-agent vendor=codex,model=default,effort=high \
   --reviewer-agent name=R1,vendor=codex,model=default,effort=medium \
   --requirements-review-max-rounds 5 \
@@ -235,7 +235,7 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
 - `--effort low|medium|high|xhigh|max`
 - `--proxy-url <port-or-url>` 或路由阶段的 `--proxy-port`
 - `--ponytail-mode off|lite|full|ultra`
-- `--graphify-mode off|auto|required`
+- `--codegraph-mode off|auto|required`
 - A00/A03：`--requirements-mode standard|grill|grill-with-docs`
 - `--reviewer-agent name=<key>,vendor=...,model=...,effort=...,proxy=...`
 - `--review-max-rounds <number|infinite>`
@@ -259,13 +259,12 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
 {
   "ponytail_mode": "full",
   "requirements_mode": "grill",
-  "graphify_mode": "auto",
-  "graphify": {
-    "include": ["src/**", "tests/**"],
-    "exclude": ["generated/**"],
-    "max_workers": 1,
-    "initial_timeout_sec": 120,
-    "incremental_timeout_sec": 30
+  "codegraph_mode": "auto",
+  "codegraph": {
+    "max_files": 6,
+    "max_output_chars": 12000,
+    "init_timeout_sec": 300,
+    "sync_timeout_sec": 60
   },
   "main": {
     "vendor": "codex",
@@ -285,7 +284,7 @@ python3 A08_OverallReview.py --project-dir /absolute/path/to/project --requireme
       "requirements_mode": "grill-with-docs"
     },
     "routing": {
-      "graphify_mode": "required"
+      "codegraph_mode": "required"
     },
     "development": {
       "main": {
@@ -337,36 +336,37 @@ Grill 是 A03 可选的需求访谈策略，不是 coding vendor。`standard` �
 
 同一 tmux 会话首次确认提交的 Grill turn 收到完整规则，后续只收到精简提醒。人类没有明确确认“共享理解一致”前，A03 不会完成。`grill-with-docs` 的文档在访谈期间只保存在需求运行时目录，确认后才原子发布；ADR 路径和编号由系统控制。固定的上游提交、MIT 许可证和完整性哈希记录在 `third_party/mattpocock-skills/UPSTREAM.json`。
 
-## Graphify 项目代码图谱
+## CodeGraph 项目代码图谱
 
-Graphify 是可选的项目级代码关系服务，不是第八个 coding agent 厂商。本项目固定兼容 Apache-2.0 许可的 `graphifyy==0.9.27`，并通过 `tools/graphify/pyproject.toml`、`tools/graphify/uv.lock` 使用隔离的 Python 3.11 环境；不会升级或覆盖用户已安装的 Graphify。
+CodeGraph 是可选的项目级源码导航服务，不是第八个 coding agent 厂商。本项目固定兼容 CodeGraph 1.5.0 官方 MIT 许可证版本；`tools/codegraph/`记录上游发布信息和校验值。系统不会调用`codegraph install`，也不会修改用户全局 Agent/MCP 配置。
 
-`--graphify-mode` 支持 `off`、`auto`、`required`。新工作流默认 `auto`；旧 runner/worker state 缺少字段时仍按 `off` 恢复。优先级依次为 CLI、`stages.<stage>.graphify_mode`、顶层 `graphify_mode`。Graphify 属于项目级配置，角色级覆盖会被拒绝。`auto` 在工具缺失或刷新失败时降级继续，并可复用上一份成功图；`required` 在工具、构图或 schema 失败时会在创建智能体前停止阶段。
+`--codegraph-mode`支持`off`、`auto`、`required`。新工作流默认`auto`；旧 runner/worker state 缺少字段时按`off`恢复。优先级为 CLI、`stages.<stage>.codegraph_mode`、顶层`codegraph_mode`，角色级覆盖会被拒绝。废弃的`graphify_mode`只兼容一个迁移版本并输出警告；旧 Graphify worker 不会跨引擎恢复。
 
 在仓库根目录使用维护包装器：
 
 ```bash
-scripts/tmux-graphify setup
-scripts/tmux-graphify doctor
-scripts/tmux-graphify status
-scripts/tmux-graphify build --project /absolute/path/to/project
-scripts/tmux-graphify query "calculate_total 的调用者"
-scripts/tmux-graphify affected "calculate_total"
-scripts/tmux-graphify path "HTTP handler" "calculate_total"
-scripts/tmux-graphify prune
+scripts/tmux-codegraph setup
+scripts/tmux-codegraph doctor
+scripts/tmux-codegraph --project /absolute/path/to/project init
+scripts/tmux-codegraph --project /absolute/path/to/project sync
+scripts/tmux-codegraph --project /absolute/path/to/project status
+scripts/tmux-codegraph --project /absolute/path/to/project explore "calculate_total 的调用者"
 ```
 
-`setup` 只把固定版本安装到 `$XDG_DATA_HOME/tmux_coding_team/tools/graphify/0.9.27/`（未设置时为 `~/.local/share/...`），必须由用户显式执行且需要联网；不会运行 Graphify 平台安装器、Git Hook、watch、MCP 或 global graph 命令。`doctor` 会校验精确版本与 CLI 契约。智能体可见的包装器只允许 `query`、`affected`、`path`、`explain`、`god-nodes` 等只读操作。
+`setup`只会在用户明确选择后下载固定官方 Release，校验 SHA-256，再安装到`$XDG_DATA_HOME/tmux_coding_team/tools/codegraph/1.5.0/<os-arch>/`（未设置时为`~/.local/share/...`）。`--yes`和无交互运行不会静默安装或初始化。每个 checkout 的索引都保存在自身`.codegraph/`；系统不会借用其他 worktree 的索引，只在明确阶段 checkpoint 执行`init`或`sync`，也不会启动 watch、MCP daemon 或后台模型进程。
 
-构图固定使用 `--code-only`、`--no-cluster` 和受控源码快照：不跟随符号链接，排除凭据类文件、运行时目录、构建目录和 vendor 目录；文件大小、文件数和总输入上限超出时明确失败，不静默截断。Graphify 子进程固定使用 `GRAPHIFY_QUERY_LOG_DISABLE=1`，并移除模型厂商凭据。不可变 generation 存放在用户缓存 `$XDG_CACHE_HOME/tmux_coding_team/graphify/`（未设置时为 `~/.cache/...`）；失败的 staging 永远不会替换上一份有效图。TUI/Web 不暴露 raw graph、缓存路径或可执行文件路径。
+`auto`模式下，工具或索引缺失会降级继续；交互运行可选择初始化、本次关闭、以后关闭或终止。`required`模式要求创建 worker 前已有兼容且可用的索引。已有索引通过`codegraph status --json`审核新增/修改/删除、partial 状态、pending refs、reindex 建议和 worktree mismatch。TUI/Web 只显示脱敏后的项目级 Ready、Stale、Degraded 等状态。
 
-Codex、Claude、Gemini、OpenCode、MiMo、AGY、DevEco 都通过普通提示词链获得同一份有边界的 Graphify 证据，并获得同一套只读命令环境；无需安装 Graphify Skill、MCP、Hook 或插件。只要本轮存在证据，提示词就会明确要求智能体先阅读。查询采用条件强制：`EXTRACTED` 证据充分时可不查；路由首次发现、代码事实或关系边缺失、实现种子未覆盖、真实改动评审等场景会给出一条无占位符的 `query`、`affected`、`path`、`explain` 或 `god-nodes --top 10` 必查命令。只读包装器用 runner、session、turn、evidence、graph fingerprint 和调用摘要核验真实执行，不保存查询参数或结果。Auto 模式漏查时提醒一次后记录降级并继续；Required 模式保留智能体现场，要求人工复检、明确按源码核验结果 override，或终止阶段。Graphify 始终只作导航，结论仍须回到 `AGENTS.md`（存在时）、源码、测试和配置核实。
+Codex、Claude、Gemini、OpenCode、MiMo、AGY、DevEco 获得相同环境和精简说明。需要跨文件导航时，智能体可以使用原生`codegraph_explore`工具，或只选择一个 fallback 命令：
 
-证据会结合当前阶段、角色、任务、由阶段层按 AI Hermes 合同解析的路由路径、明确符号和 A07 实际改动，生成最多三条可直接执行的推荐查询。每个 tmux 会话首次确认提交的 Graphify turn 会收到完整使用指南，后续只保留自包含提醒和本轮建议；未确认或结果不确定的提交不会锁存指南。A07 使用任务开始前后的受控源码 manifest 记录真实改动，A08 使用累计账本，并在每次开发修复后刷新图谱，避免把项目启动前已有的 dirty 文件误算为本需求修改。对于 manifest 已确认删除的源码路径，证据和可选命令 `affected <路径> --previous` 会使用上一份不可变 generation，并将结果明确标记为 `OLD_GENERATION/AMBIGUOUS`，不会冒充当前代码事实。
+```bash
+"$TMUX_CODEGRAPH_CMD" explore "具体的源码、调用链或影响面问题"
+"$TMUX_CODEGRAPH_CMD" status
+```
 
-五类智能体查询都会先轻量核对图谱与当前源码。图谱过期或新鲜度未知时仍可查询不可变 generation，但结果会明确标记 `stale/unknown`，要求回到当前源码核验，且不会由智能体命令自动触发构图。查询默认返回带 BEGIN/END marker 的有界文本，也支持 `--format json` 的 `tmux-graphify-query-result/1` 结果；绝对路径、本地文件/编辑器 URI、UNC 路径、ANSI 和控制字符都会被脱敏，保存的输出限制为 6,000 字符。查询统计按阶段、runner 和 tmux 会话 generation 隔离：复用会话会计入当前阶段，旧会话不能污染新阶段。TUI/Web 只展示该阶段查询次数与最近一次命令/新鲜度，不保存问题或结果正文。
+智能体包装器固定目标项目，只允许`explore`和`status`，默认最多返回 6 个文件、12,000 字符，并拒绝初始化、同步、安装、服务、删除索引及跨项目路径。同一 tmux 会话的第一条相关 Turn 收到不超过 600 字符的教程，后续只收到不超过 250 字符的提醒和最多一条可选查询建议。A01 audit/refine 与 A02 不查询；A07 reviewer 使用当前任务变化，A08 使用累计变化账本。
 
-事实优先级不变：当前代码、测试、配置是实现事实；`AGENTS.md`、`repo_map.json`、`task_routes.json`、`pitfalls.json`仍是机器路由权威；Graphify 只提供静态导航和影响面候选。A01 create 可以消费这些证据，A01 audit/refine 则会明确关闭 Graphify，并保持只审核或修改四个路由文件。动态 import、反射、代码生成、运行时配置与跨服务行为必须重新核查代码或运行证据。
+CodeGraph 不会预生成 Evidence、创建独立初始化消息、补救 Turn、查询合同修复 Turn，也不检查智能体是否执行查询，更不会把查询作为完成门禁。智能体不查询时，Auto 与 Off 的模型 Turn 数完全一致。查询失败只提示回到源码核验，不能改变任务结果合同或 Agent READY/BUSY 状态。源码、测试、配置仍是实现事实；`AGENTS.md`及 AI Hermes 路由文件仍是范围与路由权威。静态导航无法证明动态 import、反射、代码生成、运行时配置或跨服务行为。
 
 ## 运行时文件和状态
 
@@ -412,7 +412,7 @@ Python 桥接层在 `tmux_core/bridge`：
 - `T11_web_backend.py` 是 Web HTTP/SSE 后端兼容入口。
 - `tmux_core/bridge/backend.py` 负责统一 action 分发、快照构建、worker 控制、文件预览、prompt 响应、HITL 状态和运行时事件。
 - `tmux_core/bridge/web_backend.py` 暴露本地 HTTP API。
-- Graphify 只通过可选的项目级 `snapshot.app.graphify` 状态和脱敏证据报告预览展示；不新增 endpoint，也不升级 NDJSON 协议版本。
+- CodeGraph 只通过可选、脱敏的项目级`snapshot.app.codegraph`状态展示；不新增 endpoint、报告预览、Agent 查询标签，也不升级 NDJSON 协议版本。
 
 Web 后端提供的主要接口：
 

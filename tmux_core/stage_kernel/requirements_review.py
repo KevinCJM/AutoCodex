@@ -51,7 +51,7 @@ from tmux_core.runtime.hitl import (
     run_hitl_agent_loop,
     save_grill_session_state,
 )
-from tmux_core.runtime.graphify import GraphifyQueryIntent
+from tmux_core.runtime.codegraph import CodeGraphQueryIntent, normalize_codegraph_config
 from tmux_core.runtime.tmux_runtime import (
     AgentRunConfig,
     CommandResult,
@@ -73,10 +73,10 @@ from tmux_core.stage_kernel.reviewer_orchestration import (
     shutdown_stage_workers,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
-from tmux_core.stage_kernel.graphify_route_context import (
-    build_stage_graphify_turn_context,
-    worker_graphify_route_hints_enabled,
-    worker_graphify_scope,
+from tmux_core.stage_kernel.codegraph_route_context import (
+    build_stage_codegraph_turn_context,
+    worker_codegraph_route_hints_enabled,
+    worker_codegraph_scope,
 )
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
@@ -110,7 +110,7 @@ from tmux_core.stage_kernel.shared_review import (
     ensure_review_artifacts,
     ensure_review_artifacts_exist,
     inherit_legacy_handoff_ponytail_mode,
-    inherit_legacy_handoff_graphify_mode,
+    inherit_legacy_handoff_codegraph_mode,
     is_recoverable_startup_failure,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
@@ -145,6 +145,7 @@ from T09_terminal_ops import (
     PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
+    cleanup_codegraph_processes_on_exit,
     collect_multiline_input,
     get_terminal_ui,
     message,
@@ -179,21 +180,21 @@ REVIEW_CLARIFICATION_STAGE_NAME = "requirements_clarification"
 REVIEW_CLARIFICATION_TURN_PHASE = "requirements_clarification"
 
 
-def _requirements_review_graphify_context(
+def _requirements_review_codegraph_context(
     worker: object,
     *,
     phase: str,
     role: str,
     task_name: str = REQUIREMENTS_REVIEW_TASK_NAME,
 ):
-    project_root, requirement_name = worker_graphify_scope(worker)
+    project_root, requirement_name = worker_codegraph_scope(worker)
     paths = build_requirements_review_paths(project_root, requirement_name) if requirement_name else {}
-    return build_stage_graphify_turn_context(
+    return build_stage_codegraph_turn_context(
         project_root,
         stage_key="A04",
         phase=phase,
         role=role,
-        intent=GraphifyQueryIntent.REQUIREMENT_IMPACT,
+        intent=CodeGraphQueryIntent.REQUIREMENT_IMPACT,
         requirement_name=requirement_name,
         task_name=task_name,
         query_seeds=(requirement_name, "requirement impact", "callers and tests"),
@@ -208,7 +209,7 @@ def _requirements_review_graphify_context(
             )
             if key in paths
         ),
-        resolve_route_hints=worker_graphify_route_hints_enabled(worker),
+        resolve_route_hints=worker_codegraph_route_hints_enabled(worker),
     )
 
 @dataclass(frozen=True)
@@ -439,8 +440,8 @@ def prompt_review_agent_selection(
     default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
     default_proxy_url: str = "",
     default_ponytail_mode: str = "full",
-    default_graphify_mode: str = "off",
-    default_graphify_config: Mapping[str, object] | None = None,
+    default_codegraph_mode: str = "off",
+    default_codegraph_config: Mapping[str, object] | None = None,
         *,
         role_label: str = "",
         progress: ReviewStageProgress | None = None,
@@ -454,8 +455,8 @@ def prompt_review_agent_selection(
         default_reasoning_effort=default_reasoning_effort,
         default_proxy_url=default_proxy_url,
         default_ponytail_mode=default_ponytail_mode,
-        default_graphify_mode=default_graphify_mode,
-        default_graphify_config=default_graphify_config,
+        default_codegraph_mode=default_codegraph_mode,
+        default_codegraph_config=default_codegraph_config,
         role_label=role_label,
         progress=progress,
         allow_back_first_step=allow_back_first_step,
@@ -523,13 +524,17 @@ def prompt_replacement_review_agent_selection(
             default_model=previous_selection.model,
             default_reasoning_effort=previous_selection.reasoning_effort,
             default_proxy_url=previous_selection.proxy_url,
+            default_ponytail_mode=previous_selection.ponytail_mode,
+            default_codegraph_mode=previous_selection.codegraph_mode,
+            default_codegraph_config=previous_selection.codegraph_config,
             role_label=role_label,
             progress=progress,
         )
         selection = replace(
             selection,
             ponytail_mode=previous_selection.ponytail_mode,
-            graphify_mode=previous_selection.graphify_mode,
+            codegraph_mode=previous_selection.codegraph_mode,
+            codegraph_config=previous_selection.codegraph_config,
         )
         if (
                 not force_model_change
@@ -560,13 +565,17 @@ def prompt_required_replacement_review_agent_selection(
             default_model=previous_selection.model,
             default_reasoning_effort=previous_selection.reasoning_effort,
             default_proxy_url=previous_selection.proxy_url,
+            default_ponytail_mode=previous_selection.ponytail_mode,
+            default_codegraph_mode=previous_selection.codegraph_mode,
+            default_codegraph_config=previous_selection.codegraph_config,
             role_label=role_label,
             progress=progress,
         )
         selection = replace(
             selection,
             ponytail_mode=previous_selection.ponytail_mode,
-            graphify_mode=previous_selection.graphify_mode,
+            codegraph_mode=previous_selection.codegraph_mode,
+            codegraph_config=previous_selection.codegraph_config,
         )
         if (
                 not force_model_change
@@ -585,7 +594,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--review-max-rounds", default="", help="需求评审最多重试几轮；传 infinite 表示不设上限")
     parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
-    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--codegraph-mode", choices=("off", "auto", "required"), default="", help="CodeGraph 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--reviewer-agent", action="append", default=[], help="审核智能体模型配置: name=R1,vendor=...,model=...,effort=...,proxy=...")
@@ -1211,7 +1221,7 @@ def _run_ba_turn(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         stage_label=REQUIREMENTS_REVIEW_TASK_NAME,
         role_label=str(getattr(handoff.worker, "session_name", "") or "需求分析师"),
-        graphify_context=_requirements_review_graphify_context(
+        codegraph_context=_requirements_review_codegraph_context(
             handoff.worker,
             phase=result_contract.phase,
             role="requirements_analyst",
@@ -1235,7 +1245,7 @@ def _run_reviewer_turn(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         stage_label=REQUIREMENTS_REVIEW_TASK_NAME,
         role_label=_reviewer_artifact_agent_name(reviewer),
-        graphify_context=_requirements_review_graphify_context(
+        codegraph_context=_requirements_review_codegraph_context(
             reviewer.worker,
             phase=reviewer.contract.phase,
             role="requirements_reviewer",
@@ -1292,8 +1302,8 @@ def run_ba_turn_with_recreation(
                         current_handoff.reasoning_effort,
                         current_handoff.proxy_url,
                         current_handoff.ponytail_mode,
-                        current_handoff.graphify_mode,
-                        current_handoff.graphify_config,
+                        current_handoff.codegraph_mode,
+                        current_handoff.codegraph_config,
                     ),
                     force_model_change=True,
                     role_label=ba_display_name,
@@ -1330,8 +1340,8 @@ def run_ba_turn_with_recreation(
                     reasoning_effort=selection.reasoning_effort,
                     proxy_url=selection.proxy_url,
                     ponytail_mode=selection.ponytail_mode,
-                    graphify_mode=selection.graphify_mode,
-                    graphify_config=selection.graphify_config,
+                    codegraph_mode=selection.codegraph_mode,
+                    codegraph_config=selection.codegraph_config,
                     requirements_mode=current_handoff.requirements_mode,
                     requirements_behavior="standard",
                 )
@@ -1348,8 +1358,8 @@ def run_ba_turn_with_recreation(
                         current_handoff.reasoning_effort,
                         current_handoff.proxy_url,
                         current_handoff.ponytail_mode,
-                        current_handoff.graphify_mode,
-                        current_handoff.graphify_config,
+                        current_handoff.codegraph_mode,
+                        current_handoff.codegraph_config,
                     ),
                     force_model_change=True,
                     role_label=ba_display_name,
@@ -1386,8 +1396,8 @@ def run_ba_turn_with_recreation(
                     reasoning_effort=selection.reasoning_effort,
                     proxy_url=selection.proxy_url,
                     ponytail_mode=selection.ponytail_mode,
-                    graphify_mode=selection.graphify_mode,
-                    graphify_config=selection.graphify_config,
+                    codegraph_mode=selection.codegraph_mode,
+                    codegraph_config=selection.codegraph_config,
                     requirements_mode=current_handoff.requirements_mode,
                     requirements_behavior="standard",
                 )
@@ -1578,7 +1588,8 @@ def prepare_ba_handoff(
         paths: dict[str, Path],
         progress: ReviewStageProgress | None = None,
         ponytail_mode: str = "full",
-        graphify_mode: str = "off",
+        codegraph_mode: str = "off",
+        codegraph_config: Mapping[str, object] | None = None,
 ) -> tuple[RequirementsAnalystHandoff, tuple[str, ...]]:
     progress = _resolve_review_progress(progress)
     if ba_handoff is not None:
@@ -1593,7 +1604,8 @@ def prepare_ba_handoff(
         selection_title="进入需求评审阶段（需求分析师）",
         progress=progress,
         ponytail_mode=ponytail_mode,
-        graphify_mode=graphify_mode,
+        codegraph_mode=codegraph_mode,
+        codegraph_config=codegraph_config,
     )
     handoff, payload = run_ba_turn_with_recreation(
         handoff,
@@ -1621,14 +1633,16 @@ def _create_review_ba_handoff(
         selection_title: str,
         progress: ReviewStageProgress | None = None,
         ponytail_mode: str = "full",
-        graphify_mode: str = "off",
+        codegraph_mode: str = "off",
+        codegraph_config: Mapping[str, object] | None = None,
 ) -> RequirementsAnalystHandoff:
     progress = _resolve_review_progress(progress)
     ba_display_name = _review_ba_display_name(project_dir=project_dir)
     selection = prompt_review_agent_selection(
         DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
         default_ponytail_mode=ponytail_mode,
-        default_graphify_mode=graphify_mode,
+        default_codegraph_mode=codegraph_mode,
+        default_codegraph_config=codegraph_config,
         role_label=ba_display_name,
         progress=progress,
     )
@@ -1657,8 +1671,8 @@ def _create_review_ba_handoff(
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
         ponytail_mode=selection.ponytail_mode,
-        graphify_mode=selection.graphify_mode,
-        graphify_config=selection.graphify_config,
+        codegraph_mode=selection.codegraph_mode,
+        codegraph_config=selection.codegraph_config,
         requirements_mode=str(
             getattr(config, "requirements_mode", "standard") or "standard"
         ),
@@ -1676,7 +1690,7 @@ def _create_review_ba_handoff_compat(**kwargs) -> RequirementsAnalystHandoff:
             optional_key = next(
                 (
                     key
-                    for key in ("graphify_mode", "ponytail_mode")
+                    for key in ("codegraph_config", "codegraph_mode", "ponytail_mode")
                     if f"unexpected keyword argument '{key}'" in str(error)
                 ),
                 "",
@@ -1702,8 +1716,8 @@ def recreate_ba_handoff(
             previous_handoff.reasoning_effort,
             previous_handoff.proxy_url,
             previous_handoff.ponytail_mode,
-            previous_handoff.graphify_mode,
-            previous_handoff.graphify_config,
+            previous_handoff.codegraph_mode,
+            previous_handoff.codegraph_config,
         ),
         force_model_change=True,
         role_label=ba_display_name,
@@ -1735,8 +1749,8 @@ def recreate_ba_handoff(
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
         ponytail_mode=selection.ponytail_mode,
-        graphify_mode=selection.graphify_mode,
-        graphify_config=selection.graphify_config,
+        codegraph_mode=selection.codegraph_mode,
+        codegraph_config=selection.codegraph_config,
         requirements_mode=previous_handoff.requirements_mode,
         requirements_behavior="standard",
     )
@@ -1837,7 +1851,8 @@ def run_human_check_loop(
         return_to_grill_on_ambiguity: bool = False,
         auto_confirm: bool = False,
         ponytail_mode: str = "full",
-        graphify_mode: str = "off",
+        codegraph_mode: str = "off",
+        codegraph_config: Mapping[str, object] | None = None,
 ) -> RequirementsAnalystHandoff | None:
     progress = _resolve_review_progress(progress)
     message("进入需求评审阶段")
@@ -1853,7 +1868,8 @@ def run_human_check_loop(
                 selection_title="进入需求评审阶段（需求分析师）",
                 progress=progress,
                 ponytail_mode=ponytail_mode,
-                graphify_mode=graphify_mode,
+                codegraph_mode=codegraph_mode,
+                codegraph_config=codegraph_config,
             )
         return current_handoff
     while True:
@@ -1892,7 +1908,8 @@ def run_human_check_loop(
                     selection_title="进入需求评审阶段（需求分析师）",
                     progress=progress,
                     ponytail_mode=ponytail_mode,
-                    graphify_mode=graphify_mode,
+                    codegraph_mode=codegraph_mode,
+                    codegraph_config=codegraph_config,
                 )
             return current_handoff
         with progress.suspended() if progress is not None else nullcontext():
@@ -1911,7 +1928,8 @@ def run_human_check_loop(
                 selection_title="按人类建议启动需求分析师",
                 progress=progress,
                 ponytail_mode=ponytail_mode,
-                graphify_mode=graphify_mode,
+                codegraph_mode=codegraph_mode,
+                codegraph_config=codegraph_config,
             )
         if reuse_existing_handoff:
             initial_prompt = human_feed_bck(
@@ -2072,12 +2090,12 @@ def _run_review_clarification_continuation(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         fresh_completion_paths=fresh_completion_paths,
         fresh_completion_start_round=2,
-        graphify_context_factory=lambda hitl_context: build_stage_graphify_turn_context(
+        codegraph_context_factory=lambda hitl_context: build_stage_codegraph_turn_context(
             paths["project_root"],
             stage_key="A04",
             phase=hitl_context.turn_phase,
             role="requirements_analyst",
-            intent=GraphifyQueryIntent.REQUIREMENT_IMPACT,
+            intent=CodeGraphQueryIntent.REQUIREMENT_IMPACT,
             requirement_name=requirement_name,
             task_name=f"review_clarification_{hitl_context.hitl_round}",
             query_seeds=(requirement_name, "requirement impact"),
@@ -2146,8 +2164,8 @@ def build_reviewer_workers(
             selection = replace(selection, ponytail_mode=agent_config.ponytail_mode)
             selection = replace(
                 selection,
-                graphify_mode=agent_config.graphify_mode,
-                graphify_config=agent_config.graphify_config,
+                codegraph_mode=agent_config.codegraph_mode,
+                codegraph_config=agent_config.codegraph_config,
             )
             next_allow_back = False
             message(render_review_agent_selection(f"审核器 {reviewer_display_name} 配置", selection))
@@ -2254,7 +2272,8 @@ def _run_review_feedback_loop(
         skip_ba_feedback: bool = False,
         audit_context: StageAuditRunContext | None = None,
         ponytail_mode: str = "full",
-        graphify_mode: str = "off",
+        codegraph_mode: str = "off",
+        codegraph_config: Mapping[str, object] | None = None,
         return_to_grill_on_ambiguity: bool = False,
 ) -> tuple[RequirementsAnalystHandoff, list[ReviewerRuntime]]:
     progress = _resolve_review_progress(progress)
@@ -2271,7 +2290,8 @@ def _run_review_feedback_loop(
             paths=paths,
             progress=progress,
             ponytail_mode=ponytail_mode,
-            graphify_mode=graphify_mode,
+            codegraph_mode=codegraph_mode,
+            codegraph_config=codegraph_config,
         )
     if not skip_ba_feedback:
         if audit_context is not None:
@@ -2412,7 +2432,8 @@ def run_requirements_review_limit_hitl_loop(
         human_input_provider=None,
         audit_context: StageAuditRunContext | None = None,
         ponytail_mode: str = "full",
-        graphify_mode: str = "off",
+        codegraph_mode: str = "off",
+        codegraph_config: Mapping[str, object] | None = None,
 ) -> tuple[RequirementsAnalystHandoff, list[ReviewerRuntime], bool]:
     progress = _resolve_review_progress(progress)
     reviewer_label_getter = lambda reviewer, index: _reviewer_artifact_agent_name(reviewer) or f"审核智能体 {index}"  # noqa: E731
@@ -2425,7 +2446,8 @@ def run_requirements_review_limit_hitl_loop(
             paths=paths,
             progress=progress,
             ponytail_mode=ponytail_mode,
-            graphify_mode=graphify_mode,
+            codegraph_mode=codegraph_mode,
+            codegraph_config=codegraph_config,
         )
     if audit_context is not None:
         record_before_cleanup(
@@ -2573,10 +2595,11 @@ def run_requirements_review_stage(
     args = parser.parse_args(argv)
     if ba_handoff is not None:
         inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
-        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
+        inherit_legacy_handoff_codegraph_mode(args, ba_handoff.codegraph_mode)
     agent_config = resolve_stage_agent_config(args, stage_key="requirements_review")
     main_ponytail_mode = resolve_main_ponytail_mode(args, agent_config=agent_config)
-    graphify_mode = agent_config.graphify_mode
+    codegraph_mode = agent_config.codegraph_mode
+    codegraph_config = agent_config.codegraph_config
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     return_to_grill_on_ambiguity = allow_previous_stage_back
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
@@ -2598,14 +2621,29 @@ def run_requirements_review_stage(
         and str(
             getattr(
                 getattr(ba_handoff.worker, "config", None),
-                "graphify_mode",
-                ba_handoff.graphify_mode,
+                "codegraph_mode",
+                ba_handoff.codegraph_mode,
             )
             or "off"
         ).strip()
-        != graphify_mode
+        != codegraph_mode
     ):
-        message("需求分析师的 Graphify 模式与需求评审配置不一致，将重建会话")
+        message("需求分析师的 CodeGraph 模式与需求评审配置不一致，将重建会话")
+        with suppress(Exception):
+            ba_handoff.worker.request_kill()
+        ba_handoff = None
+    if (
+        ba_handoff is not None
+        and normalize_codegraph_config(
+            getattr(
+                getattr(ba_handoff.worker, "config", None),
+                "codegraph_config",
+                ba_handoff.codegraph_config,
+            )
+        )
+        != normalize_codegraph_config(codegraph_config)
+    ):
+        message("需求分析师的 CodeGraph 配置与需求评审配置不一致，将重建会话")
         with suppress(Exception):
             ba_handoff.worker.request_kill()
         ba_handoff = None
@@ -2658,7 +2696,8 @@ def run_requirements_review_stage(
                 return_to_grill_on_ambiguity=return_to_grill_on_ambiguity,
                 auto_confirm=bool(getattr(args, "yes", False)),
                 ponytail_mode=main_ponytail_mode,
-                graphify_mode=graphify_mode,
+                codegraph_mode=codegraph_mode,
+                codegraph_config=codegraph_config,
             )
             allow_previous_stage_back = False
         except _SkipToDetailedDesign as skip_to_design:
@@ -2780,7 +2819,8 @@ def run_requirements_review_stage(
                     skip_ba_feedback=post_hitl_continue_completed,
                     audit_context=audit_context,
                     ponytail_mode=main_ponytail_mode,
-                    graphify_mode=graphify_mode,
+                    codegraph_mode=codegraph_mode,
+                    codegraph_config=codegraph_config,
                     return_to_grill_on_ambiguity=return_to_grill_on_ambiguity,
                 )
                 post_hitl_continue_completed = False
@@ -2858,7 +2898,8 @@ def run_requirements_review_stage(
                     ) if bool(getattr(args, "yes", False)) else None,
                     audit_context=audit_context,
                     ponytail_mode=main_ponytail_mode,
-                    graphify_mode=graphify_mode,
+                    codegraph_mode=codegraph_mode,
+                    codegraph_config=codegraph_config,
                 )
                 review_round_policy.reset_after_hitl()
             round_index += 1
@@ -2915,6 +2956,7 @@ def run_requirements_review_stage(
             lock_context.__exit__(None, None, None)
 
 
+@cleanup_codegraph_processes_on_exit
 def main(argv: Sequence[str] | None = None) -> int:
     redirected, launch = maybe_launch_tui(argv, route="review", action="stage.a04.start")
     if redirected:

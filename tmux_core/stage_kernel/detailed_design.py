@@ -45,7 +45,7 @@ from tmux_core.runtime.contracts import (
     write_task_status,
 )
 from tmux_core.runtime.hitl import build_prefixed_sha256
-from tmux_core.runtime.graphify import GraphifyQueryIntent
+from tmux_core.runtime.codegraph import CodeGraphQueryIntent
 from tmux_core.runtime.tmux_runtime import (
     CommandResult,
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -61,7 +61,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_turn_artifact_contract_error,
     is_worker_death_error,
     list_registered_tmux_workers,
-    normalize_graphify_config,
+    normalize_codegraph_config,
 )
 from tmux_core.stage_kernel.reviewer_orchestration import (
     repair_reviewer_round_outputs,
@@ -74,10 +74,10 @@ from tmux_core.stage_kernel.death_orchestration import (
     run_reviewer_phase_with_death_handling,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
-from tmux_core.stage_kernel.graphify_route_context import (
-    build_stage_graphify_turn_context,
-    worker_graphify_route_hints_enabled,
-    worker_graphify_scope,
+from tmux_core.stage_kernel.codegraph_route_context import (
+    build_stage_codegraph_turn_context,
+    worker_codegraph_route_hints_enabled,
+    worker_codegraph_scope,
 )
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
@@ -106,7 +106,7 @@ from tmux_core.stage_kernel.shared_review import (
     ensure_review_artifacts,
     ensure_review_artifacts_exist,
     inherit_legacy_handoff_ponytail_mode,
-    inherit_legacy_handoff_graphify_mode,
+    inherit_legacy_handoff_codegraph_mode,
     mark_reviewer_turn_succeeded_from_materialized_outputs,
     mark_worker_awaiting_reconfiguration,
     parse_review_max_rounds,
@@ -127,8 +127,8 @@ from tmux_core.stage_kernel.shared_review import (
     resolve_reviewer_artifact_agent_name,
     resolve_agent_run_config_with_recovery,
     resolve_main_ponytail_mode,
-    resolve_workflow_graphify_config,
-    resolve_workflow_graphify_mode,
+    resolve_workflow_codegraph_config,
+    resolve_workflow_codegraph_mode,
     resolve_stage_agent_config,
     run_review_limit_hitl_cycle,
     worker_has_provider_auth_error,
@@ -152,6 +152,7 @@ from T09_terminal_ops import (
     PROMPT_BACK_VALUE,
     BridgeTerminalUI,
     PromptBackRequested,
+    cleanup_codegraph_processes_on_exit,
     collect_multiline_input,
     get_terminal_ui,
     maybe_launch_tui,
@@ -179,20 +180,20 @@ MAX_DETAILED_DESIGN_REVIEW_ROUNDS = 5
 MAX_DETAILED_DESIGN_HITL_ROUNDS = 8
 
 
-def _detailed_design_graphify_context(
+def _detailed_design_codegraph_context(
     worker: object,
     *,
     phase: str,
     role: str,
 ):
-    project_root, requirement_name = worker_graphify_scope(worker)
+    project_root, requirement_name = worker_codegraph_scope(worker)
     paths = build_detailed_design_paths(project_root, requirement_name) if requirement_name else {}
-    return build_stage_graphify_turn_context(
+    return build_stage_codegraph_turn_context(
         project_root,
         stage_key="A05",
         phase=phase,
         role=role,
-        intent=GraphifyQueryIntent.ARCHITECTURE_BOUNDARY,
+        intent=CodeGraphQueryIntent.ARCHITECTURE_BOUNDARY,
         requirement_name=requirement_name,
         task_name=DETAILED_DESIGN_TASK_NAME,
         query_seeds=(requirement_name, "architecture boundaries", "shared dependencies"),
@@ -208,7 +209,7 @@ def _detailed_design_graphify_context(
             )
             if key in paths
         ),
-        resolve_route_hints=worker_graphify_route_hints_enabled(worker),
+        resolve_route_hints=worker_codegraph_route_hints_enabled(worker),
     )
 
 
@@ -253,7 +254,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effort", help="需求分析师推理强度")
     parser.add_argument("--proxy-url", default="", help="需求分析师代理端口或完整代理 URL")
     parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
-    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--codegraph-mode", choices=("off", "auto", "required"), default="", help="CodeGraph 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--reuse-review-ba", action="store_true", help="优先复用需求评审阶段的需求分析师")
@@ -541,8 +543,8 @@ def _is_live_ba_handoff(handoff: RequirementsAnalystHandoff | None) -> bool:
 
 def _reviewer_default_selection(
         ponytail_mode: str = "full",
-        graphify_mode: str = "off",
-        graphify_config: dict[str, object] | None = None,
+        codegraph_mode: str = "off",
+        codegraph_config: dict[str, object] | None = None,
 ) -> ReviewAgentSelection:
     return ReviewAgentSelection(
         vendor=DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
@@ -550,8 +552,8 @@ def _reviewer_default_selection(
         reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
         proxy_url="",
         ponytail_mode=str(ponytail_mode or "full").strip() or "full",
-        graphify_mode=str(graphify_mode or "off").strip() or "off",
-        graphify_config=dict(graphify_config or {}),
+        codegraph_mode=str(codegraph_mode or "off").strip() or "off",
+        codegraph_config=dict(codegraph_config or {}),
     )
 
 
@@ -863,8 +865,8 @@ def collect_ba_agent_selection(
         "detailed_design",
     )
     ponytail_mode = resolve_main_ponytail_mode(args, stage_key=ponytail_stage_key)
-    graphify_mode = resolve_workflow_graphify_mode(args, stage_key=ponytail_stage_key)
-    graphify_config = resolve_workflow_graphify_config(args)
+    codegraph_mode = resolve_workflow_codegraph_mode(args, stage_key=ponytail_stage_key)
+    codegraph_config = resolve_workflow_codegraph_config(args)
     if interactive and not any((vendor_value, model_value, effort_value, proxy_value)):
         return prompt_review_agent_selection(
             DEFAULT_REQUIREMENTS_CLARIFICATION_VENDOR,
@@ -872,8 +874,8 @@ def collect_ba_agent_selection(
             default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
             default_proxy_url="",
             default_ponytail_mode=ponytail_mode,
-            default_graphify_mode=graphify_mode,
-            default_graphify_config=graphify_config,
+            default_codegraph_mode=codegraph_mode,
+            default_codegraph_config=codegraph_config,
             role_label=role_label,
             allow_back_first_step=allow_back_first_step,
             stage_key=stage_key,
@@ -892,8 +894,8 @@ def collect_ba_agent_selection(
             default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
             default_proxy_url=proxy_value,
             default_ponytail_mode=ponytail_mode,
-            default_graphify_mode=graphify_mode,
-            default_graphify_config=graphify_config,
+            default_codegraph_mode=codegraph_mode,
+            default_codegraph_config=codegraph_config,
             role_label=role_label,
             allow_back_first_step=allow_back_first_step,
             stage_key=stage_key,
@@ -904,8 +906,8 @@ def collect_ba_agent_selection(
         reasoning_effort=reasoning_effort,
         proxy_url=proxy_value,
         ponytail_mode=ponytail_mode,
-        graphify_mode=graphify_mode,
-        graphify_config=graphify_config,
+        codegraph_mode=codegraph_mode,
+        codegraph_config=codegraph_config,
     )
 
 
@@ -1039,8 +1041,8 @@ def create_design_ba_handoff(
         reasoning_effort=selection.reasoning_effort,
         proxy_url=selection.proxy_url,
         ponytail_mode=selection.ponytail_mode,
-        graphify_mode=selection.graphify_mode,
-        graphify_config=selection.graphify_config,
+        codegraph_mode=selection.codegraph_mode,
+        codegraph_config=selection.codegraph_config,
         requirements_mode=str(
             getattr(config, "requirements_mode", "standard") or "standard"
         ),
@@ -1058,10 +1060,10 @@ def prepare_design_ba_handoff(
 ) -> tuple[RequirementsAnalystHandoff, bool]:
     if ba_handoff is not None:
         inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
-        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
+        inherit_legacy_handoff_codegraph_mode(args, ba_handoff.codegraph_mode)
     expected_ponytail_mode = resolve_main_ponytail_mode(args, stage_key="detailed_design")
-    expected_graphify_mode = resolve_workflow_graphify_mode(args, stage_key="detailed_design")
-    expected_graphify_config = resolve_workflow_graphify_config(args)
+    expected_codegraph_mode = resolve_workflow_codegraph_mode(args, stage_key="detailed_design")
+    expected_codegraph_config = resolve_workflow_codegraph_config(args)
     strategy_prompted = (
         ba_handoff is not None
         and stdin_is_interactive()
@@ -1081,20 +1083,20 @@ def prepare_design_ba_handoff(
         and str(
             getattr(
                 getattr(ba_handoff.worker, "config", None),
-                "graphify_mode",
-                ba_handoff.graphify_mode,
+                "codegraph_mode",
+                ba_handoff.codegraph_mode,
             )
             or "off"
         ).strip()
-        == expected_graphify_mode
-        and normalize_graphify_config(
+        == expected_codegraph_mode
+        and normalize_codegraph_config(
             getattr(
                 getattr(ba_handoff.worker, "config", None),
-                "graphify_config",
-                ba_handoff.graphify_config,
+                "codegraph_config",
+                ba_handoff.codegraph_config,
             )
         )
-        == expected_graphify_config
+        == expected_codegraph_config
     )
     handoff_live = _is_live_ba_handoff(ba_handoff) if strategy == "reuse" else False
     if strategy == "reuse" and handoff_live and mode_compatible:
@@ -1387,7 +1389,7 @@ def _run_ba_turn(
         timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
         stage_label=DETAILED_DESIGN_TASK_NAME,
         role_label=str(getattr(handoff.worker, "session_name", "") or "需求分析师"),
-        graphify_context=_detailed_design_graphify_context(
+        codegraph_context=_detailed_design_codegraph_context(
             handoff.worker,
             phase=result_contract.phase,
             role="design_analyst",
@@ -1415,8 +1417,8 @@ def recreate_design_ba_handoff(
         previous_handoff.reasoning_effort,
         previous_handoff.proxy_url,
         previous_handoff.ponytail_mode,
-        previous_handoff.graphify_mode,
-        previous_handoff.graphify_config,
+        previous_handoff.codegraph_mode,
+        previous_handoff.codegraph_config,
     )
     selection = (
         prompt_required_replacement_review_agent_selection(
@@ -1815,7 +1817,7 @@ def run_reviewer_turn_with_recreation(
                 timeout_sec=DEFAULT_COMMAND_TIMEOUT_SEC,
                 stage_label=DETAILED_DESIGN_TASK_NAME,
                 role_label=_reviewer_artifact_agent_name(current_reviewer),
-                graphify_context=_detailed_design_graphify_context(
+                codegraph_context=_detailed_design_codegraph_context(
                     current_reviewer.worker,
                     phase=current_reviewer.contract.phase,
                     role="design_reviewer",
@@ -1973,15 +1975,15 @@ def build_reviewer_workers(
             selection = replace(selection, ponytail_mode=agent_config.ponytail_mode)
             selection = replace(
                 selection,
-                graphify_mode=agent_config.graphify_mode,
-                graphify_config=agent_config.graphify_config,
+                codegraph_mode=agent_config.codegraph_mode,
+                codegraph_config=agent_config.codegraph_config,
             )
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
         elif selection is None:
             selection = _reviewer_default_selection(
                 agent_config.ponytail_mode,
-                agent_config.graphify_mode,
-                agent_config.graphify_config,
+                agent_config.codegraph_mode,
+                agent_config.codegraph_config,
             )
         reviewers.append(
             create_reviewer_runtime(
@@ -2443,7 +2445,7 @@ def run_detailed_design_stage(
     args = parser.parse_args(argv)
     if ba_handoff is not None:
         inherit_legacy_handoff_ponytail_mode(args, ba_handoff.ponytail_mode)
-        inherit_legacy_handoff_graphify_mode(args, ba_handoff.graphify_mode)
+        inherit_legacy_handoff_codegraph_mode(args, ba_handoff.codegraph_mode)
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     if args.project_dir:
         project_dir = str(Path(args.project_dir).expanduser().resolve())
@@ -2594,8 +2596,8 @@ def run_detailed_design_stage(
                 allow_back_first_prompt=reviewer_selection_allow_back,
                 stage_key="detailed_design_reviewer_selection",
                 default_ponytail_mode=agent_config.ponytail_mode,
-                default_graphify_mode=agent_config.graphify_mode,
-                default_graphify_config=agent_config.graphify_config,
+                default_codegraph_mode=agent_config.codegraph_mode,
+                default_codegraph_config=agent_config.codegraph_config,
             )
             _, reviewer_workers, active_ba_handoff = run_main_phase_with_death_handling(
                 active_ba_handoff,
@@ -2658,8 +2660,8 @@ def run_detailed_design_stage(
                 allow_back_first_prompt=reviewer_selection_allow_back,
                 stage_key="detailed_design_reviewer_selection",
                 default_ponytail_mode=agent_config.ponytail_mode,
-                default_graphify_mode=agent_config.graphify_mode,
-                default_graphify_config=agent_config.graphify_config,
+                default_codegraph_mode=agent_config.codegraph_mode,
+                default_codegraph_config=agent_config.codegraph_config,
             )
             reviewer_workers = build_reviewer_workers(
                 args,
@@ -3047,6 +3049,7 @@ def run_detailed_design_stage(
             lock_context.__exit__(None, None, None)
 
 
+@cleanup_codegraph_processes_on_exit
 def main(argv: Sequence[str] | None = None) -> int:
     redirected, launch = maybe_launch_tui(argv, route="design", action="stage.a05.start")
     if redirected:

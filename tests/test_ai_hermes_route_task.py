@@ -47,12 +47,12 @@ def _write_routing_project(
 def test_r12_materializes_current_project_selectors(route_task: ModuleType) -> None:
     resolved = route_task.resolve_route(
         project_root=ROOT,
-        route_id="R12_graphify_code_graph",
+        route_id="R12_codegraph_code_graph",
     )
 
     assert resolved["status"] == "ok"
-    assert "tmux_core/runtime/graphify.py" in resolved["files"]["first_read"]
-    assert "tests/test_graphify_runtime.py" in resolved["minimum_regression"]
+    assert "tmux_core/runtime/codegraph.py" in resolved["files"]["first_read"]
+    assert "tests/test_codegraph_runtime.py" in resolved["minimum_regression"]
     assert resolved["routing_policy"]["merge_strategy"] == "append"
     assert resolved["actions"]["expand_search"][0]["action"] != "unknown"
 

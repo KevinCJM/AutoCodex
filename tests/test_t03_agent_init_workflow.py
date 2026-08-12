@@ -249,6 +249,53 @@ class FakeWorker:
 
 
 class AgentInitWorkflowTests(unittest.TestCase):
+    def test_run_store_load_rejects_legacy_graphify_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            store = RunStore.create(
+                selection=selection,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmpdir) / "runtime",
+                run_id="run_legacy_graphify",
+            )
+            payload = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+            payload["config"].pop("codegraph_mode", None)
+            payload["config"].pop("codegraph_config", None)
+            payload["config"]["graphify_mode"] = "required"
+            payload["config"]["graphify_config"] = {"max_workers": 1}
+            store.manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            with self.assertRaisesRegex(RuntimeError, "旧 Graphify routing run 不能跨引擎恢复"):
+                RunStore.load(
+                    run_id="run_legacy_graphify",
+                    runtime_root=Path(tmpdir) / "runtime",
+                )
+
+    def test_run_store_pre_graph_manifest_defaults_to_codegraph_off(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project_dir = (Path(tmpdir) / "project").resolve()
+            project_dir.mkdir(parents=True)
+            selection = resolve_target_selection(project_dir=project_dir, run_init=True)
+            store = RunStore.create(
+                selection=selection,
+                config=AgentRunConfig(vendor="codex", model="gpt-5"),
+                runtime_root=Path(tmpdir) / "runtime",
+                run_id="run_pre_graph",
+            )
+            payload = json.loads(store.manifest_path.read_text(encoding="utf-8"))
+            payload["config"].pop("codegraph_mode", None)
+            payload["config"].pop("codegraph_config", None)
+            store.manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            loaded = RunStore.load(
+                run_id="run_pre_graph",
+                runtime_root=Path(tmpdir) / "runtime",
+            )
+
+        self.assertEqual(loaded.config_object().codegraph_mode, "off")
+
     @staticmethod
     def _runtime_test_resolution(
         vendor_id: str,

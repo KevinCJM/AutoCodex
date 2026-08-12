@@ -42,11 +42,11 @@ from T02_tmux_agents import (
     worker_state_is_prelaunch_active,
 )
 from tmux_core.stage_kernel.agent_intervention import run_worker_turn_with_startup_recovery
-from tmux_core.runtime.graphify import (
-    GraphifyMode,
-    GraphifyQueryIntent,
-    GraphifyTurnContext,
-    GraphifyTurnProfile,
+from tmux_core.runtime.codegraph import (
+    CodeGraphMode,
+    CodeGraphQueryIntent,
+    CodeGraphTurnContext,
+    CodeGraphTurnProfile,
 )
 
 
@@ -1148,6 +1148,21 @@ class LiveWorkerHandle:
         return self.worker.session_name
 
 
+def _reject_legacy_graphify_run_config(config: object, *, run_id: str) -> None:
+    """Prevent an A01 Graphify run from silently resuming as CodeGraph Off."""
+
+    if not isinstance(config, dict):
+        return
+    legacy_keys = sorted(str(key) for key in config if str(key).startswith("graphify_"))
+    if not legacy_keys:
+        return
+    raise RuntimeError(
+        "旧 Graphify routing run 不能跨引擎恢复为 CodeGraph: "
+        f"run_id={run_id}, legacy_fields={','.join(legacy_keys)}。"
+        "请重新执行路由初始化创建新的 run；系统不会自动续跑或重发旧任务。"
+    )
+
+
 class RunStore:
     def __init__(self, *, run_root: str | Path, manifest: RunManifest) -> None:
         self.run_root = Path(run_root).expanduser().resolve()
@@ -1200,6 +1215,8 @@ class RunStore:
         if not manifest_path.exists():
             raise FileNotFoundError(f"未找到 run manifest: {manifest_path}")
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        raw_config = payload.get("config", {}) if isinstance(payload, dict) else {}
+        _reject_legacy_graphify_run_config(raw_config, run_id=run_id)
         workers = [
             WorkerManifestEntry(
                 work_dir=str(item.get("work_dir", "")),
@@ -1268,16 +1285,20 @@ class RunStore:
         )
 
     def config_object(self) -> AgentRunConfig:
+        _reject_legacy_graphify_run_config(
+            self.manifest.config,
+            run_id=self.manifest.run_id,
+        )
         return AgentRunConfig(
             vendor=self.manifest.config["vendor"],
             model=self.manifest.config["model"],
             reasoning_effort=self.manifest.config["reasoning_effort"],
             proxy_url=self.manifest.config.get("proxy_url", ""),
             ponytail_mode=self.manifest.config.get("ponytail_mode", "off"),
-            graphify_mode=self.manifest.config.get("graphify_mode", "off"),
-            graphify_config=(
-                dict(self.manifest.config.get("graphify_config", {}))
-                if isinstance(self.manifest.config.get("graphify_config", {}), dict)
+            codegraph_mode=self.manifest.config.get("codegraph_mode", "off"),
+            codegraph_config=(
+                dict(self.manifest.config.get("codegraph_config", {}))
+                if isinstance(self.manifest.config.get("codegraph_config", {}), dict)
                 else {}
             ),
         )
@@ -1788,17 +1809,17 @@ def run_directory_initialization_with_worker(
             run_turn_kwargs: dict[str, object],
     ) -> CommandResult:
         effective_kwargs = dict(run_turn_kwargs)
-        if "graphify_profile" in effective_kwargs:
+        if "codegraph_profile" in effective_kwargs:
             try:
                 declared_parameters = inspect.signature(worker.run_turn).parameters
             except (TypeError, ValueError):
                 declared_parameters = {}
-            # Audit/refine explicitly disable Graphify on the real runtime.
+            # Audit/refine explicitly disable CodeGraph on the real runtime.
             # Legacy/custom A01 worker factories may expose only the former
             # run_turn contract (or a forwarding **kwargs wrapper), so keep
             # those factories compatible instead of leaking a new keyword.
-            if "graphify_profile" not in declared_parameters:
-                effective_kwargs.pop("graphify_profile", None)
+            if "codegraph_profile" not in declared_parameters:
+                effective_kwargs.pop("codegraph_profile", None)
 
         def on_intervention(error: Exception) -> None:
             sync_state(
@@ -1919,34 +1940,34 @@ def run_directory_initialization_with_worker(
         current_turn_status_path = str(contract.status_path)
         sync_state("create_running", note="create_routing_layer")
         create_prompt = build_create_prompt()
-        graphify_profile: object | None = None
-        prepare_graphify = getattr(worker, "prepare_graphify_turn_profile", None)
-        if callable(prepare_graphify):
-            turn_context = GraphifyTurnContext(
+        codegraph_profile: object | None = None
+        prepare_codegraph = getattr(worker, "prepare_codegraph_turn_profile", None)
+        if callable(prepare_codegraph):
+            turn_context = CodeGraphTurnContext(
                 stage_key="A01",
                 phase=PHASE_ROUTING_LAYER_CREATE,
                 role="routing_agent",
-                intent=GraphifyQueryIntent.ROUTING_DISCOVERY,
+                intent=CodeGraphQueryIntent.ROUTING_DISCOVERY,
                 query_seeds=("project entry points", "module boundaries", "related tests"),
             )
             try:
-                parameters = inspect.signature(prepare_graphify).parameters.values()
+                parameters = inspect.signature(prepare_codegraph).parameters.values()
             except (TypeError, ValueError):
                 parameters = ()
             if any(
                 parameter.name == "turn_context" or parameter.kind == inspect.Parameter.VAR_KEYWORD
                 for parameter in parameters
             ):
-                graphify_profile = prepare_graphify(create_prompt, turn_context=turn_context)
+                codegraph_profile = prepare_codegraph(create_prompt, turn_context=turn_context)
             else:
-                graphify_profile = prepare_graphify(create_prompt)
+                codegraph_profile = prepare_codegraph(create_prompt)
         create_turn_kwargs: dict[str, object] = {
             "label": "create_routing_layer",
             "prompt": create_prompt,
             "completion_contract": contract,
         }
-        if graphify_profile is not None:
-            create_turn_kwargs["graphify_profile"] = graphify_profile
+        if codegraph_profile is not None:
+            create_turn_kwargs["codegraph_profile"] = codegraph_profile
         create_result = run_routing_turn_with_startup_recovery(
             workflow_stage="create_running",
             run_turn_kwargs=create_turn_kwargs,
@@ -1991,7 +2012,7 @@ def run_directory_initialization_with_worker(
                 "label": f"audit_routing_layer_{round_index}",
                 "prompt": build_audit_prompt(audit_round=round_index),
                 "completion_contract": contract,
-                "graphify_profile": GraphifyTurnProfile(mode=GraphifyMode.OFF.value),
+                "codegraph_profile": CodeGraphTurnProfile(mode=CodeGraphMode.OFF.value),
             },
         )
         if run_store is not None:
@@ -2040,7 +2061,7 @@ def run_directory_initialization_with_worker(
                 "label": f"refine_routing_layer_{current_round}",
                 "prompt": build_refine_prompt(audit_record),
                 "completion_contract": contract,
-                "graphify_profile": GraphifyTurnProfile(mode=GraphifyMode.OFF.value),
+                "codegraph_profile": CodeGraphTurnProfile(mode=CodeGraphMode.OFF.value),
             },
         )
         if run_store is not None:

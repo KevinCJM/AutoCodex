@@ -23,7 +23,7 @@ This repository has been flattened into the current project root. The documentat
 - Launch multiple reviewer agents in parallel to review requirements clarification, detailed design, task lists, code changes, and final code quality.
 - Split detailed designs into trackable Markdown task lists and JSON progress files.
 - Drive development agents through long-running tmux sessions, then perform task-level review, repair, and status updates.
-- Build a project-local, code-only Graphify relationship graph and expose bounded static evidence to every supported agent vendor.
+- Optionally maintain a project-local CodeGraph index and give every supported agent vendor the same bounded, read-only navigation command.
 - Support stage rollback, runtime recovery, worker reconstruction, model/vendor selection, proxy configuration, and review-round limits.
 - Provide three user interfaces: OpenTUI terminal UI, Web console, and legacy Python CLI.
 
@@ -63,8 +63,8 @@ This repository has been flattened into the current project root. The documentat
 ├── docs/                        # Machine-first routing facts
 ├── scripts/
 │   ├── tmux-tui                 # OpenTUI launcher
-│   └── tmux-graphify            # Read-only Graphify setup/build/query wrapper
-├── tools/graphify/              # Pinned, isolated Graphify tool manifest and lock
+│   └── tmux-codegraph            # Managed setup plus agent-safe explore/status wrapper
+├── tools/codegraph/              # Pinned CodeGraph release metadata, license, and checksums
 └── tests/                       # Python regression tests
 ```
 
@@ -79,7 +79,7 @@ Some top-level files are compatibility entry points and map into real implementa
 - At least one available agent CLI: `codex`, `claude`, `gemini`, `opencode`, `mimo`, `agy`, or `deveco` (DevEco Code).
 - Login, API authentication, and network proxy setup for the selected agent CLI.
 - Optional: Node.js. Some provider/model detection code reads Node package metadata.
-- Optional: `uv` for installing the isolated, project-managed Graphify 0.9.27 environment. The main workflow never replaces a user-global Graphify installation.
+- Optional: CodeGraph 1.5.0. The wrapper can explicitly install the pinned official binary without replacing a user installation.
 - Ponytail requires no separate plugin, Node.js process, MCP server, or network access; the audited skills are bundled under `third_party/ponytail`.
 
 ## Installation
@@ -165,7 +165,7 @@ python3 A00_main_tui.py \
   --requirement-name new-feature \
   --ponytail-mode full \
   --requirements-mode standard \
-  --graphify-mode auto \
+  --codegraph-mode auto \
   --main-agent vendor=codex,model=default,effort=high \
   --reviewer-agent name=R1,vendor=codex,model=default,effort=medium \
   --requirements-review-max-rounds 5 \
@@ -239,7 +239,7 @@ Most stages support:
 - `--effort low|medium|high|xhigh|max`
 - `--proxy-url <port-or-url>` or the routing-stage `--proxy-port`
 - `--ponytail-mode off|lite|full|ultra`
-- `--graphify-mode off|auto|required`
+- `--codegraph-mode off|auto|required`
 - A00/A03: `--requirements-mode standard|grill|grill-with-docs`
 - `--reviewer-agent name=<key>,vendor=...,model=...,effort=...,proxy=...`
 - `--review-max-rounds <number|infinite>`
@@ -263,13 +263,12 @@ You can also write configuration into a JSON file and pass it with `--agent-conf
 {
   "ponytail_mode": "full",
   "requirements_mode": "grill",
-  "graphify_mode": "auto",
-  "graphify": {
-    "include": ["src/**", "tests/**"],
-    "exclude": ["generated/**"],
-    "max_workers": 1,
-    "initial_timeout_sec": 120,
-    "incremental_timeout_sec": 30
+  "codegraph_mode": "auto",
+  "codegraph": {
+    "max_files": 6,
+    "max_output_chars": 12000,
+    "init_timeout_sec": 300,
+    "sync_timeout_sec": 60
   },
   "main": {
     "vendor": "codex",
@@ -289,7 +288,7 @@ You can also write configuration into a JSON file and pass it with `--agent-conf
       "requirements_mode": "grill-with-docs"
     },
     "routing": {
-      "graphify_mode": "required"
+      "codegraph_mode": "required"
     },
     "development": {
       "main": {
@@ -341,36 +340,37 @@ The workflow injects a self-contained, vendor-neutral rules block through the sh
 
 The first confirmed Grill turn in a tmux session receives the complete rules; later turns receive a compact reminder. A03 cannot complete until the human explicitly confirms shared understanding. In `grill-with-docs`, drafts stay in the requirement runtime and are atomically published only after that confirmation; ADR paths and numbers remain host-controlled. The pinned upstream commit, MIT license, and integrity hashes are recorded in `third_party/mattpocock-skills/UPSTREAM.json`.
 
-## Project Code Graph With Graphify
+## Project Code Graph With CodeGraph
 
-Graphify is an optional project-level code relationship service, not an eighth coding-agent vendor. This integration is pinned to the Apache-2.0 `graphifyy==0.9.27` package and runs from an isolated Python 3.11 environment described by `tools/graphify/pyproject.toml` and `tools/graphify/uv.lock`. It does not upgrade or overwrite a Graphify executable already installed by the user.
+CodeGraph is an optional project-level source-navigation service, not an eighth coding-agent vendor. The integration is pinned to CodeGraph 1.5.0 and its MIT-licensed official release. `tools/codegraph/` records the upstream release and checksums; the workflow never invokes `codegraph install` or changes global agent/MCP configuration.
 
-`--graphify-mode` supports `off`, `auto`, and `required`. New workflows default to `auto`; restored legacy runner or worker state without the field remains `off`. CLI configuration takes precedence over `stages.<stage>.graphify_mode`, then the top-level `graphify_mode`. Graphify is project-level, so role-level overrides are rejected. In `auto`, missing tools or failed refreshes degrade to the existing routing workflow and can reuse a stale successful graph. In `required`, tool, build, or schema failures stop the stage before an agent is created.
+`--codegraph-mode` supports `off`, `auto`, and `required`. New workflows default to `auto`; restored old runner or worker state without the field remains `off`. Precedence is CLI, `stages.<stage>.codegraph_mode`, then top-level `codegraph_mode`; role-level overrides are rejected. The deprecated `graphify_mode` key is accepted for one migration release and mapped with a warning. A worker from the retired engine is never resumed as a CodeGraph worker.
 
 Use the maintenance wrapper from the repository root:
 
 ```bash
-scripts/tmux-graphify setup
-scripts/tmux-graphify doctor
-scripts/tmux-graphify status
-scripts/tmux-graphify build --project /absolute/path/to/project
-scripts/tmux-graphify query "callers of calculate_total"
-scripts/tmux-graphify affected "calculate_total"
-scripts/tmux-graphify path "HTTP handler" "calculate_total"
-scripts/tmux-graphify prune
+scripts/tmux-codegraph setup
+scripts/tmux-codegraph doctor
+scripts/tmux-codegraph --project /absolute/path/to/project init
+scripts/tmux-codegraph --project /absolute/path/to/project sync
+scripts/tmux-codegraph --project /absolute/path/to/project status
+scripts/tmux-codegraph --project /absolute/path/to/project explore "callers of calculate_total"
 ```
 
-`setup` installs only the pinned managed environment under `$XDG_DATA_HOME/tmux_coding_team/tools/graphify/0.9.27/` (or `~/.local/share/...`) and requires an explicit command plus network access. It never runs Graphify platform installers, Git hooks, watch mode, MCP, or global graph commands. `doctor` verifies the exact version and CLI contract. The agent-facing wrapper permits only read operations such as `query`, `affected`, `path`, `explain`, and `god-nodes`.
+`setup` downloads only the pinned official release into `$XDG_DATA_HOME/tmux_coding_team/tools/codegraph/1.5.0/<os-arch>/` (or `~/.local/share/...`) after an explicit interactive choice and SHA-256 verification. `--yes` and headless runs never install or initialize silently. CodeGraph stores each checkout's index in that checkout's `.codegraph/`; the system never borrows another worktree's index and runs `init`/`sync` only at explicit stage checkpoints. It starts no watcher, MCP daemon, or background model process.
 
-Graph builds use `--code-only`, `--no-cluster`, and a controlled source snapshot. Symlinks are not followed, secret-like files and runtime/build/vendor directories are excluded, and bounded file/count/size limits fail explicitly instead of silently truncating input. Graphify subprocesses receive `GRAPHIFY_QUERY_LOG_DISABLE=1` and no model-provider credentials. Immutable generations live in the user cache (`$XDG_CACHE_HOME/tmux_coding_team/graphify/` or `~/.cache/...`); partial builds are staged and never replace the last valid graph. Neither the raw graph nor cache paths are exposed through TUI/Web snapshots.
+In `auto`, a missing tool or index degrades without blocking the workflow; an interactive run can choose to initialize, disable once, disable for the project, or terminate. In `required`, a compatible ready index is required before worker creation. Existing indexes are audited through `codegraph status --json` for pending changes, partial indexing, pending references, reindex recommendations, and worktree mismatch. TUI and Web expose only sanitized project-level state such as Ready, Stale, or Degraded.
 
-Codex, Claude, Gemini, OpenCode, MiMo, AGY, and DevEco receive the same bounded Graphify evidence through the ordinary prompt chain and the same read-only command environment. No vendor needs a Graphify Skill, MCP server, hook, or plugin. Whenever evidence exists, the prompt requires the agent to read it first. Queries remain conditional: sufficiently complete `EXTRACTED` evidence makes them optional, while routing discovery, missing code facts/edges, uncovered implementation seeds, and changed-file reviews receive one concrete required `query`, `affected`, `path`, `explain`, or `god-nodes --top 10` command. The wrapper audit binds a successful query to the current runner, session, turn, evidence, graph fingerprint, and invocation digest without storing query arguments or output. Auto mode reminds once and then records a degraded result when the query receipt remains missing; Required mode keeps the worker alive and requests human recheck, explicit source-verified override, or termination. Graphify still provides navigation only, so agents must verify results against `AGENTS.md` when present, source, tests, and configuration.
+Codex, Claude, Gemini, OpenCode, MiMo, AGY, and DevEco receive the same environment and compact instructions. When cross-file navigation is useful, an agent may use a native `codegraph_explore` tool or exactly one fallback command:
 
-Evidence is ranked with the current stage, role, task, stage-materialized AI Hermes routed paths, explicit symbols, and the actual A07 change set, and includes at most three executable query suggestions. The first confirmed Graphify turn in a tmux session receives the full guide; later turns receive only a self-contained reminder and task-specific suggestions. An unconfirmed or outcome-unknown submission does not latch the guide. A07 derives its task changes from controlled source manifests captured before and after development, and A08 consumes the accumulated ledger and refreshes after every developer repair, so pre-existing dirty files are not attributed to the requirement. For a manifest-confirmed deleted source path, evidence and the optional `affected <path> --previous` query use the previous immutable generation and mark every result `OLD_GENERATION/AMBIGUOUS` rather than presenting it as current code truth.
+```bash
+"$TMUX_CODEGRAPH_CMD" explore "a specific source, call-path, or impact question"
+"$TMUX_CODEGRAPH_CMD" status
+```
 
-Every agent query performs a lightweight source-freshness assessment first. A stale or unknown graph may still answer from an immutable generation, but the result is visibly marked and must be checked against current source; agent queries never trigger a build. The default bounded text envelope has stable BEGIN/END markers, while `--format json` returns `tmux-graphify-query-result/1`. Absolute paths, local file/editor URIs, UNC paths, ANSI and control characters are sanitized, and stored output is capped at 6,000 characters. Query aggregation is isolated by stage, runner and tmux session generation, so reused sessions count in the current stage while superseded sessions cannot pollute it. TUI/Web expose only that stage aggregate and the latest command/freshness, never the question or result body.
+The worker wrapper pins the target project, permits only `explore` and `status`, caps output at six files and 12,000 characters, and rejects initialization, synchronization, installation, services, deletion, and cross-project paths. The first relevant turn in a tmux session receives a tutorial of at most 600 characters; later turns receive at most 250 characters and at most one optional query suggestion. A01 audit/refine and A02 do not query. A07 reviewers receive the current task's source changes, while A08 receives the accumulated change ledger.
 
-Routing authority does not change: active code, tests, and configuration are implementation truth; `AGENTS.md`, `repo_map.json`, `task_routes.json`, and `pitfalls.json` remain the machine-routing authority; Graphify only supplies static navigation and impact candidates. A01 creation may consume that evidence, while A01 audit/refine turns intentionally disable it and stay within the four routing files. Dynamic imports, reflection, generated code, runtime configuration, and cross-service behavior always require direct code or runtime confirmation.
+CodeGraph never precomputes prompt evidence, creates a separate initialization or repair message, checks whether an agent queried, or gates task completion. With no agent query, Auto and Off use the same number of model turns. Query failures only tell the agent to verify source and cannot change task-result contracts or READY/BUSY state. Source, tests, and configuration remain implementation truth; `AGENTS.md` and the AI Hermes routing files remain routing authority. Static navigation cannot prove dynamic imports, reflection, generated code, runtime configuration, or cross-service behavior.
 
 ## Runtime Files And State
 
@@ -418,7 +418,7 @@ The Python bridge layer lives under `tmux_core/bridge`:
 - `T11_web_backend.py` is the Web HTTP/SSE backend compatibility entry point.
 - `tmux_core/bridge/backend.py` handles action dispatch, snapshot construction, worker control, file preview, prompt responses, HITL state, and runtime events.
 - `tmux_core/bridge/web_backend.py` exposes the local HTTP API.
-- Graphify is exposed only as optional project-level `snapshot.app.graphify` state and a sanitized evidence report preview; it does not add an endpoint or change the NDJSON protocol version.
+- CodeGraph is exposed only as optional sanitized project-level `snapshot.app.codegraph` state; it adds no endpoint, report preview, per-agent query label, or NDJSON version change.
 
 Main Web backend endpoints:
 

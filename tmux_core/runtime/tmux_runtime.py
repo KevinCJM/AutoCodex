@@ -64,30 +64,28 @@ from tmux_core.runtime.grill import (
     normalize_requirements_mode,
     validate_grill_bundle,
 )
-from tmux_core.runtime.graphify import (
-    GRAPHIFY_FULL_GUIDE_MARKER,
-    GRAPHIFY_GUIDE_VERSION,
-    GraphifyBuildConfig,
-    GraphifyError,
-    GraphifyMode,
-    GraphifyTurnContext,
-    GraphifyTurnProfile,
-    GraphifyUsageAssessment,
-    GraphifyUsageContractError,
-    GraphifyUsagePolicy,
-    assess_graphify_turn_usage,
-    build_graphify_evidence_block,
-    graphify_interactive_recovery_enabled,
-    graphify_required_recovery_decision,
-    graphify_required_recovery_guard,
-    normalize_graphify_mode,
-    publish_graphify_off_status,
-    publish_graphify_pending_status,
-    register_graphify_turn_usage,
-    resolve_graphify_tool,
-    resolve_graphify_turn_profile,
-    set_graphify_required_recovery_decision,
-    setup_managed_graphify,
+from tmux_core.runtime.codegraph import (
+    CODEGRAPH_FULL_GUIDE_MARKER,
+    CODEGRAPH_GUIDE_VERSION,
+    CodeGraphConfig,
+    CodeGraphError,
+    CodeGraphMode,
+    CodeGraphTurnContext,
+    CodeGraphTurnProfile,
+    CodeGraphUnavailable,
+    build_codegraph_hint_block,
+    codegraph_interactive_recovery_enabled,
+    codegraph_required_recovery_decision,
+    codegraph_required_recovery_guard,
+    initialize_codegraph_project,
+    inspect_codegraph_project,
+    normalize_codegraph_mode,
+    publish_codegraph_off_status,
+    resolve_codegraph_tool,
+    resolve_codegraph_turn_profile,
+    set_codegraph_required_recovery_decision,
+    setup_managed_codegraph,
+    write_codegraph_project_preference,
 )
 from tmux_core.runtime.contracts import (
     TASK_RESULT_COMPLETED,
@@ -160,7 +158,6 @@ TASK_RESULT_READY_MISSING_GRACE_SEC = 2.0
 STALE_BUSY_WITHOUT_CONTRACT_REASON_PREFIX = "stale_busy_without_contract"
 LONG_RUNNING_TASK_RESULT_REASON_PREFIX = "long_running_task_result"
 LONG_RUNNING_TASK_RESULT_BLOCKER = "long_running_task_result"
-GRAPHIFY_USAGE_BLOCKER = "graphify_usage_required"
 TASK_CONTRACT_STALL_IDLE_SEC = 45.0
 CODEX_TRANSIENT_SHELL_START_GRACE_SEC = 15.0
 TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS = _positive_int_env("TMUX_TASK_RESULT_BUSY_TIMEOUT_MAX_EXTENSIONS", 30)
@@ -2016,73 +2013,28 @@ class GrillSessionModeMismatch(RuntimeError):
     """A live session cannot be reused under a different requirements policy."""
 
 
-def normalize_graphify_config(value: Mapping[str, object] | None) -> dict[str, object]:
-    """Validate and canonicalize the stage-wide Graphify build policy."""
+def normalize_codegraph_config(value: Mapping[str, object] | None) -> dict[str, object]:
+    """Validate and canonicalize the stage-wide CodeGraph runtime policy."""
 
-    if not value:
-        return {}
     if not isinstance(value, Mapping):
-        raise ValueError("graphify 配置必须是 JSON 对象")
-    allowed = {
-        "include",
-        "exclude",
-        "max_workers",
-        "initial_timeout_sec",
-        "incremental_timeout_sec",
-    }
+        if value in (None, {}):
+            value = {}
+        else:
+            raise ValueError("codegraph 配置必须是 JSON 对象")
+    allowed = {"max_files", "max_output_chars", "init_timeout_sec", "sync_timeout_sec"}
     unknown = sorted(str(key) for key in value if str(key) not in allowed)
     if unknown:
-        raise ValueError(f"graphify 配置包含未知字段: {', '.join(unknown)}")
-
-    def patterns(key: str) -> tuple[str, ...]:
-        raw = value.get(key, ())
-        if raw in (None, ""):
-            return ()
-        if not isinstance(raw, (list, tuple)):
-            raise ValueError(f"graphify.{key} 必须是字符串数组")
-        normalized = tuple(str(item or "").strip() for item in raw)
-        if any(not item for item in normalized):
-            raise ValueError(f"graphify.{key} 不能包含空值")
-        return normalized
-
-    def positive_int(key: str, default: int) -> int:
-        try:
-            result = int(value.get(key, default))
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"graphify.{key} 必须是正整数") from error
-        if result <= 0:
-            raise ValueError(f"graphify.{key} 必须是正整数")
-        return result
-
-    def positive_float(key: str, default: float) -> float:
-        try:
-            result = float(value.get(key, default))
-        except (TypeError, ValueError) as error:
-            raise ValueError(f"graphify.{key} 必须是正数") from error
-        if result <= 0:
-            raise ValueError(f"graphify.{key} 必须是正数")
-        return result
-
-    defaults = GraphifyBuildConfig()
-    normalized = {
-        "include": patterns("include"),
-        "exclude": patterns("exclude"),
-        "max_workers": positive_int("max_workers", defaults.max_workers),
-        "initial_timeout_sec": positive_float(
-            "initial_timeout_sec",
-            defaults.initial_timeout_sec,
-        ),
-        "incremental_timeout_sec": positive_float(
-            "incremental_timeout_sec",
-            defaults.incremental_timeout_sec,
-        ),
+        raise ValueError(f"codegraph 配置包含未知字段: {', '.join(unknown)}")
+    config = CodeGraphConfig(**dict(value))
+    return {
+        "max_files": config.max_files,
+        "max_output_chars": config.max_output_chars,
+        "init_timeout_sec": config.init_timeout_sec,
+        "sync_timeout_sec": config.sync_timeout_sec,
     }
-    if normalized["max_workers"] != 1:
-        raise ValueError("graphify.max_workers 第一版固定为 1")
-    return normalized
 
 
-class GraphifySessionModeMismatch(RuntimeError):
+class CodeGraphSessionModeMismatch(RuntimeError):
     """A live session cannot be reused under a different project graph policy."""
 
 
@@ -2519,6 +2471,15 @@ def load_worker_from_state_path(
     config_payload = payload.get("config", {})
     if not work_dir or not isinstance(config_payload, dict):
         return None
+    # Graphify and CodeGraph have incompatible session policies and delivery
+    # latches.  A legacy Graphify state must never be reconstructed as a
+    # CodeGraph-Off worker merely because the new fields are absent.  Truly old
+    # workers that predate both graph engines still retain the documented Off
+    # compatibility default.
+    if any(str(key).startswith("graphify_") for key in payload) or any(
+        str(key).startswith("graphify_") for key in config_payload
+    ):
+        return None
     vendor = str(config_payload.get("vendor", "")).strip()
     model = str(config_payload.get("model", "")).strip()
     if not vendor or not model:
@@ -2544,13 +2505,13 @@ def load_worker_from_state_path(
                     config_payload.get("requirements_mode", RequirementsMode.STANDARD.value)
                 ).strip()
                 or RequirementsMode.STANDARD.value,
-                graphify_mode=str(
-                    config_payload.get("graphify_mode", GraphifyMode.OFF.value)
+                codegraph_mode=str(
+                    config_payload.get("codegraph_mode", CodeGraphMode.OFF.value)
                 ).strip()
-                or GraphifyMode.OFF.value,
-                graphify_config=(
-                    config_payload.get("graphify_config", {})
-                    if isinstance(config_payload.get("graphify_config", {}), Mapping)
+                or CodeGraphMode.OFF.value,
+                codegraph_config=(
+                    config_payload.get("codegraph_config", {})
+                    if isinstance(config_payload.get("codegraph_config", {}), Mapping)
                     else {}
                 ),
             ),
@@ -3989,8 +3950,8 @@ class AgentRunConfig:
     resolved_executable: str = ""
     ponytail_mode: str = PonytailMode.OFF.value
     requirements_mode: str = RequirementsMode.STANDARD.value
-    graphify_mode: str = GraphifyMode.OFF.value
-    graphify_config: Mapping[str, object] = field(default_factory=dict)
+    codegraph_mode: str = CodeGraphMode.OFF.value
+    codegraph_config: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "vendor", normalize_vendor(self.vendor))
@@ -4011,13 +3972,13 @@ class AgentRunConfig:
         )
         object.__setattr__(
             self,
-            "graphify_mode",
-            normalize_graphify_mode(
-                self.graphify_mode,
-                default=GraphifyMode.OFF,
+            "codegraph_mode",
+            normalize_codegraph_mode(
+                self.codegraph_mode,
+                default=CodeGraphMode.OFF,
             ).value,
         )
-        object.__setattr__(self, "graphify_config", normalize_graphify_config(self.graphify_config))
+        object.__setattr__(self, "codegraph_config", normalize_codegraph_config(self.codegraph_config))
         object.__setattr__(self, "model", str(self.model or "").strip())
         if not self.model:
             raise ValueError("model 不能为空")
@@ -4079,8 +4040,8 @@ class AgentRunConfig:
             "proxy_url": self.proxy_url,
             "ponytail_mode": self.ponytail_mode,
             "requirements_mode": self.requirements_mode,
-            "graphify_mode": self.graphify_mode,
-            "graphify_config": dict(self.graphify_config),
+            "codegraph_mode": self.codegraph_mode,
+            "codegraph_config": dict(self.codegraph_config),
             "reasoning_note": build_reasoning_note(self.vendor, self.reasoning_effort, model=self.model, resolution=resolution),
         }
 
@@ -4163,15 +4124,21 @@ class AgentRunConfig:
             raise ValueError(f"不支持的厂商: {self.vendor}")
 
         args.extend(self.extra_args)
-        graphify_wrapper = PROJECT_ROOT / "scripts" / "tmux-graphify"
+        codegraph_wrapper = PROJECT_ROOT / "scripts" / "tmux-codegraph"
         environment = [
             "env",
             "PONYTAIL_DEFAULT_MODE=off",
-            f"TMUX_GRAPHIFY_CMD={graphify_wrapper}",
-            f"TMUX_GRAPHIFY_PROJECT_DIR={work_dir}",
-            f"TMUX_GRAPHIFY_MODE={self.graphify_mode}",
-            "TMUX_GRAPHIFY_READ_ONLY=1",
-            "GRAPHIFY_QUERY_LOG_DISABLE=1",
+            f"TMUX_CODEGRAPH_CMD={codegraph_wrapper}",
+            f"TMUX_CODEGRAPH_PROJECT_DIR={work_dir}",
+            f"TMUX_CODEGRAPH_MODE={self.codegraph_mode}",
+            "TMUX_CODEGRAPH_READ_ONLY=1",
+            "CODEGRAPH_DIR=.codegraph",
+            "CODEGRAPH_TELEMETRY=0",
+            "CODEGRAPH_NO_DAEMON=1",
+            "CODEGRAPH_NO_UPDATE_CHECK=1",
+            "CODEGRAPH_NO_PROMPT_HOOK=1",
+            "DO_NOT_TRACK=1",
+            "NO_COLOR=1",
         ]
         if self.vendor == Vendor.DEVECO:
             environment.append("DEVECO_DISABLE_AUTOUPDATE=1")
@@ -4254,22 +4221,15 @@ class TmuxBatchWorker:
         self.requirements_grill_session_id = ""
         self.requirements_transition_pending = False
         self.requirements_transition_delivered = False
-        self.graphify_mode = normalize_graphify_mode(
-            getattr(self.config, "graphify_mode", GraphifyMode.OFF.value),
-            default=GraphifyMode.OFF,
+        self.codegraph_mode = normalize_codegraph_mode(
+            getattr(self.config, "codegraph_mode", CodeGraphMode.OFF.value),
+            default=CodeGraphMode.OFF,
         ).value
-        self.graphify_generation_refreshed = False
-        self.graphify_session_generation = uuid.uuid4().hex
-        self.graphify_orientation_delivered = False
-        self.graphify_delivered_mode = ""
-        self.graphify_delivered_guide_version = ""
-        self.graphify_usage_turn_id = ""
-        self.graphify_usage_policy = GraphifyUsagePolicy()
-        self.graphify_usage_delivery = ""
-        self.graphify_query_status = ""
-        self.graphify_usage_receipt = ""
-        self.graphify_usage_manual_override = False
-        self._graphify_usage_repair_active = False
+        self.codegraph_generation_refreshed = False
+        self.codegraph_session_generation = uuid.uuid4().hex
+        self.codegraph_orientation_delivered = False
+        self.codegraph_delivered_mode = ""
+        self.codegraph_delivered_guide_version = ""
         self.backend = backend or TmuxBackend()
         self.detector = build_output_detector(self.config.vendor)
         self.runtime_root = Path(runtime_root or DEFAULT_RUNTIME_ROOT).expanduser().resolve()
@@ -4347,17 +4307,11 @@ class TmuxBatchWorker:
         self.stage_runner_id = str(
             self._runtime_metadata.get("stage_runner_id", self._runtime_metadata.get("runner_id", "")) or ""
         ).strip()
-        if self.graphify_mode == GraphifyMode.OFF.value:
+        if self.codegraph_mode == CodeGraphMode.OFF.value:
             # OFF must remain a hard runtime no-op while still replacing a
             # previous runner's Ready/Failed project badge with the truthful
             # current mode.
-            publish_graphify_off_status(self.work_dir)
-        else:
-            publish_graphify_pending_status(
-                self.work_dir,
-                self.graphify_mode,
-                runner_id=self.stage_runner_id,
-            )
+            publish_codegraph_off_status(self.work_dir)
         self.last_terminal_signature = ""
         self.last_terminal_changed_at = ""
         self.terminal_recently_changed = False
@@ -4374,8 +4328,8 @@ class TmuxBatchWorker:
         self.launch_command = self._build_agent_launch_command()
         if self.state_path.exists():
             existing_state = self.read_state()
-            self.graphify_generation_refreshed = bool(
-                existing_state.get("graphify_generation_refreshed", False)
+            self.codegraph_generation_refreshed = bool(
+                existing_state.get("codegraph_generation_refreshed", False)
             )
             existing_config = existing_state.get("config", {})
             if not isinstance(existing_config, Mapping):
@@ -4400,24 +4354,24 @@ class TmuxBatchWorker:
                     f"session={existing_session_name}, existing={existing_requirements_mode}, "
                     f"requested={self.requirements_mode}"
                 )
-            existing_graphify_mode = normalize_graphify_mode(
-                existing_config.get("graphify_mode", GraphifyMode.OFF.value),
-                default=GraphifyMode.OFF,
+            existing_codegraph_mode = normalize_codegraph_mode(
+                existing_config.get("codegraph_mode", CodeGraphMode.OFF.value),
+                default=CodeGraphMode.OFF,
             ).value
-            if existing_session_name and existing_graphify_mode != self.graphify_mode:
-                raise GraphifySessionModeMismatch(
-                    "cannot reuse tmux session with a different Graphify mode: "
-                    f"session={existing_session_name}, existing={existing_graphify_mode}, "
-                    f"requested={self.graphify_mode}"
+            if existing_session_name and existing_codegraph_mode != self.codegraph_mode:
+                raise CodeGraphSessionModeMismatch(
+                    "cannot reuse tmux session with a different CodeGraph mode: "
+                    f"session={existing_session_name}, existing={existing_codegraph_mode}, "
+                    f"requested={self.codegraph_mode}"
                 )
-            existing_graphify_config = normalize_graphify_config(
-                existing_config.get("graphify_config", {})
-                if isinstance(existing_config.get("graphify_config", {}), Mapping)
+            existing_codegraph_config = normalize_codegraph_config(
+                existing_config.get("codegraph_config", {})
+                if isinstance(existing_config.get("codegraph_config", {}), Mapping)
                 else {}
             )
-            if existing_session_name and existing_graphify_config != dict(self.config.graphify_config):
-                raise GraphifySessionModeMismatch(
-                    "cannot reuse tmux session with a different Graphify scan policy: "
+            if existing_session_name and existing_codegraph_config != dict(self.config.codegraph_config):
+                raise CodeGraphSessionModeMismatch(
+                    "cannot reuse tmux session with a different CodeGraph scan policy: "
                     f"session={existing_session_name}"
                 )
             self.pane_id = existing_pane_id or str(existing_state.get("pane_id", self.pane_id))
@@ -4504,60 +4458,23 @@ class TmuxBatchWorker:
                         requirements_policy.get("transition_pending", False)
                         and not self.requirements_transition_delivered
                     )
-            graphify_policy = existing_state.get("graphify_policy", {})
-            if isinstance(graphify_policy, Mapping):
-                existing_generation = str(graphify_policy.get("session_generation", "") or "").strip()
+            codegraph_policy = existing_state.get("codegraph_policy", {})
+            if isinstance(codegraph_policy, Mapping):
+                existing_generation = str(codegraph_policy.get("session_generation", "") or "").strip()
                 if existing_generation:
-                    self.graphify_session_generation = existing_generation
-                delivered_mode = str(graphify_policy.get("delivered_mode", "") or "").strip().lower()
+                    self.codegraph_session_generation = existing_generation
+                delivered_mode = str(codegraph_policy.get("delivered_mode", "") or "").strip().lower()
                 delivered_guide_version = str(
-                    graphify_policy.get("guide_version", "") or ""
+                    codegraph_policy.get("guide_version", "") or ""
                 ).strip()
-                self.graphify_orientation_delivered = bool(
-                    graphify_policy.get("orientation_delivered", False)
-                    and delivered_mode == self.graphify_mode
-                    and delivered_guide_version == GRAPHIFY_GUIDE_VERSION
+                self.codegraph_orientation_delivered = bool(
+                    codegraph_policy.get("orientation_delivered", False)
+                    and delivered_mode == self.codegraph_mode
+                    and delivered_guide_version == CODEGRAPH_GUIDE_VERSION
                 )
-                if self.graphify_orientation_delivered:
-                    self.graphify_delivered_mode = delivered_mode
-                    self.graphify_delivered_guide_version = delivered_guide_version
-            self.graphify_usage_turn_id = str(
-                existing_state.get("current_graphify_usage_turn_id", "") or ""
-            ).strip()
-            self.graphify_usage_delivery = str(
-                existing_state.get("graphify_evidence_delivery", "") or ""
-            ).strip()
-            self.graphify_query_status = str(
-                existing_state.get("graphify_query_status", "") or ""
-            ).strip()
-            existing_usage_receipt = str(
-                existing_state.get("graphify_usage_receipt", "") or ""
-            ).strip()
-            self.graphify_usage_receipt = (
-                str(self._task_runtime_dir() / existing_usage_receipt)
-                if existing_usage_receipt and Path(existing_usage_receipt).name == existing_usage_receipt
-                else ""
-            )
-            existing_evidence_id = str(
-                existing_state.get("graphify_evidence_id", "") or ""
-            ).strip()
-            existing_query_requirement = str(
-                existing_state.get("graphify_query_requirement", "not_applicable")
-                or "not_applicable"
-            ).strip().lower()
-            if existing_query_requirement not in {"required", "optional", "not_applicable"}:
-                existing_query_requirement = "not_applicable"
-            self.graphify_usage_policy = GraphifyUsagePolicy(
-                evidence_required=bool(existing_evidence_id),
-                query_requirement=existing_query_requirement,
-                evidence_id=existing_evidence_id,
-                graph_fingerprint=str(
-                    existing_state.get("graphify_fingerprint", "") or ""
-                ).strip(),
-                freshness=str(
-                    existing_state.get("graphify_freshness", "") or ""
-                ).strip(),
-            )
+                if self.codegraph_orientation_delivered:
+                    self.codegraph_delivered_mode = delivered_mode
+                    self.codegraph_delivered_guide_version = delivered_guide_version
             existing_runner_id = str(existing_state.get("stage_runner_id", "") or "").strip()
             if (
                     metadata_owns_runner_id
@@ -4813,18 +4730,18 @@ class TmuxBatchWorker:
             default=default_behavior,
         ).value
 
-    def _configured_graphify_mode(self) -> str:
+    def _configured_codegraph_mode(self) -> str:
         config = getattr(self, "config", None)
-        return normalize_graphify_mode(
+        return normalize_codegraph_mode(
             getattr(
                 self,
-                "graphify_mode",
-                getattr(config, "graphify_mode", GraphifyMode.OFF.value),
+                "codegraph_mode",
+                getattr(config, "codegraph_mode", CodeGraphMode.OFF.value),
             ),
-            default=GraphifyMode.OFF,
+            default=CodeGraphMode.OFF,
         ).value
 
-    def _graphify_runner_scope_id(self) -> str:
+    def _codegraph_runner_scope_id(self) -> str:
         authoritative = str(getattr(self, "stage_runner_id", "") or "").strip()
         if authoritative:
             return authoritative
@@ -4833,31 +4750,31 @@ class TmuxBatchWorker:
 
     def _build_agent_launch_command(self) -> str:
         command = self.config.build_launch_command(self.work_dir)
-        runner_id = self._graphify_runner_scope_id()
-        graphify_session_generation = ""
-        if self._configured_graphify_mode() != GraphifyMode.OFF.value:
-            graphify_session_generation = str(
-                getattr(self, "graphify_session_generation", "") or ""
+        runner_id = self._codegraph_runner_scope_id()
+        codegraph_session_generation = ""
+        if self._configured_codegraph_mode() != CodeGraphMode.OFF.value:
+            codegraph_session_generation = str(
+                getattr(self, "codegraph_session_generation", "") or ""
             ).strip()
         assignments = []
         if runner_id:
             assignments.append(
-                shlex.quote(f"TMUX_GRAPHIFY_RUNNER_ID={runner_id}")
+                shlex.quote(f"TMUX_CODEGRAPH_RUNNER_ID={runner_id}")
             )
-        if graphify_session_generation:
+        if codegraph_session_generation:
             assignments.append(
                 shlex.quote(
-                    "TMUX_GRAPHIFY_SESSION_GENERATION="
-                    f"{graphify_session_generation}"
+                    "TMUX_CODEGRAPH_SESSION_GENERATION="
+                    f"{codegraph_session_generation}"
                 )
             )
         if not assignments:
             return command
         return " ".join(("env", *assignments, command))
 
-    def _graphify_stage_scope_key(
+    def _codegraph_stage_scope_key(
             self,
-            turn_context: GraphifyTurnContext | None = None,
+            turn_context: CodeGraphTurnContext | None = None,
     ) -> str:
         if turn_context is not None:
             stage_key = str(getattr(turn_context, "stage_key", "") or "").strip()
@@ -4869,272 +4786,102 @@ class TmuxBatchWorker:
         match = re.search(r"(?i)(?:^|[._-])(a(?:0[0-9]|1[0-9]))(?:$|[._-])", action)
         return match.group(1).upper() if match else ""
 
-    def activate_graphify_query_scope(
-            self,
-            turn_context: GraphifyTurnContext | None = None,
-    ) -> bool:
-        if self._configured_graphify_mode() == GraphifyMode.OFF.value:
-            return False
-        return publish_graphify_pending_status(
-            self.work_dir,
-            self._configured_graphify_mode(),
-            runner_id=self._graphify_runner_scope_id(),
-            stage_key=self._graphify_stage_scope_key(turn_context),
-            session_generation=str(
-                getattr(self, "graphify_session_generation", "") or ""
-            ).strip(),
-        )
-
-    @staticmethod
-    def _graphify_usage_command_name(policy: GraphifyUsagePolicy) -> str:
-        match = re.search(
-            r'\$TMUX_GRAPHIFY_CMD"?\s+(query|affected|path|explain|god-nodes)\b',
-            str(policy.recommended_command or ""),
-        )
-        return match.group(1) if match else ""
-
-    def _graphify_usage_receipt_path(self, label: str, turn_id: str) -> Path:
-        basename = _slugify(f"{label}-{turn_id[:12]}-graphify-usage", max_len=128)
-        return self._task_runtime_dir() / f"{basename}.json"
-
-    def _persist_graphify_usage_state_fast(
-            self,
-            *,
-            last_writer: str = "TmuxBatchWorker.graphify_usage",
-    ) -> None:
-        policy = self.graphify_usage_policy
-        with self.state_lock:
-            payload = self.read_state()
-            payload.update(
-                {
-                    "current_graphify_usage_turn_id": self.graphify_usage_turn_id,
-                    "graphify_usage_policy": f"query_{policy.query_requirement}",
-                    "graphify_evidence_delivery": self.graphify_usage_delivery,
-                    "graphify_query_requirement": policy.query_requirement,
-                    "graphify_query_status": self.graphify_query_status,
-                    "graphify_query_command": self._graphify_usage_command_name(policy),
-                    "graphify_usage_receipt": Path(self.graphify_usage_receipt).name
-                    if self.graphify_usage_receipt else "",
-                    "updated_at": _now_iso(),
-                    "state_revision": int(payload.get("state_revision", 0) or 0) + 1,
-                    "last_writer": last_writer,
-                }
-            )
-            _atomic_write_json(self.state_path, payload)
-        _notify_runtime_state_changed_best_effort()
-
-    def _begin_graphify_turn_usage(
-            self,
-            *,
-            label: str,
-            profile: GraphifyTurnProfile,
-    ) -> None:
-        if not profile.enabled:
-            return
-        self.graphify_usage_turn_id = uuid.uuid4().hex
-        self.graphify_usage_policy = profile.usage_policy
-        self.graphify_usage_delivery = "pending"
-        self.graphify_query_status = (
-            "pending" if profile.usage_policy.query_requirement == "required" else "optional"
-        )
-        self.graphify_usage_receipt = str(
-            self._graphify_usage_receipt_path(label, self.graphify_usage_turn_id)
-        )
-        self.graphify_usage_manual_override = False
-        register_graphify_turn_usage(
-            self.work_dir,
-            self._configured_graphify_mode(),
-            runner_id=self._graphify_runner_scope_id(),
-            stage_key=self._graphify_stage_scope_key(profile.turn_context),
-            session_generation=self.graphify_session_generation,
-            turn_id=self.graphify_usage_turn_id,
-            policy=self.graphify_usage_policy,
-            delivery_confirmed=False,
-        )
-
-    def _confirm_graphify_turn_delivery(self, profile: GraphifyTurnProfile) -> None:
-        if (
-            not profile.enabled
-            or not str(getattr(self, "graphify_usage_turn_id", "") or "")
-            or profile.usage_policy.evidence_id
-            != getattr(self, "graphify_usage_policy", GraphifyUsagePolicy()).evidence_id
-        ):
-            return
-        if self.graphify_usage_delivery == "confirmed":
-            return
-        registered = register_graphify_turn_usage(
-            self.work_dir,
-            self._configured_graphify_mode(),
-            runner_id=self._graphify_runner_scope_id(),
-            stage_key=self._graphify_stage_scope_key(profile.turn_context),
-            session_generation=self.graphify_session_generation,
-            turn_id=self.graphify_usage_turn_id,
-            policy=self.graphify_usage_policy,
-            delivery_confirmed=True,
-        )
-        if not registered:
-            return
-        self.graphify_usage_delivery = "confirmed"
-        self._persist_graphify_usage_state_fast(
-            last_writer="TmuxBatchWorker.graphify_usage_delivery"
-        )
-
-    def _assess_graphify_usage(
-            self,
-            *,
-            degraded: bool = False,
-            manual_override: bool = False,
-    ) -> GraphifyUsageAssessment:
-        assessment = assess_graphify_turn_usage(
-            self.work_dir,
-            self.graphify_usage_policy,
-            session_generation=self.graphify_session_generation,
-            turn_id=self.graphify_usage_turn_id,
-            delivery_confirmed=self.graphify_usage_delivery == "confirmed",
-            receipt_path=self.graphify_usage_receipt or None,
-            manual_override=manual_override,
-            degraded=degraded,
-        )
-        self.graphify_query_status = assessment.query_status
-        self.graphify_usage_manual_override = assessment.query_status == "manual_override"
-        self._persist_graphify_usage_state_fast()
-        return assessment
-
-    def override_graphify_usage_requirement(self) -> None:
-        """Record an explicit human override for the current Required-mode turn."""
-
-        self._assess_graphify_usage(manual_override=True)
-
-    def _graphify_required_query_is_satisfied(self) -> bool:
-        if not self.graphify_usage_turn_id:
-            return True
-        return self._assess_graphify_usage(
-            manual_override=self.graphify_usage_manual_override,
-        ).satisfied
-
-    def _graphify_policy_payload(self) -> dict[str, object]:
+    def _codegraph_policy_payload(self) -> dict[str, object]:
         return {
-            "session_generation": self.graphify_session_generation,
-            "guide_version": GRAPHIFY_GUIDE_VERSION,
-            "orientation_delivered": self.graphify_orientation_delivered,
-            "delivered_mode": self.graphify_delivered_mode,
+            "session_generation": self.codegraph_session_generation,
+            "guide_version": CODEGRAPH_GUIDE_VERSION,
+            "orientation_delivered": self.codegraph_orientation_delivered,
+            "delivered_mode": self.codegraph_delivered_mode,
         }
 
-    def _graphify_full_guide_required(self, profile: GraphifyTurnProfile) -> bool:
+    def _codegraph_full_guide_required(self, profile: CodeGraphTurnProfile) -> bool:
         return (
-            not bool(getattr(self, "graphify_orientation_delivered", False))
-            or str(getattr(self, "graphify_delivered_mode", "") or "") != profile.mode
-            or str(getattr(self, "graphify_delivered_guide_version", "") or "")
-            != GRAPHIFY_GUIDE_VERSION
+            not bool(getattr(self, "codegraph_orientation_delivered", False))
+            or str(getattr(self, "codegraph_delivered_mode", "") or "") != profile.mode
+            or str(getattr(self, "codegraph_delivered_guide_version", "") or "")
+            != CODEGRAPH_GUIDE_VERSION
         )
 
-    def _graphify_prompt_kind_for_turn(
+    def _codegraph_prompt_kind_for_turn(
             self,
-            profile: GraphifyTurnProfile | GraphifyMode | str | None,
+            profile: CodeGraphTurnProfile | CodeGraphMode | str | None,
     ) -> str:
         if profile is None:
             return ""
-        normalized = self._normalize_graphify_profile_for_turn(profile)
+        normalized = self._normalize_codegraph_profile_for_turn(profile)
         if not normalized.enabled:
             return ""
-        return "full" if self._graphify_full_guide_required(normalized) else "reminder"
+        return "full" if self._codegraph_full_guide_required(normalized) else "reminder"
 
     @staticmethod
-    def _submitted_prompt_contains_managed_graphify_full_guide(
+    def _submitted_prompt_contains_managed_codegraph_full_guide(
             submitted_prompt: str,
-            profile: GraphifyTurnProfile,
+            profile: CodeGraphTurnProfile,
     ) -> bool:
-        evidence = getattr(profile, "evidence", None)
-        if evidence is None:
-            return False
-        authoritative_block = str(evidence.block_text or "").strip()
-        if (
-                not authoritative_block
-                or GRAPHIFY_FULL_GUIDE_MARKER not in authoritative_block
-        ):
-            return False
-        source = str(submitted_prompt or "")
-        start = source.find(authoritative_block)
-        while start >= 0:
-            before = source[:start]
-            after = source[start + len(authoritative_block):]
-            if (
-                    (not before or before.endswith("\n\n"))
-                    and (not after or after.startswith("\n\n"))
-            ):
-                return True
-            start = source.find(authoritative_block, start + 1)
-        return False
+        return bool(
+            profile.enabled
+            and CODEGRAPH_FULL_GUIDE_MARKER in str(profile.full_text or "")
+            and str(profile.full_text or "").strip() in str(submitted_prompt or "")
+        )
 
-    def _reset_graphify_delivery_generation(self) -> None:
-        self.graphify_session_generation = uuid.uuid4().hex
-        self.graphify_orientation_delivered = False
-        self.graphify_delivered_mode = ""
-        self.graphify_delivered_guide_version = ""
-        self.graphify_usage_turn_id = ""
-        self.graphify_usage_policy = GraphifyUsagePolicy()
-        self.graphify_usage_delivery = ""
-        self.graphify_query_status = ""
-        self.graphify_usage_receipt = ""
-        self.graphify_usage_manual_override = False
+    def _reset_codegraph_delivery_generation(self) -> None:
+        self.codegraph_session_generation = uuid.uuid4().hex
+        self.codegraph_orientation_delivered = False
+        self.codegraph_delivered_mode = ""
+        self.codegraph_delivered_guide_version = ""
         if not self.state_path.exists():
             return
         with self.state_lock:
             payload = self.read_state()
-            payload["graphify_policy"] = self._graphify_policy_payload()
+            payload["codegraph_policy"] = self._codegraph_policy_payload()
             payload.update(
                 {
-                    "graphify_evidence_id": "",
-                    "graphify_fingerprint": "",
-                    "graphify_freshness": "",
-                    "current_graphify_usage_turn_id": "",
-                    "graphify_usage_policy": "",
-                    "graphify_evidence_delivery": "",
-                    "graphify_query_requirement": "not_applicable",
-                    "graphify_query_status": "",
-                    "graphify_query_command": "",
-                    "graphify_usage_receipt": "",
+                    "codegraph_available": False,
+                    "codegraph_hint_delivery": "",
                 }
             )
             payload["updated_at"] = _now_iso()
             payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
-            payload["last_writer"] = "TmuxBatchWorker.graphify_generation"
+            payload["last_writer"] = "TmuxBatchWorker.codegraph_generation"
             _atomic_write_json(self.state_path, payload)
         _notify_runtime_state_changed_best_effort()
 
-    def _persist_graphify_policy_fast(self) -> None:
+    def _persist_codegraph_policy_fast(self) -> None:
         with self.state_lock:
             payload = self.read_state()
-            payload["graphify_policy"] = self._graphify_policy_payload()
+            payload["codegraph_policy"] = self._codegraph_policy_payload()
+            payload["codegraph_available"] = self.codegraph_mode != CodeGraphMode.OFF.value
+            payload["codegraph_hint_delivery"] = (
+                "confirmed" if self.codegraph_orientation_delivered else ""
+            )
             payload["updated_at"] = _now_iso()
             payload["state_revision"] = int(payload.get("state_revision", 0)) + 1
-            payload["last_writer"] = "TmuxBatchWorker.graphify_delivery"
+            payload["last_writer"] = "TmuxBatchWorker.codegraph_delivery"
             _atomic_write_json(self.state_path, payload)
         _notify_runtime_state_changed_best_effort()
 
-    def _confirm_graphify_orientation_delivery(
+    def _confirm_codegraph_orientation_delivery(
             self,
             submitted_prompt: str,
-            profile: GraphifyTurnProfile | GraphifyMode | str | None,
+            profile: CodeGraphTurnProfile | CodeGraphMode | str | None,
             *,
             prompt_kind: str = "",
-            delivery_guide_version: str = GRAPHIFY_GUIDE_VERSION,
+            delivery_guide_version: str = CODEGRAPH_GUIDE_VERSION,
     ) -> None:
-        """Latch the full Graphify guide only after submission is observed."""
+        """Latch the full CodeGraph guide only after submission is observed."""
 
         if profile is None:
             return
-        normalized = self._normalize_graphify_profile_for_turn(profile)
+        normalized = self._normalize_codegraph_profile_for_turn(profile)
         if not normalized.enabled:
             return
-        self._confirm_graphify_turn_delivery(normalized)
-        if str(delivery_guide_version or "").strip() != GRAPHIFY_GUIDE_VERSION:
+        if str(delivery_guide_version or "").strip() != CODEGRAPH_GUIDE_VERSION:
             return
         managed_prompt_kind = str(prompt_kind or "").strip().lower()
         if not managed_prompt_kind:
             managed_prompt_kind = (
                 "full"
-                if self._submitted_prompt_contains_managed_graphify_full_guide(
+                if self._submitted_prompt_contains_managed_codegraph_full_guide(
                     submitted_prompt,
                     normalized,
                 )
@@ -5143,120 +4890,113 @@ class TmuxBatchWorker:
         if managed_prompt_kind != "full":
             return
         previous = (
-            self.graphify_orientation_delivered,
-            self.graphify_delivered_mode,
-            self.graphify_delivered_guide_version,
+            self.codegraph_orientation_delivered,
+            self.codegraph_delivered_mode,
+            self.codegraph_delivered_guide_version,
         )
-        self.graphify_orientation_delivered = True
-        self.graphify_delivered_mode = normalized.mode
-        self.graphify_delivered_guide_version = GRAPHIFY_GUIDE_VERSION
+        self.codegraph_orientation_delivered = True
+        self.codegraph_delivered_mode = normalized.mode
+        self.codegraph_delivered_guide_version = CODEGRAPH_GUIDE_VERSION
         if previous == (
-            self.graphify_orientation_delivered,
-            self.graphify_delivered_mode,
-            self.graphify_delivered_guide_version,
+            self.codegraph_orientation_delivered,
+            self.codegraph_delivered_mode,
+            self.codegraph_delivered_guide_version,
         ):
             return
         try:
-            self._persist_graphify_policy_fast()
+            self._persist_codegraph_policy_fast()
         except Exception:
             (
-                self.graphify_orientation_delivered,
-                self.graphify_delivered_mode,
-                self.graphify_delivered_guide_version,
+                self.codegraph_orientation_delivered,
+                self.codegraph_delivered_mode,
+                self.codegraph_delivered_guide_version,
             ) = previous
             raise
 
-    def _normalize_graphify_profile_for_turn(
+    def _normalize_codegraph_profile_for_turn(
             self,
-            profile: GraphifyTurnProfile | GraphifyMode | str,
-    ) -> GraphifyTurnProfile:
-        if isinstance(profile, GraphifyTurnProfile):
+            profile: CodeGraphTurnProfile | CodeGraphMode | str,
+    ) -> CodeGraphTurnProfile:
+        if isinstance(profile, CodeGraphTurnProfile):
             normalized = profile
         else:
-            normalized = GraphifyTurnProfile(mode=normalize_graphify_mode(profile).value)
-        configured_mode = self._configured_graphify_mode()
-        if normalized.mode != GraphifyMode.OFF.value and normalized.mode != configured_mode:
-            raise GraphifySessionModeMismatch(
-                "Graphify turn mode does not match the worker project graph mode: "
+            normalized = CodeGraphTurnProfile(mode=normalize_codegraph_mode(profile).value)
+        configured_mode = self._configured_codegraph_mode()
+        if normalized.mode != CodeGraphMode.OFF.value and normalized.mode != configured_mode:
+            raise CodeGraphSessionModeMismatch(
+                "CodeGraph turn mode does not match the worker project graph mode: "
                 f"session={getattr(self, 'session_name', '')}, configured={configured_mode}, "
                 f"turn={normalized.mode}"
             )
         return normalized
 
-    def _resolve_graphify_profile_for_turn(
+    def _resolve_codegraph_profile_for_turn(
             self,
             prompt: str,
-            profile: GraphifyTurnProfile | GraphifyMode | str | None,
-            turn_context: GraphifyTurnContext | None = None,
-    ) -> GraphifyTurnProfile:
+            profile: CodeGraphTurnProfile | CodeGraphMode | str | None,
+            turn_context: CodeGraphTurnContext | None = None,
+    ) -> CodeGraphTurnProfile:
         if profile is not None:
-            return self._normalize_graphify_profile_for_turn(profile)
-        if self._configured_graphify_mode() == GraphifyMode.OFF.value:
-            # OFF is a hard no-op: do not touch the cache, probe tools, or
+            return self._normalize_codegraph_profile_for_turn(profile)
+        if self._configured_codegraph_mode() == CodeGraphMode.OFF.value:
+            # OFF is a hard no-op: do not inspect the index, probe tools, or
             # publish project status merely because a turn wrapper prepared
             # an immutable profile for its repair cycle.
-            return GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
-        refresh = not bool(getattr(self, "graphify_generation_refreshed", False))
-        resolved = resolve_graphify_turn_profile(
+            return CodeGraphTurnProfile(mode=CodeGraphMode.OFF.value)
+        resolved = resolve_codegraph_turn_profile(
             project_dir=self.work_dir,
-            mode=self._configured_graphify_mode(),
+            mode=self._configured_codegraph_mode(),
             prompt=str(prompt or ""),
-            runtime_dir=self.runtime_dir,
-            config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
-            refresh=refresh,
+            config=CodeGraphConfig(**dict(getattr(self.config, "codegraph_config", {}) or {})),
+            refresh=False,
             turn_context=turn_context,
-            usage_session_generation=self.graphify_session_generation,
         )
-        if self._configured_graphify_mode() != GraphifyMode.OFF.value:
-            self.graphify_generation_refreshed = True
+        if self._configured_codegraph_mode() != CodeGraphMode.OFF.value:
+            self.codegraph_generation_refreshed = True
         return resolved
 
-    def prepare_graphify_turn_profile(
+    def prepare_codegraph_turn_profile(
             self,
             prompt: str,
-            turn_context: GraphifyTurnContext | None = None,
-    ) -> GraphifyTurnProfile:
-        """Resolve one immutable evidence profile for a logical turn/repairs."""
+            turn_context: CodeGraphTurnContext | None = None,
+    ) -> CodeGraphTurnProfile:
+        """Resolve one immutable optional navigation hint for a logical turn."""
 
-        self.activate_graphify_query_scope(turn_context)
-        return self._resolve_graphify_profile_for_turn(
+        return self._resolve_codegraph_profile_for_turn(
             str(prompt or ""),
             None,
             turn_context=turn_context,
         )
 
-    def refresh_graphify_generation(
+    def refresh_codegraph_generation(
             self,
             prompt: str,
-            turn_context: GraphifyTurnContext | None = None,
-    ) -> GraphifyTurnProfile:
+            turn_context: CodeGraphTurnContext | None = None,
+    ) -> CodeGraphTurnProfile:
         """Refresh the shared project graph at an explicit stage checkpoint."""
 
-        if self._configured_graphify_mode() == GraphifyMode.OFF.value:
-            return GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
-        self.activate_graphify_query_scope(turn_context)
-        profile = resolve_graphify_turn_profile(
+        if self._configured_codegraph_mode() == CodeGraphMode.OFF.value:
+            return CodeGraphTurnProfile(mode=CodeGraphMode.OFF.value)
+        profile = resolve_codegraph_turn_profile(
             project_dir=self.work_dir,
-            mode=self._configured_graphify_mode(),
-            prompt=str(prompt or "Graphify stage checkpoint"),
-            runtime_dir=self.runtime_dir,
-            config=GraphifyBuildConfig(**dict(getattr(self.config, "graphify_config", {}) or {})),
+            mode=self._configured_codegraph_mode(),
+            prompt=str(prompt or "CodeGraph stage checkpoint"),
+            config=CodeGraphConfig(**dict(getattr(self.config, "codegraph_config", {}) or {})),
             refresh=True,
             turn_context=turn_context,
-            usage_session_generation=self.graphify_session_generation,
         )
-        self.graphify_generation_refreshed = True
+        self.codegraph_generation_refreshed = True
         return profile
 
-    def mark_graphify_generation_current(
+    def mark_codegraph_generation_current(
             self,
-            turn_context: GraphifyTurnContext | None = None,
+            turn_context: CodeGraphTurnContext | None = None,
     ) -> None:
         """Tell a peer worker that another worker refreshed their shared graph."""
 
-        if self._configured_graphify_mode() != GraphifyMode.OFF.value:
-            self.activate_graphify_query_scope(turn_context)
-            self.graphify_generation_refreshed = True
+        if self._configured_codegraph_mode() != CodeGraphMode.OFF.value:
+            del turn_context
+            self.codegraph_generation_refreshed = True
 
     def _grill_policy_payload(self) -> dict[str, object]:
         return {
@@ -5611,8 +5351,6 @@ class TmuxBatchWorker:
             ).strip()
             normalized["stage_runner_id"] = self.stage_runner_id
         self._runtime_metadata.update(normalized)
-        with contextlib.suppress(Exception):
-            self.activate_graphify_query_scope()
         if not self.state_path.exists():
             return
         with self.state_lock:
@@ -6154,8 +5892,6 @@ class TmuxBatchWorker:
             # A human recheck grants another wait budget while the same already
             # submitted turn remains live; it must never cause prompt replay.
             return True
-        if blocker == GRAPHIFY_USAGE_BLOCKER:
-            return self._graphify_required_query_is_satisfied()
         return True
 
     def _request_runtime_intervention(
@@ -6314,8 +6050,8 @@ class TmuxBatchWorker:
         raise_if_runtime_shutdown_requested("creating tmux session")
         self._reset_ponytail_delivery_generation()
         self._reset_grill_delivery_generation()
-        self._reset_graphify_delivery_generation()
-        # The Graphify session generation is part of the child process
+        self._reset_codegraph_delivery_generation()
+        # The CodeGraph session generation is part of the child process
         # identity used by the trusted stage query-scope ledger.
         self.launch_command = self._build_agent_launch_command()
         self._reset_terminal_activity()
@@ -6565,18 +6301,10 @@ class TmuxBatchWorker:
             "ponytail_policy": self._ponytail_policy_payload(),
             "grill_policy": self._grill_policy_payload(),
             "requirements_policy": self._requirements_policy_payload(),
-            "graphify_policy": self._graphify_policy_payload(),
-            "graphify_evidence_id": "",
-            "graphify_fingerprint": "",
-            "graphify_freshness": "",
-            "current_graphify_usage_turn_id": "",
-            "graphify_usage_policy": "",
-            "graphify_evidence_delivery": "",
-            "graphify_query_requirement": "not_applicable",
-            "graphify_query_status": "",
-            "graphify_query_command": "",
-            "graphify_usage_receipt": "",
-            "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
+            "codegraph_policy": self._codegraph_policy_payload(),
+            "codegraph_available": False,
+            "codegraph_hint_delivery": "",
+            "codegraph_generation_refreshed": bool(self.codegraph_generation_refreshed),
         }
         payload.update(self._runtime_metadata)
         payload.update(self._tmux_control_state_payload())
@@ -6653,21 +6381,10 @@ class TmuxBatchWorker:
                 "ponytail_policy": self._ponytail_policy_payload(),
                 "grill_policy": self._grill_policy_payload(),
                 "requirements_policy": self._requirements_policy_payload(),
-                "graphify_policy": self._graphify_policy_payload(),
-                # A new tmux session is a new delivery generation.  Evidence
-                # identity belongs to the prior session until a new immutable
-                # profile is resolved, so never carry it across this boundary.
-                "graphify_evidence_id": "",
-                "graphify_fingerprint": "",
-                "graphify_freshness": "",
-                "current_graphify_usage_turn_id": "",
-                "graphify_usage_policy": "",
-                "graphify_evidence_delivery": "",
-                "graphify_query_requirement": "not_applicable",
-                "graphify_query_status": "",
-                "graphify_query_command": "",
-                "graphify_usage_receipt": "",
-                "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
+                "codegraph_policy": self._codegraph_policy_payload(),
+                "codegraph_available": False,
+                "codegraph_hint_delivery": "",
+                "codegraph_generation_refreshed": bool(self.codegraph_generation_refreshed),
             }
             payload.update(self._runtime_metadata)
             previous_runner_id = str(previous.get("stage_runner_id", "") or "").strip()
@@ -6838,39 +6555,17 @@ class TmuxBatchWorker:
                 "ponytail_policy": self._ponytail_policy_payload(),
                 "grill_policy": self._grill_policy_payload(),
                 "requirements_policy": self._requirements_policy_payload(),
-                "graphify_policy": self._graphify_policy_payload(),
-                "graphify_evidence_id": str(previous.get("graphify_evidence_id", "") or ""),
-                "graphify_fingerprint": str(previous.get("graphify_fingerprint", "") or ""),
-                "graphify_freshness": str(previous.get("graphify_freshness", "") or ""),
-                "current_graphify_usage_turn_id": self.graphify_usage_turn_id or str(
-                    previous.get("current_graphify_usage_turn_id", "") or ""
+                "codegraph_policy": self._codegraph_policy_payload(),
+                "codegraph_available": bool(
+                    previous.get("codegraph_available", False)
+                    or self.codegraph_orientation_delivered
                 ),
-                "graphify_usage_policy": (
-                    f"query_{self.graphify_usage_policy.query_requirement}"
-                    if self.graphify_usage_policy.evidence_required
-                    else str(previous.get("graphify_usage_policy", "") or "")
+                "codegraph_hint_delivery": (
+                    "confirmed"
+                    if self.codegraph_orientation_delivered
+                    else str(previous.get("codegraph_hint_delivery", "") or "")
                 ),
-                "graphify_evidence_delivery": self.graphify_usage_delivery or str(
-                    previous.get("graphify_evidence_delivery", "") or ""
-                ),
-                "graphify_query_requirement": (
-                    self.graphify_usage_policy.query_requirement
-                    if self.graphify_usage_policy.evidence_required
-                    else str(previous.get("graphify_query_requirement", "not_applicable") or "not_applicable")
-                ),
-                "graphify_query_status": self.graphify_query_status or str(
-                    previous.get("graphify_query_status", "") or ""
-                ),
-                "graphify_query_command": (
-                    self._graphify_usage_command_name(self.graphify_usage_policy)
-                    or str(previous.get("graphify_query_command", "") or "")
-                ),
-                "graphify_usage_receipt": (
-                    Path(self.graphify_usage_receipt).name
-                    if self.graphify_usage_receipt
-                    else str(previous.get("graphify_usage_receipt", "") or "")
-                ),
-                "graphify_generation_refreshed": bool(self.graphify_generation_refreshed),
+                "codegraph_generation_refreshed": bool(self.codegraph_generation_refreshed),
             }
             for key in (
                 "project_dir",
@@ -10112,24 +9807,24 @@ class TmuxBatchWorker:
             raise self._deveco_startup_intervention(last_deveco_blocker)
         raise RuntimeError(f"Timed out waiting for agent ready.\n{self.capture_visible(240)}")
 
-    def _replace_graphify_mode_before_launch(self, mode: GraphifyMode | str) -> None:
-        normalized = normalize_graphify_mode(mode, default=GraphifyMode.AUTO).value
-        self.graphify_mode = normalized
+    def _replace_codegraph_mode_before_launch(self, mode: CodeGraphMode | str) -> None:
+        normalized = normalize_codegraph_mode(mode, default=CodeGraphMode.AUTO).value
+        self.codegraph_mode = normalized
         # AgentRunConfig is frozen and reconstructing it would repeat dynamic
         # vendor/model discovery.  Clone the already-resolved launch config and
         # change only this pre-launch, stage-wide policy selected by the human.
         next_config = copy.copy(self.config)
-        object.__setattr__(next_config, "graphify_mode", normalized)
+        object.__setattr__(next_config, "codegraph_mode", normalized)
         self.config = next_config
         self.launch_command = self._build_agent_launch_command()
-        self.graphify_generation_refreshed = False
-        self.graphify_orientation_delivered = False
-        self.graphify_delivered_mode = ""
-        self.graphify_delivered_guide_version = ""
-        if normalized == GraphifyMode.OFF.value:
-            publish_graphify_off_status(self.work_dir)
+        self.codegraph_generation_refreshed = False
+        self.codegraph_orientation_delivered = False
+        self.codegraph_delivered_mode = ""
+        self.codegraph_delivered_guide_version = ""
+        if normalized == CodeGraphMode.OFF.value:
+            publish_codegraph_off_status(self.work_dir)
 
-    def _graphify_recovery_interaction_scope(self) -> str:
+    def _codegraph_recovery_interaction_scope(self) -> str:
         runner_id = str(getattr(self, "stage_runner_id", "") or "").strip()
         if runner_id:
             return runner_id
@@ -10141,8 +9836,8 @@ class TmuxBatchWorker:
             workflow_action = str(metadata.get("workflow_action", "") or "").strip()
             stage_seq = str(metadata.get("stage_seq", "") or "").strip()
             requirement_name = str(metadata.get("requirement_name", "") or "").strip()
-            if workflow_action and stage_seq:
-                return f"stage:{requirement_name}:{workflow_action}:{stage_seq}"
+            if workflow_action:
+                return f"stage:{requirement_name}:{workflow_action}:{stage_seq or 'current'}"
         runtime_dir = getattr(self, "runtime_dir", None)
         if runtime_dir:
             return f"runtime:{Path(runtime_dir).expanduser().resolve()}"
@@ -10150,31 +9845,39 @@ class TmuxBatchWorker:
         # metadata. Keep their decision local to this worker object.
         return f"legacy-worker:{id(self)}"
 
-    def _run_required_graphify_preflight(self) -> None:
-        prompt = "Graphify required preflight for this project"
-        interaction_scope = self._graphify_recovery_interaction_scope()
-        original_error: GraphifyError | None = None
+    def _run_required_codegraph_preflight(self) -> None:
+        prompt = "CodeGraph required preflight for this project"
+        interaction_scope = self._codegraph_recovery_interaction_scope()
+        original_error: CodeGraphError | None = None
         try:
-            self._resolve_graphify_profile_for_turn(prompt, None)
-            self.graphify_generation_refreshed = True
+            self.refresh_codegraph_generation(prompt)
+            self.codegraph_generation_refreshed = True
             return
-        except GraphifyError as error:
+        except CodeGraphError as error:
             original_error = error
-            if not graphify_interactive_recovery_enabled(self.work_dir):
+            if not codegraph_interactive_recovery_enabled(self.work_dir):
                 raise
 
         # All project workers share one graph. Serialize this recovery prompt
         # so parallel workers owned by the same runner cannot duplicate it.
-        with graphify_required_recovery_guard():
-            remembered = graphify_required_recovery_decision(
+        with codegraph_required_recovery_guard(self.work_dir):
+            # A peer may have completed installation/synchronization while this
+            # worker waited for the project recovery lock.
+            try:
+                self.refresh_codegraph_generation(prompt)
+                self.codegraph_generation_refreshed = True
+                return
+            except CodeGraphError as error:
+                original_error = error
+            remembered = codegraph_required_recovery_decision(
                 self.work_dir,
                 interaction_scope=interaction_scope,
             )
-            if remembered in {GraphifyMode.AUTO.value, GraphifyMode.OFF.value}:
-                self._replace_graphify_mode_before_launch(remembered)
-                if remembered == GraphifyMode.AUTO.value:
-                    self._resolve_graphify_profile_for_turn(prompt, None)
-                    self.graphify_generation_refreshed = True
+            if remembered in {CodeGraphMode.AUTO.value, CodeGraphMode.OFF.value}:
+                self._replace_codegraph_mode_before_launch(remembered)
+                if remembered == CodeGraphMode.AUTO.value:
+                    self.refresh_codegraph_generation(prompt)
+                    self.codegraph_generation_refreshed = True
                 return
 
             from T09_terminal_ops import message, prompt_metadata, prompt_select_option
@@ -10184,119 +9887,175 @@ class TmuxBatchWorker:
             current_error: BaseException = original_error
             while True:
                 with prompt_metadata(
-                    stage_key="graphify_required_recovery",
-                    interaction_kind="graphify_setup",
+                    stage_key="codegraph_required_recovery",
+                    interaction_kind="codegraph_setup",
                 ):
                     decision = prompt_select_option(
-                        title="Graphify Required 预检失败",
+                        title="CodeGraph Required 预检失败",
                         options=(
-                            ("install_retry", "安装或重试 Graphify 0.9.27"),
-                            (GraphifyMode.AUTO.value, "切换 Auto — 允许无图降级"),
-                            (GraphifyMode.OFF.value, "切换 Off — 关闭本阶段图谱"),
+                            ("install_retry", "安装/初始化/同步 CodeGraph 1.5.0"),
+                            (CodeGraphMode.AUTO.value, "切换 Auto — 允许无图降级"),
+                            (CodeGraphMode.OFF.value, "切换 Off — 关闭本阶段图谱"),
                             ("terminate", "终止当前阶段"),
                         ),
                         default_value="install_retry",
-                        prompt_text="选择 Graphify 恢复方式",
+                        prompt_text="选择 CodeGraph 恢复方式",
                         extra_payload={
-                            "interaction_kind": "graphify_setup",
+                            "interaction_kind": "codegraph_setup",
                             "reason_text": str(current_error),
-                            "recovery_kind": "graphify_required_intervention",
+                            "recovery_kind": "codegraph_required_intervention",
                         },
                     )
                 if decision == "install_retry":
                     try:
-                        setup_managed_graphify()
-                        self.graphify_generation_refreshed = False
-                        self._resolve_graphify_profile_for_turn(prompt, None)
-                    except GraphifyError as error:
+                        if not resolve_codegraph_tool().compatible:
+                            setup_managed_codegraph()
+                        status = inspect_codegraph_project(
+                            self.work_dir,
+                            mode=CodeGraphMode.REQUIRED,
+                            force_tool_refresh=True,
+                        )
+                        if not status.initialized:
+                            initialize_codegraph_project(
+                                self.work_dir,
+                                mode=CodeGraphMode.REQUIRED,
+                                config=CodeGraphConfig(**dict(self.config.codegraph_config)),
+                            )
+                        self.codegraph_generation_refreshed = False
+                        self.refresh_codegraph_generation(prompt)
+                    except CodeGraphError as error:
                         current_error = error
-                        message(f"Graphify 预检仍未通过: {error}")
+                        message(f"CodeGraph 预检仍未通过: {error}")
                         continue
-                    self.graphify_generation_refreshed = True
+                    self.codegraph_generation_refreshed = True
                     return
-                if decision in {GraphifyMode.AUTO.value, GraphifyMode.OFF.value}:
-                    set_graphify_required_recovery_decision(
+                if decision in {CodeGraphMode.AUTO.value, CodeGraphMode.OFF.value}:
+                    set_codegraph_required_recovery_decision(
                         self.work_dir,
                         decision,
                         interaction_scope=interaction_scope,
                     )
-                    self._replace_graphify_mode_before_launch(decision)
-                    if decision == GraphifyMode.AUTO.value:
-                        self._resolve_graphify_profile_for_turn(prompt, None)
-                        self.graphify_generation_refreshed = True
+                    self._replace_codegraph_mode_before_launch(decision)
+                    if decision == CodeGraphMode.AUTO.value:
+                        self.refresh_codegraph_generation(prompt)
+                        self.codegraph_generation_refreshed = True
                     return
                 raise original_error
 
-    def _run_auto_graphify_availability_decision(self) -> None:
-        if not graphify_interactive_recovery_enabled(self.work_dir):
+    def _run_auto_codegraph_availability_decision(self) -> None:
+        if not codegraph_interactive_recovery_enabled(self.work_dir):
             return
-        resolution = resolve_graphify_tool()
-        if resolution.compatible:
+        resolution = resolve_codegraph_tool()
+        status = (
+            inspect_codegraph_project(self.work_dir, mode=CodeGraphMode.AUTO)
+            if resolution.compatible
+            else None
+        )
+        if resolution.compatible and status is not None and status.initialized:
             return
-        interaction_scope = self._graphify_recovery_interaction_scope()
-        with graphify_required_recovery_guard():
-            remembered = graphify_required_recovery_decision(
+        interaction_scope = self._codegraph_recovery_interaction_scope()
+        with codegraph_required_recovery_guard(self.work_dir):
+            # Recheck after acquiring the shared lock: another parallel worker
+            # may already have initialized this checkout.
+            current_resolution = resolve_codegraph_tool()
+            if current_resolution.compatible:
+                current_status = inspect_codegraph_project(
+                    self.work_dir,
+                    mode=CodeGraphMode.AUTO,
+                )
+                if current_status.initialized:
+                    return
+            remembered = codegraph_required_recovery_decision(
                 self.work_dir,
                 interaction_scope=interaction_scope,
             )
             if remembered == "continue_auto":
                 return
-            if remembered == GraphifyMode.OFF.value:
-                self._replace_graphify_mode_before_launch(GraphifyMode.OFF)
+            if remembered == CodeGraphMode.OFF.value:
+                self._replace_codegraph_mode_before_launch(CodeGraphMode.OFF)
                 return
 
             from T09_terminal_ops import message, prompt_metadata, prompt_select_option
 
-            current_error = resolution.error
+            current_error = (
+                resolution.error
+                if not resolution.compatible
+                else "当前项目尚未初始化 CodeGraph"
+            )
             while True:
                 with prompt_metadata(
-                    stage_key="graphify_auto_setup",
-                    interaction_kind="graphify_setup",
+                    stage_key="codegraph_auto_setup",
+                    interaction_kind="codegraph_setup",
                 ):
                     decision = prompt_select_option(
-                        title="Graphify 0.9.27 尚不可用",
+                        title="CodeGraph 1.5.0 尚不可用",
                         options=(
-                            ("install", "安装项目托管 Graphify 0.9.27"),
-                            ("continue_auto", "本次不安装 — Auto 降级继续"),
-                            (GraphifyMode.OFF.value, "关闭本次 Graphify"),
+                            ("install", "安装/初始化项目 CodeGraph 1.5.0"),
+                            ("continue_auto", "本次关闭 — Auto 降级继续"),
+                            (CodeGraphMode.OFF.value, "以后关闭 — 本 runner 改为 Off"),
+                            ("terminate", "终止当前阶段"),
                         ),
                         default_value="install",
-                        prompt_text="选择 Graphify 处理方式",
+                        prompt_text="选择 CodeGraph 处理方式",
                         extra_payload={
-                            "interaction_kind": "graphify_setup",
+                            "interaction_kind": "codegraph_setup",
                             "reason_text": current_error,
                         },
                     )
                 if decision == "install":
                     try:
-                        setup_managed_graphify()
-                    except GraphifyError as error:
+                        if not resolve_codegraph_tool().compatible:
+                            setup_managed_codegraph()
+                        status = inspect_codegraph_project(
+                            self.work_dir,
+                            mode=CodeGraphMode.AUTO,
+                            force_tool_refresh=True,
+                        )
+                        if not status.initialized:
+                            initialize_codegraph_project(
+                                self.work_dir,
+                                mode=CodeGraphMode.AUTO,
+                                config=CodeGraphConfig(**dict(self.config.codegraph_config)),
+                            )
+                    except CodeGraphError as error:
                         current_error = str(error)
-                        message(f"Graphify 安装未完成: {error}")
+                        message(f"CodeGraph 安装未完成: {error}")
                         continue
                     return
                 if decision == "continue_auto":
-                    set_graphify_required_recovery_decision(
+                    set_codegraph_required_recovery_decision(
                         self.work_dir,
                         "continue_auto",
                         interaction_scope=interaction_scope,
                     )
                     return
-                set_graphify_required_recovery_decision(
+                if decision == "terminate":
+                    raise CodeGraphUnavailable("人类终止 CodeGraph 初始化决策")
+                set_codegraph_required_recovery_decision(
                     self.work_dir,
-                    GraphifyMode.OFF.value,
+                    CodeGraphMode.OFF.value,
                     interaction_scope=interaction_scope,
                 )
-                self._replace_graphify_mode_before_launch(GraphifyMode.OFF)
+                write_codegraph_project_preference(self.work_dir, CodeGraphMode.OFF)
+                self._replace_codegraph_mode_before_launch(CodeGraphMode.OFF)
                 return
 
     def launch_agent(self, timeout_sec: float = 60.0) -> None:
-        if self._configured_graphify_mode() == GraphifyMode.AUTO.value:
-            self._run_auto_graphify_availability_decision()
-        if self._configured_graphify_mode() == GraphifyMode.REQUIRED.value:
+        if self._configured_codegraph_mode() == CodeGraphMode.AUTO.value:
+            self._run_auto_codegraph_availability_decision()
+            with contextlib.suppress(CodeGraphError):
+                resolve_codegraph_turn_profile(
+                    project_dir=self.work_dir,
+                    mode=CodeGraphMode.AUTO,
+                    prompt="CodeGraph stage-start checkpoint",
+                    config=CodeGraphConfig(**dict(self.config.codegraph_config)),
+                    refresh=True,
+                )
+                self.codegraph_generation_refreshed = True
+        if self._configured_codegraph_mode() == CodeGraphMode.REQUIRED.value:
             # Required mode is a launch gate: tool/build/schema failures must
             # happen before tmux is mutated so no empty worker session leaks.
-            self._run_required_graphify_preflight()
+            self._run_required_codegraph_preflight()
         last_error: Exception | None = None
         max_attempts = 1
         for attempt in range(1, max_attempts + 1):
@@ -10676,25 +10435,25 @@ class TmuxBatchWorker:
             complete_task_command: str | None = None,
             include_turn_protocol: bool,
             grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
-            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
+            codegraph_profile: CodeGraphTurnProfile | CodeGraphMode | str | None = None,
     ) -> str:
         del task_status_path
         del complete_task_command
         business_prompt = str(prompt or "").strip()
-        normalized_graphify_profile = (
-            self._normalize_graphify_profile_for_turn(graphify_profile)
-            if graphify_profile is not None
-            else GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
+        normalized_codegraph_profile = (
+            self._normalize_codegraph_profile_for_turn(codegraph_profile)
+            if codegraph_profile is not None
+            else CodeGraphTurnProfile(mode=CodeGraphMode.OFF.value)
         )
-        graphify_prompt = (
-            build_graphify_evidence_block(
-                normalized_graphify_profile,
+        codegraph_prompt = (
+            build_codegraph_hint_block(
+                normalized_codegraph_profile,
                 business_prompt,
-                include_full_guide=self._graphify_full_guide_required(
-                    normalized_graphify_profile
+                include_full_guide=self._codegraph_full_guide_required(
+                    normalized_codegraph_profile
                 ),
             )
-            if normalized_graphify_profile.enabled
+            if normalized_codegraph_profile.enabled
             else business_prompt
         )
         normalized_grill_profile = self._normalize_grill_profile_for_turn(grill_profile)
@@ -10706,17 +10465,17 @@ class TmuxBatchWorker:
             ):
                 grill_prompt = build_grill_completion_transition(
                     self._configured_requirements_mode(),
-                    graphify_prompt,
+                    codegraph_prompt,
                 )
             else:
-                grill_prompt = graphify_prompt
+                grill_prompt = codegraph_prompt
         elif (
                 not self.grill_full_delivered
                 or self.grill_delivered_mode != normalized_grill_profile.mode
         ):
-            grill_prompt = build_grill_bootstrap(normalized_grill_profile, graphify_prompt)
+            grill_prompt = build_grill_bootstrap(normalized_grill_profile, codegraph_prompt)
         else:
-            grill_prompt = build_grill_reminder(normalized_grill_profile, graphify_prompt)
+            grill_prompt = build_grill_reminder(normalized_grill_profile, codegraph_prompt)
         ponytail_mode = self._configured_ponytail_mode()
         if ponytail_mode == PonytailMode.OFF.value:
             ponytail_prompt = grill_prompt
@@ -11034,7 +10793,7 @@ class TmuxBatchWorker:
             file_result: TurnFileResult,
             task_status_path: Path | None,
             grill_profile: GrillTurnProfile | RequirementsMode | str | None,
-            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None,
+            codegraph_profile: CodeGraphTurnProfile | CodeGraphMode | str | None,
     ) -> CommandResult:
         persisted_state = self.read_state()
         if task_status_path is not None:
@@ -11071,14 +10830,14 @@ class TmuxBatchWorker:
                     self.requirements_transition_delivered,
                 ) = previous_transition
                 raise
-        self._confirm_graphify_orientation_delivery(
+        self._confirm_codegraph_orientation_delivery(
             "",
-            graphify_profile,
+            codegraph_profile,
             prompt_kind=str(
-                persisted_state.get("current_graphify_prompt_kind", "") or ""
+                persisted_state.get("current_codegraph_prompt_kind", "") or ""
             ),
             delivery_guide_version=str(
-                persisted_state.get("current_graphify_guide_version", "") or ""
+                persisted_state.get("current_codegraph_guide_version", "") or ""
             ),
         )
         reply = json.dumps(
@@ -11136,7 +10895,7 @@ class TmuxBatchWorker:
             submission_cursor: str = "",
             stage_status_path: str | Path | None = None,
             grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
-            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
+            codegraph_profile: CodeGraphTurnProfile | CodeGraphMode | str | None = None,
             runtime_intervention_handler: Callable[[object, AgentRuntimeInterventionRequired], None] | None = None,
     ) -> CommandResult | None:
         """Resume an interrupted file-contract turn without submitting its prompt again.
@@ -11174,7 +10933,7 @@ class TmuxBatchWorker:
                 file_result=file_result,
                 task_status_path=task_status_path,
                 grill_profile=grill_profile,
-                graphify_profile=graphify_profile,
+                codegraph_profile=codegraph_profile,
             )
 
         expected_status_path = str(completion_contract.status_path.expanduser().resolve())
@@ -11252,19 +11011,9 @@ class TmuxBatchWorker:
             file_result=file_result,
             task_status_path=task_status_path,
             grill_profile=grill_profile,
-            graphify_profile=graphify_profile,
+            codegraph_profile=codegraph_profile,
         )
-        if graphify_profile is None:
-            return result
-        normalized_graphify_profile = self._normalize_graphify_profile_for_turn(
-            graphify_profile
-        )
-        return self._enforce_graphify_usage_after_turn(
-            result=result,
-            label=label,
-            profile=normalized_graphify_profile,
-            timeout_sec=timeout_sec,
-        )
+        return result
 
     def run_turn(
             self,
@@ -11281,16 +11030,16 @@ class TmuxBatchWorker:
             pre_submit_observation_tail_bytes: int | None = None,
             runtime_intervention_handler: Callable[[object, AgentRuntimeInterventionRequired], None] | None = None,
             grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
-            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
+            codegraph_profile: CodeGraphTurnProfile | CodeGraphMode | str | None = None,
     ) -> CommandResult:
         previous_handler = self._runtime_intervention_handler
         self._runtime_intervention_handler = runtime_intervention_handler
         try:
-            resolved_graphify_profile = self._resolve_graphify_profile_for_turn(
+            resolved_codegraph_profile = self._resolve_codegraph_profile_for_turn(
                 prompt,
-                graphify_profile,
+                codegraph_profile,
             )
-            result = self._run_turn_impl(
+            return self._run_turn_impl(
                 label=label,
                 prompt=prompt,
                 required_tokens=required_tokens,
@@ -11302,155 +11051,10 @@ class TmuxBatchWorker:
                 pre_submit_observation_tail_lines=pre_submit_observation_tail_lines,
                 pre_submit_observation_tail_bytes=pre_submit_observation_tail_bytes,
                 grill_profile=grill_profile,
-                graphify_profile=resolved_graphify_profile,
-            )
-            return self._enforce_graphify_usage_after_turn(
-                result=result,
-                label=label,
-                profile=resolved_graphify_profile,
-                timeout_sec=timeout_sec,
+                codegraph_profile=resolved_codegraph_profile,
             )
         finally:
             self._runtime_intervention_handler = previous_handler
-
-    def _restore_business_turn_state_after_graphify_gate(
-            self,
-            *,
-            label: str,
-            previous: Mapping[str, object],
-            degraded: bool = False,
-    ) -> None:
-        self.current_task_status_path = str(previous.get("current_task_status_path", "") or "")
-        self.current_task_result_path = str(previous.get("current_task_result_path", "") or "")
-        self.current_task_runtime_status = str(
-            previous.get("current_task_runtime_status", TASK_STATUS_DONE) or TASK_STATUS_DONE
-        )
-        self.dispatch_state = str(previous.get("dispatch_state", "") or "")
-        self.dispatch_reason = str(previous.get("dispatch_reason", "") or "")
-        self._write_state(
-            WorkerStatus.SUCCEEDED,
-            note=(f"done:{label}:graphify_degraded" if degraded else f"done:{label}:graphify_checked"),
-            extra={
-                "label": label,
-                "result_status": "succeeded",
-                "current_turn_id": str(previous.get("current_turn_id", "") or ""),
-                "current_turn_phase": str(previous.get("current_turn_phase", "") or ""),
-                "current_turn_status_path": str(previous.get("current_turn_status_path", "") or ""),
-                "current_task_status_path": self.current_task_status_path,
-                "current_task_result_path": self.current_task_result_path,
-                "current_task_runtime_status": self.current_task_runtime_status,
-                "dispatch_state": self.dispatch_state,
-                "dispatch_reason": self.dispatch_reason,
-                "turn_state": TurnState.SUCCEEDED.value,
-                "graphify_evidence_id": self.graphify_usage_policy.evidence_id,
-                "graphify_fingerprint": self.graphify_usage_policy.graph_fingerprint,
-                "graphify_freshness": self.graphify_usage_policy.freshness,
-                "current_graphify_usage_turn_id": self.graphify_usage_turn_id,
-                "graphify_usage_policy": f"query_{self.graphify_usage_policy.query_requirement}",
-                "graphify_evidence_delivery": self.graphify_usage_delivery,
-                "graphify_query_requirement": self.graphify_usage_policy.query_requirement,
-                "graphify_query_status": self.graphify_query_status,
-                "graphify_query_command": self._graphify_usage_command_name(self.graphify_usage_policy),
-                "graphify_usage_receipt": Path(self.graphify_usage_receipt).name
-                if self.graphify_usage_receipt else "",
-            },
-        )
-
-    def _enforce_graphify_usage_after_turn(
-            self,
-            *,
-            result: CommandResult,
-            label: str,
-            profile: GraphifyTurnProfile,
-            timeout_sec: float,
-    ) -> CommandResult:
-        if not profile.enabled or not result.ok:
-            return result
-        business_state = self.read_state()
-        assessment = self._assess_graphify_usage()
-        if assessment.satisfied or profile.usage_policy.query_requirement != "required":
-            self._restore_business_turn_state_after_graphify_gate(
-                label=label,
-                previous=business_state,
-            )
-            return result
-
-        repair_prompt = """Graphify usage correction — do not repeat the original business task.
-
-The original task artifacts/result contract are already valid, but this turn required one audited Graphify query.
-Execute exactly this read-only command now:
-{command}
-
-Inspect the result, then verify relevant conclusions against AGENTS.md, source, tests, and config.
-Only update the existing business artifacts if that verification changes the conclusion.
-After the query and verification, briefly report completion. Do not rebuild or modify the Graphify graph.
-""".format(command=profile.usage_policy.recommended_command)
-        repair_result: CommandResult | None = None
-        self._graphify_usage_repair_active = True
-        try:
-            repair_result = self._run_turn_impl(
-                label=f"{label}_graphify_usage_repair",
-                prompt=repair_prompt,
-                timeout_sec=min(float(timeout_sec), 180.0),
-                graphify_profile=profile,
-            )
-        finally:
-            self._graphify_usage_repair_active = False
-            if repair_result is not None and self.results and self.results[-1] is repair_result:
-                self.results.pop()
-        assessment = self._assess_graphify_usage()
-        if assessment.satisfied:
-            self._restore_business_turn_state_after_graphify_gate(
-                label=label,
-                previous=business_state,
-            )
-            return result
-        if profile.mode == GraphifyMode.AUTO.value:
-            self._assess_graphify_usage(degraded=True)
-            self._restore_business_turn_state_after_graphify_gate(
-                label=label,
-                previous=business_state,
-                degraded=True,
-            )
-            self._log_event(
-                "graphify_usage_degraded",
-                label=label,
-                evidence_id=profile.usage_policy.evidence_id,
-                query_status=assessment.query_status,
-            )
-            return result
-
-        self._restore_business_turn_state_after_graphify_gate(
-            label=label,
-            previous=business_state,
-        )
-        error = AgentRuntimeInterventionRequired(
-            blocker_kind=GRAPHIFY_USAGE_BLOCKER,
-            session_name=self.session_name,
-            state_path=str(self.state_path),
-            message=(
-                "Required 模式未取得当前 turn 的 Graphify 查询回执。\n"
-                f"请进入会话执行: {profile.usage_policy.recommended_command}\n"
-                "执行后选择重新检查，或由人类明确记录本轮源码核验 override。"
-            ),
-        )
-        self._request_runtime_intervention(
-            error,
-            context=f"graphify_usage:{label}",
-            preserve_agent_state=AgentRuntimeState.READY,
-        )
-        final_assessment = self._assess_graphify_usage(
-            manual_override=self.graphify_usage_manual_override,
-        )
-        if not final_assessment.satisfied:
-            raise GraphifyUsageContractError(
-                "Required Graphify query remains unsatisfied after manual intervention"
-            )
-        self._restore_business_turn_state_after_graphify_gate(
-            label=label,
-            previous=business_state,
-        )
-        return result
 
     def _run_turn_impl(
             self,
@@ -11466,7 +11070,7 @@ After the query and verification, briefly report completion. Do not rebuild or m
             pre_submit_observation_tail_lines: int | None = None,
             pre_submit_observation_tail_bytes: int | None = None,
             grill_profile: GrillTurnProfile | RequirementsMode | str | None = None,
-            graphify_profile: GraphifyTurnProfile | GraphifyMode | str | None = None,
+            codegraph_profile: CodeGraphTurnProfile | CodeGraphMode | str | None = None,
     ) -> CommandResult:
         raise_if_runtime_shutdown_requested(f"starting turn {label}")
         started_at = _now_iso()
@@ -11489,19 +11093,14 @@ After the query and verification, briefly report completion. Do not rebuild or m
             self.dispatch_reason = ""
             prompt_submission_observed = False
             prompt_confirmation_uncertain = False
-            graphify_prompt_kind = self._graphify_prompt_kind_for_turn(
-                graphify_profile
+            codegraph_prompt_kind = self._codegraph_prompt_kind_for_turn(
+                codegraph_profile
             )
-            normalized_usage_profile = (
-                self._normalize_graphify_profile_for_turn(graphify_profile)
-                if graphify_profile is not None
-                else GraphifyTurnProfile(mode=GraphifyMode.OFF.value)
+            normalized_codegraph_profile = (
+                self._normalize_codegraph_profile_for_turn(codegraph_profile)
+                if codegraph_profile is not None
+                else CodeGraphTurnProfile(mode=CodeGraphMode.OFF.value)
             )
-            if normalized_usage_profile.enabled and not self._graphify_usage_repair_active:
-                self._begin_graphify_turn_usage(
-                    label=label,
-                    profile=normalized_usage_profile,
-                )
             submitted_prompt = self._build_turn_prompt(
                 prompt,
                 turn_token,
@@ -11509,7 +11108,7 @@ After the query and verification, briefly report completion. Do not rebuild or m
                 task_status_path=task_status_path,
                 include_turn_protocol=completion_contract is None and result_contract is None,
                 grill_profile=grill_profile,
-                graphify_profile=graphify_profile,
+                codegraph_profile=codegraph_profile,
             )
             managed_grill_prompt = self._managed_grill_profile_from_prompt(submitted_prompt)
             managed_requirements_transition = bool(
@@ -11540,39 +11139,16 @@ After the query and verification, briefly report completion. Do not rebuild or m
                     "current_requirements_session_generation": (
                         self.grill_session_generation if managed_requirements_transition else ""
                     ),
-                    "graphify_evidence_id": str(
-                        getattr(getattr(graphify_profile, "evidence", None), "evidence_id", "") or ""
+                    "codegraph_available": bool(normalized_codegraph_profile.enabled),
+                    "codegraph_hint_delivery": (
+                        "pending" if normalized_codegraph_profile.enabled else ""
                     ),
-                    "graphify_fingerprint": str(
-                        getattr(getattr(graphify_profile, "evidence", None), "graph_fingerprint", "") or ""
+                    "codegraph_generation_refreshed": bool(
+                        getattr(self, "codegraph_generation_refreshed", False)
                     ),
-                    "graphify_freshness": str(
-                        getattr(getattr(graphify_profile, "evidence", None), "freshness", "") or ""
-                    ),
-                    "graphify_generation_refreshed": bool(
-                        getattr(self, "graphify_generation_refreshed", False)
-                    ),
-                    "current_graphify_prompt_kind": graphify_prompt_kind,
-                    "current_graphify_guide_version": (
-                        GRAPHIFY_GUIDE_VERSION if graphify_prompt_kind else ""
-                    ),
-                    "current_graphify_usage_turn_id": self.graphify_usage_turn_id,
-                    "graphify_usage_policy": (
-                        f"query_{self.graphify_usage_policy.query_requirement}"
-                        if normalized_usage_profile.enabled else ""
-                    ),
-                    "graphify_evidence_delivery": self.graphify_usage_delivery,
-                    "graphify_query_requirement": (
-                        self.graphify_usage_policy.query_requirement
-                        if normalized_usage_profile.enabled else "not_applicable"
-                    ),
-                    "graphify_query_status": self.graphify_query_status,
-                    "graphify_query_command": self._graphify_usage_command_name(
-                        self.graphify_usage_policy
-                    ),
-                    "graphify_usage_receipt": (
-                        Path(self.graphify_usage_receipt).name
-                        if self.graphify_usage_receipt else ""
+                    "current_codegraph_prompt_kind": codegraph_prompt_kind,
+                    "current_codegraph_guide_version": (
+                        CODEGRAPH_GUIDE_VERSION if codegraph_prompt_kind else ""
                     ),
                     "current_turn_id": completion_contract.turn_id if completion_contract else "",
                     "current_turn_phase": completion_contract.phase if completion_contract else "",
@@ -11756,10 +11332,10 @@ After the query and verification, briefly report completion. Do not rebuild or m
                 # BUSY/prompt observation or by a completed contract above.
                 if prompt_submission_observed:
                     self._confirm_grill_prompt_delivery(submitted_prompt)
-                    self._confirm_graphify_orientation_delivery(
+                    self._confirm_codegraph_orientation_delivery(
                         submitted_prompt,
-                        graphify_profile,
-                        prompt_kind=graphify_prompt_kind,
+                        codegraph_profile,
+                        prompt_kind=codegraph_prompt_kind,
                     )
                 self._mark_turn_waiting_result(label=label)
                 prompt_confirmation_timeout = min(
@@ -11773,10 +11349,10 @@ After the query and verification, briefly report completion. Do not rebuild or m
                             self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                             prompt_submission_observed = True
                             self._confirm_grill_prompt_delivery(submitted_prompt)
-                            self._confirm_graphify_orientation_delivery(
+                            self._confirm_codegraph_orientation_delivery(
                                 submitted_prompt,
-                                graphify_profile,
-                                prompt_kind=graphify_prompt_kind,
+                                codegraph_profile,
+                                prompt_kind=codegraph_prompt_kind,
                             )
                         except PromptSubmissionRejectedError as error:
                             self._record_prompt_submission_rejected(
@@ -11841,10 +11417,10 @@ After the query and verification, briefly report completion. Do not rebuild or m
                                 self._log_event("prompt_confirm_done", label=label, timeout_sec=prompt_confirmation_timeout)
                                 prompt_submission_observed = True
                                 self._confirm_grill_prompt_delivery(submitted_prompt)
-                                self._confirm_graphify_orientation_delivery(
+                                self._confirm_codegraph_orientation_delivery(
                                     submitted_prompt,
-                                    graphify_profile,
-                                    prompt_kind=graphify_prompt_kind,
+                                    codegraph_profile,
+                                    prompt_kind=codegraph_prompt_kind,
                                 )
                             except PromptSubmissionRejectedError as error:
                                 self._record_prompt_submission_rejected(
@@ -11898,10 +11474,10 @@ After the query and verification, briefly report completion. Do not rebuild or m
                 # A valid reply/result contract proves that the prompt was
                 # submitted even when the terminal did not expose a distinct
                 # BUSY transition.  Only now may the full guide be latched.
-                self._confirm_graphify_orientation_delivery(
+                self._confirm_codegraph_orientation_delivery(
                     submitted_prompt,
-                    graphify_profile,
-                    prompt_kind=graphify_prompt_kind,
+                    codegraph_profile,
+                    prompt_kind=codegraph_prompt_kind,
                 )
                 self.current_task_runtime_status = read_task_status(task_status_path)
                 self.dispatch_state = ""
@@ -11968,17 +11544,17 @@ After the query and verification, briefly report completion. Do not rebuild or m
                         prompt_confirmation_uncertain = False
                         self._confirm_ponytail_bootstrap_delivery(submitted_prompt)
                         self._confirm_grill_prompt_delivery(submitted_prompt)
-                        self._confirm_graphify_orientation_delivery(
+                        self._confirm_codegraph_orientation_delivery(
                             submitted_prompt,
-                            graphify_profile,
-                            prompt_kind=graphify_prompt_kind,
+                            codegraph_profile,
+                            prompt_kind=codegraph_prompt_kind,
                         )
                 if prompt_submission_observed:
                     prompt_confirmation_uncertain = False
-                    self._confirm_graphify_orientation_delivery(
+                    self._confirm_codegraph_orientation_delivery(
                         submitted_prompt,
-                        graphify_profile,
-                        prompt_kind=graphify_prompt_kind,
+                        codegraph_profile,
+                        prompt_kind=codegraph_prompt_kind,
                     )
                 if completion_contract is not None:
                     file_result = self._try_finalize_turn_artifacts_after_timeout(

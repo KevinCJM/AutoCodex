@@ -33,7 +33,7 @@ Strict machine-first routing protocol for downstream agents inside this subtree 
 2. Collect referenced modules from `docs/repo_map.json`.
 3. Collect referenced pitfalls from `docs/pitfalls.json`.
 4. Materialize selectors by the route merge contract.
-5. Optionally use project Graphify evidence to widen candidate reads; never let it override routing or prove implementation behavior.
+5. Optionally use project CodeGraph navigation to widen candidate reads; never let it override routing or prove implementation behavior.
 6. Re-check active code, callers/callees, tests, and configs.
 7. Edit the smallest confirmed in-scope surface.
 8. Run materialized `minimum_regression_selectors`.
@@ -93,7 +93,7 @@ Machine-first routing protocol for downstream agents operating from the current 
 3. Expand into `expand_to_modules` only when route rule codes trigger.
 4. Resolve `first_read_files`, `then_check_files`, `related_tests`, `related_configs`, and `minimum_regression` from `docs/repo_map.json` using `docs/task_routes.json` merge policy.
 5. Load linked pitfalls from `docs/pitfalls.json`.
-6. Use Graphify only as optional static discovery evidence after route resolution.
+6. Use CodeGraph only as optional static navigation after route resolution.
 7. Verify claims from code, tests, configs, or command output before promoting them to routing memory.
 
 ## AI Routing Validation

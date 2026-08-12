@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.0",
+  "name": "CodeGraph",
+  "version": "1.5.0",
+  "license": "MIT",
+  "upstream": {
+    "repository": "https://github.com/colbymchenry/codegraph",
+    "release": "https://github.com/colbymchenry/codegraph/releases/tag/v1.5.0",
+    "commit": "ea72e1b"
+  },
+  "runtime_contract": {
+    "executable": "codegraph",
+    "version_output": "1.5.0",
+    "agent_commands": ["explore", "status"],
+    "system_commands": ["init", "sync", "status", "explore"],
+    "project_index": ".codegraph",
+    "telemetry_env": "CODEGRAPH_TELEMETRY=0"
+  },
+  "installation_policy": {
+    "managed_binary": true,
+    "global_install": false,
+    "agent_config_install": false,
+    "hooks": false,
+    "background_daemon": false,
+    "network_install_only_after_explicit_confirmation": true
+  }
+}

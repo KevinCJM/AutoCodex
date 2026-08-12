@@ -104,7 +104,13 @@ from T08_pre_development import (
     mark_requirement_clarification_completed,
     mark_requirement_intake_completed,
 )
-from T09_terminal_ops import SingleLineSpinnerMonitor, clear_pending_tty_input, maybe_launch_tui, message
+from T09_terminal_ops import (
+    SingleLineSpinnerMonitor,
+    cleanup_codegraph_processes_on_exit,
+    clear_pending_tty_input,
+    maybe_launch_tui,
+    message,
+)
 from T02_tmux_agents import TmuxBatchWorker
 from T05_hitl_runtime import build_prefixed_sha256
 from tmux_core.runtime.hitl import read_grill_session_header
@@ -113,7 +119,8 @@ from tmux_core.stage_kernel.shared_review import (
     is_agent_config_error,
     resolve_main_ponytail_mode,
     resolve_workflow_ponytail_mode,
-    resolve_workflow_graphify_mode,
+    resolve_workflow_codegraph_config,
+    resolve_workflow_codegraph_mode,
     resolve_workflow_requirements_mode,
 )
 from T12_requirements_common import (
@@ -159,6 +166,7 @@ _INTAKE_VALUE_FLAGS = {
     "--ponytail-mode",
     "--main-ponytail-mode",
     "--requirements-mode",
+    "--codegraph-mode",
     "--graphify-mode",
     "--agent-config",
 }
@@ -228,18 +236,16 @@ def _materialize_workflow_requirements_args(argv: Sequence[str]) -> tuple[list[s
     return raw_args, mode
 
 
-def _materialize_workflow_graphify_args(argv: Sequence[str]) -> tuple[list[str], str]:
+def _materialize_workflow_codegraph_args(argv: Sequence[str]) -> tuple[list[str], str]:
     raw_args = list(argv)
-    workflow_args = SimpleNamespace(
-        graphify_mode=_extract_passthrough_option(raw_args, "--graphify-mode"),
-        agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
+    # Do not turn the new-workflow Auto default into a CLI override before A02
+    # has selected a project. Intake and clarification resolve their own stage
+    # policy after the project is known; explicit CLI/config values remain in
+    # ``raw_args`` and keep their normal precedence.
+    mode = (
+        _extract_passthrough_option(raw_args, "--codegraph-mode")
+        or _extract_passthrough_option(raw_args, "--graphify-mode")
     )
-    mode = resolve_workflow_graphify_mode(
-        workflow_args,
-        stage_key="requirements_clarification",
-    )
-    if "--graphify-mode" not in raw_args:
-        raw_args.extend(["--graphify-mode", mode])
     return raw_args, mode
 
 
@@ -288,7 +294,8 @@ def run_requirements_analysis(
         proxy_url: str = "",
         ponytail_mode: str = "off",
         requirements_mode: str = "standard",
-        graphify_mode: str = "off",
+        codegraph_mode: str = "off",
+        codegraph_config: dict[str, object] | None = None,
         resume_existing: bool = False,
         preserve_ba_worker: bool = False,
 ) -> RequirementsClarificationStageResult:
@@ -302,7 +309,8 @@ def run_requirements_analysis(
             proxy_url=proxy_url,
             ponytail_mode=ponytail_mode,
             requirements_mode=requirements_mode,
-            graphify_mode=graphify_mode,
+            codegraph_mode=codegraph_mode,
+            codegraph_config=dict(codegraph_config or {}),
             resume_existing=resume_existing,
             preserve_ba_worker=preserve_ba_worker,
         )
@@ -313,7 +321,8 @@ def collect_requirements_analysis_agent_selection(args) -> RequirementsClarifica
     vendor_value = str(getattr(args, "vendor", "") or "").strip()
     proxy_url = str(getattr(args, "proxy_url", "") or "").strip()
     ponytail_mode = resolve_main_ponytail_mode(args, stage_key="requirements_clarification")
-    graphify_mode = resolve_workflow_graphify_mode(args, stage_key="requirements_clarification")
+    codegraph_mode = resolve_workflow_codegraph_mode(args, stage_key="requirements_clarification")
+    codegraph_config = resolve_workflow_codegraph_config(args)
     try:
         if vendor_value:
             vendor = normalize_vendor_choice(vendor_value)
@@ -356,7 +365,8 @@ def collect_requirements_analysis_agent_selection(args) -> RequirementsClarifica
         proxy_url=proxy_url,
         ponytail_mode=ponytail_mode,
         requirements_mode=str(getattr(args, "requirements_mode", "") or "standard").strip(),
-        graphify_mode=graphify_mode,
+        codegraph_mode=codegraph_mode,
+        codegraph_config=codegraph_config,
     )
 
 
@@ -367,7 +377,7 @@ def run_requirements_stage(
 ) -> RequirementsClarificationStageResult:
     materialized_argv, _ = _materialize_workflow_ponytail_args(argv or ())
     materialized_argv, _ = _materialize_workflow_requirements_args(materialized_argv)
-    materialized_argv, _ = _materialize_workflow_graphify_args(materialized_argv)
+    materialized_argv, _ = _materialize_workflow_codegraph_args(materialized_argv)
     intake_result = run_requirement_intake_stage(materialized_argv)
     clear_pending_tty_input()
     message("进入需求澄清阶段")
@@ -387,6 +397,7 @@ def run_requirements_stage(
             "--ponytail-mode",
             "--main-ponytail-mode",
             "--requirements-mode",
+            "--codegraph-mode",
             "--graphify-mode",
             "--agent-config",
             "--yes",
@@ -403,6 +414,7 @@ def run_requirements_stage(
     )
 
 
+@cleanup_codegraph_processes_on_exit
 def main(argv: Sequence[str] | None = None) -> int:
     redirected, launch = maybe_launch_tui(argv, route="requirements", action="stage.a02.start")
     if redirected:
@@ -410,12 +422,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         raw_args, workflow_ponytail_mode = _materialize_workflow_ponytail_args(launch)
         raw_args, workflow_requirements_mode = _materialize_workflow_requirements_args(raw_args)
-        raw_args, workflow_graphify_mode = _materialize_workflow_graphify_args(raw_args)
+        raw_args, _ = _materialize_workflow_codegraph_args(raw_args)
         intake_result = run_requirement_intake_stage(_build_intake_argv(raw_args))
         clear_pending_tty_input()
         message("进入需求澄清阶段")
         project_dir = intake_result.project_dir
         requirement_name = intake_result.requirement_name
+        scoped_codegraph_args = SimpleNamespace(
+            codegraph_mode=_extract_passthrough_option(raw_args, "--codegraph-mode"),
+            graphify_mode=_extract_passthrough_option(raw_args, "--graphify-mode"),
+            agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
+            project_dir=project_dir,
+            yes="--yes" in raw_args,
+        )
+        workflow_codegraph_mode = resolve_workflow_codegraph_mode(
+            scoped_codegraph_args,
+            stage_key="requirements_clarification",
+        )
+        workflow_codegraph_config = resolve_workflow_codegraph_config(scoped_codegraph_args)
         _, grill_session_path, _ = build_requirements_grill_paths(project_dir, requirement_name)
         grill_session_header = read_grill_session_header(grill_session_path)
         active_grill_session = (
@@ -460,7 +484,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             proxy_url=_extract_passthrough_option(raw_args, "--proxy-url"),
             ponytail_mode=workflow_ponytail_mode,
             requirements_mode=workflow_requirements_mode,
-            graphify_mode=workflow_graphify_mode,
+            codegraph_mode=workflow_codegraph_mode,
+            codegraph_config=workflow_codegraph_config,
+            project_dir=project_dir,
+            graphify_mode=_extract_passthrough_option(raw_args, "--graphify-mode"),
             main_ponytail_mode="",
             agent_config=_extract_passthrough_option(raw_args, "--agent-config"),
             yes="--yes" in raw_args,
@@ -505,7 +532,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     proxy_url=selection.proxy_url,
                     ponytail_mode=selection.ponytail_mode,
                     requirements_mode=workflow_requirements_mode,
-                    graphify_mode=selection.graphify_mode,
+                    codegraph_mode=selection.codegraph_mode,
+                    codegraph_config=selection.codegraph_config,
                     resume_existing=True,
                     preserve_ba_worker=False,
                 )
@@ -531,7 +559,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 proxy_url=selection.proxy_url,
                 ponytail_mode=selection.ponytail_mode,
                 requirements_mode=workflow_requirements_mode,
-                graphify_mode=selection.graphify_mode,
+                codegraph_mode=selection.codegraph_mode,
+                codegraph_config=selection.codegraph_config,
                 resume_existing=False,
                 preserve_ba_worker=False,
             )

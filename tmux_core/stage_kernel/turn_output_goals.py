@@ -444,24 +444,24 @@ def _build_completion_goal_error(
     )
 
 
-def _prepare_graphify_turn_profile(
+def _prepare_codegraph_turn_profile(
     worker: object,
     prompt: str,
-    graphify_context: object | None = None,
+    codegraph_context: object | None = None,
 ) -> object | None:
-    """Freeze one graph snapshot/evidence payload for the whole repair cycle."""
-    prepare = getattr(worker, "prepare_graphify_turn_profile", None)
+    """Freeze one compact navigation hint for the whole repair cycle."""
+    prepare = getattr(worker, "prepare_codegraph_turn_profile", None)
     if not callable(prepare):
         return None
     try:
         parameters = inspect.signature(prepare).parameters.values()
     except (TypeError, ValueError):
         parameters = ()
-    if graphify_context is not None and any(
+    if codegraph_context is not None and any(
         parameter.name == "turn_context" or parameter.kind == inspect.Parameter.VAR_KEYWORD
         for parameter in parameters
     ):
-        return prepare(prompt, turn_context=graphify_context)
+        return prepare(prompt, turn_context=codegraph_context)
     return prepare(prompt)
 
 
@@ -483,7 +483,7 @@ def run_task_result_turn_with_repair(
     role_label: str = "",
     task_name: str = "",
     requirement_name: str = "",
-    graphify_context: object | None = None,
+    codegraph_context: object | None = None,
     propagate_file_intervention_action: bool = False,
 ) -> dict[str, object]:
     repair_budget = turn_goal.max_repair_attempts if turn_goal is not None else 0
@@ -492,10 +492,10 @@ def run_task_result_turn_with_repair(
         if turn_goal is not None and turn_goal.repair_prompt_builder is not None
         else build_default_task_repair_prompt
     )
-    graphify_profile = _prepare_graphify_turn_profile(
+    codegraph_profile = _prepare_codegraph_turn_profile(
         worker,
         prompt,
-        graphify_context,
+        codegraph_context,
     )
     current_prompt = prompt
     for repair_attempt in range(0, repair_budget + 1):
@@ -511,8 +511,8 @@ def run_task_result_turn_with_repair(
             "result_contract": active_result_contract,
             "timeout_sec": timeout_sec,
         }
-        if graphify_profile is not None:
-            run_turn_kwargs["graphify_profile"] = graphify_profile
+        if codegraph_profile is not None:
+            run_turn_kwargs["codegraph_profile"] = codegraph_profile
         if turn_start_timeout_sec is not None:
             run_turn_kwargs["turn_start_timeout_sec"] = turn_start_timeout_sec
         if prompt_submit_timeout_sec is not None:
@@ -693,7 +693,7 @@ def run_completion_turn_with_repair(
     role_label: str = "",
     task_name: str = "",
     requirement_name: str = "",
-    graphify_context: object | None = None,
+    codegraph_context: object | None = None,
     propagate_file_intervention_action: bool = False,
 ) -> None:
     repair_budget = turn_goal.max_repair_attempts if turn_goal is not None else 0
@@ -702,10 +702,10 @@ def run_completion_turn_with_repair(
         if turn_goal is not None and turn_goal.repair_prompt_builder is not None
         else build_default_completion_repair_prompt
     )
-    graphify_profile = _prepare_graphify_turn_profile(
+    codegraph_profile = _prepare_codegraph_turn_profile(
         worker,
         prompt,
-        graphify_context,
+        codegraph_context,
     )
     current_prompt = prompt
     for repair_attempt in range(0, repair_budget + 1):
@@ -726,8 +726,8 @@ def run_completion_turn_with_repair(
             "completion_contract": completion_contract,
             "timeout_sec": timeout_sec,
         }
-        if graphify_profile is not None:
-            run_turn_kwargs["graphify_profile"] = graphify_profile
+        if codegraph_profile is not None:
+            run_turn_kwargs["codegraph_profile"] = codegraph_profile
         if turn_start_timeout_sec is not None:
             run_turn_kwargs["turn_start_timeout_sec"] = turn_start_timeout_sec
         if prompt_submit_timeout_sec is not None:

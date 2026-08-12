@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test'
-import { buildAgentConfigLabel, buildGraphifyUsageLabel, buildHomeAgents, isBusyTurnWorker, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState, workerOwnedPromptIsReady } from './agents'
+import { buildAgentConfigLabel, buildHomeAgents, isBusyTurnWorker, reconcileWorkerSnapshots, resolveAgentProgressLine, resolveAgentState, workerOwnedPromptIsReady } from './agents'
 import type { PromptSnapshot, WorkerSnapshot } from './types'
 
 function worker(overrides: Partial<WorkerSnapshot> = {}): WorkerSnapshot {
@@ -65,20 +65,6 @@ test('agent config label appends Ponytail mode and keeps legacy labels unchanged
   expect(buildAgentConfigLabel(worker({ ponytailMode: 'full' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Ponytail Full')
   expect(buildAgentConfigLabel(worker({ ponytailMode: 'off' }))).toBe('DevEco Code | deveco/GLM-5.1, Max | Ponytail Off')
   expect(buildAgentConfigLabel(worker())).toBe('DevEco Code | deveco/GLM-5.1, Max')
-})
-
-test('Graphify usage labels never claim the model read evidence', () => {
-  expect(buildGraphifyUsageLabel(worker({
-    graphifyEvidenceDelivery: 'confirmed',
-    graphifyQueryRequirement: 'optional',
-    graphifyQueryStatus: 'optional',
-  }))).toBe('图谱证据：已投递 · 查询可选')
-  expect(buildGraphifyUsageLabel(worker({
-    graphifyEvidenceDelivery: 'confirmed',
-    graphifyQueryRequirement: 'required',
-    graphifyQueryStatus: 'query_failed',
-    graphifyQueryCommand: 'path',
-  }))).toBe('图谱证据：已投递 · 必须查询 path · 执行失败')
 })
 
 test('agent config label appends Grill modes and hides Standard', () => {

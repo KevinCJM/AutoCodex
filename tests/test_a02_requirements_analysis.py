@@ -1192,7 +1192,8 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 proxy_url="",
                 ponytail_mode="full",
                 requirements_mode="standard",
-                graphify_mode="auto",
+                codegraph_mode="auto",
+                codegraph_config={"max_files": 6, "max_output_chars": 12000, "init_timeout_sec": 300.0, "sync_timeout_sec": 60.0},
                 resume_existing=False,
                 preserve_ba_worker=False,
             )
@@ -1350,7 +1351,8 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 proxy_url="",
                 ponytail_mode="full",
                 requirements_mode="standard",
-                graphify_mode="auto",
+                codegraph_mode="auto",
+                codegraph_config={"max_files": 6, "max_output_chars": 12000, "init_timeout_sec": 300.0, "sync_timeout_sec": 60.0},
                 resume_existing=True,
                 preserve_ba_worker=False,
             )
@@ -1386,7 +1388,8 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 proxy_url="",
                 ponytail_mode="full",
                 requirements_mode="standard",
-                graphify_mode="auto",
+                codegraph_mode="auto",
+                codegraph_config={"max_files": 6, "max_output_chars": 12000, "init_timeout_sec": 300.0, "sync_timeout_sec": 60.0},
                 resume_existing=False,
                 preserve_ba_worker=False,
             )
@@ -1451,7 +1454,8 @@ class RequirementsAnalysisIntakeTests(unittest.TestCase):
                 proxy_url="",
                 ponytail_mode="full",
                 requirements_mode="standard",
-                graphify_mode="auto",
+                codegraph_mode="auto",
+                codegraph_config={"max_files": 6, "max_output_chars": 12000, "init_timeout_sec": 300.0, "sync_timeout_sec": 60.0},
                 resume_existing=False,
                 preserve_ba_worker=False,
             )

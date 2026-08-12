@@ -295,6 +295,10 @@ class A07DevelopmentTests(unittest.TestCase):
                     with self.assertRaises(type(error)):
                         _recover_worker_from_state(Path("/tmp/worker.state.json"))
 
+                with patch.object(worker, "session_exists", side_effect=error):
+                    with self.assertRaises(type(error)):
+                        _worker_appears_live_for_reviewer_recovery(worker)
+
     def test_developer_init_contract_probe_propagates_tmux_control_unavailable(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             project_dir = Path(tmp_dir)
@@ -331,10 +335,6 @@ class A07DevelopmentTests(unittest.TestCase):
 
             with self.assertRaises(TmuxControlUnavailable):
                 _developer_init_contract_is_ready(ProbeWorker(), paths=paths)
-
-                with patch.object(worker, "session_exists", side_effect=error):
-                    with self.assertRaises(type(error)):
-                        _worker_appears_live_for_reviewer_recovery(worker)
 
     def test_code_review_reviewer_count_prompt_allows_previous_step_back(self):
         from T09_terminal_ops import BridgePromptRequest, BridgeTerminalUI, PROMPT_BACK_VALUE, PromptBackRequested, use_terminal_ui

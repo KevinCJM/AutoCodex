@@ -236,27 +236,6 @@ export function buildAgentConfigLabel(worker: WorkerSnapshot): string {
   return [vendor, modelAndEffort, ponytail, requirements].filter(Boolean).join(' | ')
 }
 
-export function buildGraphifyUsageLabel(worker: WorkerSnapshot): string {
-  const delivery = String(worker.graphifyEvidenceDelivery || '').trim().toLowerCase()
-  const requirement = String(worker.graphifyQueryRequirement || '').trim().toLowerCase()
-  const status = String(worker.graphifyQueryStatus || '').trim().toLowerCase()
-  const command = String(worker.graphifyQueryCommand || '').trim()
-  const freshness = String(worker.graphifyFreshness || '').trim()
-  if (!delivery && !requirement && !status) return ''
-  if (delivery !== 'confirmed') return '图谱证据：投递确认中'
-  if (status === 'degraded') return '图谱证据：Auto 降级 · 未执行必需查询'
-  if (status === 'manual_override') return '图谱证据：已投递 · 人工确认按源码核验结果继续'
-  if (status === 'satisfied') {
-    return `图谱证据：已投递 · ${command || '查询'} 已完成${freshness ? `/${freshness}` : ''}`
-  }
-  if (requirement === 'required') {
-    const suffix = status === 'query_failed' ? '执行失败' : '待执行'
-    return `图谱证据：已投递 · 必须查询 ${command || 'Graphify'} · ${suffix}`
-  }
-  if (requirement === 'optional' || status === 'optional') return '图谱证据：已投递 · 查询可选'
-  return ''
-}
-
 function workerRoleFromSessionName(sessionName: string): string {
   const normalized = String(sessionName || '').trim()
   const separatorIndex = normalized.indexOf('-')
@@ -394,7 +373,6 @@ export function buildHomeAgents(
           healthStatus: worker.healthStatus || 'unknown',
           agentState: nextAgentState,
           agentConfigLabel: buildAgentConfigLabel(worker),
-          graphifyUsageLabel: buildGraphifyUsageLabel(worker),
           attachCommand: `tmux attach -t ${sessionName}`,
           workDir: worker.workDir,
         },

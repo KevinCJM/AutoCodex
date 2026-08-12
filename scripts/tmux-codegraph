@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the project-owned Graphify adapter from any working directory."""
+"""Run the project-owned CodeGraph adapter from any working directory."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from tmux_core.runtime.graphify import cli_main  # noqa: E402
+from tmux_core.runtime.codegraph import cli_main  # noqa: E402
 
 
 if __name__ == "__main__":

@@ -62,12 +62,12 @@ from tmux_core.runtime.grill import (
     RequirementsMode,
     normalize_requirements_mode,
 )
-from tmux_core.runtime.graphify import (
-    GraphifyMode,
-    GraphifyQueryIntent,
+from tmux_core.runtime.codegraph import (
+    CodeGraphMode,
+    CodeGraphQueryIntent,
 )
-from tmux_core.stage_kernel.graphify_route_context import (
-    build_stage_graphify_turn_context,
+from tmux_core.stage_kernel.codegraph_route_context import (
+    build_stage_codegraph_turn_context,
 )
 from tmux_core.stage_kernel.agent_intervention import (
     request_file_noncompliance_intervention,
@@ -76,8 +76,8 @@ from tmux_core.stage_kernel.agent_intervention import (
 from tmux_core.stage_kernel.shared_review import (
     is_agent_config_error,
     resolve_main_ponytail_mode,
-    resolve_workflow_graphify_mode,
-    resolve_workflow_graphify_config,
+    resolve_workflow_codegraph_mode,
+    resolve_workflow_codegraph_config,
     resolve_workflow_requirements_mode,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
@@ -93,6 +93,7 @@ from T09_terminal_ops import (
     PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
+    cleanup_codegraph_processes_on_exit,
     maybe_launch_tui,
     message,
     prompt_metadata,
@@ -188,8 +189,8 @@ class RequirementsClarificationAgentSelection:
     proxy_url: str
     ponytail_mode: str = "off"
     requirements_mode: str = RequirementsMode.STANDARD.value
-    graphify_mode: str = GraphifyMode.OFF.value
-    graphify_config: dict[str, object] = field(default_factory=dict)
+    codegraph_mode: str = CodeGraphMode.OFF.value
+    codegraph_config: dict[str, object] = field(default_factory=dict)
 
 
 RequirementsAnalysisAgentSelection = RequirementsClarificationAgentSelection
@@ -205,7 +206,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effort", help="需求澄清阶段推理强度")
     parser.add_argument("--proxy-url", default="", help="需求澄清阶段代理端口或完整代理 URL")
     parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
-    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--codegraph-mode", choices=("off", "auto", "required"), default="", help="CodeGraph 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument(
@@ -388,11 +390,11 @@ def collect_requirements_clarification_agent_selection(args: argparse.Namespace)
         args,
         stage_key="requirements_clarification",
     )
-    graphify_mode = resolve_workflow_graphify_mode(
+    codegraph_mode = resolve_workflow_codegraph_mode(
         args,
         stage_key="requirements_clarification",
     )
-    graphify_config = resolve_workflow_graphify_config(args)
+    codegraph_config = resolve_workflow_codegraph_config(args)
     try:
         model_value = str(getattr(args, "model", "") or "").strip()
         effort_value = str(getattr(args, "effort", "") or "").strip()
@@ -487,8 +489,8 @@ def collect_requirements_clarification_agent_selection(args: argparse.Namespace)
         proxy_url=proxy_url,
         ponytail_mode=ponytail_mode,
         requirements_mode=requirements_mode,
-        graphify_mode=graphify_mode,
-        graphify_config=graphify_config,
+        codegraph_mode=codegraph_mode,
+        codegraph_config=codegraph_config,
     )
 
 
@@ -502,7 +504,7 @@ def render_requirements_clarification_stage_start(selection: RequirementsClarifi
             f"proxy_url: {selection.proxy_url or '(none)'}",
             f"ponytail_mode: {getattr(selection, 'ponytail_mode', 'off') or 'off'}",
             f"requirements_mode: {getattr(selection, 'requirements_mode', RequirementsMode.STANDARD.value) or RequirementsMode.STANDARD.value}",
-            f"graphify_mode: {getattr(selection, 'graphify_mode', GraphifyMode.OFF.value) or GraphifyMode.OFF.value}",
+            f"codegraph_mode: {getattr(selection, 'codegraph_mode', CodeGraphMode.OFF.value) or CodeGraphMode.OFF.value}",
         ]
     )
 
@@ -517,8 +519,8 @@ def prompt_recreate_requirements_clarification_agent(
         current_proxy_url: str,
         current_ponytail_mode: str,
         current_requirements_mode: str,
-        current_graphify_mode: str,
-        current_graphify_config: dict[str, object],
+        current_codegraph_mode: str,
+        current_codegraph_config: dict[str, object],
         force_model_change: bool,
 ) -> RequirementsClarificationAgentSelection | None:
     if not stdin_is_interactive():
@@ -539,8 +541,8 @@ def prompt_recreate_requirements_clarification_agent(
                 proxy_url=proxy_url,
                 ponytail_mode=current_ponytail_mode,
                 requirements_mode=current_requirements_mode,
-                graphify_mode=current_graphify_mode,
-                graphify_config=dict(current_graphify_config),
+                codegraph_mode=current_codegraph_mode,
+                codegraph_config=dict(current_codegraph_config),
             )
             message(render_requirements_clarification_stage_start(selection))
             return selection
@@ -648,8 +650,8 @@ def load_persisted_requirements_grill_selection(
         proxy_url=str(config.get("proxy_url", "") or "").strip(),
         ponytail_mode=str(config.get("ponytail_mode", "off") or "off").strip(),
         requirements_mode=expected_mode,
-        graphify_mode=str(config.get("graphify_mode", GraphifyMode.OFF.value) or GraphifyMode.OFF.value).strip(),
-        graphify_config=(dict(config.get("graphify_config", {})) if isinstance(config.get("graphify_config", {}), dict) else {}),
+        codegraph_mode=str(config.get("codegraph_mode", CodeGraphMode.OFF.value) or CodeGraphMode.OFF.value).strip(),
+        codegraph_config=(dict(config.get("codegraph_config", {})) if isinstance(config.get("codegraph_config", {}), dict) else {}),
     )
 
 
@@ -698,8 +700,8 @@ def run_requirements_clarification(
         proxy_url: str = "",
         ponytail_mode: str = "off",
         requirements_mode: str = RequirementsMode.STANDARD.value,
-        graphify_mode: str = GraphifyMode.OFF.value,
-        graphify_config: dict[str, object] | None = None,
+        codegraph_mode: str = CodeGraphMode.OFF.value,
+        codegraph_config: dict[str, object] | None = None,
         resume_existing: bool = False,
         preserve_ba_worker: bool = False,
         human_input_provider: Callable[..., str] | None = None,
@@ -724,8 +726,8 @@ def run_requirements_clarification(
     current_proxy_url = proxy_url
     current_ponytail_mode = ponytail_mode
     current_requirements_mode = normalize_requirements_mode(requirements_mode).value
-    current_graphify_mode = graphify_mode
-    current_graphify_config = dict(graphify_config or {})
+    current_codegraph_mode = codegraph_mode
+    current_codegraph_config = dict(codegraph_config or {})
     existing_grill_header = read_grill_session_header(grill_session_path)
     if (
         existing_grill_header is not None
@@ -755,8 +757,8 @@ def run_requirements_clarification(
         current_reasoning_effort = persisted_grill_selection.reasoning_effort
         current_proxy_url = persisted_grill_selection.proxy_url
         current_ponytail_mode = persisted_grill_selection.ponytail_mode
-        current_graphify_mode = persisted_grill_selection.graphify_mode
-        current_graphify_config = persisted_grill_selection.graphify_config
+        current_codegraph_mode = persisted_grill_selection.codegraph_mode
+        current_codegraph_config = persisted_grill_selection.codegraph_config
     current_resume_existing = bool(resume_existing)
     keep_worker_alive = False
     worker: TmuxBatchWorker | None = None
@@ -839,8 +841,8 @@ def run_requirements_clarification(
                         current_reasoning_effort = worker.config.reasoning_effort
                         current_proxy_url = worker.config.proxy_url
                         current_ponytail_mode = worker.config.ponytail_mode
-                        current_graphify_mode = worker.config.graphify_mode
-                        current_graphify_config = dict(worker.config.graphify_config)
+                        current_codegraph_mode = worker.config.codegraph_mode
+                        current_codegraph_config = dict(worker.config.codegraph_config)
                         message(f"恢复现有需求分析师会话: tmux attach -t {worker.session_name}")
                 if worker is None:
                     worker = TmuxBatchWorker(
@@ -853,8 +855,8 @@ def run_requirements_clarification(
                             proxy_url=current_proxy_url,
                             ponytail_mode=current_ponytail_mode,
                             requirements_mode=current_requirements_mode,
-                            graphify_mode=current_graphify_mode,
-                            graphify_config=current_graphify_config,
+                            codegraph_mode=current_codegraph_mode,
+                            codegraph_config=current_codegraph_config,
                         ),
                         runtime_root=runtime_root,
                     )
@@ -903,8 +905,8 @@ def run_requirements_clarification(
                     current_proxy_url=current_proxy_url,
                     current_ponytail_mode=current_ponytail_mode,
                     current_requirements_mode=current_requirements_mode,
-                    current_graphify_mode=current_graphify_mode,
-                    current_graphify_config=current_graphify_config,
+                    current_codegraph_mode=current_codegraph_mode,
+                    current_codegraph_config=current_codegraph_config,
                     force_model_change=False,
                 )
                 if selection is not None:
@@ -914,8 +916,8 @@ def run_requirements_clarification(
                     current_proxy_url = selection.proxy_url
                     current_ponytail_mode = selection.ponytail_mode
                     current_requirements_mode = selection.requirements_mode
-                    current_graphify_mode = selection.graphify_mode
-                    current_graphify_config = dict(selection.graphify_config)
+                    current_codegraph_mode = selection.codegraph_mode
+                    current_codegraph_config = dict(selection.codegraph_config)
                     current_resume_existing = current_resume_existing or bool(get_markdown_content(requirements_clear_path).strip())
                     keep_worker_alive = False
                     worker = None
@@ -1019,13 +1021,13 @@ def run_requirements_clarification(
                 hitl_loop_kwargs: dict[str, object] = {}
                 if human_input_provider is not None:
                     hitl_loop_kwargs["human_input_provider"] = human_input_provider
-                hitl_loop_kwargs["graphify_context_factory"] = (
-                    lambda hitl_context: build_stage_graphify_turn_context(
+                hitl_loop_kwargs["codegraph_context_factory"] = (
+                    lambda hitl_context: build_stage_codegraph_turn_context(
                         project_root,
                         stage_key="A03",
                         phase=hitl_context.turn_phase,
                         role="requirements_analyst",
-                        intent=GraphifyQueryIntent.CODE_FACT_DISCOVERY,
+                        intent=CodeGraphQueryIntent.CODE_FACT_DISCOVERY,
                         requirement_name=requirement_name,
                         task_name=f"requirements_question_{hitl_context.hitl_round}",
                         query_seeds=(requirement_name, "code-verifiable requirement facts"),
@@ -1034,7 +1036,7 @@ def run_requirements_clarification(
                             requirements_clear_path,
                             hitl_record_path,
                         ),
-                        resolve_route_hints=current_graphify_mode != GraphifyMode.OFF.value,
+                        resolve_route_hints=current_codegraph_mode != CodeGraphMode.OFF.value,
                     )
                 )
 
@@ -1183,8 +1185,8 @@ def run_requirements_clarification(
                         reasoning_effort=worker.config.reasoning_effort,
                         proxy_url=worker.config.proxy_url,
                         ponytail_mode=worker.config.ponytail_mode,
-                        graphify_mode=worker.config.graphify_mode,
-                        graphify_config=dict(worker.config.graphify_config),
+                        codegraph_mode=worker.config.codegraph_mode,
+                        codegraph_config=dict(worker.config.codegraph_config),
                         requirements_mode=current_requirements_mode,
                         requirements_behavior=requirements_behavior,
                     )
@@ -1227,8 +1229,8 @@ def run_requirements_clarification(
                         current_proxy_url=current_proxy_url,
                         current_ponytail_mode=current_ponytail_mode,
                         current_requirements_mode=current_requirements_mode,
-                        current_graphify_mode=current_graphify_mode,
-                        current_graphify_config=current_graphify_config,
+                        current_codegraph_mode=current_codegraph_mode,
+                        current_codegraph_config=current_codegraph_config,
                         force_model_change=True,
                     )
                     if selection is not None:
@@ -1238,8 +1240,8 @@ def run_requirements_clarification(
                         current_proxy_url = selection.proxy_url
                         current_ponytail_mode = selection.ponytail_mode
                         current_requirements_mode = selection.requirements_mode
-                        current_graphify_mode = selection.graphify_mode
-                        current_graphify_config = dict(selection.graphify_config)
+                        current_codegraph_mode = selection.codegraph_mode
+                        current_codegraph_config = dict(selection.codegraph_config)
                         current_resume_existing = current_resume_existing or bool(get_markdown_content(requirements_clear_path).strip())
                         keep_worker_alive = False
                         worker = None
@@ -1260,8 +1262,8 @@ def run_requirements_clarification(
                         current_proxy_url=current_proxy_url,
                         current_ponytail_mode=current_ponytail_mode,
                         current_requirements_mode=current_requirements_mode,
-                        current_graphify_mode=current_graphify_mode,
-                        current_graphify_config=current_graphify_config,
+                        current_codegraph_mode=current_codegraph_mode,
+                        current_codegraph_config=current_codegraph_config,
                         force_model_change=True,
                     )
                     if selection is not None:
@@ -1271,8 +1273,8 @@ def run_requirements_clarification(
                         current_proxy_url = selection.proxy_url
                         current_ponytail_mode = selection.ponytail_mode
                         current_requirements_mode = selection.requirements_mode
-                        current_graphify_mode = selection.graphify_mode
-                        current_graphify_config = dict(selection.graphify_config)
+                        current_codegraph_mode = selection.codegraph_mode
+                        current_codegraph_config = dict(selection.codegraph_config)
                         current_resume_existing = current_resume_existing or bool(get_markdown_content(requirements_clear_path).strip())
                         keep_worker_alive = False
                         worker = None
@@ -1293,8 +1295,8 @@ def run_requirements_clarification(
                         current_proxy_url=current_proxy_url,
                         current_ponytail_mode=current_ponytail_mode,
                         current_requirements_mode=current_requirements_mode,
-                        current_graphify_mode=current_graphify_mode,
-                        current_graphify_config=current_graphify_config,
+                        current_codegraph_mode=current_codegraph_mode,
+                        current_codegraph_config=current_codegraph_config,
                         force_model_change=True,
                     )
                     if selection is not None:
@@ -1304,8 +1306,8 @@ def run_requirements_clarification(
                         current_proxy_url = selection.proxy_url
                         current_ponytail_mode = selection.ponytail_mode
                         current_requirements_mode = selection.requirements_mode
-                        current_graphify_mode = selection.graphify_mode
-                        current_graphify_config = dict(selection.graphify_config)
+                        current_codegraph_mode = selection.codegraph_mode
+                        current_codegraph_config = dict(selection.codegraph_config)
                         current_resume_existing = current_resume_existing or bool(get_markdown_content(requirements_clear_path).strip())
                         keep_worker_alive = False
                         worker = None
@@ -1509,8 +1511,8 @@ def run_requirements_clarification_stage(
                                 reasoning_effort=restored_worker.config.reasoning_effort,
                                 proxy_url=restored_worker.config.proxy_url,
                                 ponytail_mode=restored_worker.config.ponytail_mode,
-                                graphify_mode=restored_worker.config.graphify_mode,
-                                graphify_config=dict(restored_worker.config.graphify_config),
+                                codegraph_mode=restored_worker.config.codegraph_mode,
+                                codegraph_config=dict(restored_worker.config.codegraph_config),
                                 requirements_mode=requirements_mode,
                                 requirements_behavior="standard",
                             ),
@@ -1560,8 +1562,8 @@ def run_requirements_clarification_stage(
                     getattr(selection, "requirements_mode", requirements_mode)
                     or requirements_mode
                 ),
-                graphify_mode=getattr(selection, "graphify_mode", GraphifyMode.OFF.value) or GraphifyMode.OFF.value,
-                graphify_config=getattr(selection, "graphify_config", {}) or {},
+                codegraph_mode=getattr(selection, "codegraph_mode", CodeGraphMode.OFF.value) or CodeGraphMode.OFF.value,
+                codegraph_config=getattr(selection, "codegraph_config", {}) or {},
                 resume_existing=True,
                 preserve_ba_worker=preserve_ba_worker,
                 human_input_provider=human_input_provider,
@@ -1596,8 +1598,8 @@ def run_requirements_clarification_stage(
                     getattr(selection, "requirements_mode", requirements_mode)
                     or requirements_mode
                 ),
-                graphify_mode=getattr(selection, "graphify_mode", GraphifyMode.OFF.value) or GraphifyMode.OFF.value,
-                graphify_config=getattr(selection, "graphify_config", {}) or {},
+                codegraph_mode=getattr(selection, "codegraph_mode", CodeGraphMode.OFF.value) or CodeGraphMode.OFF.value,
+                codegraph_config=getattr(selection, "codegraph_config", {}) or {},
                 resume_existing=False,
                 preserve_ba_worker=preserve_ba_worker,
                 human_input_provider=human_input_provider,
@@ -1642,6 +1644,7 @@ def run_requirements_clarification_stage(
         lock_context.__exit__(None, None, None)
 
 
+@cleanup_codegraph_processes_on_exit
 def main(argv: Sequence[str] | None = None) -> int:
     redirected, launch = maybe_launch_tui(argv, route="requirements", action="stage.a03.start")
     if redirected:

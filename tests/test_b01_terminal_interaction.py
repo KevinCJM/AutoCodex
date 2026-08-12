@@ -637,6 +637,19 @@ class B01TerminalInteractionTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         mocked_resume.assert_called_once_with(run_id="run_demo", project_dir=resolved_project_dir, max_refine_rounds=3)
 
+    def test_main_resume_run_rejects_legacy_graphify_manifest(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest = Path(tmpdir) / ".routing_init_runtime" / "run_legacy" / "manifest.json"
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps({"config": {"graphify_mode": "auto"}}),
+                encoding="utf-8",
+            )
+            launch = ["--project-dir", tmpdir, "--resume-run", "run_legacy"]
+            with patch("B01_terminal_interaction.maybe_launch_tui", return_value=(False, launch)):
+                with self.assertRaisesRegex(RuntimeError, "旧 Graphify routing run 不能跨引擎恢复"):
+                    main([])
+
     def test_pending_work_count_counts_unfinished_dirs(self):
         control_center = AgentInitControlCenter.__new__(AgentInitControlCenter)
         control_center.selection = SimpleNamespace(selected_dirs=("/tmp/project",))

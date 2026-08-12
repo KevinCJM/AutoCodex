@@ -22,7 +22,7 @@ import type {
   WorkerSnapshot,
 } from './types'
 import { STAGE_ROUTES } from './stages'
-import { normalizeGraphifyStatus } from './graphifyStatus'
+import { normalizeCodeGraphStatus } from './codegraphStatus'
 import { resolvePromptMetadata } from './promptMetadata'
 
 export const EMPTY_STAGE: StageSnapshot = {
@@ -245,27 +245,11 @@ export function normalizeWorkerSnapshot(value: unknown): WorkerSnapshot {
       const parsed = Number(raw)
       return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
     })(),
-    graphifyUsagePolicy: item.graphify_usage_policy === undefined && item.graphifyUsagePolicy === undefined
-      ? undefined
-      : str(item.graphify_usage_policy ?? item.graphifyUsagePolicy),
-    graphifyFreshness: item.graphify_freshness === undefined && item.graphifyFreshness === undefined
-      ? undefined
-      : str(item.graphify_freshness ?? item.graphifyFreshness),
-    graphifyEvidenceDelivery: item.graphify_evidence_delivery === undefined && item.graphifyEvidenceDelivery === undefined
-      ? undefined
-      : str(item.graphify_evidence_delivery ?? item.graphifyEvidenceDelivery),
-    graphifyQueryRequirement: item.graphify_query_requirement === undefined && item.graphifyQueryRequirement === undefined
-      ? undefined
-      : str(item.graphify_query_requirement ?? item.graphifyQueryRequirement),
-    graphifyQueryStatus: item.graphify_query_status === undefined && item.graphifyQueryStatus === undefined
-      ? undefined
-      : str(item.graphify_query_status ?? item.graphifyQueryStatus),
-    graphifyQueryCommand: item.graphify_query_command === undefined && item.graphifyQueryCommand === undefined
-      ? undefined
-      : str(item.graphify_query_command ?? item.graphifyQueryCommand),
-    graphifyUsageReceipt: item.graphify_usage_receipt === undefined && item.graphifyUsageReceipt === undefined
-      ? undefined
-      : str(item.graphify_usage_receipt ?? item.graphifyUsageReceipt),
+    codegraphMode: item.codegraph_mode === undefined && item.codegraphMode === undefined
+      ? undefined : str(item.codegraph_mode ?? item.codegraphMode),
+    codegraphAvailable: item.codegraph_available === true || item.codegraphAvailable === true,
+    codegraphHintDelivery: item.codegraph_hint_delivery === undefined && item.codegraphHintDelivery === undefined
+      ? undefined : str(item.codegraph_hint_delivery ?? item.codegraphHintDelivery),
     retryCount: num(item.retry_count ?? item.retryCount),
     note: str(item.note),
     transcriptPath: str(item.transcript_path ?? item.transcriptPath),
@@ -412,7 +396,7 @@ export function normalizeAppSnapshot(value: unknown): AppSnapshot {
     pendingAttention: bool(item.pending_attention ?? item.pendingAttention),
     pendingAttentionReason: str(item.pending_attention_reason ?? item.pendingAttentionReason),
     pendingAttentionSince: str(item.pending_attention_since ?? item.pendingAttentionSince),
-    graphify: normalizeGraphifyStatus(item.graphify),
+    codegraph: normalizeCodeGraphStatus(item.codegraph),
     recentArtifacts: Array.isArray(item.recent_artifacts) ? item.recent_artifacts.map(artifact) : [],
     availableRuns: runs.map((run): RunOption => {
       const raw = objectOf(run)

@@ -28,8 +28,8 @@ from Prompt_02_RequirementIntake import (
 )
 from A01_Routing_LayerPlanning import DEFAULT_MODEL_BY_VENDOR, prompt_effort, prompt_model, prompt_vendor
 from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
-from tmux_core.runtime.graphify import GraphifyMode
-from tmux_core.stage_kernel.shared_review import resolve_main_ponytail_mode, resolve_workflow_graphify_mode
+from tmux_core.runtime.codegraph import CodeGraphMode
+from tmux_core.stage_kernel.shared_review import resolve_main_ponytail_mode, resolve_workflow_codegraph_mode
 from T01_tools import get_markdown_content
 from T02_tmux_agents import (
     DEFAULT_COMMAND_TIMEOUT_SEC,
@@ -51,6 +51,7 @@ from T09_terminal_ops import (
     PromptBackRequested,
     SingleLineSpinnerMonitor,
     TERMINAL_SPINNER_FRAMES,
+    cleanup_codegraph_processes_on_exit,
     collect_multiline_input,
     maybe_launch_tui,
     message,
@@ -95,7 +96,7 @@ class RequirementIntakeRequest:
     auto_confirm: bool
     reuse_existing_original_requirement: bool = False
     ponytail_mode: str = PonytailMode.OFF.value
-    graphify_mode: str = GraphifyMode.OFF.value
+    codegraph_mode: str = CodeGraphMode.OFF.value
 
 
 @dataclass(frozen=True)
@@ -112,7 +113,7 @@ class RequirementIntakeStageResult:
     cleanup_paths: tuple[str, ...] = ()
     reuse_existing_original_requirement: bool = False
     ponytail_mode: str = PonytailMode.OFF.value
-    graphify_mode: str = GraphifyMode.OFF.value
+    codegraph_mode: str = CodeGraphMode.OFF.value
 
 
 class NotionInputRetryRequired(RuntimeError):
@@ -137,6 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reuse-existing-original-requirement", action="store_true", help="复用已存在的原始需求文件")
     parser.add_argument("--allow-previous-stage-back", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
+    parser.add_argument("--codegraph-mode", choices=("off", "auto", "required"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
     parser.add_argument(
@@ -386,7 +388,7 @@ def reprompt_request_for_input_source(request: RequirementIntakeRequest) -> Requ
         auto_confirm=request.auto_confirm,
         reuse_existing_original_requirement=request.reuse_existing_original_requirement,
         ponytail_mode=request.ponytail_mode,
-        graphify_mode=request.graphify_mode,
+        codegraph_mode=request.codegraph_mode,
     )
 
 
@@ -473,7 +475,7 @@ def run_notion_reader(
     requirement_name: str,
     *,
     ponytail_mode: str = PonytailMode.OFF.value,
-    graphify_mode: str = GraphifyMode.OFF.value,
+    codegraph_mode: str = CodeGraphMode.OFF.value,
 ) -> InputReadResult:
     project_root = resolve_existing_directory(project_dir)
     runtime_root = project_root / NOTION_RUNTIME_ROOT_NAME
@@ -493,7 +495,7 @@ def run_notion_reader(
                 ponytail_mode=ponytail_mode,
                 # A02 only propagates the workflow policy.  The temporary
                 # Notion reader must not build/query or inject a project graph.
-                graphify_mode=GraphifyMode.OFF.value,
+                codegraph_mode=CodeGraphMode.OFF.value,
             ),
             runtime_root=runtime_root,
         )
@@ -701,7 +703,7 @@ def read_input_content(request: RequirementIntakeRequest) -> InputReadResult:
             request.input_value,
             request.requirement_name,
             ponytail_mode=request.ponytail_mode,
-            graphify_mode=request.graphify_mode,
+            codegraph_mode=request.codegraph_mode,
         )
         return InputReadResult(content=ensure_non_empty_content(result.content), cleanup_paths=result.cleanup_paths)
     raise ValueError(f"不支持的输入方式: {request.input_type}")
@@ -830,7 +832,7 @@ def collect_request(args: argparse.Namespace) -> RequirementIntakeRequest:
             if explicit_ponytail_mode
             else PonytailMode.FULL.value
         )
-    graphify_mode = resolve_workflow_graphify_mode(args, stage_key="requirement_intake")
+    codegraph_mode = resolve_workflow_codegraph_mode(args, stage_key="requirement_intake")
     grill_session_path = (
         Path(project_dir).expanduser().resolve()
         / ".tmux_workflow"
@@ -853,7 +855,7 @@ def collect_request(args: argparse.Namespace) -> RequirementIntakeRequest:
         auto_confirm=bool(args.yes),
         reuse_existing_original_requirement=reuse_existing_original_requirement,
         ponytail_mode=ponytail_mode,
-        graphify_mode=graphify_mode,
+        codegraph_mode=codegraph_mode,
     )
 
 
@@ -936,10 +938,11 @@ def run_requirement_intake_stage(argv: Sequence[str] | None = None) -> Requireme
         original_requirement_path=str(output_path.resolve()),
         reuse_existing_original_requirement=request.reuse_existing_original_requirement,
         ponytail_mode=request.ponytail_mode,
-        graphify_mode=request.graphify_mode,
+        codegraph_mode=request.codegraph_mode,
     )
 
 
+@cleanup_codegraph_processes_on_exit
 def main(argv: Sequence[str] | None = None) -> int:
     redirected, launch = maybe_launch_tui(argv, route="requirements", action="stage.a02.start")
     if redirected:

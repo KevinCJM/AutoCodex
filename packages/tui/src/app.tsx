@@ -30,7 +30,7 @@ import { DevelopmentRoute } from './routes/DevelopmentRoute'
 import { OverallReviewRoute } from './routes/OverallReviewRoute'
 import { ControlRoute } from './routes/ControlRoute'
 import { resolveFooterProgressLine } from './footerProgress'
-import { normalizeGraphifyStatus } from './graphifyStatus'
+import { normalizeCodeGraphStatus } from './codegraphStatus'
 import { buildHomeAgents } from './homeAgents'
 import { promptAllowsBack, resolvePromptBackValue, withPromptBackOption } from './promptBack'
 import { writePromptDraft } from './promptMemory'
@@ -839,27 +839,11 @@ function normalizeWorkerSnapshot(value: Record<string, unknown>): WorkerSnapshot
       const parsed = Number(raw)
       return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined
     })(),
-    graphifyUsagePolicy: value.graphify_usage_policy === undefined && value.graphifyUsagePolicy === undefined
-      ? undefined
-      : String(value.graphify_usage_policy ?? value.graphifyUsagePolicy ?? ''),
-    graphifyFreshness: value.graphify_freshness === undefined && value.graphifyFreshness === undefined
-      ? undefined
-      : String(value.graphify_freshness ?? value.graphifyFreshness ?? ''),
-    graphifyEvidenceDelivery: value.graphify_evidence_delivery === undefined && value.graphifyEvidenceDelivery === undefined
-      ? undefined
-      : String(value.graphify_evidence_delivery ?? value.graphifyEvidenceDelivery ?? ''),
-    graphifyQueryRequirement: value.graphify_query_requirement === undefined && value.graphifyQueryRequirement === undefined
-      ? undefined
-      : String(value.graphify_query_requirement ?? value.graphifyQueryRequirement ?? ''),
-    graphifyQueryStatus: value.graphify_query_status === undefined && value.graphifyQueryStatus === undefined
-      ? undefined
-      : String(value.graphify_query_status ?? value.graphifyQueryStatus ?? ''),
-    graphifyQueryCommand: value.graphify_query_command === undefined && value.graphifyQueryCommand === undefined
-      ? undefined
-      : String(value.graphify_query_command ?? value.graphifyQueryCommand ?? ''),
-    graphifyUsageReceipt: value.graphify_usage_receipt === undefined && value.graphifyUsageReceipt === undefined
-      ? undefined
-      : String(value.graphify_usage_receipt ?? value.graphifyUsageReceipt ?? ''),
+    codegraphMode: value.codegraph_mode === undefined && value.codegraphMode === undefined
+      ? undefined : String(value.codegraph_mode ?? value.codegraphMode ?? ''),
+    codegraphAvailable: value.codegraph_available === true || value.codegraphAvailable === true,
+    codegraphHintDelivery: value.codegraph_hint_delivery === undefined && value.codegraphHintDelivery === undefined
+      ? undefined : String(value.codegraph_hint_delivery ?? value.codegraphHintDelivery ?? ''),
     retryCount: Number(value.retry_count ?? value.retryCount ?? 0),
     note: String(value.note ?? ''),
     transcriptPath: String(value.transcript_path ?? value.transcriptPath ?? ''),
@@ -1044,7 +1028,7 @@ function normalizeAppSnapshot(payload: Record<string, unknown>): AppSnapshot {
     pendingAttention: Boolean(payload.pending_attention ?? payload.pendingAttention),
     pendingAttentionReason: String(payload.pending_attention_reason ?? payload.pendingAttentionReason ?? ''),
     pendingAttentionSince: String(payload.pending_attention_since ?? payload.pendingAttentionSince ?? ''),
-    graphify: normalizeGraphifyStatus(payload.graphify),
+    codegraph: normalizeCodeGraphStatus(payload.codegraph),
     recentArtifacts: Array.isArray(payload.recent_artifacts)
       ? payload.recent_artifacts.map((item) => ({
         path: String((item as Record<string, unknown>).path ?? ''),

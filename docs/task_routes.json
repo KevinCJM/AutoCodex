@@ -260,7 +260,7 @@
         "pitfalls",
         "machine_first",
         "audit",
-        "graphify_evidence",
+        "codegraph_navigation",
         "code_graph_candidate"
       ],
       "negative_keywords": [
@@ -396,9 +396,9 @@
         "grill_confirmation",
         "grill_recovery",
         "domain_document_publish",
-        "graphify_mode",
-        "graphify_evidence",
-        "tmux_graphify_cmd"
+        "codegraph_mode",
+        "codegraph_hint",
+        "tmux_codegraph_cmd"
       ],
       "negative_keywords": [],
       "route_priority": 80,
@@ -442,8 +442,8 @@
         "reason_text",
         "prompt_response_cursor",
         "grill_prompt",
-        "graphify_status",
-        "snapshot_app_graphify",
+        "codegraph_status",
+        "snapshot_app_codegraph",
         "code_graph_status"
       ],
       "negative_keywords": [
@@ -490,7 +490,7 @@
         "webbackend",
         "healthz",
         "backend_port",
-        "graphify_status",
+        "codegraph_status",
         "code_graph_status"
       ],
       "negative_keywords": [
@@ -782,8 +782,8 @@
         "grill-with-docs",
         "requirements_mode",
         "requirements interview",
-        "graphify",
-        "graphify_mode",
+        "codegraph",
+        "codegraph_mode",
         "code_graph"
       ],
       "route_priority": 90,
@@ -884,38 +884,26 @@
       ]
     },
     {
-      "id": "R12_graphify_code_graph",
-      "task_type": "project_graphify_code_graph_or_evidence",
+      "id": "R12_codegraph_code_graph",
+      "task_type": "project_codegraph_index_or_navigation",
       "match_keywords": [
-        "graphify",
-        "graphifyy",
-        "graphify_mode",
+        "codegraph",
+        "codegraph_mode",
         "project_graph",
         "code_graph",
-        "code-only",
-        "code_only",
-        "source_snapshot",
-        "graph_cache",
-        "graphify_evidence",
-        "tmux-graphify",
-        "affected",
-        "god-nodes",
-        "graphify_turn_context",
+        "tmux-codegraph",
+        "codegraph_explore",
+        "codegraph_turn_context",
         "query_intent",
-        "graphify_freshness",
-        "graphify_change_ledger",
-        "graphify_route_context",
-        "previous_generation",
-        "session_generation",
-        "query_scope",
-        "validation.json",
-        "query_audit",
-        "graphify_usage_policy",
-        "graphify_usage_receipt",
-        "query_required",
-        "no_query_receipt",
-        "graphify_usage_intervention",
-        "invocation_digest"
+        "codegraph_freshness",
+        "source_change_ledger",
+        "codegraph_route_context",
+        "project_index",
+        "index_sync",
+        "pending_refs",
+        "worktree_mismatch",
+        "managed_binary",
+        "read_only_wrapper"
       ],
       "negative_keywords": [
         "vendor_catalog",

@@ -268,8 +268,8 @@ class PreserveFailedWorkerTests(unittest.TestCase):
                     proxy_url=str(kwargs.get("proxy_url", "")),
                     ponytail_mode=str(kwargs.get("ponytail_mode", "off")),
                     requirements_mode=str(kwargs.get("requirements_mode", "standard")),
-                    graphify_mode=str(kwargs.get("graphify_mode", "off")),
-                    graphify_config=dict(kwargs.get("graphify_config", {})),
+                    codegraph_mode=str(kwargs.get("codegraph_mode", "off")),
+                    codegraph_config=dict(kwargs.get("codegraph_config", {})),
                 ),
             ), patch(
                 "A03_RequirementsClarification.run_hitl_agent_loop",
@@ -698,8 +698,8 @@ class RequirementsClarificationAgentSelectionTests(unittest.TestCase):
                     reasoning_effort="high",
                     proxy_url="",
                     ponytail_mode="full",
-                    graphify_mode="auto",
-                    graphify_config={},
+                    codegraph_mode="auto",
+                    codegraph_config={},
                     requirements_mode="grill",
                 )
 

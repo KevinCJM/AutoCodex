@@ -1,0 +1,31 @@
+{
+  "schema_version": "1.0",
+  "version": "1.5.0",
+  "release": "https://github.com/colbymchenry/codegraph/releases/tag/v1.5.0",
+  "assets": {
+    "darwin-arm64": {
+      "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.5.0/codegraph-darwin-arm64.tar.gz",
+      "sha256": "cf5ee435a6e44d097b2f98f2b7b8b9422bb1094844404efed82519c5da1af2cf"
+    },
+    "darwin-x64": {
+      "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.5.0/codegraph-darwin-x64.tar.gz",
+      "sha256": "0a0ccc29bf7da9d10be1458d89d7e15c55927ae24cd95e9fa3de4bdfea059dde"
+    },
+    "linux-arm64": {
+      "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.5.0/codegraph-linux-arm64.tar.gz",
+      "sha256": "9f17750aedf45d51f68caae39ed21d6e2a7290b2326e5c53f95a165918ebd1d8"
+    },
+    "linux-x64": {
+      "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.5.0/codegraph-linux-x64.tar.gz",
+      "sha256": "2ba65e87a1210b706bb1e67d5e48b5fc4a1935e43dbb3fb5f31c5597840d2e58"
+    },
+    "win32-arm64": {
+      "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.5.0/codegraph-win32-arm64.zip",
+      "sha256": "de125e792b5eed7dee8def2ab9bd7e762f372012f75f595e59d3b0c8714b0d55"
+    },
+    "win32-x64": {
+      "url": "https://github.com/colbymchenry/codegraph/releases/download/v1.5.0/codegraph-win32-x64.zip",
+      "sha256": "d6798622b4f44ee6757c94335f437ee27a9ff7d3537b554cb6a2b3baf11bc4a1"
+    }
+  }
+}

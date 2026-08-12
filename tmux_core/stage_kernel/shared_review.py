@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import time
+import warnings
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -11,10 +12,11 @@ from typing import Any, Callable, Mapping, Sequence
 from tmux_core.runtime.vendor_catalog import get_default_model_for_vendor
 from tmux_core.runtime.ponytail import PonytailMode, normalize_ponytail_mode
 from tmux_core.runtime.grill import RequirementsMode, normalize_requirements_mode
-from tmux_core.runtime.graphify import (
-    GraphifyMode,
-    enable_graphify_interactive_recovery,
-    normalize_graphify_mode,
+from tmux_core.runtime.codegraph import (
+    CodeGraphMode,
+    enable_codegraph_interactive_recovery,
+    normalize_codegraph_mode,
+    read_codegraph_project_preference,
 )
 from A01_Routing_LayerPlanning import (
     DEFAULT_MODEL_BY_VENDOR,
@@ -33,7 +35,7 @@ from tmux_core.runtime.tmux_runtime import (
     TmuxBatchWorker,
     Vendor,
     WorkerStatus,
-    normalize_graphify_config,
+    normalize_codegraph_config,
     is_agent_ready_timeout_error,
     is_agent_startup_intervention_error,
     is_provider_auth_error,
@@ -80,8 +82,8 @@ class ReviewAgentSelection:
     reasoning_effort: str
     proxy_url: str
     ponytail_mode: str = PonytailMode.OFF.value
-    graphify_mode: str = GraphifyMode.OFF.value
-    graphify_config: dict[str, object] = field(default_factory=dict)
+    codegraph_mode: str = CodeGraphMode.OFF.value
+    codegraph_config: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -121,8 +123,8 @@ class StageAgentConfig:
     invalid_main: InvalidAgentSelection | None = None
     invalid_reviewers: dict[str, InvalidAgentSelection] = field(default_factory=dict)
     ponytail_mode: str = PonytailMode.OFF.value
-    graphify_mode: str = GraphifyMode.OFF.value
-    graphify_config: dict[str, object] = field(default_factory=dict)
+    codegraph_mode: str = CodeGraphMode.OFF.value
+    codegraph_config: dict[str, object] = field(default_factory=dict)
 
     def reviewer_selection(self, reviewer_key: str) -> ReviewAgentSelection | None:
         selections = self.reviewers or {}
@@ -146,7 +148,7 @@ class ReviewRoundPolicy:
         self.quota_count = 0
 
 
-def refresh_graphify_workers_for_checkpoint(
+def refresh_codegraph_workers_for_checkpoint(
     workers: Sequence[object],
     *,
     prompt: str,
@@ -157,13 +159,13 @@ def refresh_graphify_workers_for_checkpoint(
     eligible = [
         worker
         for worker in workers
-        if callable(getattr(worker, "refresh_graphify_generation", None))
-        and str(getattr(worker, "graphify_mode", GraphifyMode.OFF.value) or "").strip()
-        != GraphifyMode.OFF.value
+        if callable(getattr(worker, "refresh_codegraph_generation", None))
+        and str(getattr(worker, "codegraph_mode", CodeGraphMode.OFF.value) or "").strip()
+        != CodeGraphMode.OFF.value
     ]
     if not eligible:
         return None
-    refresh = eligible[0].refresh_graphify_generation
+    refresh = eligible[0].refresh_codegraph_generation
     try:
         parameters = inspect.signature(refresh).parameters.values()
     except (TypeError, ValueError):
@@ -176,7 +178,7 @@ def refresh_graphify_workers_for_checkpoint(
     else:
         profile = refresh(prompt)
     for worker in eligible[1:]:
-        marker = getattr(worker, "mark_graphify_generation_current", None)
+        marker = getattr(worker, "mark_codegraph_generation_current", None)
         if callable(marker):
             try:
                 marker_parameters = inspect.signature(marker).parameters.values()
@@ -567,14 +569,14 @@ def parse_agent_selection_spec(
     default_model: str = "",
     default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
     default_ponytail_mode: str = PonytailMode.OFF.value,
-    default_graphify_mode: str = GraphifyMode.OFF.value,
-    default_graphify_config: Mapping[str, object] | None = None,
+    default_codegraph_mode: str = CodeGraphMode.OFF.value,
+    default_codegraph_config: Mapping[str, object] | None = None,
     source: str = "agent",
 ) -> tuple[str, ReviewAgentSelection]:
     fields = _coerce_agent_spec_fields(spec, source=source)
-    if "graphify_mode" in fields or "graphify_config" in fields or "graphify" in fields:
+    if "codegraph_mode" in fields or "codegraph_config" in fields or "codegraph" in fields:
         raise RuntimeError(
-            f"{source} 不支持角色级 graphify_mode；请在顶层或 stages.<stage> 配置。"
+            f"{source} 不支持角色级 codegraph_mode；请在顶层或 stages.<stage> 配置。"
         )
     raw_vendor = fields.get("vendor") or default_vendor
     vendor = normalize_vendor_choice(raw_vendor)
@@ -596,9 +598,9 @@ def parse_agent_selection_spec(
         fields.get("ponytail_mode") or fields.get("ponytail") or default_ponytail_mode,
         default=PonytailMode.OFF,
     ).value
-    graphify_mode = normalize_graphify_mode(
-        default_graphify_mode,
-        default=GraphifyMode.OFF,
+    codegraph_mode = normalize_codegraph_mode(
+        default_codegraph_mode,
+        default=CodeGraphMode.OFF,
     ).value
     name = (
         fields.get("name")
@@ -615,8 +617,8 @@ def parse_agent_selection_spec(
             reasoning_effort=effort,
             proxy_url=str(proxy_url or "").strip(),
             ponytail_mode=ponytail_mode,
-            graphify_mode=graphify_mode,
-            graphify_config=normalize_graphify_config(default_graphify_config),
+            codegraph_mode=codegraph_mode,
+            codegraph_config=normalize_codegraph_config(default_codegraph_config),
         ),
     )
 
@@ -699,7 +701,7 @@ def resolve_workflow_ponytail_mode(
     return mode
 
 
-def resolve_workflow_graphify_mode(
+def resolve_workflow_codegraph_mode(
     args: object,
     *,
     config_payload: Mapping[str, Any] | None = None,
@@ -709,14 +711,14 @@ def resolve_workflow_graphify_mode(
 
     A00 resolves every stage from the same ``argparse.Namespace``.  A
     stage-scoped value therefore must be cached per stage instead of being
-    written back to ``args.graphify_mode`` and accidentally becoming the next
+    written back to ``args.codegraph_mode`` and accidentally becoming the next
     stage's CLI override.
     """
 
     cache_key = str(stage_key or "__workflow__").strip() or "__workflow__"
-    cached_modes = getattr(args, "_resolved_graphify_modes", None)
+    cached_modes = getattr(args, "_resolved_codegraph_modes", None)
     if isinstance(cached_modes, Mapping) and cache_key in cached_modes:
-        return normalize_graphify_mode(cached_modes[cache_key]).value
+        return normalize_codegraph_mode(cached_modes[cache_key]).value
 
     payload = (
         dict(config_payload)
@@ -724,29 +726,75 @@ def resolve_workflow_graphify_mode(
         else _load_agent_config_payload(getattr(args, "agent_config", ""))
     )
     stage_payload = _stage_config_payload(payload, stage_key)
-    explicit = str(getattr(args, "graphify_mode", "") or "").strip()
-    stage_configured = str(stage_payload.get("graphify_mode", "") or "").strip()
-    root_configured = str(payload.get("graphify_mode", "") or "").strip()
-    mode = normalize_graphify_mode(
-        explicit or stage_configured or root_configured or GraphifyMode.AUTO.value,
-        default=GraphifyMode.AUTO,
+    explicit = str(getattr(args, "codegraph_mode", "") or "").strip()
+    legacy_explicit = str(getattr(args, "graphify_mode", "") or "").strip()
+    stage_configured = str(stage_payload.get("codegraph_mode", "") or "").strip()
+    legacy_stage = str(stage_payload.get("graphify_mode", "") or "").strip()
+    root_configured = str(payload.get("codegraph_mode", "") or "").strip()
+    legacy_root = str(payload.get("graphify_mode", "") or "").strip()
+    legacy_mode = legacy_explicit or legacy_stage or legacy_root
+    if legacy_mode:
+        warnings.warn(
+            "graphify_mode 已废弃，本版暂时映射为 codegraph_mode；请更新 CLI/配置。",
+            FutureWarning,
+            stacklevel=2,
+        )
+    project_preference = ""
+    project_dir = str(getattr(args, "project_dir", "") or "").strip()
+    if project_dir and not any((explicit, stage_configured, root_configured, legacy_mode)):
+        project_preference = read_codegraph_project_preference(project_dir)
+    mode = normalize_codegraph_mode(
+        explicit or stage_configured or root_configured or legacy_mode or project_preference or CodeGraphMode.AUTO.value,
+        default=CodeGraphMode.AUTO,
     ).value
     if not bool(getattr(args, "yes", False)) and stdin_is_interactive():
         # Actual tool decisions happen immediately before the first worker
         # launch.  Keeping config resolution side-effect free avoids inserting
         # a surprise prompt into requirement/model selection flows that may not
         # create any coding agent at all.
-        project_dir = str(getattr(args, "project_dir", "") or "").strip()
         if project_dir:
-            enable_graphify_interactive_recovery(project_dir)
+            enable_codegraph_interactive_recovery(project_dir)
     next_cache = dict(cached_modes) if isinstance(cached_modes, Mapping) else {}
     next_cache[cache_key] = mode
     with suppress(Exception):
-        setattr(args, "_resolved_graphify_modes", next_cache)
+        setattr(args, "_resolved_codegraph_modes", next_cache)
     return mode
 
 
-def resolve_workflow_graphify_config(
+def configured_workflow_codegraph_mode(
+    args: object,
+    *,
+    config_payload: Mapping[str, Any] | None = None,
+    stage_key: str = "",
+) -> str:
+    """Return only an explicit CLI/config graph policy, without defaulting.
+
+    A00 uses this before the interactive project directory exists.  Returning
+    an empty value lets A01 resolve the selected project's persisted preference
+    instead of turning the workflow default into an accidental CLI override.
+    """
+
+    payload = (
+        dict(config_payload)
+        if config_payload is not None
+        else _load_agent_config_payload(getattr(args, "agent_config", ""))
+    )
+    stage_payload = _stage_config_payload(payload, stage_key)
+    configured = str(
+        getattr(args, "codegraph_mode", "")
+        or getattr(args, "graphify_mode", "")
+        or stage_payload.get("codegraph_mode", "")
+        or stage_payload.get("graphify_mode", "")
+        or payload.get("codegraph_mode", "")
+        or payload.get("graphify_mode", "")
+        or ""
+    ).strip()
+    if not configured:
+        return ""
+    return normalize_codegraph_mode(configured, default=CodeGraphMode.AUTO).value
+
+
+def resolve_workflow_codegraph_config(
     args: object,
     *,
     config_payload: Mapping[str, Any] | None = None,
@@ -756,8 +804,8 @@ def resolve_workflow_graphify_config(
         if config_payload is not None
         else _load_agent_config_payload(getattr(args, "agent_config", ""))
     )
-    return normalize_graphify_config(
-        payload.get("graphify", {}) if isinstance(payload.get("graphify", {}), Mapping) else payload.get("graphify")
+    return normalize_codegraph_config(
+        payload.get("codegraph", {}) if isinstance(payload.get("codegraph", {}), Mapping) else payload.get("codegraph")
     )
 
 
@@ -856,7 +904,7 @@ def inherit_legacy_handoff_ponytail_mode(args: object, mode: object) -> None:
         setattr(args, "_resolved_ponytail_mode", inherited)
 
 
-def inherit_legacy_handoff_graphify_mode(args: object, mode: object) -> None:
+def inherit_legacy_handoff_codegraph_mode(args: object, mode: object) -> None:
     """Keep an active legacy handoff on its persisted graph policy.
 
     A00 always passes an explicit mode for a new workflow.  A direct stage
@@ -867,16 +915,16 @@ def inherit_legacy_handoff_graphify_mode(args: object, mode: object) -> None:
 
     if any(
         str(getattr(args, key, "") or "").strip()
-        for key in ("graphify_mode", "agent_config")
+        for key in ("codegraph_mode", "agent_config")
     ):
         return
-    inherited = normalize_graphify_mode(
-        mode or GraphifyMode.OFF.value,
-        default=GraphifyMode.OFF,
+    inherited = normalize_codegraph_mode(
+        mode or CodeGraphMode.OFF.value,
+        default=CodeGraphMode.OFF,
     ).value
     with suppress(Exception):
-        setattr(args, "graphify_mode", inherited)
-        setattr(args, "_resolved_graphify_modes", {})
+        setattr(args, "codegraph_mode", inherited)
+        setattr(args, "_resolved_codegraph_modes", {})
 
 
 def resolve_main_ponytail_mode(
@@ -902,12 +950,12 @@ def resolve_stage_agent_config(
 ) -> StageAgentConfig:
     config_payload = _load_agent_config_payload(getattr(args, "agent_config", ""))
     ponytail_mode = resolve_workflow_ponytail_mode(args, config_payload=config_payload)
-    graphify_mode = resolve_workflow_graphify_mode(
+    codegraph_mode = resolve_workflow_codegraph_mode(
         args,
         config_payload=config_payload,
         stage_key=stage_key,
     )
-    graphify_config = resolve_workflow_graphify_config(args, config_payload=config_payload)
+    codegraph_config = resolve_workflow_codegraph_config(args, config_payload=config_payload)
     stage_payload = _stage_config_payload(config_payload, stage_key)
     main_spec = stage_payload.get("main") or stage_payload.get("main_agent") or config_payload.get("main") or config_payload.get("main_agent")
     cli_main = getattr(args, "main_agent", "")
@@ -920,8 +968,8 @@ def resolve_stage_agent_config(
             _, main_selection = parse_agent_selection_spec(
                 main_spec,
                 default_ponytail_mode=ponytail_mode,
-                default_graphify_mode=graphify_mode,
-                default_graphify_config=graphify_config,
+                default_codegraph_mode=codegraph_mode,
+                default_codegraph_config=codegraph_config,
                 source="main-agent",
             )
         except Exception as error:  # noqa: BLE001
@@ -955,8 +1003,8 @@ def resolve_stage_agent_config(
                 reviewer_spec,
                 default_name=default_name,
                 default_ponytail_mode=ponytail_mode,
-                default_graphify_mode=graphify_mode,
-                default_graphify_config=graphify_config,
+                default_codegraph_mode=codegraph_mode,
+                default_codegraph_config=codegraph_config,
                 source=source,
             )
         except Exception as error:  # noqa: BLE001
@@ -975,8 +1023,8 @@ def resolve_stage_agent_config(
         invalid_main=invalid_main,
         invalid_reviewers=invalid_reviewers,
         ponytail_mode=ponytail_mode,
-        graphify_mode=graphify_mode,
-        graphify_config=graphify_config,
+        codegraph_mode=codegraph_mode,
+        codegraph_config=codegraph_config,
     )
 
 
@@ -986,8 +1034,8 @@ def prompt_review_agent_selection(
     default_reasoning_effort: str = DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
     default_proxy_url: str = "",
     default_ponytail_mode: str = PonytailMode.FULL.value,
-    default_graphify_mode: str = GraphifyMode.OFF.value,
-    default_graphify_config: Mapping[str, object] | None = None,
+    default_codegraph_mode: str = CodeGraphMode.OFF.value,
+    default_codegraph_config: Mapping[str, object] | None = None,
     *,
     role_label: str = "",
     progress: ReviewStageProgress | None = None,
@@ -1002,9 +1050,9 @@ def prompt_review_agent_selection(
             reasoning_effort = default_reasoning_effort
             proxy_url = default_proxy_url
             ponytail_mode = normalize_ponytail_mode(default_ponytail_mode, default=PonytailMode.FULL).value
-            graphify_mode = normalize_graphify_mode(
-                default_graphify_mode,
-                default=GraphifyMode.OFF,
+            codegraph_mode = normalize_codegraph_mode(
+                default_codegraph_mode,
+                default=CodeGraphMode.OFF,
             ).value
             step = 0
             while step < 4:
@@ -1048,8 +1096,8 @@ def prompt_review_agent_selection(
                 reasoning_effort=reasoning_effort,
                 proxy_url=proxy_url,
                 ponytail_mode=ponytail_mode,
-                graphify_mode=graphify_mode,
-                graphify_config=normalize_graphify_config(default_graphify_config),
+                codegraph_mode=codegraph_mode,
+                codegraph_config=normalize_codegraph_config(default_codegraph_config),
             )
         except Exception as error:  # noqa: BLE001
             if not is_agent_config_error(error):
@@ -1078,8 +1126,8 @@ def resolve_agent_run_config_with_recovery(
                 reasoning_effort=current_selection.reasoning_effort,
                 proxy_url=current_selection.proxy_url,
                 ponytail_mode=current_selection.ponytail_mode,
-                graphify_mode=current_selection.graphify_mode,
-                graphify_config=current_selection.graphify_config,
+                codegraph_mode=current_selection.codegraph_mode,
+                codegraph_config=current_selection.codegraph_config,
             )
             return current_selection, config
         except Exception as error:  # noqa: BLE001
@@ -1093,8 +1141,8 @@ def resolve_agent_run_config_with_recovery(
                 or f"{role_text} 模型配置不可用: {error}\n请重新选择模型配置后继续当前阶段。"
             )
             preserved_ponytail_mode = current_selection.ponytail_mode
-            preserved_graphify_mode = current_selection.graphify_mode
-            preserved_graphify_config = current_selection.graphify_config
+            preserved_codegraph_mode = current_selection.codegraph_mode
+            preserved_codegraph_config = current_selection.codegraph_config
             current_selection = prompt_review_agent_selection(
                 default_vendor=current_selection.vendor,
                 default_model=current_selection.model,
@@ -1106,8 +1154,8 @@ def resolve_agent_run_config_with_recovery(
             current_selection = replace(
                 current_selection,
                 ponytail_mode=preserved_ponytail_mode,
-                graphify_mode=preserved_graphify_mode,
-                graphify_config=preserved_graphify_config,
+                codegraph_mode=preserved_codegraph_mode,
+                codegraph_config=preserved_codegraph_config,
             )
             message(render_review_agent_selection(f"{role_text} 新配置", current_selection))
 
@@ -1121,7 +1169,7 @@ def render_review_agent_selection(title: str, selection: ReviewAgentSelection) -
             f"reasoning_effort: {selection.reasoning_effort}",
             f"proxy_url: {selection.proxy_url or '(none)'}",
             f"ponytail_mode: {selection.ponytail_mode}",
-            f"graphify_mode: {selection.graphify_mode}",
+            f"codegraph_mode: {selection.codegraph_mode}",
         ]
     )
 
@@ -1137,8 +1185,8 @@ def collect_reviewer_agent_selections(
     allow_back_first_prompt: bool = False,
     stage_key: str = "reviewer_selection",
     default_ponytail_mode: str = PonytailMode.FULL.value,
-    default_graphify_mode: str = GraphifyMode.OFF.value,
-    default_graphify_config: Mapping[str, object] | None = None,
+    default_codegraph_mode: str = CodeGraphMode.OFF.value,
+    default_codegraph_config: Mapping[str, object] | None = None,
 ) -> dict[str, ReviewAgentSelection]:
     selections: dict[str, ReviewAgentSelection] = {}
     predicted_session_names: set[str] = {str(name).strip() for name in reserved_session_names if str(name).strip()}
@@ -1159,8 +1207,8 @@ def collect_reviewer_agent_selections(
                 default_model=DEFAULT_REQUIREMENTS_CLARIFICATION_MODEL,
                 default_reasoning_effort=DEFAULT_REQUIREMENTS_CLARIFICATION_EFFORT,
                 default_proxy_url="",
-                default_graphify_mode=default_graphify_mode,
-                default_graphify_config=default_graphify_config,
+                default_codegraph_mode=default_codegraph_mode,
+                default_codegraph_config=default_codegraph_config,
                 role_label=reviewer_display_name,
                 progress=progress,
                 allow_back_first_step=next_allow_back,
@@ -1172,11 +1220,11 @@ def collect_reviewer_agent_selections(
                     default_ponytail_mode,
                     default=PonytailMode.FULL,
                 ).value,
-                graphify_mode=normalize_graphify_mode(
-                    default_graphify_mode,
-                    default=GraphifyMode.OFF,
+                codegraph_mode=normalize_codegraph_mode(
+                    default_codegraph_mode,
+                    default=CodeGraphMode.OFF,
                 ).value,
-                graphify_config=normalize_graphify_config(default_graphify_config),
+                codegraph_config=normalize_codegraph_config(default_codegraph_config),
             )
             next_allow_back = False
             message(render_review_agent_selection(f"{reviewer_display_name} 配置", selection))
@@ -1190,11 +1238,11 @@ def collect_reviewer_agent_selections(
                     default_ponytail_mode,
                     default=PonytailMode.FULL,
                 ).value,
-                graphify_mode=normalize_graphify_mode(
-                    default_graphify_mode,
-                    default=GraphifyMode.OFF,
+                codegraph_mode=normalize_codegraph_mode(
+                    default_codegraph_mode,
+                    default=CodeGraphMode.OFF,
                 ).value,
-                graphify_config=normalize_graphify_config(default_graphify_config),
+                codegraph_config=normalize_codegraph_config(default_codegraph_config),
             )
         selections[reviewer_key] = selection
     return selections
@@ -1245,10 +1293,18 @@ def prompt_replacement_review_agent_selection(
             default_model=previous_selection.model,
             default_reasoning_effort=previous_selection.reasoning_effort,
             default_proxy_url=previous_selection.proxy_url,
+            default_ponytail_mode=previous_selection.ponytail_mode,
+            default_codegraph_mode=previous_selection.codegraph_mode,
+            default_codegraph_config=previous_selection.codegraph_config,
             role_label=role_label,
             progress=progress,
         )
-        selection = replace(selection, ponytail_mode=previous_selection.ponytail_mode)
+        selection = replace(
+            selection,
+            ponytail_mode=previous_selection.ponytail_mode,
+            codegraph_mode=previous_selection.codegraph_mode,
+            codegraph_config=dict(previous_selection.codegraph_config),
+        )
         if not force_model_change or (
             selection.vendor != previous_selection.vendor
             or selection.model != previous_selection.model
@@ -1276,10 +1332,18 @@ def prompt_required_replacement_review_agent_selection(
             default_model=previous_selection.model,
             default_reasoning_effort=previous_selection.reasoning_effort,
             default_proxy_url=previous_selection.proxy_url,
+            default_ponytail_mode=previous_selection.ponytail_mode,
+            default_codegraph_mode=previous_selection.codegraph_mode,
+            default_codegraph_config=previous_selection.codegraph_config,
             role_label=role_label,
             progress=progress,
         )
-        selection = replace(selection, ponytail_mode=previous_selection.ponytail_mode)
+        selection = replace(
+            selection,
+            ponytail_mode=previous_selection.ponytail_mode,
+            codegraph_mode=previous_selection.codegraph_mode,
+            codegraph_config=dict(previous_selection.codegraph_config),
+        )
         if not force_model_change or (
             selection.vendor != previous_selection.vendor
             or selection.model != previous_selection.model

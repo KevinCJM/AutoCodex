@@ -38,7 +38,6 @@ from tmux_core.runtime.hitl import (
     validate_grill_question_file,
 )
 from tmux_core.runtime.tmux_runtime import (
-    GRAPHIFY_USAGE_BLOCKER,
     RuntimeShutdownRequested,
     TMUX_IDENTITY_REQUIREMENT_NAME_OPTION,
     TMUX_IDENTITY_RUNTIME_DIR_OPTION,
@@ -62,7 +61,7 @@ from tmux_core.runtime.tmux_runtime import (
     try_resume_worker,
     worker_state_is_prelaunch_active,
 )
-from tmux_core.runtime.graphify import cancel_graphify_processes
+from tmux_core.runtime.codegraph import cancel_codegraph_processes
 from tmux_core.stage_kernel.detailed_design import (
     DETAILED_DESIGN_RUNTIME_ROOT_NAME,
     build_detailed_design_paths,
@@ -935,101 +934,61 @@ def _workflow_stage_order(action: str) -> int:
     return WORKFLOW_STAGE_ACTION_ORDER.get(str(action or "").strip(), 0)
 
 
-_GRAPHIFY_PUBLIC_STATES = {
+_CODEGRAPH_PUBLIC_STATES = {
     "off",
     "unavailable",
-    "building",
+    "initializing",
+    "syncing",
     "ready",
     "stale",
     "degraded",
     "failed",
 }
-_GRAPHIFY_PUBLIC_TEXT_KEYS = (
+_CODEGRAPH_PUBLIC_TEXT_KEYS = (
     "version",
     "freshness",
-    "generated_at",
-    "source_fingerprint",
-    "evidence_id",
+    "last_indexed",
+    "index_state",
 )
-_GRAPHIFY_PUBLIC_COUNT_KEYS = (
+_CODEGRAPH_PUBLIC_COUNT_KEYS = (
+    "file_count",
     "node_count",
     "edge_count",
-    "direct_count",
-    "inferred_count",
-)
-_GRAPHIFY_PUBLIC_QUERY_COMMANDS = {"query", "affected", "path", "explain", "god-nodes"}
-_GRAPHIFY_PUBLIC_QUERY_STATUSES = {"ok", "error", "failed", "timeout", "unavailable"}
-_GRAPHIFY_PUBLIC_FRESHNESS = {"fresh", "stale", "unknown", "cache_fallback", "degraded"}
-_GRAPHIFY_PUBLIC_TIMESTAMP_RE = re.compile(
-    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?"
 )
 
 
-def _graphify_public_text(value: object) -> str:
+def _codegraph_public_text(value: object) -> str:
     if isinstance(value, Enum):
         value = value.value
     return str(value or "").strip()
 
 
-def _redact_graphify_error(value: object) -> str:
+def _redact_codegraph_error(value: object) -> str:
     text = " ".join(str(value or "").split())[:500]
     if not text:
         return ""
     # The app snapshot is public protocol data. Keep the diagnostic useful while
     # preventing cache, executable, and home-directory paths from leaking.
-    return re.sub(r"(?<![A-Za-z0-9_.])(?:~|/)[^\s,;]+", "<redacted-path>", text)
+    text = re.sub(
+        r"([\"'`])(?:~(?:[\\/]|$)|/|[A-Za-z]:[\\/]|\\\\).*?\1",
+        "<redacted-path>",
+        text,
+    )
+    # An unquoted native path may legally contain spaces.  Token-based
+    # redaction would expose the suffix (for example ``Secret Project/x``), so
+    # consume conservatively up to punctuation, a diagnostic conjunction, or
+    # the end of the public error.  Losing a few prose words is safer than
+    # publishing a project/cache path in snapshot.app.
+    path_end = r"(?=\s+(?:and|or|then|failed|failure|error|because|while|when)\b|[,;]|$)"
+    return re.sub(
+        rf"(?<![A-Za-z0-9_.])(?:file://|~(?:[\\/]|$)|/|[A-Za-z]:[\\/]|\\\\).*?{path_end}",
+        "<redacted-path>",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 
-def _trusted_graphify_report_path(
-    *,
-    project_dir: str,
-    payload: Mapping[str, Any],
-    stage_snapshots: Mapping[str, Mapping[str, Any]] | None,
-) -> str:
-    """Accept only the evidence report owned by a known stage worker runtime."""
-
-    report_text = _graphify_public_text(payload.get("report_path", ""))
-    evidence_id = _graphify_public_text(payload.get("evidence_id", ""))
-    if not report_text or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", evidence_id):
-        return ""
-    try:
-        project_root = Path(project_dir).expanduser().resolve()
-        report_path = Path(report_text).expanduser().resolve()
-        report_path.relative_to(project_root)
-    except (OSError, ValueError):
-        return ""
-    expected_name = f"graphify_evidence_{evidence_id}.md"
-    if report_path.name != expected_name or not report_path.is_file():
-        return ""
-
-    for stage_snapshot in (stage_snapshots or {}).values():
-        if not isinstance(stage_snapshot, Mapping):
-            continue
-        workers = stage_snapshot.get("workers", [])
-        if not isinstance(workers, Sequence) or isinstance(workers, (str, bytes)):
-            continue
-        for worker in workers:
-            if not isinstance(worker, Mapping):
-                continue
-            if _graphify_public_text(worker.get("graphify_evidence_id", "")) != evidence_id:
-                continue
-            state_text = _graphify_public_text(worker.get("state_path", ""))
-            if not state_text:
-                continue
-            try:
-                state_path = Path(state_text).expanduser().resolve()
-                state_path.relative_to(project_root)
-                if state_path.name != "worker.state.json" or not state_path.is_file():
-                    continue
-                expected_report = (state_path.parent / expected_name).resolve()
-            except (OSError, ValueError):
-                continue
-            if report_path == expected_report:
-                return str(report_path)
-    return ""
-
-
-def _read_graphify_app_status(
+def _read_codegraph_app_status(
     project_dir: str,
     *,
     stage_snapshots: Mapping[str, Mapping[str, Any]] | None = None,
@@ -1038,16 +997,16 @@ def _read_graphify_app_status(
     if not project_text:
         return {}
     try:
-        from tmux_core.runtime.graphify import read_graphify_project_status
+        from tmux_core.runtime.codegraph import read_codegraph_project_status
     except (ImportError, AttributeError):
         return {}
     try:
-        raw_status = read_graphify_project_status(project_text)
+        raw_status = read_codegraph_project_status(project_text)
     except Exception as exc:  # noqa: BLE001
         return {
             "mode": "auto",
             "state": "degraded",
-            "last_error": f"Graphify status unavailable ({type(exc).__name__})",
+            "last_error": f"CodeGraph status unavailable ({type(exc).__name__})",
         }
     if raw_status is None:
         return {}
@@ -1061,58 +1020,50 @@ def _read_graphify_app_status(
             return {
                 "mode": "auto",
                 "state": "degraded",
-                "last_error": "Graphify status has an unsupported shape",
+                "last_error": "CodeGraph status has an unsupported shape",
             }
         candidate = to_public_dict()
         if not isinstance(candidate, Mapping):
             return {
                 "mode": "auto",
                 "state": "degraded",
-                "last_error": "Graphify status has an unsupported public shape",
+                "last_error": "CodeGraph status has an unsupported public shape",
             }
         payload = dict(candidate)
 
-    mode = _graphify_public_text(payload.get("mode", "")).lower()
-    state = _graphify_public_text(payload.get("state", "")).lower()
-    if state not in _GRAPHIFY_PUBLIC_STATES:
+    mode = _codegraph_public_text(payload.get("mode", "")).lower()
+    state = _codegraph_public_text(payload.get("state", "")).lower()
+    if state not in _CODEGRAPH_PUBLIC_STATES:
         state = "off" if mode == "off" else "degraded"
-    public: dict[str, Any] = {"mode": mode, "state": state}
-    for key in _GRAPHIFY_PUBLIC_TEXT_KEYS:
-        public[key] = _graphify_public_text(payload.get(key, ""))
-    for key in _GRAPHIFY_PUBLIC_COUNT_KEYS:
+    public: dict[str, Any] = {
+        "mode": mode if mode in {"off", "auto", "required"} else "auto",
+        "state": state,
+        "initialized": payload.get("initialized") is True,
+    }
+    for key in _CODEGRAPH_PUBLIC_TEXT_KEYS:
+        public[key] = _codegraph_public_text(payload.get(key, ""))
+    for key in _CODEGRAPH_PUBLIC_COUNT_KEYS:
         try:
             public[key] = max(0, int(payload.get(key, 0) or 0))
         except (TypeError, ValueError):
             public[key] = 0
 
-    if "query_count_stage" in payload:
+    pending = payload.get("pending_changes", {})
+    if not isinstance(pending, Mapping):
+        pending = {}
+    public["pending_changes"] = {}
+    for key in ("added", "modified", "removed"):
         try:
-            public["query_count_stage"] = max(0, int(payload.get("query_count_stage", 0) or 0))
+            public["pending_changes"][key] = max(0, int(pending.get(key, 0) or 0))
         except (TypeError, ValueError):
-            public["query_count_stage"] = 0
-    query_command = _graphify_public_text(payload.get("last_query_command", "")).lower()
-    if query_command in _GRAPHIFY_PUBLIC_QUERY_COMMANDS:
-        public["last_query_command"] = query_command
-    query_status = _graphify_public_text(payload.get("last_query_status", "")).lower()
-    if query_status in _GRAPHIFY_PUBLIC_QUERY_STATUSES:
-        public["last_query_status"] = query_status
-    query_freshness = _graphify_public_text(payload.get("last_query_freshness", "")).lower()
-    if query_freshness in _GRAPHIFY_PUBLIC_FRESHNESS:
-        public["last_query_freshness"] = query_freshness
-    query_at = _graphify_public_text(payload.get("last_query_at", ""))
-    if _GRAPHIFY_PUBLIC_TIMESTAMP_RE.fullmatch(query_at):
-        public["last_query_at"] = query_at
-    if isinstance(payload.get("last_query_truncated"), bool):
-        public["last_query_truncated"] = bool(payload["last_query_truncated"])
-
-    report_path = _trusted_graphify_report_path(
-        project_dir=project_text,
-        payload=payload,
-        stage_snapshots=stage_snapshots,
-    )
-    if report_path:
-        public["report_path"] = report_path
-    public["last_error"] = _redact_graphify_error(payload.get("last_error", ""))
+            public["pending_changes"][key] = 0
+    try:
+        public["pending_refs"] = max(0, int(payload.get("pending_refs", 0) or 0))
+    except (TypeError, ValueError):
+        public["pending_refs"] = 0
+    public["reindex_recommended"] = payload.get("reindex_recommended") is True
+    public["worktree_mismatch"] = payload.get("worktree_mismatch") is True
+    public["last_error"] = _redact_codegraph_error(payload.get("last_error", ""))
     return public
 
 
@@ -2048,58 +1999,29 @@ def _flatten_grill_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, Any]:
     return flattened
 
 
-def _flatten_graphify_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, str]:
-    """Expose only the current turn's safe graph identity, never cache config."""
+def _flatten_codegraph_worker_fields(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    """Expose only safe CodeGraph mode and tutorial-delivery state."""
 
     config_payload = snapshot.get("config", {})
     if not isinstance(config_payload, Mapping):
         config_payload = {}
     candidates = {
-        "graphify_mode": snapshot.get("graphify_mode") or config_payload.get("graphify_mode"),
-        "graphify_evidence_id": snapshot.get("graphify_evidence_id"),
-        "graphify_fingerprint": snapshot.get("graphify_fingerprint"),
-        "graphify_freshness": snapshot.get("graphify_freshness"),
-        "graphify_usage_policy": snapshot.get("graphify_usage_policy"),
-        "graphify_evidence_delivery": snapshot.get("graphify_evidence_delivery"),
-        "graphify_query_requirement": snapshot.get("graphify_query_requirement"),
-        "graphify_query_status": snapshot.get("graphify_query_status"),
-        "graphify_query_command": snapshot.get("graphify_query_command"),
-        "graphify_usage_receipt": snapshot.get("graphify_usage_receipt"),
+        "codegraph_mode": snapshot.get("codegraph_mode") or config_payload.get("codegraph_mode"),
+        "codegraph_available": snapshot.get("codegraph_available"),
+        "codegraph_hint_delivery": snapshot.get("codegraph_hint_delivery"),
     }
-    flattened: dict[str, str] = {}
+    flattened: dict[str, Any] = {}
     for field_name, value in candidates.items():
+        if field_name == "codegraph_available":
+            if isinstance(value, bool):
+                flattened[field_name] = value
+            continue
         text = str(value or "").strip()
         if not text:
             continue
-        if field_name == "graphify_mode" and text not in {"off", "auto", "required"}:
+        if field_name == "codegraph_mode" and text not in {"off", "auto", "required"}:
             continue
-        if field_name in {"graphify_evidence_id", "graphify_fingerprint"} and not re.fullmatch(
-            r"[A-Za-z0-9_.:-]{1,128}", text
-        ):
-            continue
-        if field_name == "graphify_usage_policy" and text not in {
-            "query_required", "query_optional", "query_not_applicable",
-        }:
-            continue
-        if field_name == "graphify_evidence_delivery" and text not in {"pending", "confirmed"}:
-            continue
-        if field_name == "graphify_query_requirement" and text not in {
-            "required", "optional", "not_applicable",
-        }:
-            continue
-        if field_name == "graphify_query_status" and text not in {
-            "pending", "missing", "query_failed", "satisfied", "optional",
-            "degraded", "manual_override", "not_applicable",
-        }:
-            continue
-        if field_name == "graphify_query_command" and text not in {
-            "query", "affected", "path", "explain", "god-nodes",
-        }:
-            continue
-        if field_name == "graphify_usage_receipt" and (
-            Path(text).name != text
-            or not re.fullmatch(r"[A-Za-z0-9_.-]{1,180}\.json", text)
-        ):
+        if field_name == "codegraph_hint_delivery" and text not in {"pending", "confirmed"}:
             continue
         flattened[field_name] = text
     return flattened
@@ -2110,7 +2032,7 @@ def _normalize_routing_worker_snapshot(snapshot: Mapping[str, Any]) -> dict[str,
     normalized = dict(snapshot)
     normalized.update(_flatten_ponytail_worker_fields(snapshot))
     normalized.update(_flatten_grill_worker_fields(snapshot))
-    normalized.update(_flatten_graphify_worker_fields(snapshot))
+    normalized.update(_flatten_codegraph_worker_fields(snapshot))
     return normalized
 
 
@@ -2280,7 +2202,7 @@ def _read_worker_state_snapshot(
     }
     snapshot.update(_flatten_ponytail_worker_fields(state))
     snapshot.update(_flatten_grill_worker_fields(state))
-    snapshot.update(_flatten_graphify_worker_fields(state))
+    snapshot.update(_flatten_codegraph_worker_fields(state))
     return snapshot
 
 
@@ -3730,7 +3652,7 @@ class BridgeCore:
         }
         worker_snapshot.update(_flatten_ponytail_worker_fields(snapshot))
         worker_snapshot.update(_flatten_grill_worker_fields(snapshot))
-        worker_snapshot.update(_flatten_graphify_worker_fields(snapshot))
+        worker_snapshot.update(_flatten_codegraph_worker_fields(snapshot))
         return _normalize_routing_worker_snapshot(worker_snapshot)
 
     def _infer_workflow_a00_stage_label(self, project_dir: str, requirement_name: str) -> str:
@@ -4864,15 +4786,14 @@ class BridgeCore:
                 self._artifact_index_scope = current_scope
                 self._artifact_index_items = []
 
-    @staticmethod
-    def _artifact_items_from_candidates(candidates: Sequence[str]) -> list[dict[str, Any]]:
+    def _artifact_items_from_candidates(self, candidates: Sequence[str]) -> list[dict[str, Any]]:
         unique_paths: list[str] = []
         for item in candidates:
             text = str(item).strip()
             if not text:
                 continue
             path = Path(text).expanduser()
-            if not path.exists():
+            if not path.exists() or not self._preview_path_is_in_scope(path):
                 continue
             resolved = str(path.resolve())
             if resolved not in unique_paths:
@@ -5092,12 +5013,12 @@ class BridgeCore:
                 "collapsible_logs": True,
             },
         }
-        graphify_status = _read_graphify_app_status(
+        codegraph_status = _read_codegraph_app_status(
             project_dir,
             stage_snapshots=stage_snapshots,
         )
-        if graphify_status:
-            snapshot["graphify"] = graphify_status
+        if codegraph_status:
+            snapshot["codegraph"] = codegraph_status
         return snapshot
 
     def _current_stage_workers(self, action: str) -> list[dict[str, Any]]:
@@ -6629,18 +6550,10 @@ class BridgeCore:
         attach_command = f"tmux attach -t {session_name}" if session_name else ""
         if runtime_intervention:
             runtime_blocker_kind = str(getattr(error, "blocker_kind", "") or "").strip()
-            graphify_usage_intervention = runtime_blocker_kind == GRAPHIFY_USAGE_BLOCKER
             question_intervention = runtime_blocker_kind == "opencode_question"
             hook_trust_intervention = runtime_blocker_kind == "codex_hook_trust"
             long_running_intervention = runtime_blocker_kind == "long_running_task_result"
-            if graphify_usage_intervention:
-                recovery_kind = "graphify_usage_intervention"
-                title = "HITL: Graphify Required 查询待处理"
-                prompt_text = (
-                    "请进入原 tmux 会话执行系统给出的只读 Graphify 命令后复检；"
-                    "也可以明确按源码核验结果继续并记录人工 override。"
-                )
-            elif long_running_intervention:
+            if long_running_intervention:
                 title = "HITL: 智能体任务长时间运行"
                 prompt_text = (
                     "原任务已经提交且智能体仍存活。请进入原 tmux 会话检查；"
@@ -6693,33 +6606,14 @@ class BridgeCore:
             message=message_text,
         )
         recovered = False
-        terminated = False
         try:
-            graphify_options = [
-                {
-                    "value": "recheck_after_manual_intervention",
-                    "label": "进入 tmux 执行查询后复检",
-                },
-                {
-                    "value": "graphify_usage_manual_override",
-                    "label": "按源码核验结果继续并记录人工 override",
-                },
-                {
-                    "value": "graphify_usage_terminate",
-                    "label": "终止本阶段",
-                },
-            ]
-            prompt_result = self._prompt_broker.request(
+            self._prompt_broker.request(
                 BridgePromptRequest(
                     prompt_type="select",
                     payload={
                         "title": title,
                         "prompt_text": prompt_text,
-                        "options": graphify_options if (
-                            runtime_intervention
-                            and str(getattr(error, "blocker_kind", "") or "").strip()
-                            == GRAPHIFY_USAGE_BLOCKER
-                        ) else [
+                        "options": [
                             {
                                 "value": "recheck_after_manual_intervention",
                                 "label": "我已处理，重新检查",
@@ -6738,23 +6632,8 @@ class BridgeCore:
             )
             backend = getattr(self._tmux_runtime, "backend", None)
             recovered_worker = load_worker_from_state_path(state_path, backend=backend) if state_path else None
-            decision = str(
-                prompt_result.get("value", "")
-                if isinstance(prompt_result, Mapping)
-                else prompt_result or ""
-            ).strip()
             if recovered_worker is not None:
-                if (
-                    runtime_intervention
-                    and str(getattr(error, "blocker_kind", "") or "").strip()
-                    == GRAPHIFY_USAGE_BLOCKER
-                    and decision == "graphify_usage_manual_override"
-                ):
-                    override = getattr(recovered_worker, "override_graphify_usage_requirement", None)
-                    if callable(override):
-                        override()
-                        recovered = True
-                elif runtime_intervention:
+                if runtime_intervention:
                     checker = getattr(recovered_worker, "runtime_intervention_is_resolved", None)
                     if callable(checker):
                         recovered = bool(checker(str(getattr(error, "blocker_kind", "") or "")))
@@ -6762,17 +6641,6 @@ class BridgeCore:
                         recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
                 else:
                     recovered = try_resume_worker(recovered_worker, timeout_sec=60.0)
-            if decision == "graphify_usage_terminate":
-                terminated = True
-                runner_id = str(getattr(self._runner_local, "runner_id", "") or "").strip()
-                self._commit_runner_failure(
-                    action=final_action or action,
-                    stage_seq=final_stage_seq,
-                    runner_id=runner_id,
-                    error=RuntimeError("人类终止 Required Graphify 查询介入"),
-                    traceback_text="",
-                    failure_kind="graphify_usage_terminated",
-                )
         finally:
             self._pending_prompt_display_state = None
         if recovered:
@@ -6795,16 +6663,15 @@ class BridgeCore:
                 request_id,
                 ok=True,
                 payload={
-                    "awaiting_input": not recovered and not terminated,
+                    "awaiting_input": not recovered,
                     "recovered": recovered,
-                    "terminated": terminated,
                     "recovery_kind": recovery_kind,
                     "session_name": session_name,
                     "attach_command": attach_command,
                     "message": message_text,
                 },
             )
-        return "terminated" if terminated else "recovered" if recovered else "awaiting_input"
+        return "recovered" if recovered else "awaiting_input"
 
     def _manual_reconfiguration_error_pending(self, *, action: str, error: BaseException) -> bool:
         message = str(error or "").strip()
@@ -7909,11 +7776,11 @@ class BridgeCore:
         # always owns and cleans its tmux sessions; callers can no longer opt out.
         _ = cleanup_tmux
         request_runtime_shutdown("tui_backend_shutdown")
-        # Graphify builds run in their own process groups and are not tmux
+        # CodeGraph operations run in their own process groups and are not tmux
         # workers. Stop them explicitly on every backend exit path before the
         # ordinary worker cleanup begins; successful immutable generations are
-        # retained by the Graphify adapter.
-        cancel_graphify_processes()
+        # retained by the CodeGraph adapter.
+        cancel_codegraph_processes()
         self._latch_shutdown_policy(ShutdownPolicy.CLEANUP, reason="tui_backend_shutdown")
         first_shutdown = False
         with self._shutdown_lock:
@@ -8154,8 +8021,21 @@ class BridgeCore:
         self._set_context(project_dir=project_dir)
         return {"runs": self._list_runs()}
 
-    @staticmethod
-    def _add_preview_path(allowed: set[str], value: object) -> None:
+    def _preview_path_is_in_scope(self, value: str | Path) -> bool:
+        project_text = str(self._resolve_project_dir() or "").strip()
+        if not project_text:
+            # File previews are a project-scoped Web capability. Before a
+            # project is selected there is no safe root against which a path
+            # can be authorized, so fail closed.
+            return False
+        try:
+            project_root = Path(project_text).expanduser().resolve()
+            Path(value).expanduser().resolve().relative_to(project_root)
+            return True
+        except (OSError, RuntimeError, ValueError):
+            return False
+
+    def _add_preview_path(self, allowed: set[str], value: object) -> None:
         text = str(value or "").strip()
         if not text:
             return
@@ -8163,22 +8043,20 @@ class BridgeCore:
             path = Path(text).expanduser().resolve()
         except Exception:
             return
-        if path.exists() and path.is_file():
+        if path.exists() and path.is_file() and self._preview_path_is_in_scope(path):
             allowed.add(str(path))
 
-    @classmethod
-    def _add_preview_paths_from_worker(cls, allowed: set[str], worker: Mapping[str, Any]) -> None:
+    def _add_preview_paths_from_worker(self, allowed: set[str], worker: Mapping[str, Any]) -> None:
         for key in ("transcript_path", "turn_status_path", "question_path", "answer_path"):
-            cls._add_preview_path(allowed, worker.get(key, ""))
+            self._add_preview_path(allowed, worker.get(key, ""))
         artifact_paths = worker.get("artifact_paths", [])
         if isinstance(artifact_paths, Sequence) and not isinstance(artifact_paths, (str, bytes)):
             for path in artifact_paths:
-                cls._add_preview_path(allowed, path)
+                self._add_preview_path(allowed, path)
 
-    @classmethod
-    def _add_preview_paths_from_prompt(cls, allowed: set[str], prompt: PendingPromptState) -> None:
+    def _add_preview_paths_from_prompt(self, allowed: set[str], prompt: PendingPromptState) -> None:
         for key in ("preview_path", "question_path", "answer_path"):
-            cls._add_preview_path(allowed, prompt.payload.get(key, ""))
+            self._add_preview_path(allowed, prompt.payload.get(key, ""))
 
     def _active_grill_session_record(
         self,
@@ -8690,11 +8568,6 @@ class BridgeCore:
             and str(persisted_state.get("source", "") or "").strip() == "runner_failure"
         ):
             self._add_preview_path(allowed, persisted_state.get("failure_path", ""))
-        graphify_status = _read_graphify_app_status(
-            self._resolve_project_dir(),
-            stage_snapshots=stage_snapshots,
-        )
-        self._add_preview_path(allowed, graphify_status.get("report_path", ""))
         return allowed
 
     def build_file_preview(self, path_value: str | Path, *, max_bytes: int = WEB_FILE_PREVIEW_MAX_BYTES) -> dict[str, Any]:
@@ -8702,7 +8575,14 @@ class BridgeCore:
         allowed = self._allowed_file_preview_paths()
         if str(requested) not in allowed:
             raise PermissionError(f"文件未在当前 Web 快照中授权预览: {requested}")
-        return _preview_path_text(requested, max_bytes=max_bytes)
+        preview = _preview_path_text(requested, max_bytes=max_bytes)
+        # Re-check the final resolved path after opening. This prevents a path
+        # swapped to an out-of-project symlink between allowlist construction
+        # and preview from being returned to the browser.
+        preview_path = Path(str(preview.get("path", "") or "")).expanduser().resolve()
+        if str(preview_path) not in allowed or not self._preview_path_is_in_scope(preview_path):
+            raise PermissionError(f"文件预览路径已越过当前项目边界: {preview_path}")
+        return preview
 
     def build_snapshots(self) -> dict[str, Any]:
         with self._display_state_lock:

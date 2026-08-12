@@ -30,10 +30,10 @@ from tmux_core.runtime.contracts import (
     finalize_task_result,
     write_task_status,
 )
-from tmux_core.runtime.graphify import (
-    GraphifyMode,
-    GraphifyQueryIntent,
-    GraphifyTurnContext,
+from tmux_core.runtime.codegraph import (
+    CodeGraphMode,
+    CodeGraphQueryIntent,
+    CodeGraphTurnContext,
 )
 from tmux_core.runtime.tmux_runtime import (
     AgentRuntimeState,
@@ -50,7 +50,7 @@ from tmux_core.runtime.tmux_runtime import (
     is_worker_death_error,
     load_worker_from_state_path,
     get_current_stage_runner_id,
-    normalize_graphify_config,
+    normalize_codegraph_config,
     try_resume_worker,
 )
 from tmux_core.stage_kernel.development import (
@@ -86,12 +86,13 @@ from tmux_core.stage_kernel.reviewer_orchestration import (
     shutdown_stage_workers,
 )
 from tmux_core.stage_kernel.requirement_concurrency import requirement_concurrency_lock
-from tmux_core.stage_kernel.graphify_change_ledger import (
-    ensure_graphify_task_baseline,
-    graphify_change_ledger_path,
-    load_graphify_cumulative_changes,
-    mark_graphify_change_scope_unknown,
-    record_graphify_task_changes,
+from tmux_core.stage_kernel.source_change_ledger import (
+    ensure_source_task_baseline,
+    source_change_ledger_exists,
+    source_change_ledger_path,
+    load_source_cumulative_changes,
+    mark_source_change_scope_unknown,
+    record_source_task_changes,
 )
 from tmux_core.stage_kernel.runtime_scope_cleanup import cleanup_runtime_dirs_by_scope
 from tmux_core.stage_kernel.stage_audit import (
@@ -117,12 +118,12 @@ from tmux_core.stage_kernel.shared_review import (
     ensure_review_artifacts_exist,
     is_recoverable_startup_failure,
     inherit_legacy_handoff_ponytail_mode,
-    inherit_legacy_handoff_graphify_mode,
+    inherit_legacy_handoff_codegraph_mode,
     mark_worker_awaiting_reconfiguration,
     note_reviewer_failure,
     parse_review_max_rounds,
     prompt_review_max_rounds,
-    refresh_graphify_workers_for_checkpoint,
+    refresh_codegraph_workers_for_checkpoint,
     resolve_reviewer_artifact_agent_name,
     resolve_main_ponytail_mode,
     resolve_stage_agent_config,
@@ -146,7 +147,13 @@ from tmux_core.stage_kernel.turn_output_goals import (
     run_task_result_turn_with_repair,
 )
 from T01_tools import get_first_false_task, get_markdown_content, is_task_progress_json, task_done
-from T09_terminal_ops import BridgeTerminalUI, get_terminal_ui, maybe_launch_tui, message
+from T09_terminal_ops import (
+    BridgeTerminalUI,
+    cleanup_codegraph_processes_on_exit,
+    get_terminal_ui,
+    maybe_launch_tui,
+    message,
+)
 from T12_requirements_common import (
     prompt_project_dir,
     prompt_requirement_name_selection,
@@ -159,26 +166,26 @@ OVERALL_REVIEW_TASK_NAME = "全面复核"
 PLACEHOLDER_NEXT_STEP = "下一步进入测试阶段（功能测试 + 全面回归，待接入）"
 MAX_OVERALL_REVIEW_ROUNDS = 5
 MAX_OVERALL_REVIEW_HITL_ROUNDS = 8
-OVERALL_REVIEW_GRAPHIFY_TASK = "__A08_overall_review__"
+OVERALL_REVIEW_SOURCE_TASK = "__A08_overall_review__"
 
 
-def _overall_review_graphify_context(
+def _overall_review_codegraph_context(
     *,
     project_dir: str | Path,
     requirement_name: str,
     phase: str,
     role: str,
-) -> GraphifyTurnContext:
-    changes = load_graphify_cumulative_changes(
-        graphify_change_ledger_path(
+) -> CodeGraphTurnContext:
+    changes = load_source_cumulative_changes(
+        source_change_ledger_path(
             build_development_runtime_root(project_dir, requirement_name)
         )
     )
-    return GraphifyTurnContext(
+    return CodeGraphTurnContext(
         stage_key="A08",
         phase=phase,
         role=role,
-        intent=GraphifyQueryIntent.WHOLE_CHANGE_REVIEW,
+        intent=CodeGraphQueryIntent.WHOLE_CHANGE_REVIEW,
         requirement_name=requirement_name,
         task_name=OVERALL_REVIEW_TASK_NAME,
         changed_files=changes.cumulative_changed_files,
@@ -210,7 +217,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--effort", help="开发工程师推理强度")
     parser.add_argument("--proxy-url", default="", help="开发工程师代理端口或完整代理 URL")
     parser.add_argument("--ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help="Ponytail 模式")
-    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help="Graphify 模式")
+    parser.add_argument("--codegraph-mode", choices=("off", "auto", "required"), default="", help="CodeGraph 模式")
+    parser.add_argument("--graphify-mode", choices=("off", "auto", "required"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--main-ponytail-mode", choices=("off", "lite", "full", "ultra"), default="", help=argparse.SUPPRESS)
     parser.add_argument("--agent-config", default="", help="智能体配置 JSON")
     parser.add_argument("--developer-role-prompt", default="", help="开发工程师自定义角色定义提示词")
@@ -597,10 +605,10 @@ def _selection_from_runtime_state(payload: dict[str, object]) -> ReviewAgentSele
         reasoning_effort=str(config_payload.get("reasoning_effort", "high")).strip() or "high",
         proxy_url=str(config_payload.get("proxy_url", "")).strip(),
         ponytail_mode=str(config_payload.get("ponytail_mode", "") or "off").strip() or "off",
-        graphify_mode=str(config_payload.get("graphify_mode", "") or "off").strip() or "off",
-        graphify_config=(
-            dict(config_payload.get("graphify_config", {}))
-            if isinstance(config_payload.get("graphify_config", {}), dict)
+        codegraph_mode=str(config_payload.get("codegraph_mode", "") or "off").strip() or "off",
+        codegraph_config=(
+            dict(config_payload.get("codegraph_config", {}))
+            if isinstance(config_payload.get("codegraph_config", {}), dict)
             else {}
         ),
     )
@@ -1032,13 +1040,13 @@ def build_reviewer_workers(
         reviewer_key = str(item.reviewer_key or item.role_name).strip()
         desired = (reviewer_selections_by_name or {}).get(reviewer_key) or agent_config.reviewer_selection(reviewer_key)
         expected_ponytail_mode = desired.ponytail_mode if desired is not None else agent_config.ponytail_mode
-        expected_graphify_mode = desired.graphify_mode if desired is not None else agent_config.graphify_mode
-        expected_graphify_config = desired.graphify_config if desired is not None else agent_config.graphify_config
+        expected_codegraph_mode = desired.codegraph_mode if desired is not None else agent_config.codegraph_mode
+        expected_codegraph_config = desired.codegraph_config if desired is not None else agent_config.codegraph_config
         return (
             str(getattr(item.selection, "ponytail_mode", "") or "off").strip() == expected_ponytail_mode
-            and str(getattr(item.selection, "graphify_mode", "") or "off").strip() == expected_graphify_mode
-            and normalize_graphify_config(getattr(item.selection, "graphify_config", {}))
-            == normalize_graphify_config(expected_graphify_config)
+            and str(getattr(item.selection, "codegraph_mode", "") or "off").strip() == expected_codegraph_mode
+            and normalize_codegraph_config(getattr(item.selection, "codegraph_config", {}))
+            == normalize_codegraph_config(expected_codegraph_config)
         )
 
     live_handoffs_by_key = {
@@ -1659,7 +1667,7 @@ def _run_overall_review_developer_turn(
                 role_label=str(current_developer.worker.session_name or "开发工程师").strip() or "开发工程师",
                 task_name=OVERALL_REVIEW_TASK_NAME,
                 requirement_name=requirement_name,
-                graphify_context=_overall_review_graphify_context(
+                codegraph_context=_overall_review_codegraph_context(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     phase=result_contract.phase,
@@ -1929,7 +1937,7 @@ def _run_single_overall_review_reviewer_init(
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
                 task_name=OVERALL_REVIEW_TASK_NAME,
                 requirement_name=requirement_name,
-                graphify_context=_overall_review_graphify_context(
+                codegraph_context=_overall_review_codegraph_context(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     phase=init_contract.phase,
@@ -2088,7 +2096,7 @@ def run_overall_review_turn_with_recreation(
                 role_label=str(current_reviewer.worker.session_name or current_reviewer.reviewer_name).strip() or current_reviewer.reviewer_name,
                 task_name=OVERALL_REVIEW_TASK_NAME,
                 requirement_name=requirement_name,
-                graphify_context=_overall_review_graphify_context(
+                codegraph_context=_overall_review_codegraph_context(
                     project_dir=project_dir,
                     requirement_name=requirement_name,
                     phase="a08_reviewer_round",
@@ -2369,22 +2377,22 @@ def run_overall_review_stage(
             args,
             getattr(developer_handoff.selection, "ponytail_mode", "off"),
         )
-        inherit_legacy_handoff_graphify_mode(
+        inherit_legacy_handoff_codegraph_mode(
             args,
-            getattr(developer_handoff.selection, "graphify_mode", "off"),
+            getattr(developer_handoff.selection, "codegraph_mode", "off"),
         )
     elif reviewer_handoff:
         inherit_legacy_handoff_ponytail_mode(
             args,
             getattr(reviewer_handoff[0].selection, "ponytail_mode", "off"),
         )
-        inherit_legacy_handoff_graphify_mode(
+        inherit_legacy_handoff_codegraph_mode(
             args,
-            getattr(reviewer_handoff[0].selection, "graphify_mode", "off"),
+            getattr(reviewer_handoff[0].selection, "codegraph_mode", "off"),
         )
     agent_config = resolve_stage_agent_config(args, stage_key="overall_review")
     main_ponytail_mode = resolve_main_ponytail_mode(args, agent_config=agent_config)
-    main_graphify_mode = agent_config.graphify_mode
+    main_codegraph_mode = agent_config.codegraph_mode
     allow_previous_stage_back = bool(getattr(args, "allow_previous_stage_back", False))
     project_dir = str(Path(args.project_dir).expanduser().resolve()) if args.project_dir else prompt_project_dir("")
     requirement_name = str(args.requirement_name).strip() if args.requirement_name else prompt_requirement_name_selection(project_dir, "").requirement_name
@@ -2411,23 +2419,23 @@ def run_overall_review_stage(
                 "args": vars(args),
             },
         )
-        graphify_stage_runner_id = (
+        source_stage_runner_id = (
             get_current_stage_runner_id()
             or f"stage-audit:A08:{audit_context.stage_run_index}"
         )
         paths = ensure_overall_review_inputs(project_dir=project_dir, requirement_name=requirement_name)
-        graphify_enabled = bool(
-            main_graphify_mode != GraphifyMode.OFF.value
+        codegraph_enabled = bool(
+            main_codegraph_mode != CodeGraphMode.OFF.value
             or any(
-                selection.graphify_mode != GraphifyMode.OFF.value
+                selection.codegraph_mode != CodeGraphMode.OFF.value
                 for selection in (agent_config.reviewers or {}).values()
             )
         )
         overall_change_ledger = (
-            graphify_change_ledger_path(
+            source_change_ledger_path(
                 build_development_runtime_root(project_dir, requirement_name)
             )
-            if graphify_enabled
+            if codegraph_enabled
             else None
         )
         active_code_context = _build_overall_review_active_code_context(project_dir)
@@ -2435,22 +2443,22 @@ def run_overall_review_stage(
             return bool(
                 item is not None
                 and str(getattr(item.selection, "ponytail_mode", "") or "off").strip() == main_ponytail_mode
-                and str(getattr(item.selection, "graphify_mode", "") or "off").strip() == main_graphify_mode
-                and normalize_graphify_config(getattr(item.selection, "graphify_config", {}))
-                == normalize_graphify_config(agent_config.graphify_config)
+                and str(getattr(item.selection, "codegraph_mode", "") or "off").strip() == main_codegraph_mode
+                and normalize_codegraph_config(getattr(item.selection, "codegraph_config", {}))
+                == normalize_codegraph_config(agent_config.codegraph_config)
             )
 
         def reviewer_mode_matches(item: ReviewAgentHandoff) -> bool:
             reviewer_key = str(item.reviewer_key or item.role_name).strip()
             desired = agent_config.reviewer_selection(reviewer_key)
             expected_ponytail_mode = desired.ponytail_mode if desired is not None else agent_config.ponytail_mode
-            expected_graphify_mode = desired.graphify_mode if desired is not None else agent_config.graphify_mode
-            expected_graphify_config = desired.graphify_config if desired is not None else agent_config.graphify_config
+            expected_codegraph_mode = desired.codegraph_mode if desired is not None else agent_config.codegraph_mode
+            expected_codegraph_config = desired.codegraph_config if desired is not None else agent_config.codegraph_config
             return (
                 str(getattr(item.selection, "ponytail_mode", "") or "off").strip() == expected_ponytail_mode
-                and str(getattr(item.selection, "graphify_mode", "") or "off").strip() == expected_graphify_mode
-                and normalize_graphify_config(getattr(item.selection, "graphify_config", {}))
-                == normalize_graphify_config(expected_graphify_config)
+                and str(getattr(item.selection, "codegraph_mode", "") or "off").strip() == expected_codegraph_mode
+                and normalize_codegraph_config(getattr(item.selection, "codegraph_config", {}))
+                == normalize_codegraph_config(expected_codegraph_config)
             )
 
         explicit_live_developer_handoff = (
@@ -2555,8 +2563,8 @@ def run_overall_review_stage(
                     allow_back_first_prompt=reviewer_selection_allow_back,
                     stage_key="overall_review_reviewer_selection",
                     default_ponytail_mode=agent_config.ponytail_mode,
-                    default_graphify_mode=agent_config.graphify_mode,
-                    default_graphify_config=agent_config.graphify_config,
+                    default_codegraph_mode=agent_config.codegraph_mode,
+                    default_codegraph_config=agent_config.codegraph_config,
                 )
             )
         review_round_allow_back, allow_previous_stage_back = _consume_stage_back(
@@ -2580,20 +2588,20 @@ def run_overall_review_stage(
             cleanup_paths.extend(cleanup_stale_overall_review_runtime_state(project_dir, requirement_name))
         cleanup_paths.extend(cleanup_existing_overall_review_artifacts(paths, requirement_name, audit_context))
         if overall_change_ledger is not None:
-            if not overall_change_ledger.exists():
-                mark_graphify_change_scope_unknown(
+            if not source_change_ledger_exists(overall_change_ledger):
+                mark_source_change_scope_unknown(
                     overall_change_ledger,
                     project_dir=project_dir,
                     scope_name="__legacy_A07_scope__",
                     reason="a07_change_ledger_missing",
                 )
-            ensure_graphify_task_baseline(
+            ensure_source_task_baseline(
                 overall_change_ledger,
                 project_dir=project_dir,
-                task_name=OVERALL_REVIEW_GRAPHIFY_TASK,
-                graphify_config=agent_config.graphify_config,
+                task_name=OVERALL_REVIEW_SOURCE_TASK,
+                source_config=None,
                 stage_key="A08",
-                runner_id=graphify_stage_runner_id,
+                runner_id=source_stage_runner_id,
             )
         _write_overall_review_state(paths["state_path"], passed=False)
         append_stage_audit_record(
@@ -2611,7 +2619,7 @@ def run_overall_review_stage(
             reviewer_selections_by_name=reviewer_selections_by_name,
             progress=progress,
         )
-        refresh_graphify_workers_for_checkpoint(
+        refresh_codegraph_workers_for_checkpoint(
             [
                 *([developer.worker] if developer is not None else []),
                 *(reviewer.worker for reviewer in reviewers),
@@ -2620,7 +2628,7 @@ def run_overall_review_stage(
                 "A08 overall-review checkpoint; refresh the graph from all current "
                 "changed files before initialization and impact analysis"
             ),
-            turn_context=_overall_review_graphify_context(
+            turn_context=_overall_review_codegraph_context(
                 project_dir=project_dir,
                 requirement_name=requirement_name,
                 phase="a08_initial_checkpoint",
@@ -2643,15 +2651,15 @@ def run_overall_review_stage(
         code_change_msg = ""
         while True:
             if round_index > 1 and overall_change_ledger is not None:
-                record_graphify_task_changes(
+                record_source_task_changes(
                     overall_change_ledger,
                     project_dir=project_dir,
-                    task_name=OVERALL_REVIEW_GRAPHIFY_TASK,
-                    graphify_config=agent_config.graphify_config,
+                    task_name=OVERALL_REVIEW_SOURCE_TASK,
+                    source_config=None,
                     stage_key="A08",
-                    runner_id=graphify_stage_runner_id,
+                    runner_id=source_stage_runner_id,
                 )
-                refresh_graphify_workers_for_checkpoint(
+                refresh_codegraph_workers_for_checkpoint(
                     [
                         *([developer.worker] if developer is not None else []),
                         *(reviewer.worker for reviewer in reviewers),
@@ -2660,7 +2668,7 @@ def run_overall_review_stage(
                         "A08 post-fix checkpoint; refresh the graph from the cumulative "
                         "development change ledger before the next whole-change review"
                     ),
-                    turn_context=_overall_review_graphify_context(
+                    turn_context=_overall_review_codegraph_context(
                         project_dir=project_dir,
                         requirement_name=requirement_name,
                         phase="a08_post_fix_checkpoint",
@@ -2871,6 +2879,7 @@ def run_overall_review_stage(
             lock_context.__exit__(None, None, None)
 
 
+@cleanup_codegraph_processes_on_exit
 def main(argv: Sequence[str] | None = None) -> int:
     redirected, launch = maybe_launch_tui(argv, route="overall-review", action="stage.a08.start")
     if redirected:

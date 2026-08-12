@@ -21,22 +21,22 @@ test('route files exist with expected exports', () => {
   }
 })
 
-test('home renders project Graphify status plus provable per-turn usage without changing config labels', () => {
+test('home renders project CodeGraph status without adding per-agent query labels', () => {
   const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
   const homeContent = readFileSync(join(import.meta.dir, 'routes/HomeRoute.tsx'), 'utf8')
   const agentContent = readFileSync(join(import.meta.dir, 'homeAgents.ts'), 'utf8')
-  expect(appContent.includes('graphify: normalizeGraphifyStatus(payload.graphify)')).toBe(true)
-  expect(homeContent.includes('代码图谱：${graphifyStatusSummary(graphify)}')).toBe(true)
-  const configLabelBody = agentContent.split('export function buildAgentConfigLabel', 2)[1]?.split('export function buildGraphifyUsageLabel', 1)[0] ?? ''
-  expect(configLabelBody.toLowerCase().includes('graphify')).toBe(false)
-  expect(agentContent.includes('export function buildGraphifyUsageLabel')).toBe(true)
-  expect(homeContent.includes('agent.graphifyUsageLabel')).toBe(true)
+  expect(appContent.includes('codegraph: normalizeCodeGraphStatus(payload.codegraph)')).toBe(true)
+  expect(homeContent.includes('代码图谱：${codegraphStatusSummary(codegraph)}')).toBe(true)
+  const configLabelBody = agentContent.split('export function buildAgentConfigLabel', 2)[1] ?? ''
+  expect(configLabelBody.toLowerCase().includes('codegraph')).toBe(false)
+  expect(agentContent.includes('buildCodeGraphUsageLabel')).toBe(false)
+  expect(homeContent.includes('codegraphUsageLabel')).toBe(false)
 })
 
-test('stage snapshots cannot replace project Graphify status', () => {
+test('stage snapshots cannot replace project CodeGraph status', () => {
   const appContent = readFileSync(join(import.meta.dir, 'app.tsx'), 'utf8')
   const stageBranch = appContent.split("if (event.type === 'snapshot.stage')", 2)[1]?.split("if (event.type === 'snapshot.control')", 1)[0] ?? ''
-  expect(stageBranch.includes('graphify')).toBe(false)
+  expect(stageBranch.includes('codegraph')).toBe(false)
 })
 
 test('index cleans tmux for human and terminal-failure shutdown', () => {

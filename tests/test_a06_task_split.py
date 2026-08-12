@@ -28,6 +28,7 @@ from A06_TaskSplit import (
     initialize_task_split_workers,
     prepare_task_split_ba_handoff,
     resolve_review_max_rounds,
+    run_ba_turn_with_recovery,
     run_ba_modify_loop,
     run_task_split_review_limit_hitl_loop,
     run_task_split_stage,
@@ -1921,6 +1922,54 @@ class A06TaskSplitTests(unittest.TestCase):
         self.assertEqual(attempts["count"], 2)
         self.assertIn("启动超时", reviewer.worker.reconfig_reason)
         recreate_runtime.assert_called_once()
+
+    def test_ba_recovery_infers_requirement_scope_when_not_explicit(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            project_dir = Path(tmp_dir)
+            worker = _ReconfigurableWorker(session_name="需求分析师-天佑星")
+            worker._runtime_metadata = {"requirement_name": "需求A"}
+            handoff = RequirementsAnalystHandoff(
+                worker=worker,
+                vendor="codex",
+                model="gpt-5.4",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            replacement = RequirementsAnalystHandoff(
+                worker=_FakeWorker(session_name="需求分析师-天魁星"),
+                vendor="codex",
+                model="gpt-5.4-mini",
+                reasoning_effort="high",
+                proxy_url="",
+            )
+            attempts = {"count": 0}
+
+            def run_turn(*_args, **_kwargs):
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise RuntimeError("Timed out waiting for agent ready")
+                return {"status": "completed"}
+
+            with (
+                patch("A06_TaskSplit._run_ba_turn", side_effect=run_turn),
+                patch(
+                    "A06_TaskSplit.recreate_task_split_ba_handoff",
+                    return_value=replacement,
+                ) as recreate,
+            ):
+                returned, payload = run_ba_turn_with_recovery(
+                    handoff,
+                    project_dir=project_dir,
+                    label="task_split_ba",
+                    prompt="work",
+                    result_contract=SimpleNamespace(),
+                    initialize_on_replacement=False,
+                    paths={},
+                )
+
+        self.assertIs(returned, replacement)
+        self.assertEqual(payload["status"], "completed")
+        self.assertEqual(recreate.call_args.kwargs["requirement_name"], "需求A")
 
     def test_build_reviewer_init_result_contract_uses_reviewer_mode(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

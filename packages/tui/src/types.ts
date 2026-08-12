@@ -42,13 +42,9 @@ export type WorkerSnapshot = {
   grillBundleCommit?: string
   grillDelivery?: string
   grillQuestionSeq?: number
-  graphifyFreshness?: string
-  graphifyUsagePolicy?: string
-  graphifyEvidenceDelivery?: string
-  graphifyQueryRequirement?: string
-  graphifyQueryStatus?: string
-  graphifyQueryCommand?: string
-  graphifyUsageReceipt?: string
+  codegraphMode?: string
+  codegraphAvailable?: boolean
+  codegraphHintDelivery?: string
   retryCount: number
   note: string
   transcriptPath: string
@@ -169,7 +165,6 @@ export type HomeAgentItem = {
   healthStatus: string
   agentState: string
   agentConfigLabel: string
-  graphifyUsageLabel?: string
   attachCommand: string
   workDir: string
 }
@@ -208,26 +203,22 @@ export type StageFailureSnapshot = {
   orphanedWorkers: StageFailureWorker[]
 }
 
-export type GraphifyStatus = {
+export type CodeGraphStatus = {
   mode: string
   state: string
   version: string
   freshness: string
-  generatedAt: string
-  sourceFingerprint: string
+  initialized: boolean
+  lastIndexed: string
+  fileCount: number
   nodeCount: number
   edgeCount: number
-  evidenceId: string
-  directCount: number
-  inferredCount: number
-  reportPath: string
+  pendingChanges: { added: number; modified: number; removed: number }
+  indexState: string
+  pendingRefs: number
+  reindexRecommended: boolean
+  worktreeMismatch: boolean
   lastError: string
-  queryCountStage: number
-  lastQueryCommand: string
-  lastQueryAt: string
-  lastQueryStatus: string
-  lastQueryFreshness: string
-  lastQueryTruncated: boolean
 }
 
 export type AppSnapshot = {
@@ -247,7 +238,7 @@ export type AppSnapshot = {
   pendingAttention: boolean
   pendingAttentionReason: string
   pendingAttentionSince: string
-  graphify?: GraphifyStatus
+  codegraph?: CodeGraphStatus
   recentArtifacts: ArtifactItem[]
   availableRuns: RunOption[]
   capabilities: Record<string, unknown>

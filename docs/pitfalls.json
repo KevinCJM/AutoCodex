@@ -139,16 +139,16 @@
       "title": "routing_docs_are_navigation_only",
       "severity": "medium",
       "confidence": "high",
-      "symptoms": ["route_code_conflict", "stale_path", "implementation_truth_claim_from_docs", "implementation_truth_claim_from_graphify"],
+      "symptoms": ["route_code_conflict", "stale_path", "implementation_truth_claim_from_docs", "implementation_truth_claim_from_codegraph"],
       "trigger_actions": ["TA06"],
-      "why_risky": "routing_docs_and_static_graph_evidence_cannot_prove_behavior",
+      "why_risky": "routing_docs_and_static_code_navigation_cannot_prove_behavior",
       "related_selectors": [
         {"type": "literal", "path": "AGENTS.md"},
         {"type": "literal", "path": "docs/repo_map.json"},
         {"type": "literal", "path": "docs/task_routes.json"},
         {"type": "literal", "path": "docs/pitfalls.json"},
-        {"type": "literal", "path": "tmux_core/runtime/graphify.py"},
-        {"type": "literal", "path": "scripts/tmux-graphify"}
+        {"type": "literal", "path": "tmux_core/runtime/codegraph.py"},
+        {"type": "literal", "path": "scripts/tmux-codegraph"}
       ],
       "affected_modules": ["M09_routing_init_layer", "M11_tests", "M12_project_graph_service"],
       "blast_radius": "false_assumption",
@@ -169,8 +169,8 @@
         {"type": "literal", "path": "A00_main_tui.py"},
         {"type": "literal", "path": "T11_tui_backend.py"},
         {"type": "literal", "path": "T11_web_backend.py"},
-        {"type": "literal", "path": "tmux_core/runtime/graphify.py"},
-        {"type": "literal", "path": "scripts/tmux-graphify"}
+        {"type": "literal", "path": "tmux_core/runtime/codegraph.py"},
+        {"type": "literal", "path": "scripts/tmux-codegraph"}
       ],
       "affected_modules": ["M01_workflow_entry", "M02_web_launcher", "M05_tmux_runtime_hitl", "M06_bridge_protocol_backends", "M12_project_graph_service"],
       "blast_radius": "incorrect_environment_claim",
@@ -182,14 +182,14 @@
       "title": "generated_artifacts_are_not_source_truth",
       "severity": "medium",
       "confidence": "medium",
-      "symptoms": ["source_inferred_from_generated_output", "fixture_only_fix", "graphify_generation_treated_as_source_truth", "inferred_edge_treated_as_extracted_fact"],
+      "symptoms": ["source_inferred_from_generated_output", "fixture_only_fix", "codegraph_navigation_treated_as_source_truth", "static_call_path_treated_as_runtime_proof"],
       "trigger_actions": ["TA08"],
-      "why_risky": "generated_outputs_and_graphify_graphs_are_not_canonical_implementation",
+      "why_risky": "generated_outputs_and_codegraph_navigation_are_not_canonical_implementation",
       "related_selectors": [
         {"type": "subtree", "path": "_tui_e2e_projects"},
         {"type": "subtree", "path": ".tmp"},
-        {"type": "literal", "path": "tmux_core/runtime/graphify.py"},
-        {"type": "literal", "path": "scripts/tmux-graphify"}
+        {"type": "literal", "path": "tmux_core/runtime/codegraph.py"},
+        {"type": "literal", "path": "scripts/tmux-codegraph"}
       ],
       "affected_modules": ["M10_generated_artifacts", "M09_routing_init_layer", "M12_project_graph_service"],
       "blast_radius": "fixture_only_fix",

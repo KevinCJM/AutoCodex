@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createSignal, onCleanup } from 'solid-js'
-import { graphifyStatusColor, graphifyStatusSummary } from '../graphifyStatus'
-import type { AppSnapshot, GraphifyStatus, HitlSnapshot, HomeAgentItem, StageFailureSnapshot } from '../types'
+import { codegraphStatusColor, codegraphStatusSummary } from '../codegraphStatus'
+import type { AppSnapshot, CodeGraphStatus, HitlSnapshot, HomeAgentItem, StageFailureSnapshot } from '../types'
 
 type Props = {
   snapshot: AppSnapshot
@@ -51,17 +51,14 @@ export function HomeRoute(props: Props) {
       <Show when={props.snapshot.requirementName}>
         <text fg="#888888">{`需求名称: ${props.snapshot.requirementName}`}</text>
       </Show>
-      <Show when={props.snapshot.graphify} keyed>
-        {(graphify: GraphifyStatus) => (
+      <Show when={props.snapshot.codegraph} keyed>
+        {(codegraph: CodeGraphStatus) => (
           <box flexDirection="column">
-            <text fg={graphifyStatusColor(graphify)}>
-              {`代码图谱：${graphifyStatusSummary(graphify)}`}
+            <text fg={codegraphStatusColor(codegraph)}>
+              {`代码图谱：${codegraphStatusSummary(codegraph)}`}
             </text>
-            <Show when={graphify.nodeCount > 0 || graphify.edgeCount > 0}>
-              <text fg="#888888">{`${graphify.nodeCount} nodes / ${graphify.edgeCount} edges`}</text>
-            </Show>
-            <Show when={graphify.lastError}>
-              <text fg="#888888">{graphify.lastError}</text>
+            <Show when={codegraph.lastError}>
+              <text fg="#888888">{codegraph.lastError}</text>
             </Show>
           </box>
         )}
@@ -121,9 +118,6 @@ export function HomeRoute(props: Props) {
                   <text>{agentSummary(agent)}</text>
                 </box>
                 <text fg="#888888">{agent.attachCommand}</text>
-                <Show when={agent.graphifyUsageLabel}>
-                  <text fg="#888888">{agent.graphifyUsageLabel}</text>
-                </Show>
               </box>
             )}
           </For>

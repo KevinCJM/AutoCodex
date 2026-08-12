@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tmux_core.runtime.graphify import GraphifyQueryIntent
-from tmux_core.stage_kernel.graphify_route_context import (
-    build_stage_graphify_turn_context,
-    resolve_stage_graphify_route_hints,
+from tmux_core.runtime.codegraph import CodeGraphQueryIntent
+from tmux_core.stage_kernel.codegraph_route_context import (
+    build_stage_codegraph_turn_context,
+    resolve_stage_codegraph_route_hints,
 )
 
 
@@ -138,7 +138,7 @@ def test_stage_route_hints_reuse_materialized_selectors_and_filter_to_safe_sourc
         encoding="utf-8",
     )
 
-    hints = resolve_stage_graphify_route_hints(
+    hints = resolve_stage_codegraph_route_hints(
         project,
         task_text="billing architecture review",
         business_artifact_paths=(artifact,),
@@ -162,27 +162,27 @@ def test_stage_route_hints_reuse_materialized_selectors_and_filter_to_safe_sourc
 def test_stage_route_hints_fail_soft_when_routing_is_missing_or_invalid(tmp_path: Path) -> None:
     project = tmp_path / "project"
     project.mkdir()
-    missing = resolve_stage_graphify_route_hints(project, task_text="billing")
+    missing = resolve_stage_codegraph_route_hints(project, task_text="billing")
     assert missing.route_id == ""
     assert missing.routed_paths == ()
     assert missing.symbols == ()
 
     (project / "docs").mkdir()
     (project / "docs" / "task_routes.json").write_text("{broken", encoding="utf-8")
-    assert resolve_stage_graphify_route_hints(project, task_text="billing").route_id == ""
+    assert resolve_stage_codegraph_route_hints(project, task_text="billing").route_id == ""
 
 
-def test_build_stage_graphify_turn_context_propagates_routing_hints(tmp_path: Path) -> None:
+def test_build_stage_codegraph_turn_context_propagates_routing_hints(tmp_path: Path) -> None:
     project = _build_routed_project(tmp_path)
     artifact = project / "Requirement.md"
     artifact.write_text("billing architecture for `BillingService.handle`", encoding="utf-8")
 
-    context = build_stage_graphify_turn_context(
+    context = build_stage_codegraph_turn_context(
         project,
         stage_key="A05",
         phase="a05_design",
         role="design_analyst",
-        intent=GraphifyQueryIntent.ARCHITECTURE_BOUNDARY,
+        intent=CodeGraphQueryIntent.ARCHITECTURE_BOUNDARY,
         requirement_name="billing",
         task_name="architecture",
         query_seeds=("shared dependencies",),
@@ -190,7 +190,7 @@ def test_build_stage_graphify_turn_context_propagates_routing_hints(tmp_path: Pa
     )
 
     assert context.stage_key == "A05"
-    assert context.intent is GraphifyQueryIntent.ARCHITECTURE_BOUNDARY
+    assert context.intent is CodeGraphQueryIntent.ARCHITECTURE_BOUNDARY
     assert context.routed_paths[:3] == (
         "src/main.py",
         "tests/test_main.py",

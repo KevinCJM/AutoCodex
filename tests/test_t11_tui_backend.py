@@ -36,15 +36,14 @@ from T11_tui_backend import (
     PromptBroker,
     RunnerExecutionState,
     TuiBackendServer,
-    _read_graphify_app_status,
+    _read_codegraph_app_status,
     _write_project_stage_state_record,
     main as backend_main,
 )
 from T10_tui_protocol import build_request
 from T09_terminal_ops import BridgePromptRequest
-from tmux_core.bridge.backend import _flatten_graphify_worker_fields
+from tmux_core.bridge.backend import _flatten_codegraph_worker_fields, _redact_codegraph_error
 from tmux_core.runtime.tmux_runtime import (
-    GRAPHIFY_USAGE_BLOCKER,
     AgentRuntimeInterventionRequired,
     AgentStartupInterventionRequired,
     clear_runtime_shutdown_request,
@@ -1029,172 +1028,115 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertEqual(snapshot["pending_attention_reason"], "select")
         self.assertEqual(snapshot["pending_attention_since"], "2026-04-23T10:00:00+08:00")
 
-    def test_app_snapshot_exposes_only_safe_project_level_graphify_status(self):
+    def test_app_snapshot_exposes_only_safe_project_level_codegraph_status(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             project_dir = Path(tmpdir).resolve()
-            evidence_id = "evidence-123"
-            runtime_dir = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / "worker-a"
-            runtime_dir.mkdir(parents=True)
-            state_path = runtime_dir / "worker.state.json"
-            state_path.write_text("{}\n", encoding="utf-8")
-            report_path = runtime_dir / f"graphify_evidence_{evidence_id}.md"
-            report_path.write_text("# Graphify evidence\n", encoding="utf-8")
-            stages = {
-                "development": {
-                    "workers": [
-                        {
-                            "state_path": str(state_path),
-                            "graphify_evidence_id": evidence_id,
-                        }
-                    ]
-                }
-            }
-            fake_graphify = SimpleNamespace(
-                read_graphify_project_status=lambda _project_dir: {
+            fake_codegraph = SimpleNamespace(
+                read_codegraph_project_status=lambda _project_dir: {
                     "mode": "auto",
                     "state": "ready",
-                    "version": "0.9.27",
+                    "version": "1.5.0",
+                    "initialized": True,
                     "freshness": "fresh",
+                    "last_indexed": "2026-08-10T10:11:12+08:00",
+                    "file_count": 1200,
                     "node_count": 5098,
                     "edge_count": 22091,
-                    "evidence_id": evidence_id,
-                    "report_path": str(report_path),
-                    "query_count_stage": 4,
-                    "last_query_command": "affected",
-                    "last_query_at": "2026-07-27T10:11:12+08:00",
-                    "last_query_status": "ok",
-                    "last_query_freshness": "fresh",
-                    "last_query_truncated": False,
+                    "pending_changes": {"added": 0, "modified": 0, "removed": 0},
+                    "index_state": "complete",
+                    "pending_refs": 0,
+                    "reindex_recommended": False,
+                    "worktree_mismatch": False,
                     "query_text": "show me /Users/example/private.py",
                     "query_result": "secret result",
-                    "last_error": "cache /Users/example/.cache/graphify failed",
-                    "executable_path": "/Users/example/.local/bin/graphify",
-                    "cache_dir": "/Users/example/.cache/graphify",
+                    "last_error": "index /Users/example/.codegraph failed",
+                    "executable_path": "/Users/example/.local/bin/codegraph",
+                    "index_path": "/Users/example/project/.codegraph",
                 }
             )
-            with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
+            with patch.dict(sys.modules, {"tmux_core.runtime.codegraph": fake_codegraph}):
                 server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
                 server._set_context(project_dir=str(project_dir))  # noqa: SLF001
-                snapshot = server._build_app_snapshot(stage_snapshots=stages)  # noqa: SLF001
+                snapshot = server._build_app_snapshot(stage_snapshots={})  # noqa: SLF001
                 allowed = server._allowed_file_preview_paths(  # noqa: SLF001
-                    stages=stages,
+                    stages={},
                     control={"workers": []},
                     hitl={},
                     artifacts={"items": []},
                 )
 
-        self.assertEqual(snapshot["graphify"]["state"], "ready")
-        self.assertEqual(snapshot["graphify"]["node_count"], 5098)
-        self.assertEqual(snapshot["graphify"]["report_path"], str(report_path))
-        self.assertEqual(snapshot["graphify"]["query_count_stage"], 4)
-        self.assertEqual(snapshot["graphify"]["last_query_command"], "affected")
-        self.assertEqual(snapshot["graphify"]["last_query_freshness"], "fresh")
-        self.assertFalse(snapshot["graphify"]["last_query_truncated"])
-        self.assertIn("<redacted-path>", snapshot["graphify"]["last_error"])
-        self.assertNotIn("executable_path", snapshot["graphify"])
-        self.assertNotIn("cache_dir", snapshot["graphify"])
-        self.assertNotIn("query_text", snapshot["graphify"])
-        self.assertNotIn("query_result", snapshot["graphify"])
-        self.assertIn(str(report_path), allowed)
+        self.assertEqual(snapshot["codegraph"]["state"], "ready")
+        self.assertEqual(snapshot["codegraph"]["node_count"], 5098)
+        self.assertEqual(snapshot["codegraph"]["file_count"], 1200)
+        self.assertTrue(snapshot["codegraph"]["initialized"])
+        self.assertIn("<redacted-path>", snapshot["codegraph"]["last_error"])
+        self.assertNotIn("executable_path", snapshot["codegraph"])
+        self.assertNotIn("index_path", snapshot["codegraph"])
+        self.assertNotIn("query_text", snapshot["codegraph"])
+        self.assertNotIn("query_result", snapshot["codegraph"])
+        self.assertFalse(any("codegraph" in path for path in allowed))
 
-    def test_graphify_report_requires_matching_known_stage_worker_runtime(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            project_dir = Path(tmpdir).resolve()
-            runtime_dir = project_dir / DEVELOPMENT_RUNTIME_ROOT_NAME / "worker-a"
-            runtime_dir.mkdir(parents=True)
-            state_path = runtime_dir / "worker.state.json"
-            state_path.write_text("{}\n", encoding="utf-8")
-            evidence_id = "evidence-123"
-            report_path = runtime_dir / f"graphify_evidence_{evidence_id}.md"
-            report_path.write_text("# Graphify evidence\n", encoding="utf-8")
-            fake_graphify = SimpleNamespace(
-                read_graphify_project_status=lambda _project_dir: {
-                    "mode": "auto",
-                    "state": "ready",
-                    "evidence_id": evidence_id,
-                    "report_path": str(report_path),
-                }
-            )
-            mismatches = (
-                {},
-                {"development": {"workers": [{"state_path": str(state_path), "graphify_evidence_id": "other"}]}},
-                {
-                    "development": {
-                        "workers": [
-                            {
-                                "state_path": str(project_dir / "worker.state.json"),
-                                "graphify_evidence_id": evidence_id,
-                            }
-                        ]
-                    }
-                },
-            )
-            with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
-                for stage_snapshots in mismatches:
-                    status = _read_graphify_app_status(
-                        str(project_dir),
-                        stage_snapshots=stage_snapshots,
-                    )
-                    self.assertNotIn("report_path", status)
-
-    def test_graphify_report_outside_project_is_not_exposed(self):
-        with tempfile.TemporaryDirectory() as tmpdir, tempfile.NamedTemporaryFile() as outside:
-            fake_graphify = SimpleNamespace(
-                read_graphify_project_status=lambda _project_dir: {
-                    "mode": "auto",
-                    "state": "ready",
-                    "report_path": outside.name,
-                    "query_count_stage": -1,
-                    "last_query_command": "/Users/example/private.py",
-                    "last_query_at": "private question",
-                    "last_query_status": "private result",
-                    "last_query_freshness": "secret",
-                    "last_query_truncated": "true",
-                }
-            )
-            with patch.dict(sys.modules, {"tmux_core.runtime.graphify": fake_graphify}):
-                status = _read_graphify_app_status(tmpdir)
-
-        self.assertEqual(status["state"], "ready")
-        self.assertEqual(status["query_count_stage"], 0)
-        self.assertNotIn("report_path", status)
-        self.assertNotIn("last_query_command", status)
-        self.assertNotIn("last_query_at", status)
-        self.assertNotIn("last_query_status", status)
-        self.assertNotIn("last_query_freshness", status)
-        self.assertNotIn("last_query_truncated", status)
-
-    def test_worker_snapshot_exposes_only_safe_graphify_turn_identity(self):
-        flattened = _flatten_graphify_worker_fields(
+    def test_worker_snapshot_exposes_only_safe_codegraph_hint_state(self):
+        flattened = _flatten_codegraph_worker_fields(
             {
                 "config": {
-                    "graphify_mode": "auto",
-                    "graphify_config": {"include": ["secret/**"]},
+                    "codegraph_mode": "auto",
+                    "codegraph_config": {"include": ["secret/**"]},
                 },
-                "graphify_evidence_id": "evidence-123",
-                "graphify_fingerprint": "a" * 64,
-                "graphify_freshness": "fresh",
-                "graphify_usage_policy": "query_required",
-                "graphify_evidence_delivery": "confirmed",
-                "graphify_query_requirement": "required",
-                "graphify_query_status": "missing",
-                "graphify_query_command": "affected",
-                "graphify_usage_receipt": "usage.json",
-                "graphify_cache_dir": "/Users/example/.cache/private",
+                "codegraph_available": True,
+                "codegraph_hint_delivery": "confirmed",
+                "codegraph_cache_dir": "/Users/example/.cache/private",
             }
         )
-        self.assertEqual(flattened["graphify_mode"], "auto")
-        self.assertEqual(flattened["graphify_evidence_id"], "evidence-123")
-        self.assertEqual(flattened["graphify_fingerprint"], "a" * 64)
-        self.assertEqual(flattened["graphify_freshness"], "fresh")
-        self.assertEqual(flattened["graphify_usage_policy"], "query_required")
-        self.assertEqual(flattened["graphify_evidence_delivery"], "confirmed")
-        self.assertEqual(flattened["graphify_query_requirement"], "required")
-        self.assertEqual(flattened["graphify_query_status"], "missing")
-        self.assertEqual(flattened["graphify_query_command"], "affected")
-        self.assertEqual(flattened["graphify_usage_receipt"], "usage.json")
-        self.assertNotIn("graphify_config", flattened)
-        self.assertNotIn("graphify_cache_dir", flattened)
+        self.assertEqual(flattened["codegraph_mode"], "auto")
+        self.assertTrue(flattened["codegraph_available"])
+        self.assertEqual(flattened["codegraph_hint_delivery"], "confirmed")
+        self.assertNotIn("codegraph_config", flattened)
+        self.assertNotIn("codegraph_cache_dir", flattened)
+
+    def test_codegraph_error_redaction_covers_unix_windows_and_unc_paths(self):
+        redacted = _redact_codegraph_error(
+            r"index /Users/alice/project/.codegraph, "
+            r"C:\Users\bob\project\.codegraph; "
+            r"\\server\share\project\.codegraph and "
+            r'"C:\Users\carol smith\project\.codegraph" failed'
+        )
+
+        self.assertEqual(redacted.count("<redacted-path>"), 4)
+        self.assertNotIn("alice", redacted)
+        self.assertNotIn("bob", redacted)
+        self.assertNotIn("server", redacted)
+        self.assertNotIn("carol", redacted)
+        self.assertNotIn("smith", redacted)
+
+    def test_codegraph_error_redaction_does_not_leak_unquoted_path_suffixes(self):
+        redacted = _redact_codegraph_error(
+            r"status failed at /Users/alice/Secret Project/private/service.py:12; "
+            r"index C:\Users\bob\Secret Project\private\service.py:13 failed"
+        )
+
+        self.assertEqual(redacted.count("<redacted-path>"), 2)
+        self.assertNotIn("Secret", redacted)
+        self.assertNotIn("Project", redacted)
+        self.assertNotIn("service.py", redacted)
+        self.assertTrue(redacted.endswith("failed"))
+
+    def test_codegraph_public_status_rejects_string_booleans(self):
+        fake_codegraph = SimpleNamespace(
+            read_codegraph_project_status=lambda _project_dir: {
+                "mode": "auto",
+                "state": "degraded",
+                "initialized": "false",
+                "reindex_recommended": "false",
+                "worktree_mismatch": "false",
+            }
+        )
+        with patch.dict(sys.modules, {"tmux_core.runtime.codegraph": fake_codegraph}):
+            status = _read_codegraph_app_status("/tmp/project")
+
+        self.assertFalse(status["initialized"])
+        self.assertFalse(status["reindex_recommended"])
+        self.assertFalse(status["worktree_mismatch"])
 
     def test_stage_status_does_not_treat_unattached_awaiting_reconfig_worker_as_running(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -6295,63 +6237,6 @@ class T11TuiBackendTests(unittest.TestCase):
         self.assertIn("运行期权限确认", prompt.payload["prompt_text"])
         self.assertEqual(checked_blockers, ["codex_approval"])
         resume_worker.assert_not_called()
-
-    def test_graphify_required_intervention_exposes_recheck_override_and_terminate(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            state_path = str((Path(tmpdir) / "runtime-worker.state.json").resolve())
-            error = AgentRuntimeInterventionRequired(
-                blocker_kind=GRAPHIFY_USAGE_BLOCKER,
-                session_name="审核员-图谱",
-                state_path=state_path,
-                message="Required Graphify query receipt missing",
-            )
-            overrides: list[str] = []
-            recovered_worker = SimpleNamespace(
-                override_graphify_usage_requirement=lambda: overrides.append("override"),
-                runtime_intervention_is_resolved=lambda _blocker_kind: False,
-            )
-            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
-
-            with patch.object(
-                server,
-                "_current_stage_workers_without_runtime_io",
-                return_value=[],
-            ), patch.object(
-                server,
-                "_current_stage_workers",
-                return_value=[],
-            ), patch.object(
-                server,
-                "_persist_runner_awaiting_input",
-                return_value=True,
-            ), patch.object(
-                server._prompt_broker,
-                "request",
-                return_value={"value": "graphify_usage_manual_override"},
-            ) as request_prompt, patch(
-                "T11_tui_backend.load_worker_from_state_path",
-                return_value=recovered_worker,
-            ):
-                outcome = server._await_agent_ready_timeout_recovery(  # noqa: SLF001
-                    request_id="",
-                    action="stage.a07.start",
-                    stage_seq=7,
-                    error=error,
-                    respond=False,
-                )
-
-        prompt = request_prompt.call_args.args[0]
-        self.assertEqual(prompt.payload["recovery_kind"], "graphify_usage_intervention")
-        self.assertEqual(
-            [item["value"] for item in prompt.payload["options"]],
-            [
-                "recheck_after_manual_intervention",
-                "graphify_usage_manual_override",
-                "graphify_usage_terminate",
-            ],
-        )
-        self.assertEqual(overrides, ["override"])
-        self.assertEqual(outcome, "recovered")
 
     def test_opencode_question_intervention_prompts_human_to_answer_in_tmux(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -12268,6 +12153,7 @@ class T11TuiBackendTests(unittest.TestCase):
 
             writer = io.StringIO()
             server = TuiBackendServer(reader=io.StringIO(), writer=writer)
+            server._set_context(project_dir=str(root))  # noqa: SLF001
             with patch.object(server, "_build_stage_snapshot_by_route", side_effect=fake_stage_snapshot):
                 server._emit_snapshot_update(include_app=True, include_all_stages=True)  # noqa: SLF001
                 built_routes.clear()
@@ -12289,8 +12175,10 @@ class T11TuiBackendTests(unittest.TestCase):
             existing = Path(tmpdir) / "artifact.md"
             existing.write_text("artifact\n", encoding="utf-8")
             missing = Path(tmpdir) / "missing.md"
+            server = TuiBackendServer(reader=io.StringIO(), writer=io.StringIO())
+            server._set_context(project_dir=tmpdir)  # noqa: SLF001
 
-            items = TuiBackendServer._artifact_items_from_candidates(["", str(missing), str(existing)])  # noqa: SLF001
+            items = server._artifact_items_from_candidates(["", str(missing), str(existing)])  # noqa: SLF001
 
         self.assertEqual([item["path"] for item in items], [str(existing.resolve())])
 

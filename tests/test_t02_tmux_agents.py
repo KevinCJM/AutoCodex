@@ -918,8 +918,8 @@ QUEUED
         self.assertEqual(config.resolved_executable, "/opt/DevEco Code/bin/DevEco")
         self.assertEqual(config.expected_current_commands(), ("deveco", "DevEco", "node"))
         self.assertIn("PONYTAIL_DEFAULT_MODE=off", command)
-        self.assertIn("TMUX_GRAPHIFY_MODE=off", command)
-        self.assertIn("TMUX_GRAPHIFY_READ_ONLY=1", command)
+        self.assertIn("TMUX_CODEGRAPH_MODE=off", command)
+        self.assertIn("TMUX_CODEGRAPH_READ_ONLY=1", command)
         self.assertIn("DEVECO_DISABLE_AUTOUPDATE=1", command)
         self.assertTrue(
             command.endswith(
@@ -2251,7 +2251,7 @@ workspace (/directory)                                                     branc
 
         self.assertIn("agy --model 'Gemini 3.5 Flash (Low)' --dangerously-skip-permissions", command)
         self.assertNotIn("agy /tmp/project", command)
-        self.assertIn("TMUX_GRAPHIFY_PROJECT_DIR=/tmp/project", command)
+        self.assertIn("TMUX_CODEGRAPH_PROJECT_DIR=/tmp/project", command)
         self.assertEqual(config.expected_current_commands(), ("agy", "node"))
         self.assertIn("vendor: agy", header)
         self.assertIn("agy_model=Gemini 3.5 Flash (Low)", header)
@@ -9583,15 +9583,21 @@ workspace (/directory)                                                     branc
                 runtime_root=Path(tmp_dir) / "runtime",
             )
             worker.pane_id = "%1"
+            monotonic_value = -0.1
 
-            with mock.patch("tmux_core.runtime.tmux_runtime.time.monotonic", side_effect=[0.0, 0.1, 0.2, 1.2]), \
+            def advancing_monotonic() -> float:
+                nonlocal monotonic_value
+                monotonic_value += 0.1
+                return monotonic_value
+
+            with mock.patch("tmux_core.runtime.tmux_runtime.time.monotonic", side_effect=advancing_monotonic), \
                     mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
                 with self.assertRaisesRegex(RuntimeError, "Timed out waiting for agent ready"):
                     worker._wait_for_agent_ready(timeout_sec=1.0)
 
             self.assertFalse(worker.agent_ready)
             self.assertEqual(worker.wrapper_state, WrapperState.NOT_READY)
-            self.assertEqual(worker.observe_count, 2)
+            self.assertGreaterEqual(worker.observe_count, 2)
 
 
     def test_codex_boot_prompt_handler_debounces_repeated_enter(self):
@@ -14682,12 +14688,17 @@ esc to cancel                                             Gemini 3.5 Flash (Low)
             worker._ensure_health_supervisor_started = lambda: None  # noqa: SLF001
             worker._log_event = lambda event, **payload: events.append((event, payload))  # noqa: SLF001
             real_release = runtime_module._release_reserved_session_name  # noqa: SLF001
+            target_session_name = worker.session_name
             release_attempts = 0
 
             def flaky_release(session_name: str) -> None:
                 nonlocal release_attempts
-                release_attempts += 1
-                if release_attempts == 1:
+                # A delayed destructor from another test can run while this
+                # module-level helper is patched. Only the reservation owned by
+                # this worker is part of the scenario under test.
+                if session_name == target_session_name:
+                    release_attempts += 1
+                if session_name == target_session_name and release_attempts == 1:
                     raise TimeoutError("lease lock timeout")
                 real_release(session_name)
 

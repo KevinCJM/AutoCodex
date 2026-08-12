@@ -15,7 +15,6 @@ from tmux_core.stage_kernel.agent_intervention import (
     AGENT_INTERVENTION_RECHECK,
     AGENT_INTERVENTION_RECREATE,
     AGENT_INTERVENTION_WORKER_DEAD,
-    GRAPHIFY_USAGE_OVERRIDE,
     request_file_noncompliance_intervention,
     request_worker_manual_intervention,
     wait_for_worker_runtime_intervention,
@@ -27,7 +26,6 @@ from tmux_core.stage_kernel.role_orchestration import (
     run_reviewer_phase,
 )
 from tmux_core.runtime.tmux_runtime import (
-    GRAPHIFY_USAGE_BLOCKER,
     AgentRuntimeInterventionRequired,
     AgentStartupInterventionRequired,
 )
@@ -362,49 +360,6 @@ class RoleOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(decision, AGENT_INTERVENTION_RECHECK)
         prompt.assert_called_once()
-
-    def test_graphify_required_runtime_intervention_supports_explicit_source_override(self):
-        overrides: list[str] = []
-        worker = SimpleNamespace(
-            session_name="审核员-图谱",
-            read_state=lambda: {
-                "status": "running",
-                "agent_state": "READY",
-                "health_status": "awaiting_reconfig",
-            },
-            override_graphify_usage_requirement=lambda: overrides.append("override"),
-        )
-        error = AgentRuntimeInterventionRequired(
-            blocker_kind=GRAPHIFY_USAGE_BLOCKER,
-            session_name=worker.session_name,
-            state_path="/tmp/graphify-worker.state.json",
-            message="Graphify query receipt missing",
-        )
-        with mock.patch(
-            "tmux_core.stage_kernel.agent_intervention.terminal_ui_is_interactive",
-            return_value=True,
-        ), mock.patch(
-            "tmux_core.stage_kernel.agent_intervention.prompt_select_option",
-            return_value=GRAPHIFY_USAGE_OVERRIDE,
-        ) as prompt:
-            wait_for_worker_runtime_intervention(
-                worker,
-                error=error,
-                stage_label="任务开发",
-                role_label="审核员",
-            )
-
-        self.assertEqual(overrides, ["override"])
-        payload = prompt.call_args.kwargs["extra_payload"]
-        self.assertEqual(payload["recovery_kind"], "graphify_usage_intervention")
-        self.assertEqual(
-            [value for value, _label in prompt.call_args.kwargs["options"]],
-            [
-                AGENT_INTERVENTION_RECHECK,
-                GRAPHIFY_USAGE_OVERRIDE,
-                "graphify_usage_terminate",
-            ],
-        )
 
     def test_file_noncompliance_intervention_does_not_mark_ready_worker_as_reconfiguring(self):
         worker = _ManualMarkerWorker()

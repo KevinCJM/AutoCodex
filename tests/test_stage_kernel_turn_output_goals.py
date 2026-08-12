@@ -102,10 +102,10 @@ class TurnOutputGoalsTests(unittest.TestCase):
                 return SimpleNamespace(ok=True, clean_output=json.dumps({"status": "hitl"}, ensure_ascii=False))
 
             worker = _FakeTaskWorker([first_response, second_response])
-            graphify_profile = object()
+            codegraph_profile = object()
             prepared_prompts: list[str] = []
-            worker.prepare_graphify_turn_profile = (  # type: ignore[attr-defined]
-                lambda current_prompt: prepared_prompts.append(current_prompt) or graphify_profile
+            worker.prepare_codegraph_turn_profile = (  # type: ignore[attr-defined]
+                lambda current_prompt: prepared_prompts.append(current_prompt) or codegraph_profile
             )
             payload = run_task_result_turn_with_repair(
                 worker=worker,
@@ -123,8 +123,8 @@ class TurnOutputGoalsTests(unittest.TestCase):
             self.assertEqual(payload["status"], "hitl")
             self.assertEqual(len(worker.prompts), 2)
             self.assertEqual(prepared_prompts, ["原始 prompt"])
-            self.assertIs(worker.run_turn_kwargs[0]["graphify_profile"], graphify_profile)
-            self.assertIs(worker.run_turn_kwargs[1]["graphify_profile"], graphify_profile)
+            self.assertIs(worker.run_turn_kwargs[0]["codegraph_profile"], codegraph_profile)
+            self.assertIs(worker.run_turn_kwargs[1]["codegraph_profile"], codegraph_profile)
             self.assertIn("遗漏了本轮协议要求的产物", worker.prompts[1])
             self.assertIn(str(ask_human), worker.prompts[1])
             self.assertNotIn("result.json", worker.prompts[1])
@@ -132,7 +132,7 @@ class TurnOutputGoalsTests(unittest.TestCase):
             self.assertNotIn("task_runtime", worker.prompts[1])
             self.assertNotIn(".development_runtime", worker.prompts[1])
 
-    def test_task_repair_freezes_graphify_profile_with_turn_context(self):
+    def test_task_repair_freezes_codegraph_profile_with_turn_context(self):
         contract = TaskResultContract(
             turn_id="context-turn",
             phase="a07_developer_task_complete",
@@ -143,25 +143,25 @@ class TurnOutputGoalsTests(unittest.TestCase):
         worker = _FakeTaskWorker(
             [lambda **_kwargs: SimpleNamespace(ok=True, clean_output=json.dumps({"status": "completed"}))]
         )
-        graphify_profile = object()
-        graphify_context = object()
+        codegraph_profile = object()
+        codegraph_context = object()
         prepared: list[tuple[str, object]] = []
 
         def prepare(prompt: str, *, turn_context=None):  # noqa: ANN001
             prepared.append((prompt, turn_context))
-            return graphify_profile
+            return codegraph_profile
 
-        worker.prepare_graphify_turn_profile = prepare  # type: ignore[attr-defined]
+        worker.prepare_codegraph_turn_profile = prepare  # type: ignore[attr-defined]
         run_task_result_turn_with_repair(
             worker=worker,
             label="context-turn",
             prompt="task prompt",
             result_contract=contract,
             parse_result_payload=json.loads,
-            graphify_context=graphify_context,
+            codegraph_context=codegraph_context,
         )
-        self.assertEqual(prepared, [("task prompt", graphify_context)])
-        self.assertIs(worker.run_turn_kwargs[0]["graphify_profile"], graphify_profile)
+        self.assertEqual(prepared, [("task prompt", codegraph_context)])
+        self.assertIs(worker.run_turn_kwargs[0]["codegraph_profile"], codegraph_profile)
 
     def test_run_task_result_turn_with_repair_forwards_pre_submit_observation_budget(self):
         contract = TaskResultContract(
@@ -541,10 +541,10 @@ class TurnOutputGoalsTests(unittest.TestCase):
                 return SimpleNamespace(ok=True, clean_output="")
 
             worker = _FakeTaskWorker([first_response, second_response])
-            graphify_profile = object()
+            codegraph_profile = object()
             prepared_prompts: list[str] = []
-            worker.prepare_graphify_turn_profile = (  # type: ignore[attr-defined]
-                lambda current_prompt: prepared_prompts.append(current_prompt) or graphify_profile
+            worker.prepare_codegraph_turn_profile = (  # type: ignore[attr-defined]
+                lambda current_prompt: prepared_prompts.append(current_prompt) or codegraph_profile
             )
             run_completion_turn_with_repair(
                 worker=worker,
@@ -565,8 +565,8 @@ class TurnOutputGoalsTests(unittest.TestCase):
             self.assertEqual(observation.observed_status, "review_fail")
             self.assertEqual(len(worker.prompts), 2)
             self.assertEqual(prepared_prompts, ["评审 prompt"])
-            self.assertIs(worker.run_turn_kwargs[0]["graphify_profile"], graphify_profile)
-            self.assertIs(worker.run_turn_kwargs[1]["graphify_profile"], graphify_profile)
+            self.assertIs(worker.run_turn_kwargs[0]["codegraph_profile"], codegraph_profile)
+            self.assertIs(worker.run_turn_kwargs[1]["codegraph_profile"], codegraph_profile)
             self.assertIn("评审输出未通过协议校验", worker.prompts[1])
             self.assertIn(str(review_md), worker.prompts[1])
 

@@ -1,11 +1,11 @@
-"""Stage-owned AI Hermes routing hints for Graphify turns.
+"""Stage-owned AI Hermes routing hints for CodeGraph turns.
 
-Graphify's runtime adapter deliberately does not read routing JSON.  Stage
+CodeGraph's runtime adapter deliberately does not read routing JSON.  Stage
 code uses this module to select an AI Hermes route, reuse the bundled route
 materializer, and pass only safe project-relative source paths and explicit
-code symbols into ``GraphifyTurnContext``.
+code symbols into ``CodeGraphTurnContext``.
 
-All routing failures are fail-soft: Graphify can still fall back to its prompt
+All routing failures are fail-soft: CodeGraph can still fall back to its prompt
 keyword strategy, while the business stage continues unchanged.
 """
 
@@ -20,9 +20,9 @@ import re
 from types import ModuleType
 from typing import Iterable, Mapping, Sequence
 
-from tmux_core.runtime.graphify import (
-    GraphifyQueryIntent,
-    GraphifyTurnContext,
+from tmux_core.runtime.codegraph import (
+    CodeGraphQueryIntent,
+    CodeGraphTurnContext,
 )
 
 
@@ -90,8 +90,8 @@ _NON_SYMBOL_WORDS = frozenset(
 
 
 @dataclass(frozen=True)
-class StageGraphifyRouteHints:
-    """Safe route evidence resolved by the stage layer."""
+class StageCodeGraphRouteHints:
+    """Safe navigation seeds resolved by the stage layer."""
 
     route_id: str = ""
     routed_paths: tuple[str, ...] = ()
@@ -286,23 +286,23 @@ def _module_symbols(
     return _stable_unique(symbols, limit=_MAX_SYMBOLS)
 
 
-def resolve_stage_graphify_route_hints(
+def resolve_stage_codegraph_route_hints(
     project_dir: str | Path,
     *,
     task_text: str,
     business_artifact_paths: Sequence[str | Path] = (),
     explicit_paths: Sequence[str | Path] = (),
     explicit_symbols: Sequence[str] = (),
-) -> StageGraphifyRouteHints:
-    """Resolve stage-level Graphify seeds without making routing authoritative."""
+) -> StageCodeGraphRouteHints:
+    """Resolve stage-level CodeGraph seeds without making routing authoritative."""
 
     try:
         project_root = Path(project_dir).expanduser().resolve()
     except (OSError, RuntimeError):
-        return StageGraphifyRouteHints()
+        return StageCodeGraphRouteHints()
     task_routes = _load_json_mapping(project_root / "docs" / "task_routes.json")
     if task_routes is None:
-        return StageGraphifyRouteHints()
+        return StageCodeGraphRouteHints()
 
     combined_parts = [str(task_text or "")]
     remaining = _MAX_ROUTE_TEXT_CHARS - len(combined_parts[0])
@@ -321,12 +321,12 @@ def resolve_stage_graphify_route_hints(
     combined_text = "\n".join(combined_parts)[:_MAX_ROUTE_TEXT_CHARS]
     route_id = _select_route_id(task_routes, combined_text)
     if not route_id:
-        return StageGraphifyRouteHints()
+        return StageCodeGraphRouteHints()
 
     resolver_module = _load_route_task_module()
     resolver = getattr(resolver_module, "resolve_route", None) if resolver_module else None
     if not callable(resolver):
-        return StageGraphifyRouteHints()
+        return StageCodeGraphRouteHints()
     try:
         resolved = resolver(
             project_root=project_root,
@@ -334,9 +334,9 @@ def resolve_stage_graphify_route_hints(
             expand="conditional",
         )
     except Exception:  # noqa: BLE001 - stage behavior must not depend on hints.
-        return StageGraphifyRouteHints()
+        return StageCodeGraphRouteHints()
     if not isinstance(resolved, Mapping) or resolved.get("status") != "ok":
-        return StageGraphifyRouteHints()
+        return StageCodeGraphRouteHints()
 
     path_values: list[object] = list(explicit_paths)
     files = resolved.get("files", {})
@@ -375,20 +375,20 @@ def resolve_stage_graphify_route_hints(
         ),
         limit=_MAX_SYMBOLS,
     )
-    return StageGraphifyRouteHints(
+    return StageCodeGraphRouteHints(
         route_id=route_id,
         routed_paths=routed_paths,
         symbols=symbols,
     )
 
 
-def build_stage_graphify_turn_context(
+def build_stage_codegraph_turn_context(
     project_dir: str | Path,
     *,
     stage_key: str,
     phase: str,
     role: str,
-    intent: GraphifyQueryIntent,
+    intent: CodeGraphQueryIntent,
     requirement_name: str = "",
     task_name: str = "",
     query_seeds: Sequence[str] = (),
@@ -396,8 +396,8 @@ def build_stage_graphify_turn_context(
     explicit_paths: Sequence[str | Path] = (),
     explicit_symbols: Sequence[str] = (),
     resolve_route_hints: bool = True,
-) -> GraphifyTurnContext:
-    """Build a Graphify context enriched by stage-resolved routing hints."""
+) -> CodeGraphTurnContext:
+    """Build a CodeGraph context enriched by stage-resolved routing hints."""
 
     task_text = "\n".join(
         value
@@ -411,7 +411,7 @@ def build_stage_graphify_turn_context(
         if value
     )
     hints = (
-        resolve_stage_graphify_route_hints(
+        resolve_stage_codegraph_route_hints(
             project_dir,
             task_text=task_text,
             business_artifact_paths=business_artifact_paths,
@@ -419,9 +419,9 @@ def build_stage_graphify_turn_context(
             explicit_symbols=explicit_symbols,
         )
         if resolve_route_hints
-        else StageGraphifyRouteHints()
+        else StageCodeGraphRouteHints()
     )
-    return GraphifyTurnContext(
+    return CodeGraphTurnContext(
         stage_key=stage_key,
         phase=phase,
         role=role,
@@ -434,7 +434,7 @@ def build_stage_graphify_turn_context(
     )
 
 
-def worker_graphify_scope(worker: object) -> tuple[Path, str]:
+def worker_codegraph_scope(worker: object) -> tuple[Path, str]:
     """Return worker project/requirement metadata without runtime coupling."""
 
     try:
@@ -452,11 +452,11 @@ def worker_graphify_scope(worker: object) -> tuple[Path, str]:
     return project_root, requirement_name
 
 
-def worker_graphify_route_hints_enabled(worker: object) -> bool:
-    """Skip route reads only when the worker explicitly configured Graphify Off."""
+def worker_codegraph_route_hints_enabled(worker: object) -> bool:
+    """Skip route reads only when the worker explicitly configured CodeGraph Off."""
 
     config = getattr(worker, "config", None)
-    mode = getattr(config, "graphify_mode", None)
+    mode = getattr(config, "codegraph_mode", None)
     if mode is None:
         return True
     normalized = str(getattr(mode, "value", mode) or "").strip().casefold()
@@ -464,9 +464,9 @@ def worker_graphify_route_hints_enabled(worker: object) -> bool:
 
 
 __all__ = [
-    "StageGraphifyRouteHints",
-    "build_stage_graphify_turn_context",
-    "resolve_stage_graphify_route_hints",
-    "worker_graphify_route_hints_enabled",
-    "worker_graphify_scope",
+    "StageCodeGraphRouteHints",
+    "build_stage_codegraph_turn_context",
+    "resolve_stage_codegraph_route_hints",
+    "worker_codegraph_route_hints_enabled",
+    "worker_codegraph_scope",
 ]
