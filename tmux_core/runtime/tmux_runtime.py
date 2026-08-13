@@ -9197,6 +9197,20 @@ class TmuxBatchWorker:
             candidates.append(work_dir_name)
         return tuple(candidates)
 
+    def _codex_title_indicates_launch_ready(self, pane_title: str) -> bool:
+        """Reject shell-inherited titles while Codex is still booting.
+
+        Codex normally replaces the pane title with the project name once its
+        input surface is usable.  Before that happens tmux can keep the shell's
+        hostname as the title; treating every non-spinner title as READY lets a
+        business prompt race the remaining Codex initialization.
+        """
+
+        title = str(pane_title or "").strip()
+        if not title or BRAILLE_SPINNER_PREFIX_RE.match(title):
+            return False
+        return title in self._codex_title_candidates()
+
     def _title_indicates_ready(self, pane_title: str) -> bool:
         title = str(pane_title or "").strip()
         if not title:
@@ -9298,6 +9312,12 @@ class TmuxBatchWorker:
             if not self.agent_started:
                 return AgentRuntimeState.STARTING
             return self.agent_state
+        title_ready = self._title_indicates_ready(observation.pane_title)
+        if (
+            self.config.vendor == Vendor.CODEX
+            and (not self.agent_started or task_running_override is not None)
+        ):
+            title_ready = self._codex_title_indicates_launch_ready(observation.pane_title)
         return classify_agent_runtime_state(
             observation,
             context=AgentRuntimeClassifierContext(
@@ -9312,7 +9332,7 @@ class TmuxBatchWorker:
                     else self.current_task_runtime_status == TASK_STATUS_RUNNING
                 ),
                 pre_submit_ready_probe=task_running_override is not None,
-                title_ready=self._title_indicates_ready(observation.pane_title),
+                title_ready=title_ready,
                 title_busy=self._title_indicates_busy(observation.pane_title),
             ),
             detector=self.detector,
@@ -9482,6 +9502,16 @@ class TmuxBatchWorker:
         starting_surface = observation.visible_text if self.config.vendor == Vendor.DEVECO else surface
         if self._visible_indicates_agent_starting(starting_surface):
             return ""
+        if self.config.vendor == Vendor.CODEX:
+            if self._title_indicates_busy(observation.pane_title):
+                return ""
+            effective_surface = _codex_effective_recent_surface(surface)
+            if not _codex_surface_indicates_ready_input(effective_surface):
+                return ""
+            signature = self._build_terminal_signature("\n".join(
+                part for part in (observation.pane_title, effective_surface) if part
+            ))
+            return f"codex-visible-ready:{signature or 'ready'}"
         if not self._visible_indicates_agent_ready(
             observation.visible_text,
             observation.raw_log_tail,
@@ -9501,7 +9531,10 @@ class TmuxBatchWorker:
             surface = _codex_current_ready_surface(observation.visible_text, observation.raw_log_tail)
             if _codex_surface_has_ready_blocker(surface):
                 return False
-        if self._title_indicates_ready(observation.pane_title):
+        title_ready = self._title_indicates_ready(observation.pane_title)
+        if self.config.vendor == Vendor.CODEX:
+            title_ready = self._codex_title_indicates_launch_ready(observation.pane_title)
+        if title_ready:
             return True
         if self.config.vendor == Vendor.CODEX:
             return _codex_surface_indicates_ready_input(_codex_effective_recent_surface(surface))
@@ -9773,11 +9806,10 @@ class TmuxBatchWorker:
                         _codex_current_ready_surface(observation.visible_text, observation.raw_log_tail)
                     )
                 )
-                ready_signature = (
-                    observation.pane_title
-                    if self._title_indicates_ready(observation.pane_title) and not codex_ready_blocked
-                    else ""
-                )
+                title_ready = self._title_indicates_ready(observation.pane_title)
+                if self.config.vendor == Vendor.CODEX:
+                    title_ready = self._codex_title_indicates_launch_ready(observation.pane_title)
+                ready_signature = observation.pane_title if title_ready and not codex_ready_blocked else ""
                 if not ready_signature:
                     ready_signature = self._visible_ready_signature(observation)
                 if ready_signature and ready_signature == previous_ready_signature:

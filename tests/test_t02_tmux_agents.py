@@ -748,7 +748,9 @@ Do you trust the contents of this directory?
 
             self.assertFalse(worker._visible_indicates_agent_starting(visible))
             self.assertFalse(worker._visible_indicates_agent_ready(visible))
-            self.assertFalse(worker._visible_ready_signature(observation))
+            # Codex startup now accepts the current input box + footer as a
+            # stable READY signal even when the pane title is shell-inherited.
+            self.assertTrue(worker._visible_ready_signature(observation))
             worker.agent_started = True
             worker.pane_id = "%1"
             self.assertEqual(worker.get_agent_state(observation), AgentRuntimeState.READY)
@@ -1604,6 +1606,12 @@ QUEUED
             )
 
             self.assertTrue(worker._title_indicates_ready("tmux-api-v3"))
+            self.assertTrue(worker._codex_title_indicates_launch_ready("tmux-api-v3"))
+            self.assertFalse(
+                worker._codex_title_indicates_launch_ready(
+                    "ip-172-16-181-165.ap-southeast-1.compute.internal"
+                )
+            )
             self.assertTrue(worker._title_indicates_busy("⠋ tmux-api-v3"))
             self.assertTrue(worker._title_indicates_busy("⠧tmux-api-v3"))
 
@@ -9376,6 +9384,85 @@ workspace (/directory)                                                     branc
             self.assertEqual(state["agent_ready"], True)
             self.assertEqual(state["pane_title"], "tmux-api-v3")
 
+    def test_wait_for_agent_ready_rejects_inherited_hostname_until_visible_input_ready(self):
+        class InheritedHostnameWorker(TmuxBatchWorker):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.observe_count = 0
+
+            def target_exists(self, target=None):  # noqa: ANN001, ARG002
+                return True
+
+            def observe(self, *, tail_lines=500, tail_bytes=24000):  # noqa: ARG002
+                self.observe_count += 1
+                if self.observe_count <= 2:
+                    visible_text = "Initializing Codex session..."
+                else:
+                    visible_text = (
+                        "› Run /review on my current changes\n"
+                        "  gpt-5.6-sol xhigh · ~/Desktop/project"
+                    )
+                return WorkerObservation(
+                    visible_text=visible_text,
+                    raw_log_delta="",
+                    raw_log_tail=visible_text,
+                    current_command="node",
+                    current_path=str(self.work_dir),
+                    pane_dead=False,
+                    session_exists=True,
+                    log_mtime=0.0,
+                    observed_at=f"2026-08-13T14:21:0{self.observe_count}",
+                    pane_title="ip-172-16-181-165.ap-southeast-1.compute.internal",
+                )
+
+        with tempfile.TemporaryDirectory(prefix="codex-inherited-title-") as tmp_dir:
+            worker = InheritedHostnameWorker(
+                worker_id="codex-inherited-title-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+
+            with mock.patch("tmux_core.runtime.tmux_runtime.time.sleep", return_value=None):
+                worker._wait_for_agent_ready(timeout_sec=1.0)
+
+            self.assertEqual(worker.observe_count, 4)
+            self.assertTrue(worker.agent_ready)
+            self.assertEqual(worker.agent_state, AgentRuntimeState.READY)
+
+    def test_turn_start_ready_rejects_inherited_hostname_without_ready_surface(self):
+        with tempfile.TemporaryDirectory(prefix="codex-turn-start-title-") as tmp_dir:
+            worker = TmuxBatchWorker(
+                worker_id="codex-turn-start-title-worker",
+                work_dir=tmp_dir,
+                config=AgentRunConfig(vendor="codex", model="gpt-5.6-sol"),
+                runtime_root=Path(tmp_dir) / "runtime",
+            )
+            worker.pane_id = "%1"
+            worker.agent_started = True
+            observation = WorkerObservation(
+                visible_text="Initializing Codex session...",
+                raw_log_delta="",
+                raw_log_tail="Initializing Codex session...",
+                current_command="node",
+                current_path=str(worker.work_dir),
+                pane_dead=False,
+                session_exists=True,
+                log_mtime=0.0,
+                observed_at="2026-08-13T14:21:20",
+                pane_title="ip-172-16-181-165.ap-southeast-1.compute.internal",
+            )
+
+            self.assertFalse(
+                worker._mark_turn_start_ready_from_observation(
+                    observation,
+                    label="requirements_clarification_round_1",
+                    delayed=False,
+                )
+            )
+            self.assertFalse(worker.agent_ready)
+
     def test_wait_for_agent_ready_uses_current_codex_surface_over_stale_raw_history(self):
         class ReadyVisibleWithStaleHistoryWorker(TmuxBatchWorker):
             def __init__(self, **kwargs):
@@ -9557,10 +9644,14 @@ workspace (/directory)                                                     branc
 
             def observe(self, *, tail_lines=500, tail_bytes=24000):
                 self.observe_count += 1
+                visible_text = (
+                    "› Write tests for @filename\n"
+                    "  gpt-5.6-sol xhigh · ~/Desktop/tmux-api-v3"
+                )
                 return WorkerObservation(
-                    visible_text="› Write tests for @filename",
+                    visible_text=visible_text,
                     raw_log_delta="",
-                    raw_log_tail="› Write tests for @filename",
+                    raw_log_tail=visible_text,
                     current_command="node",
                     current_path=str(self.work_dir),
                     pane_dead=False,
